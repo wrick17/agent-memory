@@ -127,24 +127,64 @@ describe("recall channels and the vector fallback", () => {
 		expect((await call(c, "get_memory", { memory_id: j.memory_id })).embedding_status).toBe("embedded");
 	});
 
-	it("answers lexically within the vector time limit when Vectorize is slow or failing, and says so", async () => {
+	// One 3 s deadline covers the query embedding and the Vectorize query (decision of 2026-10-28; it replaced a 300 ms wait).
+	type Recall = { results: { memory_id: string; matched_by: string[] }[]; lexical_only: boolean; diagnostics: Record<string, Record<string, string> | string> };
+	const fake = () => (env as unknown as { AI: { _pending(): Promise<number>; _calls(): Promise<number> } }).AI;
+	const probe = async (c: Awaited<ReturnType<typeof contextFor>>, name: string) => {
+		const saved = await call(c, "save_memory", { name, type: "reference", description: "deadline", content: "deadline probe body", profile: "test" });
+		await runDurableObjectAlarm(profileStub(c, "test"));
+		for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: saved.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		return saved.memory_id as string;
+	};
+	const timed = async (c: Awaited<ReturnType<typeof contextFor>>, keyword: string) => {
+		const at = Date.now();
+		const r = await call<Recall>(c, "recall_memories", { keyword, profile: "test" });
+		return { r, ms: Date.now() - at, d: r.diagnostics.test as Record<string, string> };
+	};
+
+	it("lets semantic results that arrive after the old limits contribute within the shared 3 s deadline", async () => {
 		const c = await contextFor();
-		await call(c, "save_memory", { name: "Fallback probe", type: "reference", description: "fallback", content: "fallback probe body", profile: "test" });
-		const started = Date.now();
-		const slow = await call<{ results: unknown[]; lexical_only: boolean; diagnostics: Record<string, Record<string, string>> }>(c, "recall_memories", { keyword: "fallback probe [[vector-slow]]", profile: "test" });
-		expect(Date.now() - started).toBeLessThan(1500);
-		expect(slow.lexical_only).toBe(true);
-		expect(slow.diagnostics.test!.vector).toBe("timeout");
-		expect(slow.results.length).toBeGreaterThan(0);
-		const failing = await call<{ lexical_only: boolean; diagnostics: Record<string, Record<string, string>> }>(c, "recall_memories", { keyword: "fallback probe [[vector-fail]]", profile: "test" });
-		expect(failing.lexical_only).toBe(true);
-		expect(failing.diagnostics.test!.vector).toMatch(/^error:/);
-		const embedFail = await call<{ lexical_only: boolean; diagnostics: Record<string, unknown> }>(c, "recall_memories", { keyword: "fallback probe [[embed-fail]]", profile: "test" });
-		expect(embedFail.lexical_only).toBe(true);
+		const id = await probe(c, "Deadline probe late");
+		const slowEmbedding = await timed(c, "deadline probe [[embed-slow]]");
+		expect(slowEmbedding.ms).toBeGreaterThanOrEqual(1500);
+		expect(slowEmbedding.d).toMatchObject({ embedding: "ok", vector: expect.stringMatching(/^hits:/) });
+		expect(slowEmbedding.r.results.find((x) => x.memory_id === id)?.matched_by).toContain("vector");
+		const slowVector = await timed(c, "deadline probe [[vector-slow]]");
+		expect(slowVector.ms).toBeGreaterThanOrEqual(2000);
+		expect(slowVector.ms).toBeLessThan(3000);
+		expect(slowVector.r.results.find((x) => x.memory_id === id)?.matched_by).toContain("vector");
+	});
+
+	it("returns the ready lexical results at the deadline or on a provider failure, and says which stage missed", async () => {
+		const c = await contextFor();
+		const id = await probe(c, "Deadline probe missed");
+		const found = (r: Recall) => r.results.find((x) => x.memory_id === id)?.matched_by;
+		// The embedding is still pending when the lexical results come back: lexical work never waits for it.
+		const hungEmbedding = await timed(c, "deadline probe [[embed-hang]]");
+		expect(await fake()._pending()).toBeGreaterThan(0);
+		expect(hungEmbedding.ms).toBeGreaterThanOrEqual(2900);
+		expect(hungEmbedding.ms).toBeLessThan(3800);
+		expect(hungEmbedding.d).toMatchObject({ embedding: "timeout", vector: "skipped" });
+		expect(hungEmbedding.r.lexical_only).toBe(true);
+		expect(found(hungEmbedding.r)).toEqual(expect.arrayContaining(["fulltext"]));
+		expect(found(hungEmbedding.r)).not.toContain("vector");
+		const hungVector = await timed(c, "deadline probe [[vector-hang]]");
+		expect(hungVector.ms).toBeLessThan(3800);
+		expect(hungVector.d).toMatchObject({ embedding: "ok", vector: "timeout" });
+		expect(found(hungVector.r)).not.toContain("vector");
+		const vectorFails = await timed(c, "deadline probe [[vector-fail]]");
+		expect(vectorFails.ms).toBeLessThan(1500);
+		expect(vectorFails.d.vector).toMatch(/^error:/);
+		expect(found(vectorFails.r)).toBeDefined();
+		const embeddingFails = await timed(c, "deadline probe [[embed-fail]]");
+		expect(embeddingFails.d).toMatchObject({ embedding: expect.stringMatching(/^error:/), vector: "skipped" });
+		expect(found(embeddingFails.r)).toBeDefined();
 		const off = await contextFor(undefined, { EMBEDDINGS: "off" });
-		const lexical = await call<{ lexical_only: boolean; diagnostics: Record<string, unknown>; results: unknown[] }>(off, "recall_memories", { keyword: "fallback probe", profile: "test" });
-		expect(lexical).toMatchObject({ lexical_only: true, diagnostics: { embedding: "off" } });
-		expect(lexical.results.length).toBeGreaterThan(0);
+		const calls = await fake()._calls();
+		const lexical = await call<Recall>(off, "recall_memories", { keyword: "deadline probe", profile: "test" });
+		expect(lexical).toMatchObject({ lexical_only: true, diagnostics: { embedding: "off", test: { embedding: "off", vector: "off" } } });
+		expect(found(lexical)).toBeDefined();
+		expect(await fake()._calls()).toBe(calls);
 	});
 
 	it("packs results to the token budget", async () => {

@@ -5,14 +5,11 @@ import type { AccountContext, AccountStore } from "./account/store";
 import { requestHash } from "./domain/ids";
 import { redactPayload } from "./domain/redact";
 import { fail, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand } from "./domain/types";
-import { APPEND_MAX, EMBED_MODEL, embeddingsOn, NOTE_MAX, type ProfileStore } from "./profile/store";
+import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
 import { contextProfile, mayUse, readSet, routeWrite, type Route } from "./routing";
 
 export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string }
 
-const VECTOR_WAIT_MS = 300;
-// shortcut: the query embedding gets its own 1 s bound; measure real Workers AI latency in G5 and tighten if needed.
-const EMBED_WAIT_MS = 1_000;
 const RRF_K = 60;
 
 // Zod schemas are built once at module scope, not per request.
@@ -185,26 +182,11 @@ async function recall(c: ToolContext, a: RecallInput): Promise<Outcome<unknown>>
 	const envelope = { read_set: names, query: keyword, type, scope: a.scope ?? null, limit, token_budget: a.token_budget ?? null };
 	if (!keyword) return inventory(c, a, names, refs, limit, common, envelope);
 
-	let vector: number[] | undefined;
-	const diagnostics: Record<string, unknown> = {};
-	if (embeddingsOn(c.env)) {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const out = await Promise.race([
-				c.env.AI!.run(EMBED_MODEL, { text: [keyword] }) as Promise<{ data?: number[][] }>,
-				new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), EMBED_WAIT_MS); }),
-			]);
-			vector = out.data?.[0];
-			if (!vector) diagnostics.embedding = "empty";
-		} catch (e) {
-			diagnostics.embedding = `unavailable:${(e as Error).message}`;
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-		}
-	} else diagnostics.embedding = "off";
-	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, {
-		kind: "recall", keyword, limit, ...common, ...(vector ? { vector } : {}), vectorWaitMs: VECTOR_WAIT_MS,
-	})));
+	// Each profile starts its lexical channels at once and gets semantic results only within one shared deadline.
+	const semantic = embeddingsOn(c.env);
+	const diagnostics: Record<string, unknown> = semantic ? {} : { embedding: "off" };
+	const deadline = Date.now() + SEMANTIC_MS;
+	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, semantic, deadline })));
 	const merged = new Map<string, { hit: RecallHit; score: number }>();
 	for (const [i, page] of pages.entries()) {
 		if (!page.ok) return page;

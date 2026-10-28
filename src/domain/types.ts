@@ -104,7 +104,7 @@ export interface Identity { memory_id?: string; name?: string; scope?: string; t
 
 export type ReadQuery =
 	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string } }
-	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; vector?: number[]; vectorWaitMs: number }
+	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number }
 	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean }
 	| { kind: "has"; id: string };
 

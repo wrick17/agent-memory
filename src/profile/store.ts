@@ -2,13 +2,13 @@
 import { DurableObject } from "cloudflare:workers";
 import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type WriteCommand, type WriteContext } from "../domain/types";
 import { migrate } from "../storage";
-import { embedStep, embeddingsOn, namespaceOf, vectorId } from "./index";
+import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
 import { fuse, get, inventory, lexicalChannels } from "./read";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, type Who } from "./write";
 
 // The profile module's public surface: callers outside src/profile import only from here.
-export { EMBED_MODEL, embeddingsOn } from "./index";
+export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { APPEND_MAX, NOTE_MAX } from "./write";
 
 const RETRY_MS = 60_000;
@@ -73,25 +73,42 @@ export class ProfileStore extends DurableObject<Env> {
 		}
 	}
 
-	/** Starts the Vectorize query first, runs the lexical channels while it is in flight, then waits at most vectorWaitMs more. */
+	/**
+	 * Semantic enrichment shares one deadline set by the Worker (section 11). The keyword's embedding is requested first,
+	 * the lexical channels run while it is in flight, and the Vectorize query follows the embedding. Whatever has not
+	 * answered by the deadline is left out; the lexical results return, and diagnostics name the stage that missed.
+	 */
 	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>): Promise<RecallPage> {
 		const diagnostics: Record<string, string> = {};
-		const pending = q.vector && this.env.VECTORS
-			? this.env.VECTORS.query(q.vector, { topK: 100, namespace: namespaceOf(who), returnValues: false, returnMetadata: "none",
-				...(q.kinds?.length ? { filter: { kind: { $in: q.kinds } } } : {}) })
-			: undefined;
+		let stage: "embedding" | "vector" = "embedding";
+		const semantic = q.semantic && this.env.AI && this.env.VECTORS ? (async () => {
+			const out = (await this.env.AI!.run(EMBED_MODEL, { text: [q.keyword] })) as { data?: number[][] };
+			const vector = out.data?.[0];
+			if (!vector?.length) throw new Error("empty embedding");
+			diagnostics.embedding = "ok";
+			stage = "vector";
+			return this.env.VECTORS!.query(vector, { topK: 100, namespace: namespaceOf(who), returnValues: false, returnMetadata: "none",
+				...(q.kinds?.length ? { filter: { kind: { $in: q.kinds } } } : {}) });
+		})() : undefined;
+		// An answer or failure that arrives after the deadline is dropped, never left unhandled.
+		semantic?.catch(() => undefined);
 		const channels = lexicalChannels(this.ctx.storage.sql, q, diagnostics);
 		let vectorUsed = false;
-		if (!pending) diagnostics.vector = q.vector ? "unavailable" : "off";
-		else {
+		if (!semantic) {
+			diagnostics.embedding = q.semantic ? "unavailable" : "off";
+			diagnostics.vector = "off";
+		} else {
 			const timeout = Symbol("timeout");
 			let timer: ReturnType<typeof setTimeout> | undefined;
-			const res = await Promise.race([pending, new Promise<typeof timeout>((r) => { timer = setTimeout(() => r(timeout), q.vectorWaitMs); })])
+			// Clamped, so a clock difference between the Worker and this object can never stretch the wait.
+			const wait = Math.max(0, Math.min(q.deadline - Date.now(), SEMANTIC_MS));
+			const res = await Promise.race([semantic, new Promise<typeof timeout>((r) => { timer = setTimeout(() => r(timeout), wait); })])
 				.catch((e: unknown) => e as Error)
 				.finally(() => { if (timer !== undefined) clearTimeout(timer); });
-			if (res === timeout) { diagnostics.vector = "timeout"; pending.catch(() => undefined); }
-			else if (res instanceof Error) diagnostics.vector = `error:${res.name}`;
-			else {
+			if (res === timeout || res instanceof Error) {
+				diagnostics[stage] = res === timeout ? "timeout" : `error:${res.name}`;
+				if (stage === "embedding") diagnostics.vector = "skipped";
+			} else {
 				vectorUsed = true;
 				const prefix = `g${who.generation}:`;
 				const ids = res.matches.map((m) => m.id).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length));

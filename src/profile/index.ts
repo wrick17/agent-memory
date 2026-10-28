@@ -4,6 +4,8 @@ import { nextSeq } from "../storage";
 import { cardText, readPrefix, type Who } from "./write";
 
 export const EMBED_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
+/** One shared deadline for recall's semantic enrichment: query embedding plus Vectorize query (section 11, decision of 2026-10-28). */
+export const SEMANTIC_MS = 3_000;
 const BATCH = 16;
 
 export const namespaceOf = (w: Who) => `${w.userId}:${w.profile}:g${w.generation}`;

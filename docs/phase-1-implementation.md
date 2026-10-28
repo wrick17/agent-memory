@@ -52,7 +52,7 @@ Design source: [architecture v3.2](architecture.md), section 22 (phase 1) and se
 | G3 content paging returns `revision_conflict` when an append lands between pages | same | Local |
 | BothQ `content_hash` parity | same; expected value computed with BothQ's `_hash(content_source())` | Local |
 | G4 personal device token cannot read work; recall routed to work reads only work and me; same name in work and me gets two ids, both recalled; `me` refused without `company_free` | `test/isolation-recall.test.ts` | Local |
-| G5 vector channel returns the record once embedded; lexical answer within the time limit when Vectorize is slow or failing; `EMBEDDINGS=off` says `lexical_only` | same | Local fakes for Workers AI and Vectorize (`test/fakes.js`) |
+| G5 vector channel returns the record once embedded; lexical answer within the time limit when Vectorize is slow or failing (since 2026-10-28, the shared 3 s deadline: see the [semantic deadline change](#semantic-deadline-change)); `EMBEDDINGS=off` says `lexical_only` | same | Local fakes for Workers AI and Vectorize (`test/fakes.js`) |
 | Generation ids reserved in the R2 ledger; redraw on collision; 64-byte refusal | same | Local R2 |
 | `/mcp` end to end on `2026-07-28`, 2025-era stateless client, tools by scope, revocation on the next request, foreign Origin refused | `test/mcp-auth.test.ts` | Tokens signed by a test key; JWKS served by a stubbed `fetch` |
 | JWT refusals: issuer, audience, owner, expiry, signature, unknown `kid`, missing scope (403); 503 on unreachable keys | same | Verifier rules only, not Clerk's real tokens |
@@ -190,10 +190,76 @@ These tests show the stage log, the fail-closed behavior and the configuration. 
 
 **Live proof.** The deployed manual-redirect fix returned 200 with claims for the real Codex token; direct real-token MCP and device checks are recorded in [verification](phase-1-verification.md#manual-redirect-deployment-and-live-checks). Remaining gate items are listed below.
 
+## Live vector channel: diagnosis
+
+Terra's live recalls found the synthetic `test` journal only lexically. The calls reported embedding and vector-query timeouts ([live checks](phase-1-verification.md#manual-redirect-deployment-and-live-checks)). Diagnosed on Worker version `49233d08-70c4-46a6-ae26-42afe51bfb67` with read-only checks; no source, configuration, deployment or data change.
+
+**The write path works live.**
+- `get_memory` on the journal (`63d16625-df80-5241-95c9-84f41246d75f`, profile `test`) returns `embedding_status: "embedded"`, so the alarm's `embed` stage ran.
+- `wrangler vectorize info agent-memory-cards`: 1,024 dimensions, 1 vector, processed at 2026-10-28T17:08:37Z.
+- `wrangler vectorize list-vectors` and `get-vectors`: the one vector is `go25mc24teteg2:63d16625-…`, in namespace `user_3LKQ6KGbDJZfXH8o4UfNqcq6mig:test:go25mc24teteg2`, with metadata `{kind: "journal", gen: "o25mc24teteg2"}` and 1,024 values. Id, namespace and metadata all match what `src/profile/index.ts` writes and what the Durable Object's recall queries.
+- `wrangler vectorize query --vector-id … --namespace …` returns it, with and without the `kind` filter. The index, the namespace and the `kind` metadata index serve it.
+
+**The query path is starved by latency, not broken.** `/tmp/am-auth-repro/recall.mjs` runs live `recall_memories` calls in profile `test` with the isolated Codex token, read inside the script. It prints only timings, the whitelisted `embedding` and `vector` diagnostics and whether the journal was found. Across 8 calls, run back to back and 5 s apart:
+- 5 calls: the query embedding exceeded the 1 s bound in `src/mcp.ts` (`embedding: "unavailable:timeout"`), so no Vectorize query was made.
+- 3 calls: the embedding arrived, and the `test` profile's Vectorize query exceeded the 300 ms wait in `src/profile/store.ts` (`vector: "timeout"`).
+- Every call returned the journal through full text.
+
+`wrangler tail` gives each invocation's wall time, which runs until its pending provider call settles; `Authorization` was already redacted in the capture.
+- Query embedding through Workers AI: about 0.18 s and 0.7 s when in time; about 1.04, 1.45 and 1.46 s when it missed the bound.
+- The `test` Durable Object's Vectorize query: about 0.62 s and 1.4 s. The empty `me` namespace answered in about 0.2 s, which is why some responses show `lexical_only: false`: that flag covers the whole read set.
+- Durable Object reads without a query vector took 5 to 15 ms.
+
+**Cause.** The record, the index, the alarm and the query code are correct. Live provider latency on this account, from this location, is above both budgets: the approved 300 ms Vectorize wait (section 11) and the 1 s query-embedding bound, which was an author shortcut. So the vector channel rarely contributes, and recall falls back as designed. The local tests prove the channel's logic with fakes. What is missing is a live hit within budget, not a code fix. No source change is made: changing either budget is a decision, not a defect fix.
+
+**Decision, 2026-10-28 (parent, under the owner's authorization).** Both limits are replaced by one 3 s semantic-enrichment deadline. The 300 ms Vectorize wait and the 1 s query-embedding bound excluded every observed semantic result. See the [semantic deadline change](#semantic-deadline-change).
+
+**Terra repro (read-only).** Start `npx wrangler tail agent-memory --format json` into a mode-600 file. Run `node /tmp/am-auth-repro/recall.mjs semantic 4 5000`. The output gives, per call, `ms`, `embedding`, `vector`, `recordFound` and `matched_by`. A live vector hit shows `matched_by` containing `vector`.
+
+## Semantic deadline change
+
+**Flow.**
+1. The Worker sets `deadline = now + 3 s` (`SEMANTIC_MS` in `src/profile/index.ts`). It fans out to the read set's profiles at once, passing `semantic` (`EMBEDDINGS` is not `off`) and the deadline. The Worker no longer embeds the keyword.
+2. Each profile object requests the keyword's embedding from Workers AI first. It runs the exact, literal and full-text channels while that is in flight, and sends its Vectorize query when the embedding arrives (`ProfileStore.recall` in `src/profile/store.ts`).
+3. Fusion waits for the semantic chain only until the deadline, clamped to at most 3 s, so a clock difference cannot stretch it. A late answer or failure has a handler attached and is dropped. It neither delays the response nor becomes an unhandled rejection.
+4. Per-profile diagnostics are truthful:
+   - `embedding`: `ok`, `timeout`, `error:<name>`, `off` or `unavailable`.
+   - `vector`: `hits:<n>`, `no_results`, `timeout`, `error:<name>`, `skipped` (the embedding missed) or `off`.
+   - With `EMBEDDINGS=off`, the top-level `diagnostics.embedding: "off"` stays.
+
+**Unchanged:**
+- Generation-qualified ids and namespaces; profile and token isolation.
+- `type`, `kinds`, `scope` and history filters, applied to vector hits too.
+- RRF fusion and ordering, the cross-profile merge, token-budget packing.
+- Empty-keyword inventory and `EMBEDDINGS=off`, which makes no Workers AI call.
+- No new option, dependency or cache.
+
+The keyword is now embedded once per profile in the read set, so a work-plus-`me` recall makes two small calls. That keeps the change inside the existing recall call: no callback and no second round trip.
+
+| Regression in `test/isolation-recall.test.ts` | On the committed `0798699` flow | With the change |
+|---|---|---|
+| An embedding that answers after 1.5 s (past the old 1 s bound), and a Vectorize query that answers after 2 s (past the old 300 ms), each still contributes `vector` to the record's `matched_by` | Fails | Passes |
+| With the embedding still pending past the deadline, recall returns the full-text hit near 3 s while the fake embedding is still in flight (lexical work never waited for it), with `embedding: "timeout"`, `vector: "skipped"`. A Vectorize query past the deadline gives `vector: "timeout"`; a failing Vectorize or embedding gives `error:`; each returns the lexical hit. `EMBEDDINGS=off` returns lexically with no Workers AI call. | Fails | Passes |
+
+Old flow means `src/mcp.ts`, `src/profile/store.ts`, `src/profile/index.ts` and `src/domain/types.ts` at `0798699`, with the same tests and fakes.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | No errors |
+| `npx eslint` on the touched files | No issues |
+| `npx vitest run` (all four files call recall) | 4 files, 43 tests passed |
+
+**Live proof still needed (Terra).**
+- `node /tmp/am-auth-repro/recall.mjs semantic 4 5000`: expect `matched_by` containing `vector` for record `63d16625-df80-5241-95c9-84f41246d75f`. Judge the record's own `matched_by`, not `lexical_only`, which covers the whole read set.
+- If possible, a paraphrase with no shared literal, which should match only through `vector`.
+- `kinds: ["journal"]` keeps it and `kinds: ["rule"]` drops it.
+- A forced provider failure or timeout returns lexically by about 3 s.
+- `EMBEDDINGS=off` is unchanged.
+
 ## Live gates still open
 
 - **G1, T1 to T6.** Real Claude and Codex tokens now authenticate in direct MCP requests, but actual CLI tool calls, headless client configuration, negative real-token cases and refresh remain open. Terra reports that Clerk discovery publishes issuer `https://clerk.memory.wrick17.com`, which matches `CLERK_ISSUER`. The real access token must carry the resource in `aud` and `memory` in `scope` or `scp`; both stay required. If Clerk cannot satisfy them, the specified fallback (section 8) is the only alternative. Refresh (T4) is untested.
-- **G5.** Direct real-token synthetic save, append and lexical recall passed on this Mac. Actual CLI and headless client configuration checks and live vector retrieval remain open; a second physical machine is deferred. Terra measured 1,024 dimensions from a synthetic live call and the parent confirmed the `kind` String metadata index; live vector retrieval through the Worker and the query-embedding latency are untested.
+- **G5.** Direct real-token synthetic save, append and lexical recall passed on this Mac. Terra later reported actual Codex tool calls, a forced refresh and Claude `headersHelper` tool calls passing ([verification](phase-1-verification.md)). A live vector hit through recall is still open: before the shared 3 s semantic deadline, live latency kept the vector channel out ([diagnosis](#live-vector-channel-diagnosis)). After deployment, check the record's own `matched_by` for `vector` ([change](#semantic-deadline-change)). A second physical machine is deferred.
 - **Settings page in a browser.** The later CSP correction is deployed; the pinned owner Settings view rendered without CSP or initialization errors, and a test device was created and revoked. See [live evidence](phase-1-verification.md#settings-correction-redeployment-and-browser-check).
 - **G3 across physical machines.** The local test runs both callers in one process.
 
@@ -210,7 +276,6 @@ These tests show the stage log, the fail-closed behavior and the configuration. 
 
 ## Known limits
 
-- shortcut: the query embedding has its own 1 s bound in `src/mcp.ts`; measure live latency in G5 and tighten.
 - shortcut: `toLowerCase()` stands in for Python's `casefold()` in name normalization (`src/domain/ids.ts`); revisit in the migration import.
 - A Worker crash after binding a `request_id` and before the profile write leaves a binding with no result. A retry with the same payload proceeds; a retry with a changed payload is refused until the id changes.
 - The Origin check refuses browser-based MCP clients from other origins. Claude Code and Codex send no Origin.

@@ -1185,14 +1185,14 @@ Recall runs in each profile object of the read set, then merges in the Worker.
 
 ```mermaid
 flowchart LR
-	Q["keyword + repo"] --> W["Worker: route, embed the keyword once (if on)"]
+	Q["keyword + repo"] --> W["Worker: route, set one 3 s semantic deadline"]
 	W --> P1["ProfileStore work"]
 	W --> P2["ProfileStore me"]
 	subgraph IP["In each profile"]
 		C1["exact: name, key"] --> F["RRF k=60 + BothQ literal boosts + origin weight"]
 		C2["literal: texts_tri phrase"] --> F
 		C3["full text: texts_fts bm25"] --> F
-		C4["vector: Vectorize namespace query"] --> F
+		C4["vector: embed the keyword, then Vectorize namespace query, by the deadline"] --> F
 		F --> X["one-hop graph expansion from top 10 seeds (budgeted)"]
 		X --> PS["passages, 700 characters"]
 	end
@@ -1207,7 +1207,7 @@ flowchart LR
 | Full text | `texts_fts MATCH` with the phrase OR the tokens, bm25 order. The tokenizer keeps `SEQ-1234`, `foo.bar` and `#41` as single tokens. | 200 |
 | Vector | The profile queries `VECTORS` with the keyword's vector, `namespace: "<userId>:<profile>:g<generation>"` of the active generation, `topK: 100`, no metadata returned, and a `kind` filter when the caller passed `kinds`. Ids are hydrated from SQLite after the generation prefix is checked; ids with no active node are skipped and deleted lazily, by their own generation-qualified id. | 100 |
 
-- Overlap and time limit: the profile starts the Vectorize query first, runs the exact, literal and full-text channels while it is in flight, then waits at most 300 ms more for it. A slow or failing Vectorize call never stalls recall: the answer comes from the other channels and `diagnostics` says the vector channel timed out.
+- Overlap and time limit (decision of 2026-10-28): semantic enrichment has one 3 s deadline, set by the Worker when it fans out. Each profile requests the keyword's embedding first. It runs the exact, literal and full-text channels while that is in flight, and sends its Vectorize query when the embedding arrives. Fusion waits for that chain only until the deadline. A slow or failing embedding or Vectorize call never stalls recall past the deadline: the answer comes from the lexical channels, and `diagnostics` names the stage that timed out or failed. A late answer is dropped. Three seconds is a product budget, not a latency guarantee. **Superseded:** the earlier 300 ms Vectorize wait, and the separate 1 s query-embedding bound added in phase 1. Live checks on this account measured about 0.2 to 1.5 s for the query embedding and 0.6 to 1.4 s for the Vectorize query, so those limits excluded every observed semantic result ([live diagnosis](phase-1-implementation.md#live-vector-channel-diagnosis)). The keyword is embedded in each profile of the read set, so a work-plus-`me` recall makes two small embedding calls.
 - Fusion: RRF k=60 per channel, BothQ's literal boosts (+2 exact name, +1 name contains), origin weight (stated 1.0, agent 0.9, upload 0.8, inferred 0.7). Captures are excluded unless `include_captures` is set. Superseded, retired and moved nodes are excluded unless `include_history` is set or `as_of` falls in their valid time.
 - Empty keyword: the profile skips the channels and lists records in row order (stable creation order) after the cursor's position, and the Worker returns `next_cursor` holding each profile's last position.
 - Link expansion: the top 10 fused nodes seed a one-hop walk, inside the read set only (links into other profiles are not followed in recall), over current edges with basis `identifier` or `judgment` in the structural, work and reasoning classes, reading at most 1,000 edge rows. A neighbor scores the sum of its seeds' scores times a relation weight (reasoning 1.0, work 0.8, structural 0.6), divided by `1 + log(degree)` so hubs do not flood the list. Neighbors join as a `graph` channel, and each carries `via {from, rel, basis, reason}`. `expand: false` turns this off.
@@ -1856,7 +1856,7 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 | G1 auth | T1 to T6 (section 8), for whichever topology is chosen. Decides Clerk as the authorization server or the fallback. |
 | G3 contracts | Replay returns the stored result. A changed payload returns `idempotency_mismatch`. A stale revision returns `revision_conflict`. Two machines each send 100 concurrent appends to one journal: 200 entries, gapless `seq_no`, none lost. Supersession is atomic. Procedural validation matches BothQ. A retry after a routing-rule change replays in the original profile. Empty-keyword recall enumerates 250 test records completely through `next_cursor`. Content paging returns `revision_conflict` when an append lands between pages. |
 | G4 isolation | A device token for `personal` cannot read `work` directly. Recall routed to `work` returns only `work` and `me`. The same name saved in `work` and `me` gets two different ids and both appear in merged recall. A write to `me` from a work context without `company_free` is refused. |
-| G5 two machines | Save on the Mac through Claude Code (OAuth), recall on a second machine through Codex (OAuth) and on a headless box with a device token. The vector channel returns the new record once embedded, and answers lexically within its 300 ms limit when Vectorize is made to fail. With `EMBEDDINGS=off`, recall answers lexically and says so. |
+| G5 two machines | Save on the Mac through Claude Code (OAuth), recall on a second machine through Codex (OAuth) and on a headless box with a device token. The vector channel returns the new record once embedded, within the shared 3 s semantic deadline. When Workers AI or Vectorize is made slow or to fail, recall answers lexically by that deadline and says which stage missed. With `EMBEDDINGS=off`, recall answers lexically and says so. (The 300 ms limit in this check was superseded on 2026-10-28; see section 11.) |
 
 ### Phase 2: capture, backups and the first rehearsal
 
@@ -2011,7 +2011,7 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 - We accept rare links across profiles, in exchange for continuity. Scoped tokens see them as opaque ids.
 - We accept that judgment work happens only when the owner's machines run sessions, in exchange for a server that never acts. The queue waits and memory keeps working meanwhile.
 - We accept that the board and the corpus cover only what the owner's machines uploaded, with as-of dates, in exchange for Cloudflare never touching GitHub or Jira.
-- We accept a Vectorize round trip in recall, with a 300 ms limit and lexical fallback, in exchange for an index that scales without using the object's memory.
+- We accept a query embedding and a Vectorize round trip in recall, within one 3 s semantic deadline and with lexical fallback, in exchange for an index that scales without using the object's memory. (The 300 ms limit was superseded on 2026-10-28; see section 11.)
 - We accept a short fence on a record during a transfer, in exchange for transfers that cannot lose a write.
 - We accept no off-Cloudflare backup (owner decision).
 - We accept that unrouted migrated records stay invisible until the owner assigns them, in exchange for keeping unrouted data out of `me`.
