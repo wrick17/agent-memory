@@ -1,8 +1,8 @@
 // The one write path for phase 1: save (create, update, rename, scope move, retire, supersede) and append.
 // Ports BothQ memory_store.py semantics. Runs inside one transactionSync per call; never awaits.
-import { guardTexts, meGuard } from "../domain/guard";
-import { canonicalJson, collapse, isScope, newMemoryId, normalizeName, normalizeScope, sha256 } from "../domain/ids";
-import { Fail, KINDS_FOR_TYPE, type AppendArgs, type MemoryKind, type MemoryType, type SaveArgs, type Step, type WriteContext } from "../domain/types";
+import { guardTexts, meGuard, stripPersonal } from "../domain/guard";
+import { canonicalJson, collapse, isScope, newMemoryId, normalizeName, normalizeScope, sha256, uuid5 } from "../domain/ids";
+import { Fail, KINDS_FOR_TYPE, RELATION_ENDPOINTS, type AppendArgs, type CandidateArgs, type CaptureArgs, type KnowledgeArgs, type KnowledgeRef, type MemoryKind, type MemoryType, type SaveArgs, type Step, type WriteCommand, type WriteContext } from "../domain/types";
 import { nextSeq } from "../storage";
 
 export interface Who { userId: string; profile: string; generation: string }
@@ -397,11 +397,179 @@ export function append(tx: Tx, a: AppendArgs): WriteOutput {
 	return { result: result(appended, "appended", { entry_seq: entrySeq, activity_id: activityId }), created: [], embedDue: card !== node.card_hash };
 }
 
+export const captureText = (sql: SqlStorage, id: string) =>
+	sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part = 'capture' ORDER BY chunk", id).toArray().map((r) => r.body).join("");
+
+/** capture_memory: a candidate node (kind other, label capture) whose text sits in the capture lane, so recall never sees it. */
+function capture(tx: Tx, a: CaptureArgs): WriteOutput {
+	if (typeof a.content !== "string" || !a.content) throw Fail.of("validation", "capture requires non-empty content", { reason: "invalid_content" });
+	if (a.content.length > APPEND_MAX) throw Fail.of("size_budget", `a capture may hold at most ${APPEND_MAX} characters`);
+	const id = crypto.randomUUID();
+	const name = collapse(a.name ?? "") || `capture ${tx.now}`;
+	const hash = sha256(a.content);
+	tx.run(`INSERT INTO nodes (id, kind, other_label, scope, name, norm_name, description, attrs, status, origin, revision, chars, content_hash, card_hash, embed_hash,
+		recorded_at, created_at, updated_at, source_platform, updated_source_platform, seq)
+		VALUES (?, 'other', 'capture', ?, ?, ?, ?, ?, 'candidate', 'agent', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, a.scope !== undefined ? scopeOf(a.scope) : "default", name, normalizeName(name), a.kind ?? "observation",
+		JSON.stringify({ capture_kind: a.kind ?? "observation", source: a.source ?? {}, review: "pending" }), a.content.length, hash, hash, hash,
+		tx.now, tx.now, tx.now, tx.ctx.platform, tx.ctx.platform, tx.seq);
+	chunks(a.content).forEach((body, chunk) => tx.run(
+		"INSERT INTO texts (node_id, part, revision, chunk, body, request_id, actor, created_at, lane, seq) VALUES (?, 'capture', 1, ?, ?, ?, ?, ?, 'capture', ?)",
+		id, chunk, body, tx.requestId, tx.ctx.actor, tx.now, tx.seq));
+	const activityId = activity(tx, "capture", `captured ${a.kind ?? "observation"} '${name}'`, [id]);
+	return { result: { ok: true, capture_id: id, status: "candidate", activity_id: activityId }, created: [id], embedDue: false };
+}
+
+/** review_candidates promote or dismiss, as BothQ's promote_memory and dismiss_memory did. */
+function candidate(tx: Tx, who: Who, a: CandidateArgs): WriteOutput {
+	const c = tx.sql.exec<NodeRow & { other_label: string | null; attrs: string }>("SELECT rowid, * FROM nodes WHERE id = ? AND kind = 'other' AND other_label = 'capture'", a.candidate_id).toArray()[0];
+	if (!c) throw Fail.of("not_found", `no candidate found with id '${a.candidate_id}'`);
+	if (c.status !== "candidate") throw Fail.of("validation", "this candidate was already reviewed", { reason: "already_reviewed", status: (JSON.parse(c.attrs) as { review?: string }).review });
+	const attrs = JSON.parse(c.attrs) as Record<string, unknown>;
+	if (a.action === "dismiss") {
+		if (!a.reason?.trim()) throw Fail.of("validation", "dismiss needs a reason", { reason: "missing_reason" });
+		tx.run("UPDATE nodes SET status = 'dismissed', attrs = ?, revision = revision + 1, updated_at = ?, seq = ? WHERE id = ?",
+			JSON.stringify({ ...attrs, review: "dismissed", reason: a.reason }), tx.now, tx.seq, c.id);
+		const activityId = activity(tx, "dismiss", `dismissed capture '${c.name}'`, [c.id]);
+		return { result: { ok: true, action: "dismissed", capture_id: c.id, activity_id: activityId }, created: [], embedDue: false };
+	}
+	if (!a.into) throw Fail.of("validation", "promote needs into {name, type}", { reason: "missing_into" });
+	const made = create(tx, who, { name: a.into.name, type: a.into.type, description: a.into.description ?? "", content: captureText(tx.sql, c.id), origin: "agent" }, c.scope || "default");
+	const memoryId = made.created[0]!;
+	tx.run(`INSERT OR IGNORE INTO edges (src, rel, dst, dst_profile, basis, recorded_at, actor, request_id, seq) VALUES (?, 'relates_to', ?, '', 'identifier', ?, ?, ?, ?)`,
+		memoryId, c.id, tx.now, tx.ctx.actor, tx.requestId, tx.seq);
+	tx.run("INSERT OR IGNORE INTO evidence (owner, kind, ref, note, seq) VALUES (?, 'node', ?, 'promoted capture', ?)", `n:${memoryId}`, c.id, tx.seq);
+	tx.run("UPDATE nodes SET status = 'retired', attrs = ?, revision = revision + 1, updated_at = ?, seq = ? WHERE id = ?",
+		JSON.stringify({ ...attrs, review: "promoted", promoted_to: memoryId }), tx.now, tx.seq, c.id);
+	return { result: { ...made.result, action: "promoted", capture_id: c.id }, created: made.created, embedDue: true };
+}
+
+type Evidence = { kind: string; ref: string; note?: string };
+
+/** Evidence rows for a node or edge. A node pointer must name a node of this profile. */
+function addEvidence(tx: Tx, owner: string, evidence: Evidence[]): void {
+	for (const ev of evidence) {
+		if (ev.kind === "node" && !readNode(tx.sql, ev.ref)) throw Fail.of("not_found", `evidence names no node '${ev.ref}' in this profile`, { reason: "bad_evidence" });
+		tx.run("INSERT OR REPLACE INTO evidence (owner, kind, ref, note, seq) VALUES (?, ?, ?, ?, ?)", owner, ev.kind, ev.ref, ev.note ?? null, tx.seq);
+	}
+}
+
+/** Fails unless the relation's endpoint table admits these node kinds (section 4). */
+function checkEndpoints(rel: string, from: string, to: string): void {
+	const allowed = RELATION_ENDPOINTS[rel as keyof typeof RELATION_ENDPOINTS];
+	const ok = rel === "supersedes" ? from === to : !allowed || (allowed.from.includes(from as never) && allowed.to.includes(to as never));
+	if (ok) return;
+	const want = rel === "supersedes" ? "two nodes of the same kind" : `${allowed!.from.join("|")} to ${allowed!.to.join("|")}`;
+	throw Fail.of("validation", `${rel} connects ${want}, not ${from} to ${to}; use rel other with other_label for anything else`,
+		{ reason: "invalid_endpoints", rel, from, to, ...(allowed ? { allowed } : {}) });
+}
+
+/**
+ * record_knowledge: entity nodes upsert by key, else by kind, scope and name; personal fields are dropped first; a decision
+ * needs why and evidence. Every edge an agent writes is a judgment edge inside the endpoint table, with a reason (8 to 600
+ * characters) and at least one evidence pointer; ending an edge keeps it as history. Each create and change keeps a revision
+ * and rewrites the searchable head. Links into other profiles arrive in phase 3.
+ */
+function knowledge(tx: Tx, who: Who, a: KnowledgeArgs): WriteOutput {
+	const nodes = a.nodes ?? [], edges = a.edges ?? [], ends = a.end ?? [];
+	if (!nodes.length && !edges.length && !ends.length) throw Fail.of("validation", "record_knowledge needs nodes, edges or end", { reason: "no_changes" });
+	if (who.profile === "me" && nodes.some((n) => n.kind === "person")) throw Fail.of("me_sensitive_term", "me holds no person nodes", { term: "person" });
+	const made: { id: string; action: string; stripped?: string[] }[] = [], created: string[] = [];
+	let embedDue = false;
+	for (const n of nodes) {
+		const name = collapse(n.name);
+		if (!name) throw Fail.of("validation", "every node needs a name", { reason: "invalid_name" });
+		if (n.kind === "other" && !n.other_label) throw Fail.of("validation", "kind other needs other_label", { reason: "invalid_kind" });
+		if (n.kind === "decision" && !n.why?.trim()) throw Fail.of("validation", "a decision needs why", { reason: "missing_why" });
+		if (n.kind === "decision" && !n.evidence?.length) throw Fail.of("validation", "a decision needs at least one evidence pointer", { reason: "missing_evidence" });
+		const scope = n.scope !== undefined ? scopeOf(n.scope) : "default";
+		const { attrs, stripped } = stripPersonal(n.kind, n.attrs);
+		const existing = n.key
+			? tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND status <> 'moved'", n.key).toArray()[0]
+			: tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = ? AND scope = ? AND norm_name = ? AND key IS NULL AND memory_type IS NOT 'project' AND status = 'active' ORDER BY rowid LIMIT 1",
+				n.kind, scope, normalizeName(name)).toArray()[0];
+		const description = n.description ?? "";
+		const cur = existing ? readNode(tx.sql, existing.id)! : undefined;
+		if (cur && cur.kind !== n.kind) throw Fail.of("validation", `key '${n.key}' belongs to a ${cur.kind} node, not a ${n.kind}`, { reason: "key_kind_conflict", memory_id: cur.id, kind: cur.kind });
+		const why = n.why ?? cur?.why ?? null;
+		const hash = sha256(canonicalJson({ name, kind: n.kind, description, why: why ?? "", attrs }));
+		const card = sha256(cardText({ kind: n.kind, name, description, why }, ""));
+		// Decisions are memories (BothQ type project) and get an embedding card; other entities only with a description.
+		const embeds = n.kind === "decision" || !!description;
+		let id: string;
+		if (cur) {
+			id = cur.id;
+			if (cur.content_hash !== hash) {
+				tx.run(`UPDATE nodes SET name = ?, norm_name = ?, description = ?, why = ?, attrs = ?, valid_from = COALESCE(?, valid_from), valid_to = COALESCE(?, valid_to),
+					revision = revision + 1, content_hash = ?, card_hash = ?, embed_hash = ?, updated_at = ?, updated_source_platform = ?, seq = ? WHERE id = ?`,
+					name, normalizeName(name), description, why, JSON.stringify(attrs), n.valid_from ?? null, n.valid_to ?? null, hash, card,
+					embeds ? cur.embed_hash : card, tx.now, tx.ctx.platform, tx.seq, id);
+				const updated = readNode(tx.sql, id)!;
+				writeHead(tx, updated, [], updated.revision);
+				writeRevision(tx, updated, "updated", undefined);
+				embedDue ||= embeds && card !== cur.card_hash;
+				made.push({ id, action: "updated", ...(stripped.length ? { stripped } : {}) });
+			} else made.push({ id, action: "matched", ...(stripped.length ? { stripped } : {}) });
+		} else {
+			id = uuid5(n.key ? `${who.userId}:${who.profile}:${n.kind}:${n.key}` : `${who.userId}:${who.profile}:${n.kind}:${scope}:${normalizeName(name)}`);
+			if (readNode(tx.sql, id)) throw Fail.of("already_exists", `node identity '${id}' already exists`, { memory_id: id });
+			tx.run(`INSERT INTO nodes (id, kind, other_label, key, memory_type, scope, name, norm_name, description, why, attrs, status, origin, revision,
+				content_hash, card_hash, embed_hash, valid_from, valid_to, recorded_at, created_at, updated_at, source_platform, updated_source_platform, seq)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'agent', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, n.kind, n.other_label ?? null, n.key ?? null, n.kind === "decision" ? "project" : null, scope, name, normalizeName(name), description, why,
+				JSON.stringify(attrs), hash, card, embeds ? null : card, n.valid_from ?? null, n.valid_to ?? null, tx.now, tx.now, tx.now, tx.ctx.platform, tx.ctx.platform, tx.seq);
+			const node = readNode(tx.sql, id)!;
+			writeHead(tx, node, [], 1);
+			writeRevision(tx, node, "saved", undefined);
+			embedDue ||= embeds;
+			made.push({ id, action: "created", ...(stripped.length ? { stripped } : {}) });
+			created.push(id);
+		}
+		if (n.evidence?.length) addEvidence(tx, `n:${id}`, n.evidence);
+	}
+	const resolve = (r: KnowledgeRef): string => {
+		if ("ref" in r) { const hit = made[r.ref]; if (!hit) throw Fail.of("validation", `ref ${r.ref} names no node in this call`, { reason: "bad_ref" }); return hit.id; }
+		if ("id" in r) { if (!readNode(tx.sql, r.id)) throw Fail.of("not_found", `no node with id '${r.id}' in this profile; links across profiles arrive in phase 3`); return r.id; }
+		const row = "key" in r
+			? tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND kind = ? AND status <> 'moved'", r.key, r.kind).toArray()[0]
+			: tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = ? AND norm_name = ? AND scope = ? AND status = 'active' ORDER BY rowid LIMIT 1", r.kind, normalizeName(r.name), r.scope !== undefined ? scopeOf(r.scope) : "default").toArray()[0];
+		if (!row) throw Fail.of("not_found", `no ${r.kind} node matches ${"key" in r ? r.key : r.name}`);
+		return row.id;
+	};
+	const edgeIds: { id: number; action: string }[] = [];
+	for (const e of edges) {
+		if (e.rel === "other" && !e.other_label) throw Fail.of("validation", "rel other needs other_label", { reason: "invalid_rel" });
+		if (typeof e.reason !== "string" || e.reason.trim().length < 8 || e.reason.length > 600) throw Fail.of("validation", "a judgment edge needs a reason of 8 to 600 characters", { reason: "missing_reason" });
+		if (!e.evidence?.length) throw Fail.of("validation", "a judgment edge needs at least one evidence pointer", { reason: "missing_evidence" });
+		const src = resolve(e.from), dst = resolve(e.to);
+		if (src === dst) throw Fail.of("validation", "an edge needs two different nodes", { reason: "self_edge" });
+		checkEndpoints(e.rel, readNode(tx.sql, src)!.kind, readNode(tx.sql, dst)!.kind);
+		const prior = tx.sql.exec<{ id: number }>("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst_profile = '' AND dst = ? AND ended_at IS NULL", src, e.rel, dst).toArray()[0];
+		let id: number;
+		if (prior) { id = prior.id; edgeIds.push({ id, action: "matched" }); }
+		else {
+			id = Number(tx.run(`INSERT INTO edges (src, rel, other_label, dst, dst_profile, basis, reason, valid_from, valid_to, recorded_at, actor, request_id, seq)
+				VALUES (?, ?, ?, ?, '', 'judgment', ?, ?, ?, ?, ?, ?, ?) RETURNING id`, src, e.rel, e.other_label ?? null, dst, e.reason.trim(), e.valid_from ?? null, e.valid_to ?? null, tx.now, tx.ctx.actor, tx.requestId, tx.seq).one().id);
+			edgeIds.push({ id, action: "created" });
+		}
+		addEvidence(tx, `e:${id}`, e.evidence);
+	}
+	const ended: number[] = [];
+	for (const x of ends) {
+		if (!x.reason?.trim()) throw Fail.of("validation", "ending an edge needs a reason", { reason: "missing_reason" });
+		const changed = tx.run("UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE id = ? AND ended_at IS NULL", tx.now, x.valid_to, tx.seq, x.edge).rowsWritten;
+		if (!changed) throw Fail.of("not_found", `no current edge ${x.edge}`);
+		ended.push(x.edge);
+	}
+	const activityId = activity(tx, "knowledge", `recorded ${made.length} nodes, ${edgeIds.length} edges, ended ${ended.length}`, [...made.map((m) => m.id), ...edgeIds.map((e) => `e:${e.id}`)]);
+	return { result: { ok: true, action: "recorded", nodes: made, edges: edgeIds, ended, activity_id: activityId }, created, embedDue };
+}
+
 /**
  * One transaction: replay or refuse by request_id, then apply, stamp every row with the next sequence number,
  * write activity and store the request's result. A thrown Fail rolls everything back.
  */
-export function runWrite(storage: DurableObjectStorage, who: Who, cmd: { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs }, ctx: WriteContext): WriteOutput {
+export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, ctx: WriteContext): WriteOutput {
 	return storage.transactionSync(() => {
 		const sql = storage.sql;
 		const requestId = cmd.args.request_id ?? null;
@@ -417,15 +585,17 @@ export function runWrite(storage: DurableObjectStorage, who: Who, cmd: { op: "sa
 		// Only a committed result above may skip the guard; a pending binding or a retry that can still write may not.
 		if (who.profile === "me") {
 			if (!ctx.meGuard?.explicit) throw Fail.of("validation", "writes to me must name profile: \"me\" explicitly");
-			const guard = meGuard({ ...ctx.meGuard, texts: guardTexts(cmd.args as unknown as Record<string, unknown>) });
+			// Work terms registered before a work write committed here first, so this read inside the transaction cannot miss them.
+			const stored = sql.exec<{ term: string }>("SELECT term FROM guard_terms").toArray().map((r) => r.term);
+			const guard = meGuard({ ...ctx.meGuard, sensitiveTerms: [...ctx.meGuard.sensitiveTerms, ...stored], texts: guardTexts(cmd.args as unknown as Record<string, unknown>) });
 			if (!guard.ok) throw new Fail(guard.error);
 		}
 		const tx = new Tx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString(), ctx, requestId);
-		const out = cmd.op === "save" ? save(tx, who, cmd.args) : append(tx, cmd.args);
+		const out = cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
 		if (requestId) {
 			tx.run("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
-				requestId, cmd.op, ctx.payloadHash, JSON.stringify(out.result), String(out.result.memory_id ?? ""), tx.now, tx.seq);
+				requestId, cmd.op, ctx.payloadHash, JSON.stringify(out.result), String(out.result.memory_id ?? out.result.capture_id ?? ""), tx.now, tx.seq);
 		}
 		return out;
 	});

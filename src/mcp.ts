@@ -2,9 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { AccountContext, AccountStore } from "./account/store";
+import { knowledgeTerms, stripPersonal } from "./domain/guard";
 import { requestHash } from "./domain/ids";
 import { redactPayload } from "./domain/redact";
-import { fail, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand } from "./domain/types";
+import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, RELATIONS, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand } from "./domain/types";
 import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
 import { contextProfile, mayUse, readSet, routeWrite, type Route } from "./routing";
 
@@ -49,7 +50,42 @@ const recallSchema = z.object({
 	include_captures: z.boolean().optional(), include_history: z.boolean().optional(), expand: z.boolean().optional(), cursor: z.string().max(2048).optional(), ...routing,
 }).strict();
 
+const captureSchema = z.object({
+	content: z.string().min(1).max(APPEND_MAX), kind: z.enum(["observation", "correction"]).optional(), name: z.string().max(512).optional(),
+	source: z.record(z.string().max(64), z.string().max(512)).optional(), scope: scope.optional(), request_id: requestId.optional(), ...routing,
+}).strict();
+
+const reviewSchema = z.object({
+	action: z.enum(["list", "promote", "dismiss"]), candidate_id: z.string().min(1).max(128).optional(),
+	into: z.object({ name: z.string().min(1).max(512), type: z.enum(["feedback", "project", "reference", "user"]), description: text().optional() }).strict().optional(),
+	reason: text().optional(), status: z.enum(["pending", "promoted", "dismissed", "all"]).optional(), limit: z.number().int().min(1).max(100).optional(),
+	request_id: requestId.optional(), ...routing,
+}).strict();
+
+const knowledgeRef = z.union([
+	z.object({ id: memoryId }).strict(), z.object({ kind: z.enum(KNOWLEDGE_KINDS), key: z.string().min(1).max(256) }).strict(),
+	z.object({ kind: z.enum(KNOWLEDGE_KINDS), name: z.string().min(1).max(512), scope: scope.optional() }).strict(), z.object({ ref: z.number().int().min(0).max(49) }).strict(),
+]);
+const isoDate = z.string().max(40).refine((s) => !Number.isNaN(Date.parse(s)), "must be an ISO date");
+const evidence = z.array(z.object({ kind: z.enum(EVIDENCE_KINDS), ref: z.string().min(1).max(512), note: z.string().max(500).optional() }).strict()).min(1).max(20);
+const knowledgeSchema = z.object({
+	nodes: z.array(z.object({
+		kind: z.enum(KNOWLEDGE_KINDS), key: z.string().min(1).max(256).optional(), name: z.string().min(1).max(512), scope: scope.optional(), other_label: z.string().max(64).optional(),
+		description: text().optional(), why: text().optional(), attrs: z.record(z.string().max(64), z.union([z.string().max(1000), z.number(), z.boolean(), z.null()])).optional(),
+		evidence: evidence.optional(), valid_from: isoDate.optional(), valid_to: isoDate.optional(),
+	}).strict()).max(50).optional(),
+	edges: z.array(z.object({
+		from: knowledgeRef, rel: z.enum(RELATIONS), other_label: z.string().max(64).optional(), to: knowledgeRef, reason: z.string().max(600), evidence,
+		valid_from: isoDate.optional(), valid_to: isoDate.optional(),
+	}).strict()).max(100).optional(),
+	end: z.array(z.object({ edge: z.number().int().min(1), valid_to: isoDate, reason: z.string().min(1).max(600) }).strict()).max(50).optional(),
+	company_free: z.boolean().optional(), request_id: requestId.optional(), ...routing,
+}).strict();
+
 type SaveInput = z.infer<typeof saveSchema>;
+type KnowledgeInput = z.infer<typeof knowledgeSchema>;
+type CaptureInput = z.infer<typeof captureSchema>;
+type ReviewInput = z.infer<typeof reviewSchema>;
 type AppendInput = z.infer<typeof appendSchema>;
 type GetInput = z.infer<typeof getSchema>;
 type RecallInput = z.infer<typeof recallSchema>;
@@ -61,6 +97,12 @@ export const TOOLS = [
 		description: "Save or change a memory with revision history. Without memory_id: create (type feedback, project, reference, user or procedural; procedural needs objective and ordered steps). With memory_id, from_scope or new_name: update, rename or move scope, keeping the id. retire: true retires it; supersedes retires the listed ids. Pass repo {remote, path} so the server picks the profile; pass profile: \"me\" with company_free: true to write to me. Repeated request_id is idempotent." },
 	{ name: "append_memory", scope: "write" as Scope, schema: appendSchema, run: (c: ToolContext, a: AppendInput) => write(c, "append_memory", a),
 		description: "Atomically append a journal entry. request_id is required for safe retries; existing content is kept. Rejected for procedural memories." },
+	{ name: "capture_memory", scope: "write" as Scope, schema: captureSchema, run: (c: ToolContext, a: CaptureInput) => write(c, "capture_memory", a),
+		description: "Capture redacted evidence (an observation or a correction) as an untrusted candidate. It stays out of ordinary recall until reviewed. Never goes to me." },
+	{ name: "review_candidates", scope: "read" as Scope, schema: reviewSchema, run: review,
+		description: `List captured candidates (status pending, promoted, dismissed or all), promote one into a memory (into {name, type, description}) or dismiss one with a reason. Promotion creates the memory and links it to the capture in one transaction.${DATA_NOTE}` },
+	{ name: "record_knowledge", scope: "write" as Scope, schema: knowledgeSchema, run: (c: ToolContext, a: KnowledgeInput) => write(c, "record_knowledge", a),
+		description: "Write the graph: entity nodes (project, component, person, bug, feature, ticket, pr, commit, release, decision, other) upserted by key or by kind, scope and name; judgment edges, each with a reason of 8 to 600 characters and at least one evidence pointer; end[] closes an edge as history. Refer to this call's nodes with {ref: index}. A decision needs why and evidence. Typed relations follow the endpoint table (for example reviewed is person to pr); use rel other with other_label for anything else. Person nodes keep only name, github, jira and role; emails, phone numbers and other personal fields are dropped on every profile." },
 	{ name: "get_memory", scope: "read" as Scope, schema: getSchema, run: get,
 		description: `Read a memory by memory_id or unambiguous name: content up to 100k characters, steps, links and status. Larger content returns complete: false with a cursor; pass content: {complete: true, cursor} to page through it, and restart on revision_conflict. history {limit, before_revision} returns preserved revisions.${DATA_NOTE}` },
 	{ name: "recall_memories", scope: "read" as Scope, schema: recallSchema, run: recall,
@@ -68,8 +110,8 @@ export const TOOLS = [
 ] as const;
 
 // Stubs typed with the stores' own signatures; every value crossing RPC is plain JSON-like data.
-const profileStub = (env: Env, ref: ProfileRef) =>
-	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "write" | "read">;
+export const profileStub = (env: Env, ref: ProfileRef) =>
+	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "write" | "read" | "ingest" | "captureState">;
 export const accountStub = (env: Env, userId: string) =>
 	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin">;
 
@@ -89,16 +131,34 @@ async function ownerOf(c: ToolContext, id: string): Promise<string | null> {
 	return owner;
 }
 
-async function write(c: ToolContext, op: "save_memory" | "append_memory", raw: SaveInput | AppendInput): Promise<Outcome<unknown>> {
+/** record_knowledge node attributes without personal fields, and the dropped field names per node. */
+function withoutPersonal<T>(op: string, args: T): { args: T; stripped: string[][] } {
+	const nodes = (args as KnowledgeInput).nodes;
+	if (op !== "record_knowledge" || !nodes) return { args, stripped: [] };
+	const stripped: string[][] = [];
+	const clean = nodes.map((n) => {
+		if (!n.attrs) { stripped.push([]); return n; }
+		const r = stripPersonal(n.kind, n.attrs);
+		stripped.push(r.stripped);
+		const { attrs: _drop, ...rest } = n;
+		return Object.keys(r.attrs).length ? { ...rest, attrs: r.attrs as typeof n.attrs } : rest;
+	});
+	return { args: { ...args, nodes: clean }, stripped };
+}
+
+async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capture_memory" | "review_candidates" | "record_knowledge", raw: SaveInput | AppendInput | CaptureInput | ReviewInput | KnowledgeInput): Promise<Outcome<unknown>> {
 	if (!c.caller.scopes.includes("write")) return fail("forbidden", "this token cannot write");
-	const args = redactPayload(raw);
+	// Personal fields are dropped before hashing and binding, so a discarded value never changes idempotency, the stored
+	// result or the node. The profile filters again at its own boundary.
+	const { args, stripped } = withoutPersonal(op, redactPayload(raw));
 	const payloadHash = requestHash(op, args as Record<string, unknown>);
 	const account = accountStub(c.env, c.caller.userId);
-	const { profile: explicit, repo, company_free: companyFree, ...rest } = args;
+	const { profile: explicit, repo, company_free: companyFree, ...rest } = args as SaveInput & { candidate_id?: string };
+	const targetId = (args as { memory_id?: string }).memory_id ?? (args as { candidate_id?: string }).candidate_id;
 	let route: Outcome<Route>;
-	if (args.memory_id) {
-		const owner = await ownerOf(c, args.memory_id);
-		if (!owner) route = fail("not_found", `no memory found with id '${args.memory_id}'`);
+	if (targetId) {
+		const owner = await ownerOf(c, targetId);
+		if (!owner) route = fail("not_found", `no record found with id '${targetId}'`);
 		else if (explicit !== undefined && explicit !== owner) route = fail("validation", "moving a record to another profile is a transfer, which arrives in phase 3");
 		else if (!mayUse(c.caller, owner)) route = fail("forbidden", `this caller may not use profile '${owner}'`);
 		else route = ok({ profile: owner, routedBy: "memory_id", context: contextProfile(c.caller, c.account.rules, repo) });
@@ -119,9 +179,21 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory", raw: S
 		target = route.value.profile;
 		routedBy = route.value.routedBy;
 	}
+	if (target === "me" && (op === "capture_memory" || op === "review_candidates")) {
+		if (newBinding) await account.releaseRequest(args.request_id!, payloadHash);
+		return fail("forbidden", "captures never go to me");
+	}
 	const ref = refOf(c, target);
 	if (!ref) return fail("validation", `profile '${target}' is not active`);
-	const cmd = (op === "save_memory" ? { op: "save", args: rest } : { op: "append", args: rest }) as WriteCommand;
+	// New work names, keys and handles guard me before the write can commit, so no me write after it can miss them.
+	// If the write then fails, the extra terms only over-guard until the nightly rebuild.
+	const terms = op === "record_knowledge" && target === "work" ? knowledgeTerms((rest as KnowledgeInput).nodes) : [];
+	if (terms.length) {
+		const added = await account.admin({ op: "addSensitiveTerms", terms });
+		if (!added.ok) { if (newBinding) await account.releaseRequest(args.request_id!, payloadHash); return added; }
+	}
+	const cmd = ({ save_memory: { op: "save", args: rest }, append_memory: { op: "append", args: rest }, capture_memory: { op: "capture", args: rest },
+		review_candidates: { op: "candidate", args: rest }, record_knowledge: { op: "knowledge", args: rest } })[op] as WriteCommand;
 	const res = await profileStub(c.env, ref).write(ref, cmd, {
 		actor: "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
 		platform: c.platform, routedBy, payloadHash, userId: c.caller.userId,
@@ -134,6 +206,10 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory", raw: S
 	}
 	const { created, ...value } = res.value;
 	if (created.length) await account.recordNodes(target, created);
+	// Report the dropped field names of this call (never their values); they are not part of the stored result.
+	if (stripped.some((s) => s.length)) {
+		value.nodes = (value.nodes as { stripped?: string[] }[]).map((n, i) => (stripped[i]?.length ? { ...n, stripped: [...new Set([...(n.stripped ?? []), ...stripped[i]!])] } : n));
+	}
 	return ok(value);
 }
 
@@ -162,6 +238,21 @@ async function get(c: ToolContext, a: GetInput): Promise<Outcome<unknown>> {
 			{ reason: "ambiguous_name", matches: found.map((r) => ({ memory_id: (r.value as { memory_id: string }).memory_id, profile: (r.value as { profile: string }).profile })) });
 	}
 	return found[0] ?? results.find((r) => !r.ok && r.error.code !== "not_found") ?? results[0]!;
+}
+
+/** review_candidates: list reads the routed profile; promote and dismiss are writes on the candidate's own profile. */
+async function review(c: ToolContext, a: ReviewInput): Promise<Outcome<unknown>> {
+	if (a.action === "list") {
+		if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
+		const rs = readSet(c.caller, c.account.rules, c.account.known, { ...(a.profile !== undefined ? { profile: a.profile } : {}), ...(a.repo ? { repo: a.repo } : {}) });
+		if (!rs.ok) return rs;
+		const ref = refOf(c, rs.value.primary)!;
+		const r = await profileStub(c.env, ref).read(ref, { kind: "candidates", status: a.status ?? "pending", limit: a.limit ?? 20 });
+		return r.ok ? ok({ profile: rs.value.primary, candidates: r.value }) : r;
+	}
+	if (!a.candidate_id) return fail("validation", `${a.action} needs candidate_id`);
+	const { action, candidate_id, into, reason, request_id, profile, repo } = a;
+	return write(c, "review_candidates", { action, candidate_id, ...(into ? { into } : {}), ...(reason ? { reason } : {}), ...(request_id ? { request_id } : {}), ...(profile ? { profile } : {}), ...(repo ? { repo } : {}) } as ReviewInput);
 }
 
 const b64 = (o: unknown) => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

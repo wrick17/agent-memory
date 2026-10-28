@@ -8,6 +8,15 @@ Owner: Pratyush Poddar (wrick17). Confirmed in the grill-me interview on 2026-10
 
 Note on times: clock times after 15:35 IST in this file were estimated by the orchestrator and ran ahead of real time (real time was 16:26 IST when this was noticed). They show the order of decisions only.
 
+## Latest owner updates
+
+These updates supersede the earlier timing and approval rules recorded below. The [feature manifest](../docs/feature-manifest.md) and [implementation plan](../docs/architecture.md#22-implementation-plan) track their implementation.
+
+- On 2026-10-28, the owner approved implementation with "Let's build it" and then authorized all necessary non-deleting changes without further approval requests. This supersedes individual DNS approvals. Deleting existing data or resources still needs approval.
+- On 2026-10-29, the owner made the memory system, MCP and ingestion of existing BothQ and Markdown memories the top priority. A non-destructive hosted copy for review comes before automated capture extras, advanced graph work, the dashboard and corpus. BothQ remains the only live system; the copy is refreshed and reconciled before cutover. Source databases and memory files remain untouched.
+- Backup and restore are both implemented and tested at the end, after the other features and before BothQ shutdown. Dependent recovery rehearsals move with them.
+- Cross-machine parity checks also move to final verification before cutover and BothQ shutdown. Same-machine functional, privacy, capture and recovery checks continue during implementation.
+
 ## Goal
 
 One hosted "second brain" for all of the owner's coding agents (Claude Code, Codex, T3 Code) on every machine. It records everything agents come across, keeps a rolling journal, learns a model of the owner (facts, preferences, choices), links projects, repos, people and tools, and cleans itself up so it does not bloat. It replaces local BothQ and the native memory of Claude Code and Codex.

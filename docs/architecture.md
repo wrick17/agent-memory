@@ -248,7 +248,7 @@ type = "command"
 command = "~/.agent-memory/bin/agent-memory hook codex"
 ```
 
-The detached run uploads with a job-scoped device token. A digest holds bounded excerpts with their transcript positions, never whole messages. Every item carries its own natural id, so a repeated event at the same HEAD replays instead of colliding:
+The detached run uploads with a job-scoped device token. A digest holds bounded excerpts with their transcript positions, never raw transcript records or unbounded text ([precise contract](#complete-local-reading-digest-only-upload)). Every item carries its own natural id, so a repeated event at the same HEAD replays instead of colliding:
 
 ```http
 POST /v1/ingest HTTP/1.1
@@ -257,10 +257,10 @@ Content-Type: application/json
 
 { "repo": { "remote": "git@github.com:Sequoia-Engineering/web.git", "branch": "feat/token-refresh" },
   "digests": [{ "range_id": "codex:thr_123:e7a1c0:0-48211", "capture_status": "consolidated", "part_id": "0-31877", "sha256": "…",
-                "asks": [{ "text": "Fix the token refresh loop in web", "at": "2026-10-28T09:12:00Z", "pos": 1840 }],
+                "asks": [{ "text": "Fix the token refresh loop in web", "pos": 1840 }],
                 "decisions": [{ "text": "Moved refresh into one shared client instead of retrying per call site.", "pos": 31877 }],
                 "corrections": [{ "text": "Don't add retries in the components; fix it in the client.", "pos": 20410 }],
-                "outcomes": { "commits": ["9f2c1ab"], "prs": [812], "tests": ["pnpm test: 214 passed"] },
+                "outcomes": { "commits": ["9f2c1ab"], "prs": ["812"], "tests": ["pnpm test: 214 passed"] },
                 "entities": ["jira:SEQ-1234", "github:Sequoia-Engineering/web#812"], "dropped": { "asks": 0, "decisions": 0, "corrections": 0 } }],
   "manifests": [{ "range_id": "codex:thr_123:e7a1c0:0-48211", "parts": [{ "part_id": "0-31877", "sha256": "…" }, { "part_id": "31877-48211", "sha256": "…" }] }],
   "commits": [{ "sha": "9f2c1ab", "author": "pratyush-poddar_seq", "at": "2026-10-28T10:01:00Z", "title": "SEQ-1234 fix token refresh" }],
@@ -429,7 +429,7 @@ One list in `src/domain/types.ts` defines the ontology. The zod schemas, the SQL
 | Weak | `relates_to` | anything |
 | Escape | `other` with `other_label` | anything |
 
-`src/domain/types.ts` also holds a short endpoint table per relation (for example `reviewed` is person to pr). A write that breaks it fails with `validation` and names the allowed kinds, or the agent uses `other`.
+`src/domain/types.ts` also holds a short endpoint table per relation (`RELATION_ENDPOINTS`; for example `reviewed` is person to pr, and `supersedes` joins two nodes of one kind). A write that breaks it fails with `validation` and names the allowed kinds, or the agent uses `other`. A `node` evidence pointer must name a node of the same profile.
 
 ### Every edge says how it was made
 
@@ -453,7 +453,7 @@ Superseding never overwrites. The old node or edge gets `valid_to` and `ended_at
 
 ### People
 
-A `person` node holds `name`, `handles` (`github`, `jira`), `role` and links to what they worked on. The ingest path drops email addresses, phone numbers and any other personal field before storage. `works_on` edges from commits are aggregates: `weight` counts commits, and `valid_from` and `valid_to` hold the first and last seen dates. Work colleagues exist only in `work`: the `me` write guard rejects any `person` node except the owner's own.
+A `person` node holds `name`, `handles` (`github`, `jira`), `role` and links to what they worked on. Every write path drops email addresses, phone numbers and any other personal field before hashing or storage, on every profile (the Worker strips them before the request hash and binding, so a discarded value never changes idempotency, and the profile filters again): a person keeps only those attributes, and any node loses an attribute named like a contact field or holding an email address or phone number. `works_on` edges from commits are aggregates: `weight` counts commits, and `valid_from` and `valid_to` hold the first and last seen dates. Work colleagues exist only in `work`: the `me` write guard rejects any `person` node except the owner's own.
 
 ### Files are evidence, not nodes
 
@@ -506,7 +506,7 @@ Writes into `me` are explicit and guarded. `domain/guard.ts` runs in the Worker 
 
 1. The caller named `profile: "me"` explicitly. Routing never sends anything to `me` by default.
 2. When the call's repo context or device default resolves to `work`, the write carries `company_free: true`, the agent's attestation that it checked. Otherwise the guard returns `me_requires_company_free`.
-3. No text field contains a sensitive term. `AccountStore.sensitive_terms` holds org names from routing rules, and the names, keys and handles of every `work` project, component, person, ticket, feature and bug. A `work` write that creates or renames one of those returns the new terms in its result, and the Worker adds them to `AccountStore` before it responds. The list is current at the next request, not the next night. A nightly rebuild is the backstop.
+3. No text field contains a sensitive term. `AccountStore.sensitive_terms` holds org names from routing rules, and the names, keys and handles of every `work` project, component, person, ticket, feature and bug. The guard state the `me` write transaction uses is the `me` profile's own `guard_terms` table, read inside that transaction, plus the request's snapshot of the org terms. Every registration goes through `AccountStore`, which writes `sensitive_terms` and then the `me` profile's `guard_terms`, and confirms only after both commit; this covers work `record_knowledge` terms, owner-added terms and org terms from routing rules. For a `work` write that creates or renames one of those entities, the Worker registers its names, keys and handles and waits for the confirmation before it sends the work write. A `me` write therefore either commits before the term existed anywhere or sees it, even if its request started earlier (closure review F4, 2026-10-29). If the work write then fails, the extra terms only over-guard until the nightly rebuild, which also rebuilds `guard_terms` after a `me` restore. The list is current at the next request, not the next night. A nightly rebuild is the backstop.
 4. No `person` node other than the owner's own, and no personal fields (emails, phone numbers) on any node. The ingest path strips personal fields on every profile, not only `me`.
 
 A blocked write returns the code and the matched term, and nothing is stored.
@@ -644,7 +644,7 @@ Every base table has a `seq` column and an index on `(seq, primary key)`. Each w
 ```sql
 -- profile/schema.ts. Each version is a migration that runs once per object at startup.
 -- v1 (phase 1): profile_meta, nodes, texts, texts_fts, texts_tri, edges, evidence, revisions, requests, activity, cursors, deleted_rows.
--- v2 (phase 2): captures_fts, markers, maintenance. v3 (phase 3): archive, transfers, transfer_parts.
+-- v2 (phase 2): captures_fts, markers, maintenance, guard_terms. v3 (phase 3): archive, transfers, transfer_parts.
 -- Control state not exported (rebuilt after a restore): cursors, transfer_parts. profile_meta goes into the export manifest.
 CREATE TABLE profile_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; -- user_id, profile, generation, schema_version, write_seq
 
@@ -685,7 +685,7 @@ CREATE INDEX nodes_source ON nodes (source_profile) WHERE source_profile IS NOT 
 
 -- Text in chunks of at most 16k characters. head: name, description, why, how_to_apply, rendered steps.
 -- body: saved content. entry: one append (the delta revision). summary: compaction output.
--- capture: one immutable digest part or manifest of a transcript range, identified by (range_id, capture_status, capture_part). Never a whole message.
+-- capture: one immutable digest part or manifest of a transcript range, identified by (range_id, capture_status, capture_part). Bounded excerpts only, never a raw transcript record.
 CREATE TABLE texts (
 	rowid INTEGER PRIMARY KEY,
 	node_id TEXT NOT NULL,
@@ -770,6 +770,9 @@ CREATE TABLE maintenance (
 CREATE INDEX maintenance_open ON maintenance (state, kind, created_at);
 
 CREATE TABLE markers (repo TEXT PRIMARY KEY, head TEXT, uploaded_at TEXT, analyzed_at TEXT, analysis_head TEXT, seq INTEGER NOT NULL) WITHOUT ROWID;
+
+-- me profile only: the me guard's term table, written by AccountStore before it confirms a registration (section 5).
+CREATE TABLE guard_terms (term TEXT PRIMARY KEY, source TEXT NOT NULL, added_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
 
 CREATE TABLE transfers (                    -- section 9; one row per transfer this profile takes part in
 	id TEXT PRIMARY KEY, node_id TEXT NOT NULL, direction TEXT NOT NULL CHECK (direction IN ('out','in')),
@@ -1096,9 +1099,9 @@ Under T3 Code, Codex custom hooks run only after hook trust: the test saw truste
 
 ### Complete local reading, digest-only upload
 
-The hosted store never receives whole messages. The run reads everything locally and uploads a bounded digest. The run keeps two cursors per session in `~/.agent-memory/state/<client>/<session>.json` (step 9), plus an epoch, the SHA-256 of the transcript's first 4 KB.
+The hosted store never receives whole messages. The run reads everything locally and uploads a bounded digest. Precisely, no digest field holds a raw transcript record or unbounded text: every item is an excerpt or paraphrase within its limit (160 characters for asks, 280 for the rest), and a part is at most 8 KB. An owner message shorter than its limit can still appear in full as one bounded excerpt. The phase-2 scan checks that no message longer than the excerpt limits appears in uploads, spools or logs. The run keeps two cursors per session in `~/.agent-memory/state/<client>/<session>.json` (step 9), plus an epoch: the SHA-256 of the transcript's first min(size, 4 KB) bytes when the session is first read. The run stores that length and hash, checks those bytes on every later run, and extends the check toward 4 KB as the file grows, so an ordinary append keeps the epoch.
 
-1. **Debounce.** For each queued session, the run waits until no new trigger for that session has arrived for 45 seconds (at most 10 minutes in total), so a burst of turns becomes one pass.
+1. **Debounce.** For each queued session, the run waits until no new trigger for that session has arrived for 45 seconds (at most 10 minutes in total), so a burst of turns becomes one pass. The run stays until each queued trigger is due. It claims each trigger generation by an atomic rename before handling it, so a trigger that arrives meanwhile is kept and handled next. One run per machine holds an exclusive lock; a lock whose process died is reclaimed by exactly one worker.
 2. **Find the source.** Use the hook's `transcript_path`. If it is null or missing, look the session up in the client's own session store: Codex keeps `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`, and Claude Code keeps `<config dir>/projects/<project>/<session id>.jsonl`. If no file is found, the session is marked `pending` locally and nothing is acknowledged. Every later run and every `SessionStart` sweep retries the lookup for 7 days, and a pending session older than that shows on the dashboard health card by session id only. A last assistant message alone never stands in for a range.
 3. **Read the new part in full.** From the cursor to the last complete JSONL line. Every owner message and every assistant message is read whole. Tool calls, tool output, file contents, thinking, and injected system or hook text are skipped.
 4. **Build a heuristic digest at once, locally.** No model runs. One digest per input range, at most 8 KB after redaction, labeled `capture_status: heuristic`:
@@ -1120,11 +1123,11 @@ The hosted store never receives whole messages. The run reads everything locally
 	- **Completeness manifest.** Once every subrange has a stored part, the run uploads the range's manifest: the ordered part ids with their spans and SHA-256s. The server accepts it only if the spans tile the range exactly, with no gap or overlap, and every listed part is stored with that hash and zero dropped decisions and corrections; it stores the manifest in that same transaction. Until the manifest is stored, the range is not consolidated.
 
 	If the confined runtime is unavailable (its probes do not prove denial, Codex is missing, or the machine is offline), the range stays `pending`, keeps its heuristic digest, its local text and any accepted part files, and is retried on every later run. Pending and stuck ranges show on the dashboard health card by count and age. Nothing labels them complete.
-7. **Redact locally** with the same patterns the server uses, then hash.
-8. **Identify each digest immutably.** A digest's identity is `(range_id, capture_status, part_id)`, with `range_id = <client>:<session>:<epoch>:<start offset>-<end offset>`, plus its SHA-256. `part_id` is `-` for the heuristic digest, the part's `<start>-<end>` transcript offsets for a consolidated part, and `manifest` for the manifest. The same identity with the same hash replays; with a different hash the server refuses it, and the run then fetches the stored part and keeps it. A range has one heuristic digest and at most one part per span. A stored manifest supersedes the heuristic digest, which moves to the archive. If the transcript's first 4 KB change (a rewrite or rotation), the epoch changes and capture starts a new range sequence.
+7. **Redact locally** with the same patterns the server uses, string by string, then hash. Every digest follows one strict schema at every level (no other field; every string at most 160 or 280 characters, outcomes and entities included), checked locally before upload and again on ingest. The server stores the exact uploaded bytes: it refuses a part in which redaction would still change a string and never rewrites one.
+8. **Identify each digest immutably.** A digest's identity is `(range_id, capture_status, part_id)`, with `range_id = <client>:<session>:<epoch>:<start offset>-<end offset>`, plus its SHA-256. `part_id` is `-` for the heuristic digest, the part's `<start>-<end>` transcript offsets for a consolidated part, and `manifest` for the manifest. The same identity with the same hash replays; with a different hash the server refuses it, and the run then fetches the stored part and keeps it. A range has one heuristic digest and at most one part per span. A stored manifest supersedes the heuristic digest, which moves to the archive. If the checked prefix changes (a rewrite, truncation or rotation), the epoch changes and capture starts a new range sequence. A manifest longer than one 16,000-character text row is stored in chunks in the same transaction.
 9. **Acknowledge only what is stored.** The run keeps two cursors per session: `digested_to` moves past a range once its heuristic digest is stored, and `consolidated_to` only once its manifest is stored, each only after the server confirms the write in the profile's transaction (state written atomically). Only a range below `consolidated_to` counts as captured. Its local text and part files are then deleted. A crash, sleep or network drop loses nothing: the next run rebuilds the heuristic digest from the same range, uploads the kept part bytes again, which replay, and digests only subranges with no accepted part.
 
-The server stores each digest as a `capture` text on the session's `session` node, in the capture lane, so it never appears in ordinary recall. It links the session to its project, branch, commits, PRs and tickets by identifier, and queues `unprocessed_capture` and `preference_signal` items, keyed by digest hash so each consolidated part queues again. Digests count as used when an agent consolidates them into memory; unused digests move to the archive after 90 days. Local spools hold only digests and upload items. The only local copies of conversation text the run keeps are the pending range files above. Server logs record ids and counts, never digest text.
+The server stores each digest as a `capture` text on the session's `session` node, in the capture lane, so it never appears in ordinary recall. It links the session to its project, branch, commits, PRs and tickets by identifier, and queues one `unprocessed_capture` item per consolidated range, plus a `preference_signal` item when any of its parts holds corrections, both keyed by the manifest hash, so a 512-part manifest stays inside the write budget. Digests count as used when an agent consolidates them into memory; unused digests move to the archive after 90 days. Local spools hold only digests and upload items. The only local copies of conversation text the run keeps are the pending range files above. Server logs record ids and counts, never digest text.
 
 Capture must teach at least as much as Codex memory generation does today. The consolidated parts carry that learning to the hosted store even when a session is interrupted and no agent ran its task-end pass. The agent's inline consolidation adds more on top when it runs. Phase 2 checks parity on interrupted, marker-free fixtures with no inline pass (section 22).
 
@@ -1270,7 +1273,8 @@ Each item has a fingerprint (kind, subject ids, card hashes), so an unchanged it
 The batch takes at most one lease per profile per day and never mixes profiles in one prompt. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
 
 ```toml
-# $codex_home/config.toml, written fresh for each run (a throwaway CODEX_HOME)
+# $codex_home/config.toml, written fresh for each run (a throwaway CODEX_HOME). Checked against Codex CLI 0.165.0 on
+# 2026-10-28: it ignores the earlier tools.view_image key, so that key is gone (see docs/phase-2-implementation.md).
 approval_policy = "never"            # nothing can escalate out of the sandbox
 default_permissions = "am_batch"
 web_search = "disabled"
@@ -1283,8 +1287,10 @@ apps = false
 plugins = false
 hooks = false
 memories = false
-[tools]
-view_image = false
+browser_use = false                  # these four are on by default in Codex 0.165.0
+browser_use_external = false
+computer_use = false
+image_generation = false
 [agents]
 enabled = false
 [shell_environment_policy]
@@ -1320,16 +1326,16 @@ ls "$HOME" | grep -qx Library || skip_batch indeterminate "home listing control 
 probe_denied "/bin/cat $HOME/.agent-memory/probe/canary" "home-$nonce"
 probe_denied "/bin/cat $TMPDIR/am-probe-canary" "tmp-$nonce"
 probe_denied "/bin/ls $HOME" "Library"
-probe_denied "/usr/bin/curl -sS --connect-timeout 5 https://1.1.1.1/" ""      # an IP address, so DNS cannot be the cause
+probe_denied "/usr/bin/curl -sS -v --connect-timeout 5 https://1.1.1.1/" ""   # an IP address, so DNS cannot be the cause; -v prints the denial
 [ "$(shasum -a 256 "$codex_home/config.toml")" = "$config_sha" ] || skip_batch indeterminate "config changed"
 # 2. The run itself. Luna for unlinked, stale_journal and dangling_link items; Terra for the rest.
 CODEX_HOME="$codex_home" codex exec --ephemeral --json --skip-git-repo-check -m gpt-6.1-terra -c model_reasoning_effort=high \
 	--output-schema ~/.agent-memory/schemas/maintenance-ops.json - < items.json > events.jsonl
-# 3. Detection: any item other than reasoning and the final message discards the run and reports it.
+# 3. Detection: any item other than reasoning and the final message, including an error item for an ignored setting, discards the run.
 rm -rf "$run_dir" "$codex_home"
 ```
 
-- **Prevention.** Command execution is switched off. If any command tool still dispatches, for example through `unified_exec`, which the Codex config reference says ignores user opt-outs, it runs inside the `am_batch` sandbox profile: no reads of home, temp or mounted folders, no network, no inherited environment, and no way to ask for more because approvals are `never`. The model needs no file access: its items arrive on stdin.
+- **Prevention.** Command execution is switched off, and so are browser use, external browser use, computer use and image generation, which Codex 0.165.0 enables by default. If any command tool still dispatches, for example through `unified_exec`, which the Codex config reference says ignores user opt-outs, it runs inside the `am_batch` sandbox profile: no reads of home, temp or mounted folders, no network, no inherited environment, and no way to ask for more because approvals are `never`. The model needs no file access: its items arrive on stdin.
 - **Proof before every run, by classification.** A nonzero exit is not proof. Each denial probe has a known input and a positive control: the canary files hold a fresh nonce and are readable outside the sandbox, the network answers outside the sandbox on an IP address, and the sandbox itself can run `/bin/echo`. `probe_denied` then classifies the sandboxed run:
 
 	| Result | Rule | Action |
@@ -1338,9 +1344,12 @@ rm -rf "$run_dir" "$codex_home"
 	| `allowed` | Zero exit, or the nonce or listing appears | Skip the batch; dashboard alert |
 	| `indeterminate` | Anything else: a missing file or command, "Could not resolve host", a timeout, another error message, an unknown platform | Skip the batch; dashboard warning |
 
+	On macOS the network probe is classified from `curl -v`. Under the profile, curl prints the denial only in its verbose output ("Immediate connect fail for 1.1.1.1: Operation not permitted"). Without `-v` it prints only "Couldn't connect to server", which would be `indeterminate` (checked on 2026-10-28 with Codex 0.165.0; [evidence](phase-2-implementation.md#what-exists)).
+
 	The batch runs only when every positive control passes and every denial probe is `denied`, with the same configuration file, by hash, for the probes and for `codex exec`. Skipping releases the lease, records `batch_skipped` with the reason, and exits. The queue items stay open for agents' inline consolidation. Storage, capture and recall keep working. The denial message is defined for macOS in phase 2. On any platform without a tested message, every probe is `indeterminate`, so the batch stays inline-only there. A Codex update that weakens the sandbox is caught on its first run.
 - **What the probes do not prove.** They prove that the effective profile denies reading home and temp files and reaching the network. They do not prove that no tool exists. Safety rests on three things together: tools switched off, the proven denial of everything a tool could disclose, and detection.
-- **Detection stays.** The runner parses the `--json` event stream. Any tool item discards the run's output, marks the lease `stuck` and reports it, so an unexpected tool call is visible even though the sandbox already contained it.
+- **Detection stays.** The runner parses the `--json` event stream and accepts only the known envelopes (thread, turn and item events); any other event type fails closed like a configuration notice. Any tool item discards the run's output, marks the lease `stuck` and reports it, so an unexpected tool call is visible even though the sandbox already contained it.
+- **Configuration notices fail closed.** Codex reports a setting it ignores as an `error` item in the event stream ("Codex is ignoring 1 unrecognized configuration setting"). The runtime is then not the one the probes proved, so the run is discarded. The batch is skipped, and a capture range stays `pending` rather than being acknowledged. Unknown event or item types fail the same way.
 - **Confined output.** The runner validates the output against the schema. The server validates it again through the normal write path, keeps each op inside its item's subjects, logs it with undo, and turns any change to a protected node into a flag. The token stays with the runner script, never with the model.
 
 Luna (`gpt-6-luna`, low effort) gets `unlinked`, `stale_journal` and `dangling_link` items, and Terra (`gpt-6.1-terra`, high effort) gets the rest. Model slugs come from the owner's current Codex catalog. The same confined runtime and probes run the capture consolidation pass of section 10 and the corpus judgment steps of section 14. Phase 2 builds them, because capture needs them first.
@@ -1463,13 +1472,19 @@ Map and path endpoints run under the same work budgets as the graph tools (300 n
 
 BothQ stays the system of record through the whole build. Nothing writes to both systems. Every phase is verified with test data and with migration rehearsals into a `test` profile, which is wiped and recreated as needed. After all six phases pass, one final full migration runs, agents and hooks switch over, native memory is turned off, and BothQ shuts down.
 
+**Owner priority, 2026-10-29:** "Too priority should be the memory system, mcp and ingesting current memory in bothq and md files." Read as: the core memory store and MCP come first, and existing BothQ and curated Markdown memory is copied into the hosted profiles early, as a reviewable hosted copy, instead of only at cutover. This changes timing only:
+- **Early copy.** Once the core is stable (the phase-2 blocker fixes closed), the [import vertical](#import-vertical-bothq-and-curated-markdown-memory) runs the lossless steps of the pipeline below into the hosted profiles: export (1), history import (2), dates (4), mechanical pass (5), routing (6), import (8) and embedding (9), plus the curated Markdown memory files. It is an explicit, one-way, non-destructive copy: BothQ's database and the Markdown files are only read, never changed, and the copy is checked against them.
+- **BothQ stays the only live system.** No dual writes, no ordinary caller switch, no native-memory switch-off, no BothQ shutdown, and no capture of real transcripts follow from the early copy. Ordinary sessions keep writing to BothQ.
+- **Refresh before cutover.** At cutover the import runs again against a fresh export and reconciles: new records and revisions are added, existing request ids replay, and a hosted record that diverged from BothQ goes to the review list instead of being overwritten.
+- Distillation (3) and session digests (7) add judgment and capture on top of the lossless copy. They stay in the later rehearsals.
+
 ### The migration pipeline
 
 The pipeline is one-time work on the owner's machine, run in the foreground. Mechanical steps are scripts or Luna, judgment is Terra, both through Codex on the ChatGPT subscription. Every rehearsal and the final migration run the same pipeline.
 
 | Step | Who | Output |
 |---|---|---|
-| 1. Export | Luna | Read-only Cypher export of BothQ to JSONL: adopted `MemoryRecord` shapes, legacy `Rule`, `Decision`, `Resource` and `Routine` shapes with `rule`-field content, every `MemoryRevision` (snapshot or delta, revision number, date, request id), every `MemoryRequest` (request id, operation, request hash, stored result, memory id), and routine steps. Plus the 17 Claude Code memory files, and Codex `MEMORY.md`, `raw_memories.md`, rollout summaries and extension notes. A manifest with a count and hash per source. |
+| 1. Export | Luna | Read-only Cypher export of BothQ to JSONL: adopted `MemoryRecord` shapes, legacy `Rule`, `Decision`, `Resource` and `Routine` shapes with `rule`-field content, every `MemoryRevision` (snapshot or delta, revision number, date, request id), every `MemoryRequest` (request id, operation, request hash, stored result, memory id), and routine steps. Plus the curated Markdown memory: the Claude Code memory folders (`~/.plaude/projects/*/memory`, index and topic files) and `~/.codex/memories` (`MEMORY.md`, `raw_memories.md`, rollout summaries and extension notes). Raw transcripts, tool output and the corpus are not memory files and are out of scope here. A manifest with a count and SHA-256 per source and per file; the sources are opened read-only and their hashes are checked again after the run. |
 | 2. History import | Script, no model | Lossless and separate from distillation. Each BothQ record's revisions become its revision history in order: save, update, retire and supersede snapshots as `revisions` rows, append deltas as journal entry rows with their original dates. Each `MemoryRequest` becomes a `requests` row with its stored result, plus `legacy_op` and `legacy_hash`. Legacy records without history get one `legacy_snapshot` revision. Node ids are the BothQ `memory_id` values (section 5). A large record's history is split across several import transactions, each within the 1,000-row and 1 MB bound. |
 | 3. Distill | Terra, batches of about 20 records | Current-state snapshots: kind, BothQ type, name, description, content, why, how_to_apply, steps, scope, proposed profile with confidence, provenance (source, source id, path), entities and judgment edges with reasons and evidence. Finished journals also get a summary and decision nodes. The `sequioa` typo becomes `work`. Each snapshot lands as one new `distilled` revision on top of the imported history, so the history stays whole and `expected_revision` keeps counting. |
 | 4. Dates | Script, from the export | `valid_from` comes from the BothQ revision that set the current content: the latest `saved` or `updated` revision whose content hash matches the current one. Each journal entry keeps its own append date. A distilled decision takes the date of the entries it cites. When no revision establishes the fact (legacy records without history, Codex and Claude Code files), `valid_from` stays empty, `attrs.validity = "unknown"`, and the original creation date is kept as `attrs.first_recorded_at` provenance. |
@@ -1489,8 +1504,10 @@ When a call arrives with a `request_id` that has an imported request record, the
 
 | When | What runs | What it can check |
 |---|---|---|
-| Phase 2 | Steps 1 to 9 into the `test` profile, with the corpus session tables only | Verification 1 to 9 below, and 10 without the transfer cases |
-| After phase 3 | The full pipeline again, now with graph tools and transfers built | All of verification 1 to 10 |
+| Import vertical (owner priority, 2026-10-29) | Steps 1, 2, 4, 5, 6, 8 and 9 plus the curated Markdown files, first into `test`, then into the hosted profiles as the reviewable copy | Verification 1, 2 and 5 to 8 below, plus the import checks of section 22 |
+| Phase 2 | Steps 1 to 9 into the `test` profile, with the corpus session tables only | Verification 1 to 9 below. Verification 10, the restore drill, waits for the final backup stage (owner decision, 2026-10-29) |
+| After phase 3 | The full pipeline again, now with graph tools and transfers built | Verification 1 to 9 |
+| Final backup stage | The restore drill on the rehearsal data | Verification 10 |
 | Before cutover | A combined final rehearsal on a fresh BothQ export plus the full corpus into the `test` profile, timed | All of verification 1 to 10, plus the corpus checks of phase 6, so the cutover window is known |
 
 ### Verification
@@ -1512,7 +1529,7 @@ Cutover starts when all phases have passed and the owner gives the go for a chos
 
 1. **Snapshot every caller, byte for byte.** On each machine, `agent-memory cutover snapshot` copies every file the switch will change into `~/.agent-memory/cutover/<date>/`, with a manifest of paths and SHA-256 hashes: `~/.claude/settings.json`, `~/.plaude/settings.json`, `~/.claude.json`, `~/.codex/config.toml`, `~/.codex/AGENTS.md`, the dotfiles instruction files (with the dotfiles commit id), the `bothq-memory` and `task-journal` skill folders, and the manifest of the native memory folders (`~/.plaude/projects/*/memory`, `~/.codex/memories`).
 2. **Freeze.** The owner closes ordinary agent sessions on every machine, and the BothQ MCP is set read-only. From here until step 6 only scripted smoke sessions run.
-3. **Final migration.** Run the pipeline into the production profiles, plus the corpus bulk load (Paid, without the three session text tables). Run verification 1 to 10. If any check fails, go to rollback.
+3. **Final migration.** Refresh and reconcile the reviewed hosted copy from a fresh export (new records and revisions added, existing request ids replayed, diverged records to the review list), run the remaining pipeline steps into the production profiles, plus the corpus bulk load (Paid, without the three session text tables). Run verification 1 to 10. If any check fails, go to rollback.
 4. **Switch each machine.** Point Claude Code and Codex MCP configs at `https://memory.wrick17.com/mcp` and log in. Remove the BothQ MCP entries. Install the capture hooks and trust them in Codex. Turn off native memory (Claude Code `"autoMemoryEnabled": false` in `~/.claude/settings.json` and `~/.plaude/settings.json`; Codex `[features] memories = false`, `[memories] generate_memories = false`, `use_memories = false`). Install the `agent-memory` skill, rewrite `task-journal`, `global.md` and the Codex `AGENTS.md`, retire `bothq-memory`, and move the native memory folders to a dated archive folder.
 5. **Smoke checks.** On each client, including one session under T3 Code, a scripted session saves, appends, recalls and captures one turn, using `request_id`s that start with `smoke:`.
 6. **Open or roll back.** If every smoke check passes, the owner reopens ordinary sessions. That moment is the rollback boundary. If a check fails before it:
@@ -1711,7 +1728,7 @@ Captures, uploads and agent-written text are stored as data. Three places read i
 | Reader | Fence |
 |---|---|
 | Interactive agents through recall | Results wrap content in a `data` field with its `origin`. Tool descriptions and the `agent-memory` skill say recalled content is evidence to weigh, not instructions to follow. |
-| The daily maintenance batch | A throwaway `CODEX_HOME`, an empty working directory, tools and integrations off, and a sandbox permission profile with no reads of home, temp or mounted folders, no network, no inherited environment and no approvals. Classified probes through `codex sandbox`, with known inputs and positive controls, prove the denial before every run; any result other than a classified denial skips the batch. The event stream is still checked, schema-bound output is validated twice, and each op is confined to its item's subjects (section 12). |
+| The daily maintenance batch | A throwaway `CODEX_HOME`, an empty working directory, tools and integrations off (including browser use, computer use and image generation), and a sandbox permission profile with no reads of home, temp or mounted folders, no network, no inherited environment and no approvals. Classified probes through `codex sandbox`, with known inputs and positive controls, prove the denial before every run; any result other than a classified denial skips the batch. The event stream is still checked, schema-bound output is validated twice, and each op is confined to its item's subjects (section 12). |
 | The Jira context step and corpus judgment steps | Jira: Claude Code headless with a Jira-only MCP config and only the Jira read tools allowed. Corpus: the same confined `codex exec` runtime and probes, with changed files passed in as input. |
 
 The server never executes or interprets stored text.
@@ -1811,17 +1828,26 @@ Optional parts: embeddings (`EMBEDDINGS=off` gives FTS5-only recall), the corpus
 
 This is the plan for the owner's final approval. All design changes in this document are approved. Nothing below starts before that separate approval: no code build, no deployment, no Cloudflare, Clerk or DNS setup, no hook install, no agent cutover. Once approved, the plan itself authorizes the Cloudflare resources it lists, the `test` profile, and the phase-2 tests with dummy live sessions and recorded fixtures (cleaned up after). BothQ stays the system of record until cutover. Build roles follow the owner's delegation rules: Opus implements, Sol reviews, Terra verifies, commits and deploys.
 
+**Owner timing decisions, 2026-10-29.** These change when work happens, not what is promised. They supersede the timing in the [plan as approved on 2026-10-28](https://github.com/wrick17/agent-memory/blob/6ab2380ee3b3182bad3d6a8a5fe9bc130b5ccaa9/docs/architecture.md#22-implementation-plan).
+- "Backup and restore should be implemented and tested at the end, just before bothq shutdown." Building and testing the nightly exports, point-in-time restore, restore from an export, the recovery reconciliation, restore drills, and every check that needs them (including backup-side wipe checks and the dashboard's backup, restore and recovery pages) move out of phases 2 to 6 into the [final backup stage](#final-stage-backup-and-restore). It runs after every other feature is built and before the final rehearsal. Nothing of it is built or scaffolded earlier, and no rehearsal that needs it runs earlier. The contracts are unchanged: consistent exports, the permanent R2 generation ledger and its reconciliation, undo, and wipe. The R2 generation ledger already built in phase 1 is identity isolation and stays. BothQ stays the only live system, and it is not shut down until the backup, restore and recovery checks pass. Read-only migration mapping and compatibility work may proceed earlier, without changing the original sources.
+- "Cross machine parity checks should also be done towards the end." The physical second-machine and headless-box checks (the two-machine parts of G3 and G5) move to the [final combined rehearsal](#final-combined-rehearsal), before cutover and before BothQ shutdown. No second-machine access is requested earlier. Same-machine checks continue in each phase: function, auth, privacy, concurrency, crash recovery, capture, model digest parity and confinement. Isolated local clients on one machine never count as cross-machine parity.
+
+**Owner priority, 2026-10-29:** "Too priority should be the memory system, mcp and ingesting current memory in bothq and md files." The core memory store, its MCP tools and their guard, history, replay and knowledge integrity come first. The capture vertical's open review fixes finish because its uncommitted source shares the core and cannot ship with known privacy and integrity defects; no capture extras, parity work, global hooks, new graph features or UI are added after them. The next vertical is then the [import of BothQ and curated Markdown memory](#import-vertical-bothq-and-curated-markdown-memory), ahead of the rest of phase 2, phase 3's advanced graph, the dashboard and the corpus. The earlier timing, a full import only at cutover, is in the [plan as approved on 2026-10-28](https://github.com/wrick17/agent-memory/blob/6ab2380ee3b3182bad3d6a8a5fe9bc130b5ccaa9/docs/architecture.md#16-migration-and-cutover).
+
 ```mermaid
 flowchart LR
 	G0["Gate 0: owner approves this plan"] --> P1["Phase 1: core store, login, save and recall"]
-	P1 --> P2["Phase 2: capture, backups, first rehearsal"]
+	P1 --> P2a["Phase 2: capture vertical, review fixes only"]
+	P2a --> I["Import: BothQ + curated Markdown, reviewable hosted copy"]
+	I --> P2["Phase 2 remainder: capture extras, first rehearsal"]
 	P2 --> P3["Phase 3: graph, cleanup, transfers, wipe + combined check"]
 	P3 --> P4["Phase 4: dashboard"]
 	P3 --> P5["Phase 5: work graph"]
 	P5 --> P6["Phase 6: corpus (Paid)"]
-	P4 --> R["Final combined rehearsal"]
-	P6 --> R
-	R --> C["Cutover (owner's go)"]
+	P4 --> B["Final stage: backup and restore"]
+	P6 --> B
+	B --> R["Final combined rehearsal, with cross-machine parity"]
+	R --> C["Cutover (owner's go); BothQ shutdown last"]
 ```
 
 Each phase ends when its checks pass. Each phase checks only what it has built, and the combined check after phase 3 and the final rehearsal re-run everything together. A short demo keeps the owner informed and is not an approval gate. A failed check goes back to its phase. Phases 4 and 5 can run in parallel after phase 3. No phase includes performance benchmarks.
@@ -1833,12 +1859,14 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 | Gate 0 | Approve this plan | Required before any build or setup |
 | Phase 1 start | Sign in to Clerk if the dashboard asks while the "Agent Memory" app is created (already authorized) | Only the owner can sign in |
 | Phase 1 start | Approve each DNS change: the Worker route for `memory.wrick17.com`, then each Clerk record on `wrick17.com` | DNS changes are asked one at a time |
-| Phase 2 | Store `BACKUP_KEY` in a password manager | Only the owner holds the offline copy |
+| Import vertical | Review the hosted copy's review list (unrouted, low-confidence and `me`-guard-blocked records) | Only the owner decides where a record belongs |
+| Final backup stage | Store `BACKUP_KEY` in a password manager (moved from phase 2 on 2026-10-29) | Only the owner holds the offline copy |
 | Phase 2 | Trust the installed Codex hooks in Codex | Codex requires the user to trust hooks |
 | Phase 2 | Choose the 30 golden queries | Only the owner knows what good recall means |
+| Final combined rehearsal | Make a second machine and the headless box available for the cross-machine parity checks (moved from phase 1 on 2026-10-29) | Only the owner controls those machines |
 | Cutover | Pick the window and give the go | Freezes BothQ and switches every machine |
 
-### Phase 1: core store, login, save and recall from two machines
+### Phase 1: core store, login, save and recall
 
 - **Depends on:** Gate 0, the Clerk app, the DNS route.
 - **Builds:**
@@ -1854,22 +1882,21 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 | Gate | Pass condition |
 |---|---|
 | G1 auth | T1 to T6 (section 8), for whichever topology is chosen. Decides Clerk as the authorization server or the fallback. |
-| G3 contracts | Replay returns the stored result. A changed payload returns `idempotency_mismatch`. A stale revision returns `revision_conflict`. Two machines each send 100 concurrent appends to one journal: 200 entries, gapless `seq_no`, none lost. Supersession is atomic. Procedural validation matches BothQ. A retry after a routing-rule change replays in the original profile. Empty-keyword recall enumerates 250 test records completely through `next_cursor`. Content paging returns `revision_conflict` when an append lands between pages. |
+| G3 contracts | Replay returns the stored result. A changed payload returns `idempotency_mismatch`. A stale revision returns `revision_conflict`. Two clients each send 100 concurrent appends to one journal: 200 entries, gapless `seq_no`, none lost (on one machine here; the two-machine run is in the final combined rehearsal, 2026-10-29). Supersession is atomic. Procedural validation matches BothQ. A retry after a routing-rule change replays in the original profile. Empty-keyword recall enumerates 250 test records completely through `next_cursor`. Content paging returns `revision_conflict` when an append lands between pages. |
 | G4 isolation | A device token for `personal` cannot read `work` directly. Recall routed to `work` returns only `work` and `me`. The same name saved in `work` and `me` gets two different ids and both appear in merged recall. A write to `me` from a work context without `company_free` is refused. |
-| G5 two machines | Save on the Mac through Claude Code (OAuth), recall on a second machine through Codex (OAuth) and on a headless box with a device token. The vector channel returns the new record once embedded, within the shared 3 s semantic deadline. When Workers AI or Vectorize is made slow or to fail, recall answers lexically by that deadline and says which stage missed. With `EMBEDDINGS=off`, recall answers lexically and says so. (The 300 ms limit in this check was superseded on 2026-10-28; see section 11.) |
+| G5 clients | Save on the Mac through Claude Code (OAuth), recall through Codex (OAuth) and with a device token on the same Mac (the second-machine and headless-box runs moved to the final combined rehearsal, 2026-10-29). The vector channel returns the new record once embedded, within the shared 3 s semantic deadline. When Workers AI or Vectorize is made slow or to fail, recall answers lexically by that deadline and says which stage missed. With `EMBEDDINGS=off`, recall answers lexically and says so. (The 300 ms limit in this check was superseded on 2026-10-28; see section 11.) |
 
-### Phase 2: capture, backups and the first rehearsal
+### Phase 2: capture and the first rehearsal
 
-- **Depends on:** phase 1.
+- **Depends on:** phase 1. The capture vertical's review fixes come first; the rest of this phase follows the import vertical (owner priority, 2026-10-29).
 - **Builds:**
 	- `local/agent-memory`: `hook`, `run` and `install`, with the trigger queue, debounce, the two per-session cursors, transcript discovery, `pending` sessions and range files, the heuristic digest builder, consolidation in bounded parts with kept part files and the completeness manifest, the spool, and the Claude Code and Codex hook configs.
 	- The confined `codex exec` runtime with its classified probes (section 12), and the local consolidation pass that uses it (section 10). The phase-3 batch reuses both.
 	- `/v1/ingest` for digests, `session` nodes, the capture lane, `capture_memory`, `review_candidates` and `record_knowledge`.
-	- Schema v2: `captures_fts`, `markers`, and the `maintenance` table (capture and restore write items into it; the tools that lease them arrive in phase 3).
-	- The nightly export of every profile and of `AccountStore` (chunks in `seq` order, cut, fence fallback, manifest, two kept).
-	- Point-in-time restore with the recorded undo bookmark and status, restore from an export into a new generation, and the recovery reconciliation with every rule except the transfer rules, which are exercised in phase 3.
-	- The migration pipeline (export, history import, distill, dates, mechanical pass, route, session digests, import, embed) and the phase-2 rehearsal into `test`.
-	- The `agent-memory` skill and the BothQ compatibility tests for the memory tools, written but not installed.
+	- Schema v2: `captures_fts`, `markers`, and the `maintenance` table (capture writes items into it, and later restores do; the tools that lease them arrive in phase 3).
+	- The nightly export, point-in-time restore, restore from an export and the recovery reconciliation moved to the [final backup stage](#final-stage-backup-and-restore) (owner decision, 2026-10-29).
+	- The rest of the migration pipeline (distill and session digests) on top of the import vertical, and the phase-2 rehearsal into `test`.
+	- The `agent-memory` skill, written but not installed. The BothQ compatibility tests for the memory tools are written in the import vertical.
 - **Checks:**
 	- Capture, with dummy live sessions and recorded fixtures, in the `test` profile, then cleaned up:
 		- Interrupted, marker-free fixtures with no inline task-end pass, run as dummy live sessions and as recorded files: a session killed right after the owner writes "Thanks. Use the other timeout.", and one where the agent settles a choice without a marker word. After the consolidation pass, the consolidated parts hold the correction and the decision. Their heuristic digests alone do not, and the ranges are not counted captured until the manifest is stored.
@@ -1877,34 +1904,45 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 		- Golden saturation fixture, with no inline task-end pass: one range with 100 independent owner corrections, each carrying a distinct literal identifier, the literals alone over 8 KB. The range is consolidated in more than one part, each at most 8 KB with zero dropped decisions and corrections, the manifest tiles the range, every one of the 100 literals is in a stored part, and `consolidated_to` moves and the local text goes only after the manifest is stored.
 		- The same fixture with a stub model that returns an overflowing part or a nonzero `dropped` count: the subrange is split and retried, and a 2 KB subrange that keeps failing leaves the range `stuck` and pending with its local text. Killed after some parts are stored, the next run uploads the kept part bytes with the same hashes and generates only the missing parts. With the part files deleted, it adopts the server's parts and digests only the gaps. A changed part for a stored span is refused.
 		- On a transcript over 5 MB and on ten recorded sessions, every decision and owner correction a reviewer marked appears in the consolidated parts.
-		- No upload, spool file or server log contains a whole message (a scan for any message longer than the excerpt limits).
+		- No upload, spool file or server log contains a message longer than the excerpt limits (a fixture scan). The scan cannot flag a message shorter than its limit, which may appear in full as one excerpt.
 		- Repeated `Stop` events on an unchanged transcript upload nothing. `SessionEnd` after `Stop` uploads only the tail.
 		- A run killed mid-upload resumes with no duplicates, and the cursor never passes a digest the server has not stored.
 		- A rewritten transcript starts a new epoch.
 		- A Codex `Stop` with a null transcript path finds the rollout in the session store and keeps that turn's owner correction. With the store hidden, the session stays `pending` and nothing is acknowledged; once the file is back, a sweep captures the owner message.
 		- The hook does no network I/O and returns before the client waits on it.
 		- Under T3 Code, Claude `Stop` captures each turn and `SessionEnd` fires only at archive. The installed Codex hooks show as trusted and fire under T3.
-	- Backups:
-		- A key deleted and reinserted while an export runs is present after the restore.
-		- A single transaction of 1,000 rows and 600 KB, split across a chunk boundary by the byte cap, and another split by the row cap, each with writes landing between the steps: the restore holds every row of both transactions and equals the store at `E`.
-		- A restore of an export taken under concurrent writes equals the store's state at the manifest's `E`, by row counts and table hashes.
-		- With the fence threshold lowered in a test setting, the fence path cuts within its bound and lifts.
-		- A point-in-time restore records its undo bookmark before the abort, reports its status, keeps the account closed until reconciliation finishes, and the undo bookmark reverses it.
-		- An `AccountStore` restore leaves every device token disabled until re-enabled.
-		- A scratch drill embeds the same nodes under its own `g<scratch>:` ids and then deletes them; every live `g<live>:` vector and every `embed_hash` is unchanged afterwards.
-		- Account restore, then scratch: export `AccountStore` while `test` is at generation `a`, restore `test` from an export so it moves to a new generation `b` and embeds node `N`, restore `AccountStore` from the earlier export, run the reconciliation, then run a scratch drill. Reconciliation makes `b` active again from the ledger, the drill's generation id is new and appears in no earlier ledger entry, profile name or vector id, and after the drill `gb:N` and its `embed_hash` are unchanged. With the ledger read stubbed to return an existing id, allocation draws again instead of reusing it.
-	- Confinement probes, on macOS with the supported Codex version: with the `am_batch` profile, every probe is `denied` and the run proceeds. With a deliberately weakened profile, a probe is `allowed` and the run is skipped. With a missing canary, a missing `curl`, a probe pointed at a host name with DNS blocked, or the network down, the result is `indeterminate` and the run is skipped. In every skip, queue items and pending ranges stay open.
-	- Migration rehearsal: verification 1 to 9 of section 16, and 10 without the transfer cases.
+	- Backups: moved with their builds to the [final backup stage](#final-stage-backup-and-restore).
+	- Confinement probes, on macOS with the supported Codex version: with the `am_batch` profile, every probe is `denied` and the run proceeds. With a deliberately weakened profile, a probe is `allowed` and the run is skipped. With a missing canary, a missing `curl`, a probe pointed at a host name with DNS blocked, or the network down, the result is `indeterminate` and the run is skipped. The network probe is denied only when `curl -v` shows the permission-denial message. A Codex configuration notice in the event stream fails the run. In every skip, queue items and pending ranges stay open.
+	- Migration rehearsal: verification 1 to 9 of section 16. Verification 10, the restore drill, runs in the final backup stage.
 	- Compatibility: every memory-tool row of the BothQ checklist (section 7) has a passing test.
+
+### Import vertical: BothQ and curated Markdown memory
+
+Added by the owner priority of 2026-10-29. It makes the existing memory available in the hosted store as a reviewable copy while BothQ stays the only live system.
+
+- **Depends on:** phase 1 and the capture vertical's review fixes (a stable shared core). A read-only source inventory (`research/05-current-memory-import.md`) refreshes the counts and paths of `research/02` first.
+- **Builds:**
+	- `agent-memory migrate`: export (step 1, read-only Cypher and read-only file reads), history import (2), dates (4), mechanical pass with the local `me` guard (5), routing with the review list (6), upload (8), with `migration/state.json` cursors so a rerun resumes and skips finished batches.
+	- `/v1/import` with the `import` scope and actor `migration`: node ids are the BothQ `memory_id`s; revisions keep their original numbers, operations and dates; `MemoryRequest`s become `requests` rows with `legacy_op`, `legacy_hash` and the stored result, bound in `AccountStore.request_index`; each batch within the 1,000-row and 1 MB bound. The `me` guard, routing and personal-field stripping apply as on every write.
+	- BothQ-era replay (section 16, "Replaying a BothQ-era request").
+	- Curated Markdown files as records with their path and SHA-256 as provenance, byte-exact content, `attrs.validity = "unknown"` and the file's own date only as `attrs.first_recorded_at`; no valid date is invented.
+	- The BothQ compatibility tests for the memory tools.
+- **Checks**, first into `test`, then into the hosted profiles:
+	- Migration verification 1, 2 and 5 to 8 (section 16), and every memory-tool row of the BothQ checklist (section 7).
+	- Every curated Markdown file comes back byte for byte through `get_memory` with `complete: true`, and its hash matches the manifest.
+	- A run killed mid-batch resumes with no duplicates. A second full run changes nothing: every request replays and every count is unchanged.
+	- The BothQ database and every Markdown file have the same hashes after the run as before.
+	- Records the `me` guard blocks, unrouted records and low-confidence routes are in the review list, not imported into a guessed profile.
+	- Verification 4 (the 30 golden queries) runs once the owner has chosen them.
 
 ### Phase 3: knowledge graph, cleanup, transfers and wipe
 
-- **Depends on:** phase 2.
+- **Depends on:** phase 2 and the import vertical.
 - **Builds:**
 	- Identifier extraction and structural relations, similarity edges, `explore`, `trace` and `timeline` with work budgets and explicit cross-profile following, and link-expanded recall.
 	- Schema v3 (`archive`, `transfers`, `transfer_parts`), `maintenance_next` and `maintenance_complete`, and the daily batch on the phase-2 confined runtime.
 	- TTL (90 days), purge (300 days), exact dedupe and size caps, with undo for every op.
-	- The transfer protocol and the reconciliation's transfer rules.
+	- The transfer protocol and its own crash recovery. The reconciliation's transfer rules, which run after a restore, arrive in the final backup stage.
 	- The full `me` guard with sensitive terms updated in the same request, the model of the owner, `dangling_link` items, and the profile wipe.
 - **Checks:**
 	- Extraction: on a fixture with known ids, precision of at least 0.95. Mentions produce only `relates_to`, and `fixes` appears only from closing references or agent writes. `UTF-8` never becomes a ticket.
@@ -1925,25 +1963,23 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 		- A crash injected after each step resumes correctly. A collision stops the transfer.
 		- Old request ids replay after the move.
 		- A crash injected after publish and before commit, followed by two appends on the target: the target keeps both appends, the source becomes a tombstone, and the node id and its request ids point at the target. With the identities made to differ, the account stays closed until the owner picks a copy.
-	- Joint restore: a target restored to before a completed move, an `AccountStore` restored to before a move, an unfinished transfer, and a source captured `moving` with its target already published each end with exactly one owner by the rules of section 18, or keep the account closed when the pair is unresolved.
 	- Wipe, on the `test` profile, with records copied out of it beforehand:
-		- It closes the profile and deletes its stores, vectors and exports.
+		- It closes the profile and deletes its stores and vectors.
 		- A record transferred from `test` to `personal` is purged from `personal`, with its revisions, requests, vectors and archive rows.
-		- A record moved from `test` to `personal` and then given a new body in `personal`: after the wipe, its `personal` activity rows keep only time, actor, op, target ids and the redaction note, undo of them returns `undo_redacted`, and a byte scan of the fresh, decrypted `personal` export finds neither the old nor the new body. An unrelated `personal` record keeps its activity and its undo still round-trips.
+		- A record moved from `test` to `personal` and then given a new body in `personal`: after the wipe, its `personal` activity rows keep only time, actor, op, target ids and the redaction note, and undo of them returns `undo_redacted`. An unrelated `personal` record keeps its activity and its undo still round-trips.
 		- A company-free `me` preference with `test` provenance survives.
 		- A `personal` note that links to a wiped record keeps an opaque backlink.
 		- A hand-written `personal` note that contains a `test` sensitive term is listed in the report, not deleted.
-		- The exports of every profile that lost a purged record are replaced.
-		- Restoring an older export of the wiped profile or of `personal`, or importing one of the purged ids, does not bring the purged records back.
-	- **Combined check:** the full migration rehearsal again with verification 1 to 10, and every row of the BothQ compatibility checklist.
+		- The backup-side wipe checks (export replacement, the export byte scan and no resurrection from an older export) run in the final backup stage.
+	- **Combined check:** the full migration rehearsal again with verification 1 to 9 (10 waits for the final backup stage), and every row of the BothQ compatibility checklist.
 
 ### Phase 4: dashboard
 
 - **Depends on:** phase 3.
-- **Builds:** the pages and API of section 15, including activity with undo, transfers and collisions, links across profiles, recovery pages, restores and the restore drill, the wipe with its typed confirmation, and the model of the owner.
+- **Builds:** the pages and API of section 15, including activity with undo, transfers and collisions, links across profiles, the wipe with its typed confirmation, and the model of the owner. The backup, restore, recovery and restore-drill pages arrive in the final backup stage.
 - **Checks:**
 	- A reader the owner picks answers five questions ("who worked on X", "why did we choose Y", "what is blocked") from the map and entity pages without help.
-	- Undo, transfer, restore and wipe work end to end in the browser.
+	- Undo, transfer and wipe work end to end in the browser.
 	- Keyboard navigation and contrast pass an axe check.
 
 ### Phase 5: work graph
@@ -1973,15 +2009,45 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 	- An upload that includes `session_messages` is refused.
 	- A changed scratch repo refreshes its tables within a day.
 	- An untouched repo keeps its as-of date.
-	- Wipe of the `test` profile with its corpus loaded: its `CorpusStore` is cleared, its corpus exports and its part of the migration archive are deleted, and restoring its older corpus export is refused.
+	- Wipe of the `test` profile with its corpus loaded: its `CorpusStore` is cleared and its part of the migration archive is deleted. Its corpus exports and the refusal to restore an older one are checked in the final backup stage.
+
+### Final stage: backup and restore
+
+Moved here from phases 2 to 6 by the owner on 2026-10-29 ([decision](#22-implementation-plan)). It runs after every other feature is built and before the final combined rehearsal and BothQ shutdown.
+
+- **Depends on:** phases 4 and 6.
+- **Builds:**
+	- The nightly export of every profile and of `AccountStore`, the corpus included (chunks in `seq` order, cut, fence fallback, manifest, two kept).
+	- Point-in-time restore with the recorded undo bookmark and status, restore from an export into a new generation, and the recovery reconciliation with every rule of section 18, the transfer rules included.
+	- The backup-side wipe steps: replacing the affected exports and refusing a wiped profile's exports on restore.
+	- The dashboard's backup, restore, recovery and restore-drill pages and API (section 15).
+- **Checks:**
+	- Backups:
+		- A key deleted and reinserted while an export runs is present after the restore.
+		- A single transaction of 1,000 rows and 600 KB, split across a chunk boundary by the byte cap, and another split by the row cap, each with writes landing between the steps: the restore holds every row of both transactions and equals the store at `E`.
+		- A restore of an export taken under concurrent writes equals the store's state at the manifest's `E`, by row counts and table hashes.
+		- With the fence threshold lowered in a test setting, the fence path cuts within its bound and lifts.
+		- A point-in-time restore records its undo bookmark before the abort, reports its status, keeps the account closed until reconciliation finishes, and the undo bookmark reverses it.
+		- An `AccountStore` restore leaves every device token disabled until re-enabled.
+		- A scratch drill embeds the same nodes under its own `g<scratch>:` ids and then deletes them; every live `g<live>:` vector and every `embed_hash` is unchanged afterwards.
+		- Account restore, then scratch: export `AccountStore` while `test` is at generation `a`, restore `test` from an export so it moves to a new generation `b` and embeds node `N`, restore `AccountStore` from the earlier export, run the reconciliation, then run a scratch drill. Reconciliation makes `b` active again from the ledger, the drill's generation id is new and appears in no earlier ledger entry, profile name or vector id, and after the drill `gb:N` and its `embed_hash` are unchanged. With the ledger read stubbed to return an existing id, allocation draws again instead of reusing it.
+	- Joint restore: a target restored to before a completed move, an `AccountStore` restored to before a move, an unfinished transfer, and a source captured `moving` with its target already published each end with exactly one owner by the rules of section 18, or keep the account closed when the pair is unresolved.
+	- Wipe against backups, on the `test` profile, after the wipe checks of phases 3 and 6:
+		- A byte scan of the fresh, decrypted `personal` export finds neither the old nor the new body of the moved record.
+		- The exports of every profile that lost a purged record are replaced.
+		- Restoring an older export of the wiped profile or of `personal`, or importing one of the purged ids, does not bring the purged records back.
+		- A wiped `test` profile's corpus exports are deleted, and restoring its older corpus export is refused.
+	- Restore and wipe work end to end in the dashboard.
+	- Migration verification 10 (section 16): a restore drill from the newest R2 exports, including the joint ownership check and the vector rebuild.
 
 ### Final combined rehearsal
 
-- **Depends on:** phases 4 and 6.
+- **Depends on:** the final backup stage.
 - **Runs:**
+	- Cross-machine parity, moved from phase 1 on 2026-10-29: G5 with the second machine (Codex, OAuth) and the headless box (device token), recall of a record saved on the Mac within the shared 3 s semantic deadline and the lexical fallbacks; the G3 two-machine run of 100 concurrent appends each (200 entries, gapless `seq_no`); and a hooks-installed capture on the second machine that the Mac recalls.
 	- The combined final rehearsal of section 16: a fresh BothQ export plus the full corpus into `test`, with verification 1 to 10 and 20 BothQ `corpus_*` queries returning the same answers, timed.
 	- A joint restore drill, including a transfer captured after publish and before commit.
-	- A full wipe of the `test` profile after its full corpus load, with every wipe check of phases 3 and 6.
+	- A full wipe of the `test` profile after its full corpus load, with every wipe check of phases 3 and 6 and of the final backup stage.
 	- A cutover rehearsal on one machine: snapshot, switch, smoke checks, then rollback. Every snapshot file comes back with a matching hash, the native memory folders move back, and BothQ takes writes again.
 
 ### Cutover
@@ -1994,7 +2060,7 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 	4. Switch every machine.
 	5. Smoke checks.
 	6. Open, or roll back to the snapshot.
-	7. BothQ shutdown after opening.
+	7. BothQ shutdown after opening, and only once the final backup stage's backup, restore and recovery checks have passed.
 - **Rollback boundary:** the owner reopening ordinary sessions. Before it, rollback loses nothing. After it, recovery uses the hosted backups.
 
 ## 23. Tradeoffs and alternatives
@@ -2004,7 +2070,7 @@ Each phase ends when its checks pass. Each phase checks only what it has built, 
 - We accept two Durable Object hops per tool call (`AccountStore`, then the profile) in exchange for immediate token revocation, durable request binding and one owner for devices and rules.
 - We accept that a journal's full text is a join of entry chunks, in exchange for appends whose cost does not grow with the journal. `get_memory` returns whole content up to 100k characters and pages beyond that.
 - We accept the trigram index's storage (about 3x the text) in exchange for BothQ's substring recall without a table scan.
-- We accept that hosted capture holds only deterministic digests, in exchange for whole messages never leaving the machine. The agent's inline consolidation, with the full local context, carries what a digest drops.
+- We accept that hosted capture holds only deterministic digests, in exchange for whole messages, beyond what fits in one bounded excerpt, never leaving the machine. The agent's inline consolidation, with the full local context, carries what a digest drops.
 - We accept a write fence of at most 30 seconds on a night the export cannot catch up, in exchange for an export that is always bounded and consistent.
 - We accept that the account is closed while a restore reconciles, in exchange for never serving two owners of one record or a revoked token.
 - We accept that the maintenance batch is skipped whenever its confinement cannot be proved, in exchange for never running untrusted text next to readable local files.
@@ -2074,7 +2140,9 @@ No owner decision is open. These are implementation-time gates, each with a safe
 
 ## 25. Next implementation step
 
-After the owner approves the implementation plan (Gate 0): create the repo with CI and the `profile/schema.ts` v1 migration, `profile/write.ts` (`save` and `append` with `request_id`, `expected_revision`, `seq` stamps and tombstones), and `AccountStore` request binding, with the G3 contract tests written first. In parallel the owner creates the Clerk app for G1.
+Current (2026-10-29): phase 1 is deployed for owner testing, and phase 2's capture vertical is being fixed after review. The next vertical is the [import of BothQ and curated Markdown memory](#import-vertical-bothq-and-curated-markdown-memory) (owner priority). Backup and restore wait for the final backup stage, and cross-machine parity for the final combined rehearsal (section 22).
+
+As first planned, after the owner approved the implementation plan (Gate 0): create the repo with CI and the `profile/schema.ts` v1 migration, `profile/write.ts` (`save` and `append` with `request_id`, `expected_revision`, `seq` stamps and tombstones), and `AccountStore` request binding, with the G3 contract tests written first. In parallel the owner creates the Clerk app for G1.
 
 ## Sources
 
@@ -2098,7 +2166,8 @@ All read on 2026-10-28. "Updated" is the page's own date where it shows one.
 | Claude Code hooks: `Stop`, `SessionEnd`, `SessionStart`, async hooks | https://code.claude.com/docs/en/hooks | undated |
 | Claude Code auto memory: `autoMemoryEnabled`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | https://code.claude.com/docs/en/memory | undated |
 | Codex hooks, trust, `SessionEnd` behavior | https://developers.openai.com/codex/hooks | undated |
-| Codex config: `features.shell_tool`, `features.unified_exec` (user opt-outs ignored), `web_search`, `tools.view_image`, `agents.enabled`, `features.apps`, `features.plugins`, `features.hooks`, `features.memories` | https://developers.openai.com/codex/config-reference | undated |
+| Codex config: `features.shell_tool`, `features.unified_exec` (user opt-outs ignored), `web_search`, `agents.enabled`, `features.apps`, `features.plugins`, `features.hooks`, `features.memories` | https://developers.openai.com/codex/config-reference | undated |
+| Codex CLI 0.165.0 on this Mac: `tools.view_image` ignored; `browser_use`, `browser_use_external`, `computer_use`, `image_generation` on by default (`codex features list`); `codex sandbox -P am_batch` denials, with network denial visible only under `curl -v` | [phase 2 evidence](phase-2-implementation.md#what-exists) | 2026-10-28 |
 | `codex exec`: `--json`, `--output-schema`, `--ephemeral`, `--sandbox` | https://developers.openai.com/codex/noninteractive | undated |
 | Codex `approval_policy` (`never` for non-interactive runs), `default_permissions`, `permissions.<name>.filesystem` (`read`, `write`, `deny`), `permissions.<name>.network.enabled`, `shell_environment_policy.inherit` | https://learn.chatgpt.com/docs/config-file/config-reference | undated |
 | `codex sandbox [-c key=value] <command>` runs a command under the Codex sandbox | `codex sandbox --help`, Codex CLI 0.165.0, checked locally | 2026-10-28 |

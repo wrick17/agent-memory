@@ -44,7 +44,7 @@ Design source: [architecture v3.2](architecture.md), section 22 (phase 1) and se
 |---|---|---|
 | G3 replay returns the stored result; changed payload `idempotency_mismatch` | `test/g3-contracts.test.ts` | Local |
 | G3 stale revision `revision_conflict` (update and append) | same | Local |
-| G3 two machines, 100 concurrent appends each: 200 entries, gapless `entry_seq` 1 to 200, none lost | same; one OAuth context with a device header, one device token | Local, one workerd process; not two physical machines |
+| G3 two clients, 100 concurrent appends each: 200 entries, gapless `entry_seq` 1 to 200, none lost (one machine; the physical two-machine run moved to the [final combined rehearsal](architecture.md#final-combined-rehearsal) on 2026-10-29) | same; one OAuth context with a device header, one device token | Local, one workerd process; not two physical machines |
 | G3 supersession atomic, and a failed supersede changes nothing | same | Local |
 | G3 procedural validation matches BothQ messages | same | Local |
 | G3 retry after a routing-rule change replays in the original profile | same | Local |

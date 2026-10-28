@@ -127,4 +127,41 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 
 	...DELETED_ROWS,
 	...Object.keys(KEYS).flatMap((t) => [`CREATE INDEX ${t}_seq ON ${t} (seq, ${SEQ_KEY[t]})`, ...tombstoneTriggers("profile_meta", t, KEYS[t]!)]),
+], [
+	// v2 (phase 2): capture digests on texts, their own full-text index, repo markers, the maintenance queue (section 5).
+	"ALTER TABLE texts ADD COLUMN range_id TEXT",
+	"ALTER TABLE texts ADD COLUMN capture_part TEXT",
+	"ALTER TABLE texts ADD COLUMN sha256 TEXT",
+	"ALTER TABLE texts ADD COLUMN capture_status TEXT CHECK (capture_status IS NULL OR capture_status IN ('heuristic','consolidated'))",
+	// chunk is part of the identity only for a manifest, whose body can exceed one 16,000-character row.
+	"CREATE UNIQUE INDEX texts_capture ON texts (range_id, capture_status, capture_part, chunk) WHERE range_id IS NOT NULL",
+	"CREATE VIRTUAL TABLE captures_fts USING fts5 (body, content='texts', content_rowid='rowid', tokenize='porter unicode61')",
+	// captures_fts holds exactly the live capture-lane rows; ordinary recall never reads it.
+	`CREATE TRIGGER texts_cap_ai AFTER INSERT ON texts WHEN NEW.live = 1 AND NEW.lane = 'capture' BEGIN
+		INSERT INTO captures_fts (rowid, body) VALUES (NEW.rowid, NEW.body); END`,
+	`CREATE TRIGGER texts_cap_ad AFTER DELETE ON texts WHEN OLD.live = 1 AND OLD.lane = 'capture' BEGIN
+		INSERT INTO captures_fts (captures_fts, rowid, body) VALUES ('delete', OLD.rowid, OLD.body); END`,
+	`CREATE TRIGGER texts_cap_au_out AFTER UPDATE OF live, lane ON texts WHEN OLD.live = 1 AND OLD.lane = 'capture' AND NOT (NEW.live = 1 AND NEW.lane = 'capture') BEGIN
+		INSERT INTO captures_fts (captures_fts, rowid, body) VALUES ('delete', OLD.rowid, OLD.body); END`,
+	`CREATE TRIGGER texts_cap_au_in AFTER UPDATE OF live, lane ON texts WHEN NEW.live = 1 AND NEW.lane = 'capture' AND NOT (OLD.live = 1 AND OLD.lane = 'capture') BEGIN
+		INSERT INTO captures_fts (rowid, body) VALUES (NEW.rowid, NEW.body); END`,
+	"CREATE TABLE markers (repo TEXT PRIMARY KEY, head TEXT, uploaded_at TEXT, analyzed_at TEXT, analysis_head TEXT, seq INTEGER NOT NULL) WITHOUT ROWID",
+	`CREATE TABLE maintenance (
+		id INTEGER PRIMARY KEY,
+		kind TEXT NOT NULL CHECK (kind IN ('near_duplicate','possible_contradiction','unlinked','unprocessed_capture','preference_signal','stale_journal','weekly_review','dangling_link')),
+		subjects TEXT NOT NULL CHECK (json_valid(subjects)),
+		fingerprint TEXT NOT NULL UNIQUE,
+		state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','leased','done','dismissed','stuck')),
+		lease_id TEXT, lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL, done_at TEXT, outcome TEXT, seq INTEGER NOT NULL
+	)`,
+	// The me guard's work terms, kept in the me profile itself so its write transaction reads them atomically (section 5).
+	"CREATE TABLE guard_terms (term TEXT PRIMARY KEY, source TEXT NOT NULL, added_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID",
+	"CREATE INDEX guard_terms_seq ON guard_terms (seq, term)",
+	"CREATE INDEX maintenance_open ON maintenance (state, kind, created_at)",
+	"CREATE INDEX markers_seq ON markers (seq, repo)",
+	"CREATE INDEX maintenance_seq ON maintenance (seq, id)",
+	...tombstoneTriggers("profile_meta", "markers", (r) => `${r}.repo`),
+	...tombstoneTriggers("profile_meta", "maintenance", (r) => `CAST(${r}.id AS TEXT)`),
+	...tombstoneTriggers("profile_meta", "guard_terms", (r) => `${r}.term`),
 ]];

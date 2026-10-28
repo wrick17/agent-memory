@@ -1,0 +1,448 @@
+// node --test local/ : the local capture client against recorded fixtures, stub model runners and an in-memory server that
+// follows the /v1/ingest contract (the real server contract is tested in test/capture.test.ts). Probe tests use the real
+// `codex sandbox` when it is installed on macOS.
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { beforeEach, describe, it } from "node:test";
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-local-test-"));
+process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
+const am = await import("./agent-memory.mjs");
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+let n = 0;
+beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
+
+/** The /v1/ingest and /v1/capture contract in memory, with switches to simulate a crash or an outage. */
+function fakeServer() {
+	const parts = new Map(), manifests = new Map(), log = [];
+	const s = { parts, manifests, log, failAfter: Infinity, offline: false, calls: 0 };
+	s.ingest = async (batch) => {
+		if (s.offline || s.calls++ >= s.failAfter) throw new Error("network down");
+		log.push(JSON.parse(JSON.stringify(batch)));
+		const out = [];
+		for (const d of batch.digests) {
+			const key = `${d.range_id}|${d.capture_status}|${d.part_id}`;
+			if (sha(d.body) !== d.sha256 || Buffer.byteLength(d.body) > 8192) { out.push({ status: "refused", reason: "invalid" }); continue; }
+			const prior = parts.get(key);
+			if (prior) { out.push({ status: prior.sha256 === d.sha256 ? "replayed" : "refused", reason: prior.sha256 === d.sha256 ? undefined : "hash_conflict" }); continue; }
+			parts.set(key, { sha256: d.sha256, body: d.body });
+			out.push({ status: "stored" });
+		}
+		for (const m of batch.manifests) {
+			const [, a, b] = /(\d+)-(\d+)$/.exec(m.range_id).map(Number);
+			const sorted = [...m.parts].sort((x, y) => Number(x.part_id.split("-")[0]) - Number(y.part_id.split("-")[0]));
+			let at = a, ok = sorted.length > 0;
+			for (const p of sorted) {
+				const [x, y] = p.part_id.split("-").map(Number);
+				const held = parts.get(`${m.range_id}|consolidated|${p.part_id}`);
+				if (x !== at || !held || held.sha256 !== p.sha256 || JSON.parse(held.body).dropped.corrections || JSON.parse(held.body).dropped.decisions) ok = false;
+				at = y;
+			}
+			if (!ok || at !== b) { out.push({ status: "refused", reason: "not_tiled" }); continue; }
+			manifests.set(m.range_id, sorted);
+			out.push({ status: "stored" });
+		}
+		return out;
+	};
+	s.state = async (ids) => {
+		if (s.offline) throw new Error("network down");
+		return Object.fromEntries(ids.map((id) => [id, { parts: [...parts.entries()].filter(([k]) => k.startsWith(`${id}|consolidated|`)).map(([k, v]) => ({ part_id: k.split("|")[2], sha256: v.sha256 })), consolidated: manifests.has(id) }]));
+	};
+	s.storedText = () => [...parts.values()].map((p) => p.body).join("\n");
+	return s;
+}
+
+/** A model stand-in that keeps every owner sentence and assistant decision, and every literal, as an honest pass would. */
+function keepAllRunner() {
+	const r = { calls: 0, available: true };
+	r.run = async (sub) => {
+		r.calls++;
+		const part = { asks: [], decisions: [], corrections: [], outcomes: { commits: [], prs: [], tests: [] }, entities: am.literals(sub.messages), dropped: { asks: 0, decisions: 0, corrections: 0 } };
+		for (const m of sub.messages) {
+			for (const s of m.text.split(/(?<=[.!?])\s+|\n+/).filter(Boolean)) (m.role === "owner" ? part.corrections : part.decisions).push({ text: s.slice(0, 280), pos: m.pos });
+		}
+		return { kind: "ok", part };
+	};
+	return r;
+}
+const fixedRunner = (out) => ({ available: true, calls: 0, async run() { this.calls++; return out; } });
+
+const claudeLine = (type, content, extra = {}) => JSON.stringify({ type, message: { role: type, content }, ...extra }) + "\n";
+const codexLine = (type, message) => JSON.stringify({ type: "event_msg", payload: { type, message } }) + "\n";
+function transcript(name, lines) {
+	const f = path.join(tmp, `${name}-${n}.jsonl`);
+	fs.writeFileSync(f, lines.join(""));
+	return f;
+}
+const trigger = (client, session, transcript_path, cwd = tmp) => ({ client, session, transcript_path, cwd, at: 0, first_at: 0 });
+
+describe("hook", () => {
+	it("writes a trigger file with no network I/O and ignores bad input", () => {
+		const t0 = performance.now();
+		am.hook("codex", JSON.stringify({ hook_event_name: "Stop", session_id: "thr_1", transcript_path: null, cwd: "/w", turn_id: "t1", last_assistant_message: "secret answer" }), { spawnRun: false });
+		assert.ok(performance.now() - t0 < 100);
+		const q = path.join(am.home(), "queue", "codex-thr_1.json");
+		const t = JSON.parse(fs.readFileSync(q, "utf8"));
+		assert.equal(t.turn_id, "t1");
+		assert.ok(!JSON.stringify(t).includes("secret answer"));
+		assert.equal(fs.statSync(q).mode & 0o777, 0o600);
+		am.hook("codex", "not json", { spawnRun: false });
+		am.hook("other-client", "{}", { spawnRun: false });
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "queue")), ["codex-thr_1.json"]);
+	});
+});
+
+describe("reading", () => {
+	it("keeps owner and assistant text only", () => {
+		const claude = transcript("claude", [
+			claudeLine("user", "Please fix the loop."),
+			claudeLine("assistant", [{ type: "thinking", thinking: "private chain" }, { type: "text", text: "Moving refresh to one client instead of retrying." }, { type: "tool_use", name: "Bash", input: { command: "ls" } }]),
+			claudeLine("user", [{ type: "tool_result", content: "file list output" }]),
+			claudeLine("user", "<system-reminder>injected hook text</system-reminder>"),
+			claudeLine("user", "meta", { isMeta: true }),
+			JSON.stringify({ type: "attachment", attachment: "x" }) + "\n",
+		]);
+		const msgs = am.extract("claude-code", am.readLines(claude, 0).lines);
+		assert.deepEqual(msgs.map((m) => [m.role, m.text]), [["owner", "Please fix the loop."], ["assistant", "Moving refresh to one client instead of retrying."]]);
+		const codex = transcript("codex", [
+			JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>cwd</environment_context>" }] } }) + "\n",
+			codexLine("user_message", "Use pnpm."),
+			JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell", arguments: "{}" } }) + "\n",
+			JSON.stringify({ type: "response_item", payload: { type: "function_call_output", output: "tool output" } }) + "\n",
+			codexLine("agent_message", "Switched to pnpm."),
+		]);
+		assert.deepEqual(am.extract("codex", am.readLines(codex, 0).lines).map((m) => m.text), ["Use pnpm.", "Switched to pnpm."]);
+	});
+});
+
+describe("capture protocol", () => {
+	it("keeps a marker-free correction pending without a runtime, then consolidates it, and acknowledges only after the manifest", async () => {
+		const f = transcript("killed", [claudeLine("user", "Can you look at the retry setting?"), claudeLine("assistant", "The timeout is 30 s."), claudeLine("user", "Thanks. Use the other timeout.")]);
+		const server = fakeServer();
+		const t = trigger("claude-code", "sess-killed", f);
+		let r = await am.processSession(t, { server, runner: null });
+		assert.equal(r.consolidated_to, 0);
+		const heuristic = JSON.parse(server.log[0].digests[0].body);
+		assert.equal(server.log[0].digests[0].capture_status, "heuristic");
+		assert.ok(!JSON.stringify(heuristic).includes("Use the other timeout"), "the keyword digest misses the marker-free correction");
+		assert.equal(fs.readdirSync(path.join(am.home(), "pending")).filter((x) => x.endsWith(".txt")).length, 1);
+		r = await am.processSession(t, { server, runner: keepAllRunner() });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.ok(server.storedText().includes("Use the other timeout."));
+		assert.equal(server.manifests.size, 1);
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "pending")), []);
+	});
+
+	it("splits 100 literal-heavy corrections over 8 KB into tiling parts that keep every literal, with no inline pass", async () => {
+		const lits = Array.from({ length: 100 }, (_, i) => `cfg.key_${String(i).padStart(3, "0")}_${"x".repeat(96)}`);
+		const f = transcript("literals", [claudeLine("user", lits.map((l) => `Don't use the old value; set \`${l}\` instead.`).join("\n")), claudeLine("assistant", "Noted.")]);
+		const server = fakeServer();
+		const r = await am.processSession(trigger("claude-code", "sess-lits", f), { server, runner: keepAllRunner() });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		const [range, parts] = [...server.manifests.entries()][0];
+		assert.ok(parts.length > 1);
+		for (const p of parts) assert.ok(Buffer.byteLength(server.parts.get(`${range}|consolidated|${p.part_id}`).body) <= 8192);
+		const stored = server.storedText();
+		for (const l of lits) assert.ok(stored.includes(l), `literal ${l.slice(0, 12)} kept`);
+	});
+
+	it("leaves a range stuck and pending when parts overflow, drop corrections or show a tool event", async () => {
+		for (const runner of [
+			fixedRunner({ kind: "ok", part: { asks: [], decisions: [], corrections: [{ text: "y".repeat(280), pos: 0 }], outcomes: {}, entities: Array(40).fill("z".repeat(250)), dropped: { asks: 0, decisions: 0, corrections: 0 } } }),
+			fixedRunner({ kind: "ok", part: { asks: [], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 1 } } }),
+			fixedRunner({ kind: "tool_event" }),
+		]) {
+			process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`);
+			const f = transcript("stuck", [claudeLine("user", "Never squash the release commits. ".repeat(200)), claudeLine("assistant", "Understood.")]);
+			const server = fakeServer();
+			const r = await am.processSession(trigger("claude-code", "sess-stuck", f), { server, runner });
+			assert.equal(r.consolidated_to, 0);
+			assert.equal(Object.values(r.outcomes)[0], "stuck");
+			assert.equal(server.manifests.size, 0);
+			assert.ok(fs.readdirSync(path.join(am.home(), "pending")).some((x) => x.endsWith(".txt")), "local text kept");
+		}
+	});
+
+	it("resumes after a crash mid-upload with the kept part bytes, and after losing its part files adopts the server's parts", async () => {
+		const owner = Array.from({ length: 30 }, (_, i) => claudeLine("user", `Rule ${i}: always pin \`tool-${i}@1.${i}\` in CI. ${"pad ".repeat(300)}`));
+		const f = transcript("crash", owner);
+		const server = fakeServer();
+		const runner = keepAllRunner();
+		const t = trigger("claude-code", "sess-crash", f);
+		server.failAfter = 1; // the heuristic digest lands, then the network drops
+		let r = await am.processSession(t, { server, runner });
+		assert.equal(r.consolidated_to, 0);
+		const madeFirst = runner.calls;
+		assert.ok(madeFirst > 1);
+		server.failAfter = Infinity;
+		r = await am.processSession(t, { server, runner });
+		assert.equal(runner.calls, madeFirst, "accepted parts are uploaded from their kept bytes, never regenerated");
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		// A second range: two parts reach the server, then the part files are lost before the manifest.
+		fs.appendFileSync(f, Array.from({ length: 30 }, (_, i) => claudeLine("user", `Later rule ${i}: never edit \`gen-${i}.ts\`. ${"pad ".repeat(300)}`)).join(""));
+		const before = runner.calls;
+		const realIngest = server.ingest;
+		let partUploads = 0;
+		server.ingest = async (batch) => {
+			if (batch.manifests.length) throw new Error("network down");
+			if (batch.digests.some((d) => d.capture_status === "consolidated")) partUploads++;
+			return realIngest(batch);
+		};
+		await am.processSession(t, { server, runner });
+		const firstPass = runner.calls - before;
+		fs.rmSync(path.join(am.home(), "pending"), { recursive: true, force: true, filter: undefined });
+		fs.mkdirSync(path.join(am.home(), "pending"), { recursive: true });
+		server.ingest = realIngest;
+		r = await am.processSession(t, { server, runner });
+		// Losing the pending text too leaves the range stuck rather than inventing content.
+		assert.ok(Object.values(r.outcomes).every((o) => o === "stuck" || o === "consolidated"));
+		assert.ok(partUploads > 0 && firstPass > 0);
+	});
+
+	it("adopts the server's parts and digests only the gaps when only the part files are lost", async () => {
+		const f = transcript("adopt", Array.from({ length: 24 }, (_, i) => claudeLine("user", `Note ${i}: keep \`flag-${i}\` off. ${"pad ".repeat(400)}`)));
+		const server = fakeServer();
+		const runner = keepAllRunner();
+		const t = trigger("claude-code", "sess-adopt", f);
+		const realIngest = server.ingest;
+		server.ingest = async (batch) => { if (batch.manifests.length) throw new Error("network down"); return realIngest(batch); };
+		await am.processSession(t, { server, runner });
+		const firstCalls = runner.calls;
+		const partsDir = fs.readdirSync(path.join(am.home(), "pending")).find((x) => x.endsWith(".parts"));
+		fs.rmSync(path.join(am.home(), "pending", partsDir), { recursive: true });
+		server.ingest = realIngest;
+		const r = await am.processSession(t, { server, runner });
+		assert.equal(runner.calls, firstCalls, "every span was adopted from the server");
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+	});
+
+	it("finds a Codex rollout when the hook path is null, waits while it is missing, and starts a new epoch on a rewrite", async () => {
+		const codexHome = path.join(tmp, `codex-home-${n}`);
+		const t = trigger("codex", "thr_null", null);
+		const server = fakeServer();
+		let r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		assert.equal(r.status, "source_missing");
+		assert.equal(server.log.length, 0);
+		const dir = path.join(codexHome, "sessions", "2026", "10", "28");
+		fs.mkdirSync(dir, { recursive: true });
+		const f = path.join(dir, "rollout-2026-10-28T10-00-00-thr_null.jsonl");
+		fs.writeFileSync(f, codexLine("user_message", "Use the staging database.") + codexLine("agent_message", "Switched."));
+		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.ok(server.storedText().includes("Use the staging database."));
+		const calls = server.log.length;
+		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		assert.equal(server.log.length, calls, "a repeated event on an unchanged transcript uploads nothing");
+		fs.writeFileSync(f, codexLine("user_message", "Rewritten history.") + codexLine("agent_message", "Ok."));
+		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		const epochs = new Set([...server.manifests.keys()].map((k) => k.split(":")[2]));
+		assert.equal(epochs.size, 2);
+	});
+
+	it("never uploads or spools a whole long message", async () => {
+		const long = `I want this whole paragraph kept private. ${"Detail sentence about the internal system. ".repeat(40)}`;
+		const f = transcript("privacy", [claudeLine("user", long), claudeLine("assistant", `${"Long explanation. ".repeat(80)}`)]);
+		const server = fakeServer();
+		server.offline = true;
+		await am.processSession(trigger("claude-code", "sess-priv", f), { server, runner: keepAllRunner() });
+		server.offline = false;
+		await am.processSession(trigger("claude-code", "sess-priv", f), { server, runner: keepAllRunner() });
+		const spoolDir = path.join(am.home(), "spool");
+		const spooled = fs.existsSync(spoolDir) ? fs.readdirSync(spoolDir).map((x) => fs.readFileSync(path.join(spoolDir, x), "utf8")).join("") : "";
+		const uploaded = JSON.stringify(server.log);
+		assert.ok(spooled.length > 0, "the offline heuristic digest was spooled");
+		for (const text of [uploaded, spooled]) assert.ok(!text.includes(long.trim()) && !text.includes(long.slice(0, 400)));
+	});
+});
+
+describe("confined runtime", () => {
+	it("classifies probes: only a permission denial without the secret is denied", () => {
+		assert.equal(am.classify({ status: 1, stdout: "", stderr: "cat: x: Operation not permitted" }, "n"), "denied");
+		assert.equal(am.classify({ status: 0, stdout: "home-n", stderr: "" }, "home-n"), "allowed");
+		assert.equal(am.classify({ status: 1, stdout: "home-n", stderr: "Operation not permitted" }, "home-n"), "allowed");
+		assert.equal(am.classify({ status: 1, stdout: "", stderr: "cat: x: No such file or directory" }, "n"), "indeterminate");
+		assert.equal(am.classify({ status: 6, stdout: "", stderr: "curl: (6) Could not resolve host: example.com" }, ""), "indeterminate");
+		assert.equal(am.classify({ error: new Error("ENOENT") }, ""), "indeterminate");
+	});
+
+	it("parses the exec event stream: tool items discard the run; only a final agent message is output", () => {
+		const ev = (...items) => items.map((i) => JSON.stringify(i)).join("\n");
+		assert.equal(am.parseEvents(ev({ type: "thread.started" }, { type: "item.completed", item: { type: "reasoning", text: "…" } }, { type: "item.completed", item: { type: "agent_message", text: "{\"a\":1}" } }, { type: "turn.completed" })).kind, "ok");
+		assert.equal(am.parseEvents(ev({ type: "item.started", item: { type: "command_execution", command: "cat ~/.ssh/id_rsa" } })).kind, "tool_event");
+		assert.equal(am.parseEvents(ev({ type: "item.completed", item: { type: "something_new" } })).kind, "tool_event");
+		assert.equal(am.parseEvents(ev({ type: "turn.completed" })).kind, "no_output");
+		assert.equal(am.parseEvents(ev({ type: "item.completed", item: { type: "error", message: "Codex is ignoring 1 unrecognized configuration setting" } }, { type: "item.completed", item: { type: "agent_message", text: "{}" } })).kind, "runtime_warning");
+		assert.equal(am.parseEvents("not json").kind, "bad_events");
+	});
+
+	it("is indeterminate when Codex is missing or the platform is untested", async () => {
+		assert.deepEqual(await am.confinedRunner({}, { platform: "linux" }), { available: false, classification: "indeterminate", reason: "untested_platform" });
+		const missing = await am.confinedRunner({ codex_home: tmp }, {});
+		assert.equal(missing.available, false);
+		assert.equal(missing.classification, "indeterminate");
+	});
+
+	const codex = spawnSync("codex", ["--version"], { encoding: "utf8" });
+	const real = process.platform === "darwin" && codex.status === 0 && fs.existsSync(path.join(os.homedir(), ".codex", "auth.json"));
+	it("proves the denial on this Mac with the real `codex sandbox`, and classifies weakened, missing and DNS probes", { skip: !real && "codex sandbox not available" }, async () => {
+		const r = await am.confinedRunner({});
+		assert.deepEqual([r.available, r.classification], [true, "denied"], r.reason);
+		r.cleanup();
+		const ch = fs.mkdtempSync(path.join(os.tmpdir(), "am-weak-"));
+		fs.writeFileSync(path.join(ch, "config.toml"), am.CONFIG_TOML.replace(/\[permissions\.am_batch\.filesystem\][\s\S]*?\[permissions\.am_batch\.network\]/, "[permissions.am_batch.network]"));
+		const canary = path.join(am.home(), "probe", "canary");
+		am.writePrivate(canary, "home-weak");
+		const sandbox = (args, home = ch) => spawnSync("codex", ["sandbox", "-P", "am_batch", "--", ...args], { env: { PATH: process.env.PATH, HOME: os.homedir(), CODEX_HOME: home }, encoding: "utf8", timeout: 20_000 });
+		assert.equal(am.classify(sandbox(["/bin/cat", canary]), "home-weak"), "allowed");
+		const strict = fs.mkdtempSync(path.join(os.tmpdir(), "am-strict-"));
+		fs.writeFileSync(path.join(strict, "config.toml"), am.CONFIG_TOML);
+		assert.equal(am.classify(sandbox(["/bin/cat", path.join(am.home(), "probe", "no-such-canary")], strict), ""), "indeterminate", "a missing canary proves nothing");
+		assert.equal(am.classify(sandbox(["/usr/bin/no-such-command"], strict), ""), "indeterminate");
+		assert.equal(am.classify(sandbox(["/usr/bin/curl", "-sS", "-v", "--connect-timeout", "5", "https://example.invalid/"], strict), ""), "indeterminate");
+		for (const d of [ch, strict]) fs.rmSync(d, { recursive: true, force: true });
+	});
+});
+
+// Review L1-L8 (docs/review-sol-phase2a-local-2026-10-28.md), each from the reviewer's failing example.
+describe("review regressions", () => {
+	const emptyPart = () => ({ asks: [], decisions: [], corrections: [], outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+	const enqueue = (session, f, event = "Stop") => am.hook("claude-code", JSON.stringify({ session_id: session, transcript_path: f, hook_event_name: event }), { spawnRun: false });
+	const queueDir = () => path.join(am.home(), "queue");
+
+	it("L1: refuses a part that carries a whole long message in outcomes or any unknown field", async () => {
+		const text = `Private detail ${"internal detail ".repeat(35)}.`;
+		const f = transcript("raw", [claudeLine("user", text)]);
+		const server = fakeServer();
+		const raw = fixedRunner({ kind: "ok", part: { ...emptyPart(), outcomes: { commits: [], prs: [], tests: [text] } } });
+		const r = await am.processSession(trigger("claude-code", "sess-raw", f), { server, runner: raw });
+		assert.equal(r.consolidated_to, 0);
+		assert.ok(!server.storedText().includes(text));
+		assert.equal(am.rejectPart({ ...emptyPart(), outcomes: { commits: [], prs: [], tests: [text] } }, { messages: [] }), "bad_outcomes");
+		assert.equal(am.rejectPart({ ...emptyPart(), whole_message: "x" }, { messages: [] }), "bad_shape");
+		assert.equal(am.rejectPart({ ...emptyPart(), asks: [{ text: "a", pos: 1, raw: "x" }] }, { messages: [] }), "bad_items");
+		assert.equal(am.rejectPart({ ...emptyPart(), corrections: [{ text: "Use token=abc123secret", pos: 1 }] }, { messages: [] }), "bad_items");
+		assert.equal(am.rejectPart({ ...emptyPart(), corrections: [{ text: "Use token=[REDACTED]", pos: 1 }] }, { messages: [] }), null);
+	});
+
+	it("L2: a run started before the debounce deadline waits for it and then captures", async () => {
+		const f = transcript("debounce", [claudeLine("user", "Use the other timeout.")]);
+		enqueue("sess-debounce", f);
+		const server = fakeServer();
+		const t0 = Date.now();
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 60 });
+		assert.ok(Date.now() - t0 >= 50);
+		assert.equal(r.status, "ran");
+		assert.equal(server.manifests.size, 1);
+		assert.deepEqual(fs.readdirSync(queueDir()), []);
+		assert.equal(fs.existsSync(path.join(am.home(), "run.lock")), false);
+	});
+
+	it("L3: a trigger that arrives during a run is kept and handled, so the final correction is captured", async () => {
+		const f = transcript("race", [claudeLine("user", "Use one timeout.")]);
+		enqueue("sess-race", f);
+		const server = fakeServer(), ingest = server.ingest;
+		let inserted = false;
+		server.ingest = async (b) => {
+			if (!inserted) { inserted = true; fs.appendFileSync(f, claudeLine("user", "Never drop the final correction.")); enqueue("sess-race", f, "SessionEnd"); }
+			return ingest(b);
+		};
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		assert.ok(server.storedText().includes("Never drop the final correction."));
+		assert.equal(Object.values(r.results)[0].consolidated_to, fs.statSync(f).size);
+		assert.deepEqual(fs.readdirSync(queueDir()), []);
+	});
+
+	it("L4: two workers reclaiming a dead worker's lock, each paused before it removes the lock, end with exactly one owner", async () => {
+		const { spawn: spawnChild, spawnSync: run } = await import("node:child_process");
+		const amUrl = new URL("./agent-memory.mjs", import.meta.url).href;
+		fs.mkdirSync(am.home(), { recursive: true });
+		const lock = path.join(am.home(), "run.lock");
+		const dead = run(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" }).stdout.trim();
+		fs.writeFileSync(lock, JSON.stringify({ pid: Number(dead), at: Date.now(), nonce: "dead" }));
+		// Each worker pauses whenever it is about to delete the lock file, until the test releases it, as in the review's repro.
+		const worker = (name) => spawnChild(process.execPath, ["--input-type=module", "-e", `
+			const fs = await import("node:fs");
+			const hold = (f) => { if (String(f) === ${JSON.stringify(lock)}) { console.log("paused"); while (!fs.existsSync(${JSON.stringify(path.join(am.home(), "release-"))} + ${JSON.stringify(name)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } };
+			for (const k of ["unlinkSync", "rmSync"]) { const real = fs.default[k]; fs.default[k] = function (f, ...a) { hold(f); return real.call(this, f, ...a); }; }
+			const am = await import(${JSON.stringify(amUrl)});
+			console.log(am.takeLock() ? "won" : "lost"); setInterval(() => {}, 1000);`], { env: { ...process.env, AGENT_MEMORY_HOME: am.home() }, stdio: ["ignore", "pipe", "inherit"] });
+		const lines = (k) => { const out = []; k.stdout.on("data", (d) => out.push(...String(d).trim().split("\n"))); return out; };
+		const a = worker("a"), b = worker("b"), la = lines(a), lb = lines(b);
+		const settle = () => new Promise((r) => setTimeout(r, 400));
+		await settle();
+		fs.writeFileSync(path.join(am.home(), "release-a"), "");
+		await settle();
+		fs.writeFileSync(path.join(am.home(), "release-b"), "");
+		await settle();
+		a.kill(); b.kill();
+		const results = [...la, ...lb].filter((x) => x === "won" || x === "lost");
+		assert.deepEqual([results.length, results.filter((x) => x === "won").length], [2, 1], JSON.stringify({ a: la, b: lb }));
+	});
+
+	it("L5: an append to a short transcript keeps the epoch and captures only the new tail", async () => {
+		const f = transcript("short", [claudeLine("user", "Never change the release branch.")]);
+		const server = fakeServer();
+		const t = trigger("claude-code", "sess-short", f);
+		await am.processSession(t, { server, runner: keepAllRunner() });
+		fs.appendFileSync(f, claudeLine("user", "Use the other timeout."));
+		const r = await am.processSession(t, { server, runner: keepAllRunner() });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.equal(new Set([...server.manifests.keys()].map((k) => k.split(":")[2])).size, 1);
+		const copies = [...server.parts.entries()].filter(([k, p]) => k.includes("|consolidated|") && p.body.includes("Never change the release branch.")).length;
+		assert.equal(copies, 1);
+		// A rewrite of the checked bytes still starts a new epoch.
+		fs.writeFileSync(f, claudeLine("user", "Rewritten start of the file."));
+		await am.processSession(t, { server, runner: keepAllRunner() });
+		assert.equal(new Set([...server.manifests.keys()].map((k) => k.split(":")[2])).size, 2);
+	});
+
+	it("L6: consolidates kept pending text after the source transcript is gone", async () => {
+		const f = transcript("gone", [claudeLine("user", "Use the other timeout.")]);
+		const server = fakeServer();
+		const t = trigger("claude-code", "sess-gone", f);
+		await am.processSession(t, { server, runner: null });
+		fs.unlinkSync(f);
+		const runner = keepAllRunner();
+		const r = await am.processSession(t, { server, runner });
+		assert.equal(r.status, "source_missing");
+		assert.ok(runner.calls > 0);
+		assert.equal(server.manifests.size, 1);
+		assert.ok(server.storedText().includes("Use the other timeout."));
+		assert.equal(r.consolidated_to, r.digested_to);
+	});
+
+	it("L7: a crash during cleanup after the manifest is stored still acknowledges the range", async () => {
+		const f = transcript("crash-clean", [claudeLine("user", "Use the other timeout.")]);
+		const server = fakeServer();
+		const t = trigger("claude-code", "sess-crash-clean", f);
+		const rm = fs.rmSync;
+		fs.rmSync = function (file, ...args) { if (String(file).endsWith(".txt")) throw new Error("simulated crash during cleanup"); return rm.call(this, file, ...args); };
+		try { await assert.rejects(am.processSession(t, { server, runner: keepAllRunner() }), /simulated crash/); } finally { fs.rmSync = rm; }
+		let r = await am.processSession(t, { server, runner: keepAllRunner() });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.equal(fs.readdirSync(path.join(am.home(), "pending")).length, 0);
+		// Text lost before the acknowledgement was saved: the durable manifest is adopted instead of marking the range stuck.
+		const f2 = transcript("crash-ack", [claudeLine("user", "Keep the staging bucket.")]);
+		const t2 = trigger("claude-code", "sess-crash-ack", f2);
+		const st = path.join(am.home(), "state", "claude-code", "sess-crash-ack.json");
+		const realIngest = server.ingest;
+		server.ingest = async (b) => { const out = await realIngest(b); if (b.manifests.length) { fs.rmSync(path.join(am.home(), "pending"), { recursive: true, force: true }); throw new Error("crash after the manifest was stored"); } return out; };
+		await am.processSession(t2, { server, runner: keepAllRunner() });
+		server.ingest = realIngest;
+		r = await am.processSession(t2, { server, runner: keepAllRunner() });
+		assert.equal(r.consolidated_to, fs.statSync(f2).size);
+		assert.equal(Object.values(JSON.parse(fs.readFileSync(st, "utf8")).ranges)[0].status, "consolidated");
+	});
+
+	it("L8: an unknown event envelope fails closed even when a valid final message follows", () => {
+		const ev = (...items) => items.map((i) => JSON.stringify(i)).join("\n");
+		const final = { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(emptyPart()) } };
+		assert.equal(am.parseEvents(ev({ type: "runtime.notice", message: "A confinement setting was ignored" }, final, { type: "turn.completed" })).kind, "runtime_warning");
+		assert.equal(am.parseEvents(ev({ type: "item.completed" }, final)).kind, "bad_events");
+		assert.equal(am.parseEvents(ev({ type: "thread.started" }, { type: "turn.started" }, final, { type: "turn.completed" })).kind, "ok");
+	});
+});

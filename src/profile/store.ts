@@ -1,9 +1,10 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
 import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type WriteCommand, type WriteContext } from "../domain/types";
-import { migrate } from "../storage";
+import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
-import { fuse, get, inventory, lexicalChannels } from "./read";
+import { candidates, fuse, get, inventory, lexicalChannels } from "./read";
+import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, type Who } from "./write";
 
@@ -53,6 +54,30 @@ export class ProfileStore extends DurableObject<Env> {
 		}
 	}
 
+	/** The me guard's term table, written only by AccountStore before it confirms a term registration (section 5). */
+	async addGuardTerms(who: Who, terms: string[], source: string): Promise<Outcome<number>> {
+		this.bind(who);
+		if (who.profile !== "me") return { ok: false, error: { code: "validation", message: "guard terms live in the me profile" } };
+		const sql = this.ctx.storage.sql;
+		const at = new Date().toISOString();
+		this.ctx.storage.transactionSync(() => {
+			const seq = nextSeq(sql, "profile_meta");
+			for (const t of terms) sql.exec("INSERT OR IGNORE INTO guard_terms (term, source, added_at, seq) VALUES (?, ?, ?, ?)", t, source, at, seq);
+		});
+		return ok(terms.length);
+	}
+
+	/** Capture digests and manifests (section 10). Never through the memory write path: digests are not memories. */
+	async ingest(who: Who, batch: IngestBatch): Promise<Outcome<ItemResult[]>> {
+		this.bind(who);
+		return ok(ingest(this.ctx.storage, who, batch));
+	}
+
+	async captureState(who: Who, rangeIds: string[]): Promise<Outcome<ReturnType<typeof captureState>>> {
+		this.bind(who);
+		return ok(captureState(this.ctx.storage.sql, rangeIds));
+	}
+
 	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
 		try {
 			this.bind(who);
@@ -62,6 +87,8 @@ export class ProfileStore extends DurableObject<Env> {
 					return ok(get(sql, who, q));
 				case "inventory":
 					return ok(inventory(sql, who, q));
+				case "candidates":
+					return ok(candidates(sql, q));
 				case "has":
 					return ok(sql.exec("SELECT 1 FROM nodes WHERE id = ?", q.id).toArray().length > 0);
 				case "recall":

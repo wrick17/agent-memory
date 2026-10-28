@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && npm run test"
+    "check": "npm run typecheck && npm run lint && npm run test && npm run test:local",
+    "test:local": "node --test local/agent-memory.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

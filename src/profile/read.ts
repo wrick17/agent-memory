@@ -1,7 +1,7 @@
 // Phase-1 reads: get (with revision-bound paging and history), recall channels, and the inventory listing.
 import { normalizeName, normalizeScope } from "../domain/ids";
 import { Fail, type MemoryKind, type MemoryType, type RecallHit, type Step } from "../domain/types";
-import { findNode, readContent, relationships, type NodeRow, type Who } from "./write";
+import { captureText, findNode, readContent, relationships, type NodeRow, type Who } from "./write";
 
 export const PAGE = 100_000;
 const RRF_K = 60;
@@ -195,4 +195,13 @@ export function inventory(sql: SqlStorage, who: Who, q: { after: number; limit: 
 	const f = filters(q);
 	return sql.exec<NodeRow>(`SELECT n.rowid, n.* FROM nodes n WHERE n.rowid > ? AND ${f.where} ORDER BY n.rowid LIMIT ?`, q.after, ...f.params, q.limit).toArray()
 		.map((n) => hit(sql, who, n, 0, [], "", undefined));
+}
+
+/** review_candidates list: captured candidates by BothQ status, newest first. Their text is untrusted evidence. */
+export function candidates(sql: SqlStorage, q: { status: "pending" | "promoted" | "dismissed" | "all"; limit: number }) {
+	const rows = sql.exec<NodeRow & { attrs: string }>("SELECT rowid, * FROM nodes WHERE kind = 'other' AND other_label = 'capture' ORDER BY rowid DESC").toArray();
+	return rows.map((n) => ({ n, a: JSON.parse(n.attrs) as { review?: string; capture_kind?: string; source?: Record<string, string>; promoted_to?: string; reason?: string } }))
+		.filter(({ a }) => q.status === "all" || (a.review ?? "pending") === q.status).slice(0, q.limit)
+		.map(({ n, a }) => ({ capture_id: n.id, name: n.name, kind: a.capture_kind ?? "observation", status: a.review ?? "pending", source: a.source ?? {},
+			content: captureText(sql, n.id), created_at: n.created_at, ...(a.promoted_to ? { promoted_to: a.promoted_to } : {}), ...(a.reason ? { reason: a.reason } : {}) }));
 }

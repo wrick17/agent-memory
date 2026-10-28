@@ -146,7 +146,7 @@ describe("MCP over /mcp", () => {
 		const token = await jwt({});
 		const list = await rpc(token, "tools/list");
 		expect(list.status).toBe(200);
-		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["append_memory", "get_memory", "recall_memories", "save_memory"]);
+		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["append_memory", "capture_memory", "get_memory", "recall_memories", "record_knowledge", "review_candidates", "save_memory"]);
 		const saved = await rpc(token, "tools/call", { name: "save_memory", arguments: { name: "Use pnpm in Sequoia repos", type: "feedback", description: "Package manager rule",
 			content: "Run pnpm install and pnpm -w build. npm rewrites pnpm-lock.yaml.", origin: "stated", repo: { remote: "git@github.com:Sequoia-Engineering/web.git" }, request_id: "mcp-e2e-1" } });
 		const s = toolResult(saved.data);
@@ -165,13 +165,13 @@ describe("MCP over /mcp", () => {
 		expect(init.data.result.protocolVersion).toBe("2025-11-25");
 		const list = await rpc(token, "tools/list", {}, "legacy", { "mcp-protocol-version": "2025-11-25" });
 		expect(list.status).toBe(200);
-		expect(list.data.result.tools).toHaveLength(4);
+		expect(list.data.result.tools).toHaveLength(7);
 	});
 
 	it("filters tools by device-token scope and revokes on the next request", async () => {
 		const { id, token } = await deviceToken("reader-box", ["read"], ["personal", "me"], "personal");
 		const list = await rpc(token, "tools/list");
-		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["get_memory", "recall_memories"]);
+		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["get_memory", "recall_memories", "review_candidates"]);
 		const { accountStub } = await import("../src/mcp");
 		await accountStub(env, env.OWNER_USER_ID).admin({ op: "revokeDevice", id });
 		expect((await rpc(token, "tools/list")).status).toBe(401);

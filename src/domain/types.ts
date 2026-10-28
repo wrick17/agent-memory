@@ -6,6 +6,30 @@ export const RELATIONS = ["works_on", "authored", "reviewed", "reported", "assig
 	"implements", "fixes", "introduced_by", "caused_by", "blocked_by", "decided_because", "supersedes", "contradicts",
 	"relates_to", "other"] as const;
 export const MEMORY_KINDS = ["decision", "rule", "preference", "journal", "document"] as const;
+
+type Kind = (typeof NODE_KINDS)[number];
+const TRACKER: Kind[] = ["bug", "feature", "ticket"];
+const NOTES: Kind[] = ["decision", "rule", "preference", "journal", "document"];
+/**
+ * The endpoint table (section 4): the node kinds each typed relation may connect, from and to. `relates_to` and `other`
+ * connect anything; `supersedes` needs the same kind on both ends. A judgment edge outside this table fails with validation.
+ */
+export const RELATION_ENDPOINTS: Partial<Record<(typeof RELATIONS)[number], { from: Kind[]; to: Kind[] }>> = {
+	works_on: { from: ["person"], to: ["project", "component", ...TRACKER] },
+	authored: { from: ["person"], to: ["commit", "pr", "release", "document"] },
+	reviewed: { from: ["person"], to: ["pr"] },
+	reported: { from: ["person"], to: TRACKER },
+	assigned: { from: ["person"], to: TRACKER },
+	part_of: { from: ["component", "commit", "pr", "session", "project", ...TRACKER], to: ["project", "component", "pr", "feature", "release"] },
+	depends_on: { from: ["project", "component"], to: ["project", "component"] },
+	implements: { from: ["commit", "pr"], to: ["feature", "ticket"] },
+	fixes: { from: ["commit", "pr"], to: ["bug", "ticket"] },
+	introduced_by: { from: ["bug"], to: ["commit", "pr", "release"] },
+	caused_by: { from: TRACKER, to: ["commit", "pr", "release", "component", "decision", ...TRACKER] },
+	blocked_by: { from: [...TRACKER, "pr"], to: [...TRACKER, "pr", "component"] },
+	decided_because: { from: ["decision"], to: [...NODE_KINDS] },
+	contradicts: { from: NOTES, to: NOTES },
+};
 export const MEMORY_TYPES = ["feedback", "project", "reference", "user", "procedural"] as const;
 export const ORIGINS = ["stated", "agent", "inferred", "import", "upload", "index"] as const;
 export const STATUSES = ["active", "retired", "superseded", "candidate", "dismissed", "incoming", "moving", "moved"] as const;
@@ -86,7 +110,23 @@ export interface AppendArgs {
 	expected_revision?: number; request_id: string;
 }
 
-export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs };
+/** capture_memory: redacted, untrusted evidence kept as a candidate outside ordinary recall. */
+export interface CaptureArgs { content: string; kind?: "observation" | "correction"; name?: string; source?: Record<string, string>; scope?: string; request_id?: string }
+/** review_candidates promote or dismiss. Promotion creates the memory and links it to the capture in one transaction. */
+export interface CandidateArgs { action: "promote" | "dismiss"; candidate_id: string; into?: { name: string; type: "feedback" | "project" | "reference" | "user"; description?: string }; reason?: string; request_id?: string }
+
+export const EVIDENCE_KINDS = ["entry", "commit", "pr", "ticket", "session", "file", "node", "url", "corpus"] as const;
+/** Entity kinds record_knowledge may create; memories (rules, preferences, journals, documents) go through save_memory. */
+export const KNOWLEDGE_KINDS = ["project", "component", "person", "bug", "feature", "ticket", "pr", "commit", "release", "decision", "other"] as const;
+export type KnowledgeRef = { id: string } | { kind: string; key: string } | { kind: string; name: string; scope?: string } | { ref: number };
+export interface KnowledgeArgs {
+	nodes?: { kind: (typeof KNOWLEDGE_KINDS)[number]; key?: string; name: string; scope?: string; other_label?: string; description?: string; why?: string; attrs?: Record<string, string | number | boolean | null>; evidence?: { kind: (typeof EVIDENCE_KINDS)[number]; ref: string; note?: string }[]; valid_from?: string; valid_to?: string }[];
+	edges?: { from: KnowledgeRef; rel: (typeof RELATIONS)[number]; other_label?: string; to: KnowledgeRef; reason: string; evidence: { kind: (typeof EVIDENCE_KINDS)[number]; ref: string; note?: string }[]; valid_from?: string; valid_to?: string }[];
+	end?: { edge: number; valid_to: string; reason: string }[];
+	request_id?: string;
+}
+
+export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs };
 
 export interface WriteContext {
 	actor: "agent" | "owner";
@@ -106,7 +146,8 @@ export type ReadQuery =
 	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string } }
 	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number }
 	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean }
-	| { kind: "has"; id: string };
+	| { kind: "has"; id: string }
+	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number };
 
 export interface RecallHit {
 	memory_id: string; profile: string; kind: string; type: string | null; name: string; scope: string; origin: string;

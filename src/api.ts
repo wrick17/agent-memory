@@ -2,7 +2,10 @@
 import type { AccountCommand } from "./account/store";
 import { authenticate, verifyJwt } from "./auth";
 import { SCOPES } from "./domain/types";
-import { accountStub } from "./mcp";
+import { z } from "zod";
+import { PROFILE_NAME } from "./domain/types";
+import { accountStub, profileStub } from "./mcp";
+import { routeWrite } from "./routing";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
@@ -31,7 +34,7 @@ async function owner(request: Request, env: Env) {
 async function body(request: Request): Promise<Record<string, unknown> | null> {
 	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return null;
 	const raw = await request.text();
-	if (raw.length > 65_536) return null;
+	if (raw.length > 1_048_576) return null;
 	try { const v = JSON.parse(raw) as unknown; return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null; } catch { return null; }
 }
 
@@ -49,8 +52,44 @@ const CSP = (env: Env) => {
 		`worker-src 'self' blob:`, `form-action 'self'`, `base-uri 'none'`, `frame-ancestors 'none'`].join("; ");
 };
 
+const rangeId = z.string().max(256);
+const ingestSchema = z.object({
+	session: z.object({ client: z.enum(["claude-code", "codex"]), id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/) }).strict(),
+	repo: z.object({ remote: z.string().max(512).optional(), path: z.string().max(1024).optional() }).strict().optional(),
+	profile: z.string().regex(PROFILE_NAME).optional(),
+	digests: z.array(z.object({ range_id: rangeId, capture_status: z.enum(["heuristic", "consolidated"]), part_id: z.string().max(64),
+		sha256: z.string().regex(/^[0-9a-f]{64}$/), body: z.string().max(16_384) }).strict()).max(64).default([]),
+	manifests: z.array(z.object({ range_id: rangeId, parts: z.array(z.object({ part_id: z.string().max(64), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict()).min(1).max(512) }).strict()).max(16).default([]),
+}).strict();
+const stateSchema = z.object({ range_ids: z.array(rangeId).min(1).max(64), repo: ingestSchema.shape.repo, profile: ingestSchema.shape.profile }).strict();
+
+/**
+ * Capture upload and recovery for the job-scoped device token (scope `ingest`), routed like any write and never to `me`.
+ * Only bounded digests and manifests are accepted: the strict body schema has no field for a raw transcript record, and every string is bounded.
+ */
+async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/capture"): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot upload captures" } }, 403);
+	const raw = await body(request);
+	const parsed = (path === "/v1/ingest" ? ingestSchema : stateSchema).safeParse(raw);
+	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+	const input = parsed.data as z.infer<typeof stateSchema> & Partial<z.infer<typeof ingestSchema>>;
+	const route = routeWrite(ctx.value.caller, ctx.value.rules, ctx.value.known, { ...(input.profile ? { profile: input.profile } : {}), ...(input.repo ? { repo: input.repo } : {}) });
+	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
+	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "captures never go to me" } }, 403);
+	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile)!;
+	const res = path === "/v1/ingest"
+		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [] })
+		: await profileStub(env, ref).captureState(ref, input.range_ids);
+	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
+}
+
 export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
+	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
 	if (url.pathname === "/settings" && request.method === "GET") {
 		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}

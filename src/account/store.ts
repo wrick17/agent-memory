@@ -17,6 +17,7 @@ export type AccountCommand =
 	| { op: "setDeviceDefault"; id: string; defaultProfile: string | null }
 	| { op: "setRules"; rules: Omit<RoutingRule, "id">[] }
 	| { op: "addSensitiveTerm"; term: string }
+	| { op: "addSensitiveTerms"; terms: string[] }
 	| { op: "listProfiles" };
 
 type DeviceRow = { id: string; name: string; token_hash: string | null; scopes: string; profiles: string; default_profile: string | null;
@@ -177,6 +178,23 @@ export class AccountStore extends DurableObject<Env> {
 	}
 
 	/** Owner-only administration, reached only through the dashboard API. */
+	/**
+	 * Copies terms into the me profile's guard table, which the me write transaction reads. A registration is confirmed only
+	 * after this commits, so a work write dispatched after it can never be followed by a me write that misses its terms.
+	 */
+	private async guardMe(terms: string[], source: string): Promise<Outcome<unknown>> {
+		const userId = this.meta("user_id");
+		const me = this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = 'me' AND status = 'active'").toArray()[0];
+		if (!userId || !me) return fail("unavailable", "the me profile is not active");
+		const ref = { userId, profile: "me", generation: me.generation };
+		const stub = this.env.PROFILE.get(this.env.PROFILE.idFromName(`${userId}:me:${me.generation}`)) as unknown as { addGuardTerms(who: typeof ref, terms: string[], source: string): Promise<Outcome<number>> };
+		try {
+			return await stub.addGuardTerms(ref, terms, source);
+		} catch (e) {
+			return fail("unavailable", `the me guard could not be updated: ${(e as Error).message}`);
+		}
+	}
+
 	async admin(cmd: AccountCommand): Promise<Outcome<unknown>> {
 		const known = this.sql.exec<{ name: string }>("SELECT name FROM profiles").toArray().map((r) => r.name);
 		switch (cmd.op) {
@@ -229,13 +247,24 @@ export class AccountStore extends DurableObject<Env> {
 					cmd.rules.forEach((r, i) => this.sql.exec("INSERT INTO routing_rules (id, priority, match, pattern, profile, enabled, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
 						`r${i + 1}`, r.priority, r.match, r.pattern, r.profile, r.enabled ? 1 : 0, seq));
 				});
-				return ok({ rules: cmd.rules.length });
+				const org = orgTerms(cmd.rules.map((r, i) => ({ ...r, id: `r${i + 1}` })));
+				const guarded = org.length ? await this.guardMe(org, "rules") : ok(null);
+				return guarded.ok ? ok({ rules: cmd.rules.length }) : guarded;
 			}
 			case "addSensitiveTerm": {
 				const term = cmd.term.trim();
 				if (term.length < 2 || term.length > 200) return fail("validation", "a sensitive term is 2 to 200 characters");
 				this.write((seq) => this.sql.exec("INSERT OR REPLACE INTO sensitive_terms (term, source, updated_at, seq) VALUES (?, 'owner', ?, ?)", term, now(), seq));
-				return ok({ term });
+				const guarded = await this.guardMe([term], "owner");
+				return guarded.ok ? ok({ term }) : guarded;
+			}
+			case "addSensitiveTerms": {
+				// Terms from work record_knowledge writes, in one transaction; existing terms are left as they are.
+				const terms = [...new Set(cmd.terms.map((t) => t.trim()).filter((t) => t.length >= 2 && t.length <= 200))];
+				if (!terms.length) return ok({ terms: 0 });
+				this.write((seq) => { for (const t of terms) this.sql.exec("INSERT OR IGNORE INTO sensitive_terms (term, source, updated_at, seq) VALUES (?, 'work', ?, ?)", t, now(), seq); });
+				const guarded = await this.guardMe(terms, "work");
+				return guarded.ok ? ok({ terms: terms.length }) : guarded;
 			}
 		}
 	}

@@ -1,6 +1,6 @@
 // BothQ write details beyond G3: identity-preserving rename and scope moves, retire, history windows,
 // redaction before hashing, and the sequence stamps and tombstones the export depends on.
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { call, contextFor, journal, outcome } from "./helpers";
@@ -94,5 +94,159 @@ describe("sequence stamps and tombstones", () => {
 			const fts = sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts_fts WHERE texts_fts MATCH '\"first body\"'").one();
 			expect(fts.n).toBe(0);
 		});
+	});
+});
+
+describe("record_knowledge", () => {
+	it("upserts entities, writes judgment edges with evidence, ends edges as history, and feeds work terms to the me guard", async () => {
+		const c = await contextFor();
+		const args = {
+			nodes: [{ kind: "ticket", key: "jira:ZEP-7", name: "ZEP-7 refresh loop" }, { kind: "component", name: "Zephyr Billing", description: "billing service" }],
+			edges: [{ from: { ref: 0 }, rel: "blocked_by", to: { ref: 1 }, reason: "The ticket waits on the billing service migration.", evidence: [{ kind: "ticket", ref: "jira:ZEP-7" }] }],
+			profile: "work", request_id: "rk-1",
+		};
+		const first = await call<{ nodes: { id: string; action: string }[]; edges: { id: number; action: string }[] }>(c, "record_knowledge", args);
+		expect(first.nodes.map((n) => n.action)).toEqual(["created", "created"]);
+		expect(first.edges[0]!.action).toBe("created");
+		expect((await contextFor()).account.sensitiveTerms).toEqual(expect.arrayContaining(["ZEP-7 refresh loop", "ZEP-7", "Zephyr Billing"]));
+		expect(await call(c, "record_knowledge", args)).toMatchObject({ action: "replayed" });
+		const again = await call<{ nodes: { id: string; action: string }[]; edges: { action: string }[] }>(c, "record_knowledge", { ...args, request_id: "rk-2" });
+		expect(again.nodes.map((n) => n.action)).toEqual(["matched", "matched"]);
+		expect(again.edges[0]!.action).toBe("matched");
+		const ended = await call<{ ended: number[] }>(c, "record_knowledge", { end: [{ edge: first.edges[0]!.id, valid_to: "2026-10-29T00:00:00Z", reason: "migration finished" }], profile: "work" });
+		expect(ended.ended).toEqual([first.edges[0]!.id]);
+		const ref = c.account.profiles.find((x) => x.profile === "work")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:work:${ref.generation}`)), (_i, s) => {
+			const e = s.storage.sql.exec<{ ended_at: string | null; basis: string; reason: string }>("SELECT ended_at, basis, reason FROM edges WHERE id = ?", first.edges[0]!.id).one();
+			expect(e).toMatchObject({ basis: "judgment", reason: "The ticket waits on the billing service migration." });
+			expect(e.ended_at).not.toBeNull();
+			expect(s.storage.sql.exec("SELECT kind, ref FROM evidence WHERE owner = ?", `e:${first.edges[0]!.id}`).toArray()).toEqual([{ kind: "ticket", ref: "jira:ZEP-7" }]);
+		});
+		const fresh = await contextFor();
+		expect(await outcome(fresh, "save_memory", { name: "Billing habit", type: "user", description: "a preference", content: "Prefers Zephyr Billing dashboards.", profile: "me", company_free: true }))
+			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "Zephyr Billing" } } });
+	});
+
+	it("refuses an edge without a reason or evidence, a decision without why, and person nodes in me", async () => {
+		const c = await contextFor();
+		const nodes = [{ kind: "component", name: "Alpha" }, { kind: "component", name: "Beta" }];
+		expect(await outcome(c, "record_knowledge", { nodes, edges: [{ from: { ref: 0 }, rel: "depends_on", to: { ref: 1 }, reason: "short", evidence: [{ kind: "url", ref: "https://x" }] }], profile: "personal" }))
+			.toMatchObject({ ok: false, error: { details: { reason: "missing_reason" } } });
+		expect(await outcome(c, "record_knowledge", { nodes, edges: [{ from: { ref: 0 }, rel: "depends_on", to: { ref: 1 }, reason: "Alpha imports Beta at build time.", evidence: [] }], profile: "personal" }))
+			.toMatchObject({ ok: false, error: { code: "validation" } });
+		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "decision", name: "Use pnpm" }], profile: "personal" })).toMatchObject({ ok: false, error: { details: { reason: "missing_why" } } });
+		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "person", name: "A. Colleague" }], profile: "me", company_free: true })).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+	});
+
+	// Review F3-F7 and F9 (docs/review-sol-phase2a-hosted-2026-10-28.md), each from the reviewer's failing example.
+	const rows = async (profile: string, query: string, ...params: SqlStorageValue[]) => {
+		const ref = (await contextFor()).account.profiles.find((p) => p.profile === profile)!;
+		return runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${profile}:${ref.generation}`)), (_i, st) => st.storage.sql.exec(query, ...params).toArray());
+	};
+	const ev = [{ kind: "url", ref: "https://example.invalid/adr-7" }];
+
+	it("F3: drops contact fields before storage on every profile and keeps handles and role", async () => {
+		const c = await contextFor();
+		const r = await call<{ nodes: { id: string; stripped?: string[] }[] }>(c, "record_knowledge", { profile: "work", nodes: [
+			{ kind: "person", name: "Contact Person", attrs: { email: "colleague@example.invalid", phone: "+1 202 555 0147", github: "contact-gh", role: "reviewer", home_town: "x" } },
+			{ kind: "component", name: "Contact Service", attrs: { owner_mail: "team@example.invalid", tier: "gold" } }] });
+		expect(r.nodes[0]!.stripped).toEqual(["email", "phone", "home_town"]);
+		const stored = await rows("work", "SELECT attrs FROM nodes WHERE id IN (?, ?) ORDER BY name", r.nodes[0]!.id, r.nodes[1]!.id);
+		expect(stored.map((x) => JSON.parse(String(x.attrs)))).toEqual([{ github: "contact-gh", role: "reviewer" }, { tier: "gold" }]);
+	});
+
+	it("F4: registers a work person's handle as a me term before the write succeeds", async () => {
+		const c = await contextFor();
+		await call(c, "record_knowledge", { profile: "work", nodes: [{ kind: "person", key: "person:colleague", name: "Colleague Name", attrs: { github: "privatecolleague42" } }] });
+		const fresh = await contextFor();
+		expect(fresh.account.sensitiveTerms).toEqual(expect.arrayContaining(["Colleague Name", "privatecolleague42", "colleague"]));
+		expect(await outcome(fresh, "save_memory", { profile: "me", company_free: true, name: "handle preference", type: "user", description: "Ask privatecolleague42 for reviews" }))
+			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "privatecolleague42" } } });
+	});
+
+	// Closure review (docs/review-sol-phase2a-hosted-fixes-2026-10-29.md): F4 with a me call already in flight, and F3 hashing.
+	it("F4: a me write already in flight cannot miss a work handle registered before the work write", async () => {
+		const [reader, writer] = await Promise.all([contextFor(), contextFor()]);
+		let release!: () => void, entered!: () => void;
+		const paused = new Promise<void>((r) => (release = r)), started = new Promise<void>((r) => (entered = r));
+		// Only scheduling is intercepted: the me call stops before its request binding, with its earlier context.
+		const ns = { idFromName: (n: string) => env.ACCOUNT.idFromName(n), get: (id: DurableObjectId) => {
+			const real = env.ACCOUNT.get(id) as unknown as Record<string | symbol, unknown>;
+			return new Proxy(real, { get(t, k) {
+				if (k === "bindRequest") return async (a: unknown) => { entered(); await paused; return (t.bindRequest as (x: unknown) => unknown)(a); };
+				const v = t[k];
+				return typeof v === "function" ? (...x: unknown[]) => (t[k] as (...y: unknown[]) => unknown)(...x) : v;
+			} });
+		} };
+		const inFlight = outcome({ ...reader, env: { ...reader.env, ACCOUNT: ns } as unknown as Env }, "save_memory",
+			{ profile: "me", company_free: true, request_id: "race-me", name: "Concurrent handle preference", type: "user", description: "Ask racingcolleague42 for reviews" });
+		await started;
+		try { await call(writer, "record_knowledge", { profile: "work", nodes: [{ kind: "person", key: "person:race", name: "Race Colleague", attrs: { github: "racingcolleague42" } }] }); } finally { release(); }
+		expect(await inFlight).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "racingcolleague42" } } });
+		expect(await rows("me", "SELECT id FROM nodes WHERE name = 'Concurrent handle preference'")).toEqual([]);
+	});
+
+	it("F3: a retry whose only change is a discarded contact value replays the same request", async () => {
+		const c = await contextFor();
+		const args = { profile: "work", request_id: "contact-hash", nodes: [{ kind: "person", name: "Hash Person", attrs: { github: "hash-gh", email: "first@example.invalid" } }] };
+		const first = await call<{ nodes: { id: string; stripped?: string[] }[] }>(c, "record_knowledge", args);
+		expect(first.nodes[0]!.stripped).toEqual(["email"]);
+		const retry = await call<{ action: string; nodes: { id: string; stripped?: string[] }[] }>(c, "record_knowledge", { ...args, nodes: [{ ...args.nodes[0]!, attrs: { github: "hash-gh", email: "second@example.invalid" } }] });
+		expect([retry.action, retry.nodes[0]!.id, retry.nodes[0]!.stripped]).toEqual(["replayed", first.nodes[0]!.id, ["email"]]);
+		expect(await outcome(c, "record_knowledge", { ...args, nodes: [{ ...args.nodes[0]!, attrs: { github: "other-gh" } }] })).toMatchObject({ ok: false, error: { code: "idempotency_mismatch" } });
+		const [stored] = await rows("work", "SELECT attrs FROM nodes WHERE id = ?", first.nodes[0]!.id);
+		expect(JSON.parse(String(stored!.attrs))).toEqual({ github: "hash-gh" });
+	});
+
+	it("F5: a keyed update keeps revisions, refreshes the searchable head and marks the card for embedding", async () => {
+		const c = await contextFor();
+		const one = await call<{ nodes: { id: string }[] }>(c, "record_knowledge", { profile: "test", nodes: [{ kind: "decision", key: "decision:cache", name: "cache setting", description: "orchidbefore", why: "memory is bounded", evidence: ev }] });
+		const id = one.nodes[0]!.id;
+		const ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`));
+		await runDurableObjectAlarm(stub);
+		const [before] = await rows("test", "SELECT card_hash, embed_hash FROM nodes WHERE id = ?", id);
+		expect(before!.embed_hash).toBe(before!.card_hash);
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "decision", key: "decision:cache", name: "cache setting", description: "zeppelinafter", why: "memory is bounded", evidence: ev }] });
+		const got = await call<{ revision: number; revisions: { revision: number; snapshot: { description: string } }[] }>(c, "get_memory", { memory_id: id, history: { limit: 10 } });
+		expect(got.revision).toBe(2);
+		expect(got.revisions.map((r) => [r.revision, r.snapshot.description])).toEqual([[1, "orchidbefore"], [2, "zeppelinafter"]]);
+		const off = { ...c, env: { ...c.env, EMBEDDINGS: "off" } };
+		expect((await call<{ results: { memory_id: string }[] }>(off, "recall_memories", { keyword: "zeppelinafter", profile: "test" })).results.map((x) => x.memory_id)).toEqual([id]);
+		expect((await call<{ results: unknown[] }>(off, "recall_memories", { keyword: "orchidbefore", profile: "test" })).results).toHaveLength(0);
+		// The changed card was scheduled for embedding: running the alarm embeds the new card.
+		await runDurableObjectAlarm(stub);
+		const [after] = await rows("test", "SELECT card_hash, embed_hash FROM nodes WHERE id = ?", id);
+		expect(after!.card_hash).not.toBe(before!.card_hash);
+		expect(after!.embed_hash).toBe(after!.card_hash);
+	});
+
+	it("F6: refuses typed edges outside the endpoint table and allows other", async () => {
+		const c = await contextFor();
+		const nodes = [{ kind: "component", name: "service" }, { kind: "bug", name: "bad refresh" }];
+		expect(await outcome(c, "record_knowledge", { profile: "test", nodes, edges: [{ from: { ref: 0 }, rel: "reviewed", to: { ref: 1 }, reason: "I inspected the change.", evidence: ev }] }))
+			.toMatchObject({ ok: false, error: { code: "validation", details: { reason: "invalid_endpoints", allowed: { from: ["person"], to: ["pr"] } } } });
+		expect(await rows("test", "SELECT id FROM nodes WHERE name = 'bad refresh'")).toEqual([]);
+		const r = await call<{ edges: { action: string }[] }>(c, "record_knowledge", { profile: "test", nodes, edges: [{ from: { ref: 0 }, rel: "other", other_label: "inspected_for", to: { ref: 1 }, reason: "I inspected the change.", evidence: ev }] });
+		expect(r.edges[0]!.action).toBe("created");
+		expect(await outcome(c, "record_knowledge", { profile: "test", edges: [{ from: { kind: "component", name: "service" }, rel: "relates_to", to: { kind: "bug", name: "bad refresh" }, reason: "Seen in the same trace.", evidence: [{ kind: "node", ref: "missing-node" }] }] }))
+			.toMatchObject({ ok: false, error: { details: { reason: "bad_evidence" } } });
+	});
+
+	it("F7: refuses a key that belongs to another kind and leaves the node unchanged", async () => {
+		const c = await contextFor();
+		const a = await call<{ nodes: { id: string }[] }>(c, "record_knowledge", { profile: "test", nodes: [{ kind: "person", key: "person:foo", name: "Original Person" }] });
+		expect(await outcome(c, "record_knowledge", { profile: "test", nodes: [{ kind: "component", key: "person:foo", name: "Replacement Component" }] }))
+			.toMatchObject({ ok: false, error: { details: { reason: "key_kind_conflict", kind: "person" } } });
+		expect(await rows("test", "SELECT kind, name, revision FROM nodes WHERE id = ?", a.nodes[0]!.id)).toEqual([{ kind: "person", name: "Original Person", revision: 1 }]);
+	});
+
+	it("F9: a decision needs evidence, stored with it in the same write", async () => {
+		const c = await contextFor();
+		expect(await outcome(c, "record_knowledge", { profile: "test", nodes: [{ kind: "decision", key: "decision:nocache", name: "no cache setting", why: "memory is bounded" }] }))
+			.toMatchObject({ ok: false, error: { details: { reason: "missing_evidence" } } });
+		expect(await rows("test", "SELECT id FROM nodes WHERE key = 'decision:nocache'")).toEqual([]);
+		const r = await call<{ nodes: { id: string }[] }>(c, "record_knowledge", { profile: "test", nodes: [{ kind: "decision", key: "decision:nocache", name: "no cache setting", why: "memory is bounded", evidence: ev }] });
+		expect(await rows("test", "SELECT kind, ref FROM evidence WHERE owner = ?", `n:${r.nodes[0]!.id}`)).toEqual([{ kind: "url", ref: "https://example.invalid/adr-7" }]);
 	});
 });

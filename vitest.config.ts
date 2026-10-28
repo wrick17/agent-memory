@@ -14,5 +14,6 @@ export default defineConfig({
 			},
 		}),
 	],
-	test: { testTimeout: 30_000 },
+	// local/ holds the Node-only capture client; node --test runs it (npm run test:local).
+	test: { testTimeout: 30_000, include: ["test/**/*.test.ts"] },
 });
