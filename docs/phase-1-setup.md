@@ -1,0 +1,13 @@
+# Phase 1 setup readiness
+
+Observed 2026-10-28. This is setup evidence, not implementation or gate evidence.
+
+- The private repository is `https://github.com/wrick17/agent-memory`. Its initial `main` commit is `d90f14da9d60c8148e42dd8585bda5221b82ec3c`, containing only the existing planning documents and root `AGENTS.md`.
+- GitHub API identity is `wrick17`. Default SSH authenticates as `pratyush-poddar_seq`; use HTTPS with the `wrick17` gh credential for this repository, and clear inherited GitHub token overrides. HTTPS transport was verified by listing and pushing the baseline.
+- Wrangler 4.67.0 is authenticated to the personal Cloudflare account. It listed R2 buckets and Vectorize indexes. The `wrick17.com` zone is active. The zone's Free Website plan does not establish the Workers subscription; the billing subscriptions API returned 403, so Workers Paid remains unverified.
+- The Cloudflare DNS records API returned 403. Public DNS returned no A, AAAA or CNAME answer for `memory.wrick17.com`; that does not establish the full authoritative record state. The planned Worker custom domain is `memory.wrick17.com`. Obtain its exact proposed record and current authoritative state before requesting its individual approval. Clerk records are unknown until app setup. Do not change DNS without individual approval.
+- No Clerk CLI or management credential was found in the current environment. The Agent Memory Clerk app has not been created or checked. An owner must sign in to Clerk or provide an authorized management credential through the parent's secret mechanism. Configure sign-ups off and owner-only access, then check OAuth and CIMD settings. The real-token G1 tests decide the authorization-server topology.
+- Local tools: Node 24.11.1, npm 11.6.2, Bun 1.4.4, pnpm 10.28.2, Codex 0.165.0, Claude Code 2.1.312 and Playwright 1.57.0. Cached Playwright Chromium and headless-shell binaries are present. The Workers test pool, Vitest and Miniflare are not installed in this workspace; their actual prerequisites and tests depend on the author's package setup.
+- The linked-machine listing tool was unavailable in this session. A second machine and headless device-token flow remain unverified.
+
+Next: obtain Clerk management access and verify Workers Paid and authoritative DNS visibility. Wait for Opus's binding names and embedding dimensions before provisioning Cloudflare resources. After author handoff and independent review, run the phase checks, request each DNS change separately, and deploy the reviewed code. BothQ remains live; no cutover or dual writes are authorized here.
