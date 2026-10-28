@@ -5,7 +5,11 @@
 	"routes": [{ "pattern": "memory.wrick17.com", "custom_domain": true }],
 	"main": "src/worker.ts",
 	"compatibility_date": "2026-10-20",
-	"compatibility_flags": ["nodejs_compat"],
+	// global_fetch_strictly_public: the Clerk Frontend API (clerk.memory.wrick17.com) is a DNS-only CNAME in this Worker's own
+	// zone, served by Clerk's Worker. Cloudflare documents that without the flag same-zone fetches go to the zone's origin and
+	// that fetching a same-zone Worker fails (error 1042). Kept as the documented routing for this setup; a 1042 was never
+	// observed here. The live 503 was egress.ts using redirect: "error", which Workers rejects.
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"observability": { "enabled": true },
 	"durable_objects": {
 		"bindings": [
@@ -33,6 +37,7 @@
 	"env": {
 		// Test-only environment: AI and Vectorize are replaced by local fakes in vitest.config.ts.
 		"test": {
+			"routes": [],
 			"durable_objects": {
 				"bindings": [
 					{ "name": "ACCOUNT", "class_name": "AccountStore" },

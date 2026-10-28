@@ -25,21 +25,49 @@ export function resetKeyCache(): void {
 
 const jwksUrl = (env: Env) => `${env.CLERK_FRONTEND_API.replace(/\/+$/, "")}/.well-known/jwks.json`;
 
+/** A key-fetch failure with the stage it failed at, logged without any token or credential. */
+class KeyFetchError extends Error {
+	constructor(readonly stage: "fetch" | "status" | "parse", message: string, readonly detail: Record<string, unknown> = {}) { super(message); }
+}
+
+function logKeyIssue(stage: string, error: unknown, detail: Record<string, unknown> = {}): void {
+	console.error(JSON.stringify({ event: "clerk_jwks_issue", stage, ...detail, error: String((error as Error)?.message ?? error).slice(0, 200) }));
+}
+
 async function fetchKeys(env: Env): Promise<Map<string, CryptoKey>> {
-	const cache = caches.default;
 	const cacheKey = new Request(jwksUrl(env));
-	let res = await cache.match(cacheKey);
+	// The Cache API only saves refetches; if it fails, fetch the keys directly instead of failing sign-in.
+	let res = await caches.default.match(cacheKey).catch((e: unknown) => { logKeyIssue("cache_read", e); return undefined; });
 	if (!res) {
 		lastFetch = Date.now();
-		res = await egressFetch(env, jwksUrl(env));
-		if (!res.ok) throw new Error(`signing keys returned ${res.status}`);
-		await cache.put(cacheKey, new Response(res.clone().body, { headers: { "content-type": "application/json", "cache-control": "max-age=3600" } }));
+		try {
+			res = await egressFetch(env, jwksUrl(env));
+		} catch (e) {
+			throw new KeyFetchError("fetch", (e as Error).message);
+		}
+		if (!res.ok) {
+			// Cloudflare's own error pages carry an "error code: NNNN" (for example 1042 for a same-zone Worker); the page is public.
+			const text = await res.text().catch(() => "");
+			throw new KeyFetchError("status", `signing keys returned ${res.status}`, { status: res.status, cf_error: /error code:?\s*(\d{3,5})/i.exec(text)?.[1] ?? null });
+		}
+		await caches.default.put(cacheKey, new Response(res.clone().body, { headers: { "content-type": "application/json", "cache-control": "max-age=3600" } }))
+			.catch((e: unknown) => logKeyIssue("cache_write", e));
 	}
-	const body = (await res.json()) as { keys?: (JsonWebKey & { kid?: string; alg?: string })[] };
+	let body: { keys?: (JsonWebKey & { kid?: string; alg?: string })[] };
+	try {
+		body = (await res.json()) as typeof body;
+	} catch (e) {
+		throw new KeyFetchError("parse", (e as Error).message);
+	}
 	const keys = new Map<string, CryptoKey>();
 	for (const jwk of body.keys ?? []) {
 		if (!jwk.kid || jwk.kty !== "RSA" || (jwk.alg && jwk.alg !== "RS256")) continue;
-		keys.set(jwk.kid, await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]));
+		try {
+			keys.set(jwk.kid, await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]));
+		} catch (e) {
+			// One unusable key must not hide the others; a token naming it gets 401 unknown signing key.
+			logKeyIssue("import", e, { kid: jwk.kid });
+		}
 	}
 	return keys;
 }
@@ -66,7 +94,9 @@ export async function verifyJwt(env: Env, token: string, use: TokenUse): Promise
 	try { header = b64urlJson(parts[0]!); claims = b64urlJson(parts[1]!); } catch { return invalid("malformed token"); }
 	if (header.alg !== "RS256" || typeof header.kid !== "string") return invalid("unsupported signing algorithm");
 	let key: CryptoKey | undefined;
-	try { key = await keyFor(env, header.kid); } catch {
+	try { key = await keyFor(env, header.kid); } catch (e) {
+		// Fail closed: no key, no verification. The log names the failing stage so an outage is diagnosable.
+		logKeyIssue(e instanceof KeyFetchError ? e.stage : "unknown", e, e instanceof KeyFetchError ? e.detail : {});
 		return { ok: false, status: 503, error: "temporarily_unavailable", description: "signing keys are unavailable" };
 	}
 	if (!key) return invalid("unknown signing key");

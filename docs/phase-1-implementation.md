@@ -17,7 +17,7 @@ Design source: [architecture v3.2](architecture.md), section 22 (phase 1) and se
 | ProfileStore v1 | `src/profile/schema.ts`, `write.ts`, `read.ts`, `index.ts`, `store.ts` | Schema v1 tables only (section 5 v1 list), FTS5 porter and trigram indexes kept to live recall rows by triggers, seq stamps and tombstones on every base table. One `transactionSync` per write, refused past 1,000 rows or 1 MB of UTF-8 parameters. Replacing content keeps earlier append entries as non-live history. |
 | Tools | `src/mcp.ts` | `save_memory`, `append_memory`, `get_memory`, `recall_memories`, filtered by token scope. Exact, literal (trigram), full-text (bm25) and vector channels, RRF k=60, BothQ literal boosts, origin weights, cross-profile second RRF, token-budget packing. Empty keyword pages the whole inventory through `next_cursor`. |
 | Embeddings | `src/profile/index.ts` | The card is the kind, name, description, why and the first 1,200 characters of the current content (body, then live entries), read without scanning the whole record; an append that changes that prefix makes the card due. Alarm stage `embed`: 16 cards per call to `@cf/qwen/qwen3-embedding-0.6b`, upserted as `g<generation>:<node id>` into `<userId>:<profile>:g<generation>` with metadata `{kind, gen}`; `embed_hash` recorded only if the card did not change. `EMBEDDINGS=off` skips both the stage and the vector channel. |
-| Settings | `src/settings.ts`, `src/api.ts` | Loads `@clerk/ui@1` and `@clerk/clerk-js@6` from the Frontend API, calls `Clerk.load({ ui: { ClerkUI }, telemetry: false })`, then signs in and lists, creates (token shown once) and revokes devices. A missing script or a failed `load()` shows which part failed. Strict CSP with exact hosts ([live fix](#settings-sign-in-fix-after-deployment)). |
+| Settings | `src/settings.ts`, `src/api.ts` | Loads `@clerk/ui@1` and `@clerk/clerk-js@6` from the Frontend API, calls `Clerk.load({ ui: { ClerkUI }, telemetry: false })`, then signs in and lists, creates (token shown once) and revokes devices. A missing script or a failed `load()` shows which part failed. CSP limited to Clerk's documented sources ([live fix](#settings-sign-in-fix-after-deployment), [CSP correction](#csp-correction-clerks-documented-protect-sources)). |
 | Tooling | `package.json`, `tsconfig.json`, `eslint.config.js`, `vitest.config.ts`, `.github/workflows/ci.yml` | CI runs `wrangler types --check`, typecheck, lint and the Workers test pool. |
 
 ## Protocol and library checks
@@ -99,24 +99,102 @@ The first production check of Worker version `6eb6b8d3-f626-4b65-811a-7d5a6ca59e
 | Load `@clerk/ui@1` before `@clerk/clerk-js@6`, both `defer` and `crossorigin="anonymous"`, as in Clerk's quickstart | `SETTINGS_HTML` in `src/settings.ts` |
 | `Clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor }, telemetry: false })`. A missing ClerkJS or UI bundle, a failed `load()` and a failed `mountSignIn` each show their reason in the status line. | `settingsMain` in `src/settings.ts` |
 | The browser code is a TypeScript function served by `toString()`, so tests run the code the browser gets. A one-line `__name` shim covers the helper that Wrangler's esbuild `keep_names` inserts. | `SETTINGS_JS` in `src/settings.ts` |
-| `script-src` adds the exact host `https://cdn.protect.clerk.com`. `connect-src` stays `'self'` and the Frontend API, since telemetry is off. | `CSP` in `src/api.ts` |
+| `script-src` added `https://cdn.protect.clerk.com`. Superseded by the [CSP correction](#csp-correction-clerks-documented-protect-sources): an exact host is not enough. | `CSP` in `src/api.ts` |
 
-The CSP after the fix is `default-src 'none'; script-src 'self' <Frontend API> https://challenges.cloudflare.com https://cdn.protect.clerk.com; connect-src 'self' <Frontend API>; img-src 'self' https://img.clerk.com; style-src 'self' 'unsafe-inline'; frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`. Clerk's CSP guide also lists `https://*.protect.clerk.com` for `script-src` and `frame-src`, and `https://*.protect.clerk.com:*` for `connect-src`. Those wildcards are left out. The protect bootstrap fetched for this instance, with an anonymous client id, returned a 121-byte stub that loads nothing else. If the browser reports another blocked protect host, add that exact host and port. `style-src 'unsafe-inline'` remains because Clerk's components inject runtime styles, as before.
+That first CSP allowed only the exact protect loader host. It was wrong; see the correction below. `style-src 'unsafe-inline'` remains because Clerk's components inject runtime styles, as before.
 
 | Check | Result |
 |---|---|
 | `test/mcp-auth.test.ts`, "Settings page start-up" (3 tests) | Passes. A fake ClerkJS enforces the rule above. On the old start-up (`load()` without `ui`) the first test fails with `Sign-in could not start: Clerk was not loaded with Ui components`, the live message. |
-| Settings response test | The CSP has the exact `script-src`, and no `*`, bare `https:`, `'unsafe-eval'` or script `'unsafe-inline'` |
+| Settings response test | Superseded by the full-policy test in the correction below |
 | The served script from the production dry-run bundle, run in Node `vm` against the same fake | Mounted sign-in, passed `ui.ClerkUI` and `telemetry: false`; the bundle references no helper other than the shimmed `__name` |
 | `npm run check` | Typecheck and lint clean; 4 files, 38 tests passed |
 
 This shows the start-up follows ClerkJS's documented contract. It does not show that Clerk's UI renders in a real browser, which is Terra's check after redeploy. Owner, issuer, audience and `memory` scope checks are unchanged.
 
+## CSP correction: Clerk's documented protect sources
+
+The redeployed fix (version `0b2ef0d6-2149-48df-8f26-c3e8184f9efc`) rendered the real Clerk sign-in form. The console still reported two CSP violations: `img-src` blocked a `blob:` image, and `connect-src` blocked an instance-specific `client.protect.clerk.com` probe ([browser check](phase-1-verification.md#settings-correction-redeployment-and-browser-check)). The earlier choice to allow single protect hosts caused the second.
+
+**Do not narrow these sources to single hosts.** Clerk's CSP guide (`https://clerk.com/docs/guides/secure/best-practices/csp-headers`, fetched 2026-10-28) lists the protect sources as required. Clerk serves its abuse and fraud protection from per-instance and per-client subdomains of `protect.clerk.com`. This instance's loader is on `cdn.` and the live probe went to a `client.` host, on ports other than 443. A source with no port matches only port 443, so `connect-src` needs `:*`.
+
+| Directive | Sources | Why |
+|---|---|---|
+| `default-src` | `'none'` | Everything else is denied |
+| `script-src` | `'self'`, the Frontend API, `https://challenges.cloudflare.com`, `https://*.protect.clerk.com` | Documented: clerk-js, `@clerk/ui` and their chunks; Turnstile; the protect loader |
+| `connect-src` | `'self'`, the Frontend API, `https://*.protect.clerk.com:*` | Documented, including the port wildcard; `/api` calls go to `'self'` |
+| `img-src` | `'self'`, `https://img.clerk.com`, `blob:` | `img.clerk.com` is documented; `blob:` is the image the live sign-in page created |
+| `style-src` | `'self'`, `'unsafe-inline'` | Documented; Clerk's components inject runtime styles |
+| `frame-src` | `https://challenges.cloudflare.com`, `https://*.protect.clerk.com` | Documented |
+| `worker-src` | `'self'`, `blob:` | Documented; ClerkJS starts a timer worker from a blob URL |
+| `form-action`, `base-uri`, `frame-ancestors` | `'self'`, `'none'`, `'none'` | Unchanged |
+
+The only wildcard is Clerk's documented `*.protect.clerk.com` subdomain pattern; `:*` appears only in `connect-src`. No universal `*`, scheme-wide `https:`, `http:` or `data:`, `'unsafe-eval'` or script `'unsafe-inline'` is allowed, and no telemetry, Stripe or maps origin is added: telemetry is off, and billing and maps are unused. `blob:` appears only in `img-src` and `worker-src`.
+
+| Check | Result |
+|---|---|
+| Settings response test in `test/mcp-auth.test.ts` | Compares the whole policy, directive by directive, with the table above. It also checks that every wildcard source is the protect pattern, with no universal or scheme-wide source and no script `'unsafe-inline'`. It fails on the committed `3e27817` policy and passes on the fix. |
+| `npm run check` | Typecheck and lint clean; 4 files, 38 tests passed |
+| `npx wrangler deploy --dry-run --env=""` | Bundles: 1,326.94 KiB, 240.88 KiB gzipped. The dry run deploys nothing. |
+
+A clean console on the deployed page is still unproven. That needs Terra's redeploy and browser check: sign-in renders with no CSP violation, then device creation and revocation.
+
+## Live signing-key 503: diagnosis and fix
+
+After Codex and Claude completed real Clerk logins, `GET https://memory.wrick17.com/v1/whoami` with Codex's real access token returned 503 `temporarily_unavailable`, "signing keys are unavailable" ([evidence](phase-1-verification.md#isolated-codex-oauth-follow-up)).
+
+**Repro.** `node /tmp/am-auth-repro/whoami.mjs` reads the access token from the isolated Codex store `/tmp/agent-memory-live-goBMur/codex/.credentials.json` inside the script. It prints only the token's public `kid`, claim booleans and the sanitized response. Against Worker version `0b2ef0d6-2149-48df-8f26-c3e8184f9efc` it printed `issOk`, `subOk`, `audOk` and `scopeOk` all true, about 24 hours left, then `{"status":503,"error":"temporarily_unavailable","description":"signing keys are unavailable"}`, on every run. A read-only `wrangler tail` of the same request showed outcome `ok`, response 503 and no log or exception, because the old code swallowed the cause.
+
+**What was ruled out outside the Worker.**
+- The public JWKS at `https://clerk.memory.wrick17.com/.well-known/jwks.json` returns 200 `application/json`, with no redirect and no block, for no user agent, `Python-urllib` and `curl`. It holds one RS256 key whose `kid` matches the token.
+- WebCrypto imports that key with the Worker's parameters and verifies the real token's signature.
+- So the token, the keys and the crypto were fine, and the failure was the Worker's own key fetch. The earlier Python 403 (error 1010) was on `memory.wrick17.com` and does not apply here.
+
+**Actual cause, found live.** Version `8d80ae8f-b294-48a1-b298-d4db6bbf0fc6` carried the stage log below. It still returned 503 and logged stage `fetch`: Cloudflare Workers rejects `redirect: "error"`, which `src/egress.ts` passed to `fetch()`, and advises `manual` with a status check ([log](phase-1-verification.md)). The local Workers runtime accepted the option, so the tests had never caught it.
+
+**Fix for the actual cause.** `egressFetch()` is the only `fetch()` call, and `fetchKeys()` in `src/auth.ts` its only caller. It now passes `redirect: "manual"`, which Workers supports. Any 3xx response is discarded and refused with an error, so a `Location` to another host is never followed. The HTTPS and exact-Clerk-host allowlist is unchanged, and so are the signature, issuer, owner, resource audience and `memory` scope checks.
+
+| Regression in `test/mcp-auth.test.ts` | On the committed `3e27817` egress | With the fix |
+|---|---|---|
+| The key fetch uses `redirect: "manual"`; a 302 whose `Location` is another host gets 503 and logs stage `fetch` with "redirect (302)", after exactly one fetch to the Clerk host; then a plain 200 key set from the same host verifies | Fails | Passes |
+
+**Earlier hypothesis, unconfirmed.** The section below was written before the live log and is kept as the record of that diagnosis. Its same-zone routing cause (error 1042) was an inference from documentation and DNS, never observed: the flag-off control was not run, and no 1042 appeared. `global_fetch_strictly_public` stays as the routing Cloudflare documents for a same-zone, Worker-backed hostname, not as a proven fix.
+
+**Inferred cause (unconfirmed).** `clerk.memory.wrick17.com` is a DNS-only CNAME in the Worker's own zone, `wrick17.com`. It resolves through `frontend-api.clerk.services` to `worker.clerkprod-cloudflare.net`, Clerk's own Worker. Cloudflare documents two relevant rules:
+- Without the `global_fetch_strictly_public` compatibility flag, a Worker's `fetch()` to a hostname on its own zone "is routed to the zone's origin server, ignoring any Workers mapped to the URL".
+- Error 1042 is "Worker tried to fetch from another Worker on the same zone, which is only supported when the global_fetch_strictly_public compatibility flag is used".
+
+The inference was that the signing-key fetch would get a Cloudflare error instead of the JWKS. The live log showed a different, earlier failure: the rejected redirect option. Ruled out outside the Worker: a block on Worker subrequests at Clerk, JSON parsing, key import.
+
+**Changes made with that diagnosis (kept).**
+- `wrangler.jsonc` adds `global_fetch_strictly_public`. The Worker's fetches now route as from the public Internet, through Cloudflare's normal routing and security settings. `egress.ts` still allows only the Clerk Frontend API over HTTPS; the later manual-redirect correction above supersedes the earlier redirect mode.
+- No signature, issuer, audience, owner or `memory` scope check changed, and no key is pinned.
+- `fetchKeys()` now logs one sanitized line, `{"event":"clerk_jwks_issue","stage":...}`, naming the failing stage. Stages: `fetch`, `status` with the HTTP status and any Cloudflare `error code`, `parse`, or `import` with the public `kid`. It never logs a token.
+- Cold keys still fail closed with 503.
+- The Cache API is now best-effort, because it only saves refetches: a failed cache read or write is logged and the keys are fetched directly. A key that fails to import is skipped and logged, so a token naming it gets 401 "unknown signing key".
+
+| Regression in `test/mcp-auth.test.ts` | On the committed `3e27817` code | With the fix |
+|---|---|---|
+| A refused key fetch (Cloudflare `error code: 1042` page) returns 503 and logs `stage: "status"`, the status and `cf_error: "1042"`, with no token text | Fails: no log | Passes |
+| A failing Cache API still verifies a valid token and still refuses a wrong audience | Fails: 503 | Passes |
+| The deploy configuration keeps `global_fetch_strictly_public` | Fails | Passes |
+
+These tests show the stage log, the fail-closed behavior and the configuration. They cannot reproduce Cloudflare's same-zone routing, which only exists on Cloudflare's network.
+
+| Check | Result |
+|---|---|
+| `npm run check` | Typecheck and lint clean; 4 files, 41 tests passed |
+| `npx wrangler types --strict-vars=false --check` | Types up to date (now generated with `global_fetch_strictly_public`) |
+| `npx wrangler deploy --dry-run --env=""` | Bundles: 1,328.03 KiB, 241.17 KiB gzipped. The dry run deploys nothing. |
+| Live repro after these source changes | Still 503, as expected: nothing is deployed |
+
+**Live proof.** The deployed manual-redirect fix returned 200 with claims for the real Codex token; direct real-token MCP and device checks are recorded in [verification](phase-1-verification.md#manual-redirect-deployment-and-live-checks). Remaining gate items are listed below.
+
 ## Live gates still open
 
-- **G1, all of T1 to T6.** Needs real tokens from Claude Code and Codex against the deployed Worker. Terra reports that Clerk discovery publishes issuer `https://clerk.memory.wrick17.com`, which matches `CLERK_ISSUER`. The real access token must carry the resource in `aud` and `memory` in `scope` or `scp`; both stay required. If Clerk cannot satisfy them, the specified fallback (section 8) is the only alternative. Refresh (T4) is untested.
-- **G5.** Local real Claude Code, Codex and headless checks after the reviewed deployment, then a second machine later. Terra measured 1,024 dimensions from a synthetic live call and the parent confirmed the `kind` String metadata index; live vector retrieval through the Worker and the query-embedding latency are untested.
-- **Settings page in a browser.** The correction is deployed and the sign-in form renders, but the console reports CSP violations for a blob image and a Clerk protection probe. The original author must address those before the clean-console check and device tests can pass. See [live evidence](phase-1-verification.md#settings-correction-redeployment-and-browser-check).
+- **G1, T1 to T6.** Real Claude and Codex tokens now authenticate in direct MCP requests, but actual CLI tool calls, headless client configuration, negative real-token cases and refresh remain open. Terra reports that Clerk discovery publishes issuer `https://clerk.memory.wrick17.com`, which matches `CLERK_ISSUER`. The real access token must carry the resource in `aud` and `memory` in `scope` or `scp`; both stay required. If Clerk cannot satisfy them, the specified fallback (section 8) is the only alternative. Refresh (T4) is untested.
+- **G5.** Direct real-token synthetic save, append and lexical recall passed on this Mac. Actual CLI and headless client configuration checks and live vector retrieval remain open; a second physical machine is deferred. Terra measured 1,024 dimensions from a synthetic live call and the parent confirmed the `kind` String metadata index; live vector retrieval through the Worker and the query-embedding latency are untested.
+- **Settings page in a browser.** The later CSP correction is deployed; the pinned owner Settings view rendered without CSP or initialization errors, and a test device was created and revoked. See [live evidence](phase-1-verification.md#settings-correction-redeployment-and-browser-check).
 - **G3 across physical machines.** The local test runs both callers in one process.
 
 ## Deviations and interpretations

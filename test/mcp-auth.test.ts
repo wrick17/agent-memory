@@ -6,6 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resetKeyCache } from "../src/auth";
 import { egressFetch } from "../src/egress";
 import { settingsMain } from "../src/settings";
+import wranglerConfig from "../wrangler.jsonc?raw";
 import { deviceToken } from "./helpers";
 
 let keys: CryptoKeyPair;
@@ -82,6 +83,55 @@ describe("auth", () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("offline"); });
 		await caches.default.delete(new Request(`${env.CLERK_FRONTEND_API}/.well-known/jwks.json`));
 		expect((await rpc(await jwt({}), "tools/list")).status).toBe(503);
+	});
+
+	it("names the failing stage when the signing-key fetch is refused, and stays closed", async () => {
+		// What a same-zone fetch to a Worker-backed hostname gets without global_fetch_strictly_public: a Cloudflare error page.
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("error code: 1042", { status: 403, headers: { "content-type": "text/plain" } }));
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+		await caches.default.delete(new Request(`${env.CLERK_FRONTEND_API}/.well-known/jwks.json`));
+		const r = await rpc(await jwt({}), "tools/list");
+		expect(r.status).toBe(503);
+		expect(r.data).toMatchObject({ error: "temporarily_unavailable", error_description: "signing keys are unavailable" });
+		const line = logged.mock.calls.map((c) => String(c[0])).find((m) => m.includes("clerk_jwks_issue"));
+		expect(JSON.parse(line!)).toMatchObject({ stage: "status", status: 403, cf_error: "1042" });
+		expect(line).not.toMatch(/eyJ|Bearer/);
+	});
+
+	it("still verifies when the Cache API fails, since the cache only saves refetches", async () => {
+		serveJwks();
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(caches.default, "match").mockRejectedValue(new Error("cache unavailable"));
+		vi.spyOn(caches.default, "put").mockRejectedValue(new Error("cache unavailable"));
+		expect((await rpc(await jwt({}), "tools/list")).status).toBe(200);
+		expect((await rpc(await jwt({ aud: ["https://memory.test/other"] }), "tools/list")).status).toBe(401);
+	});
+
+	it("deploys with global_fetch_strictly_public, so the same-zone Clerk Frontend API is reached through public routing", () => {
+		const config = JSON.parse(wranglerConfig.replace(/^\s*\/\/.*$/gm, "")) as { compatibility_flags: string[] };
+		expect(config.compatibility_flags).toContain("global_fetch_strictly_public");
+	});
+
+	it("fetches signing keys with the Workers-supported manual redirect mode and refuses a redirect without following it", async () => {
+		const calls: { url: string; redirect: unknown }[] = [];
+		let redirectOnce = true;
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			calls.push({ url: String(input), redirect: init?.redirect });
+			if (redirectOnce) return new Response(null, { status: 302, headers: { location: "https://evil.example/jwks.json" } });
+			const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+			return Response.json({ keys: [{ ...jwk, kid: KID, alg: "RS256", use: "sig" }] });
+		});
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+		await caches.default.delete(new Request(`${env.CLERK_FRONTEND_API}/.well-known/jwks.json`));
+		expect((await rpc(await jwt({}), "tools/list")).status).toBe(503);
+		expect(calls).toEqual([{ url: `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`, redirect: "manual" }]);
+		const line = logged.mock.calls.map((c) => String(c[0])).find((m) => m.includes("clerk_jwks_issue"));
+		expect(JSON.parse(line!)).toMatchObject({ stage: "fetch", error: expect.stringContaining("redirect (302)") });
+		// A plain 200 key set from the same host still verifies.
+		resetKeyCache();
+		redirectOnce = false;
+		expect((await rpc(await jwt({}), "tools/list")).status).toBe(200);
+		expect(calls.slice(1).every((c) => c.redirect === "manual" && c.url.startsWith(env.CLERK_FRONTEND_API))).toBe(true);
 	});
 
 	it("allows egress only to the Clerk Frontend API host", async () => {
@@ -169,10 +219,22 @@ describe("owner API", () => {
 		const whoami = await (await exports.default.fetch(new Request(`${origin}/v1/whoami`, { headers: { authorization: `Bearer ${await jwt({})}` } }))).json() as { claims: { aud: string[] } };
 		expect(whoami.claims.aud).toContain(env.RESOURCE_URL);
 		const page = await exports.default.fetch(new Request(`${origin}/settings`));
-		const csp = page.headers.get("content-security-policy")!;
-		expect(csp).toContain(`script-src 'self' ${env.CLERK_FRONTEND_API} https://challenges.cloudflare.com https://cdn.protect.clerk.com;`);
-		expect(csp).toContain("frame-ancestors 'none'");
-		expect(csp).not.toMatch(/\*|'unsafe-eval'|script-src[^;]*'unsafe-inline'|\shttps:(\s|;|$)/);
+		const policy = Object.fromEntries(page.headers.get("content-security-policy")!.split("; ").map((d) => { const [name, ...src] = d.split(" "); return [name!, src]; }));
+		const fapi = env.CLERK_FRONTEND_API, protect = "https://*.protect.clerk.com";
+		// Clerk's documented sources (script, connect with any port, frame), blob: images from the live page, nothing broader.
+		expect(policy).toEqual({
+			"default-src": ["'none'"], "script-src": ["'self'", fapi, "https://challenges.cloudflare.com", protect], "connect-src": ["'self'", fapi, `${protect}:*`],
+			"img-src": ["'self'", "https://img.clerk.com", "blob:"], "style-src": ["'self'", "'unsafe-inline'"], "frame-src": ["https://challenges.cloudflare.com", protect],
+			"worker-src": ["'self'", "blob:"], "form-action": ["'self'"], "base-uri": ["'none'"], "frame-ancestors": ["'none'"],
+		});
+		// The only wildcard is Clerk's protect subdomain pattern; no universal or scheme-wide source, no unsafe script.
+		for (const sources of Object.values(policy) as string[][]) {
+			for (const src of sources) {
+				expect(src.includes("*") ? src.replace(/:\*$/, "") === protect : true).toBe(true);
+				expect(["*", "https:", "http:", "data:", "'unsafe-eval'"]).not.toContain(src);
+			}
+		}
+		expect(policy["script-src"]).not.toContain("'unsafe-inline'");
 		expect(await page.text()).toContain(`data-clerk-publishable-key="${env.CLERK_PUBLISHABLE_KEY}"`);
 	});
 });

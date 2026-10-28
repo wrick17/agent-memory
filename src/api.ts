@@ -35,14 +35,17 @@ async function body(request: Request): Promise<Record<string, unknown> | null> {
 	try { const v = JSON.parse(raw) as unknown; return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null; } catch { return null; }
 }
 
-// Clerk's documented needs (clerk.com/docs/guides/secure/best-practices/csp-headers), narrowed to exact hosts: the Frontend
-// API serves clerk-js, @clerk/ui and their chunks; this instance's protect loader is on cdn.protect.clerk.com (from
-// /v1/environment protect_config); Turnstile runs from challenges.cloudflare.com. Telemetry is off in the page, so
-// clerk-telemetry.com is not allowed. If the browser reports another blocked protect host, add that exact host.
+// Clerk's required sources (clerk.com/docs/guides/secure/best-practices/csp-headers), and nothing broader. The Frontend API
+// serves clerk-js, @clerk/ui and their chunks; Turnstile runs from challenges.cloudflare.com. Clerk's abuse and fraud
+// protection runs on per-instance and per-client subdomains of protect.clerk.com (cdn. loads the bootstrap, client. is
+// probed), on ports other than 443, so Clerk documents *.protect.clerk.com, with :* for connect-src. Do not narrow these
+// to single hosts: that breaks sign-in protection. img-src blob: is from the live sign-in page; worker-src blob: is
+// documented. Telemetry is off in the page, so clerk-telemetry.com is not allowed.
+const PROTECT = "https://*.protect.clerk.com";
 const CSP = (env: Env) => {
 	const clerk = env.CLERK_FRONTEND_API;
-	return [`default-src 'none'`, `script-src 'self' ${clerk} https://challenges.cloudflare.com https://cdn.protect.clerk.com`, `connect-src 'self' ${clerk}`,
-		`img-src 'self' https://img.clerk.com`, `style-src 'self' 'unsafe-inline'`, `frame-src https://challenges.cloudflare.com`,
+	return [`default-src 'none'`, `script-src 'self' ${clerk} https://challenges.cloudflare.com ${PROTECT}`, `connect-src 'self' ${clerk} ${PROTECT}:*`,
+		`img-src 'self' https://img.clerk.com blob:`, `style-src 'self' 'unsafe-inline'`, `frame-src https://challenges.cloudflare.com ${PROTECT}`,
 		`worker-src 'self' blob:`, `form-action 'self'`, `base-uri 'none'`, `frame-ancestors 'none'`].join("; ");
 };
 
