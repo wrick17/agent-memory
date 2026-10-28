@@ -17,7 +17,7 @@ Design source: [architecture v3.2](architecture.md), section 22 (phase 1) and se
 | ProfileStore v1 | `src/profile/schema.ts`, `write.ts`, `read.ts`, `index.ts`, `store.ts` | Schema v1 tables only (section 5 v1 list), FTS5 porter and trigram indexes kept to live recall rows by triggers, seq stamps and tombstones on every base table. One `transactionSync` per write, refused past 1,000 rows or 1 MB of UTF-8 parameters. Replacing content keeps earlier append entries as non-live history. |
 | Tools | `src/mcp.ts` | `save_memory`, `append_memory`, `get_memory`, `recall_memories`, filtered by token scope. Exact, literal (trigram), full-text (bm25) and vector channels, RRF k=60, BothQ literal boosts, origin weights, cross-profile second RRF, token-budget packing. Empty keyword pages the whole inventory through `next_cursor`. |
 | Embeddings | `src/profile/index.ts` | The card is the kind, name, description, why and the first 1,200 characters of the current content (body, then live entries), read without scanning the whole record; an append that changes that prefix makes the card due. Alarm stage `embed`: 16 cards per call to `@cf/qwen/qwen3-embedding-0.6b`, upserted as `g<generation>:<node id>` into `<userId>:<profile>:g<generation>` with metadata `{kind, gen}`; `embed_hash` recorded only if the card did not change. `EMBEDDINGS=off` skips both the stage and the vector channel. |
-| Settings | `src/settings.ts`, `src/api.ts` | Clerk JS sign-in, then list, create (token shown once) and revoke devices, and set an OAuth machine's default profile. Strict CSP. |
+| Settings | `src/settings.ts`, `src/api.ts` | Loads `@clerk/ui@1` and `@clerk/clerk-js@6` from the Frontend API, calls `Clerk.load({ ui: { ClerkUI }, telemetry: false })`, then signs in and lists, creates (token shown once) and revokes devices. A missing script or a failed `load()` shows which part failed. Strict CSP with exact hosts ([live fix](#settings-sign-in-fix-after-deployment)). |
 | Tooling | `package.json`, `tsconfig.json`, `eslint.config.js`, `vitest.config.ts`, `.github/workflows/ci.yml` | CI runs `wrangler types --check`, typecheck, lint and the Workers test pool. |
 
 ## Protocol and library checks
@@ -34,8 +34,8 @@ Design source: [architecture v3.2](architecture.md), section 22 (phase 1) and se
 | `npm run typecheck` | No errors |
 | `npm run lint` | No errors. A probe file calling `fetch` outside `egress.ts` and one importing `./profile/write` from outside the folder each fail lint. |
 | `npx wrangler types --strict-vars=false --check` | Types up to date |
-| `npx wrangler deploy --dry-run --outdir /tmp/am-bundle` | Bundles: 1,324.54 KiB, 240.30 KiB gzipped; bindings listed below. Nothing deployed. |
-| `npm test` | 4 files, 35 tests passed, in workerd with real SQLite Durable Objects and local R2 |
+| `npx wrangler deploy --dry-run --env="" --outdir /tmp/am-bundle` | Bundles: 1,326.89 KiB, 240.86 KiB gzipped after the Settings fix; bindings listed below. The dry run deploys nothing. |
+| `npm test` | 4 files, 38 tests passed, in workerd with real SQLite Durable Objects and local R2 (35 before the Settings fix) |
 | Reviewer harness, `node node_modules/vitest/vitest.mjs run --config /private/tmp/am-phase1-review-gb0ebmnc/vitest.config.ts` | 7 passed, including the F1, F1b, F2, F3, F4 and F5 reproductions, against the fixed source |
 
 ### Test coverage by gate
@@ -88,11 +88,35 @@ Each finding from the [phase-1 review](review-sol-phase1-2026-10-28.md#must-fix)
 
 The implementation report no longer suggests emptying `REQUIRED_SCOPE`; `src/auth.ts` now refuses access tokens when it is unset.
 
+## Settings sign-in fix after deployment
+
+The first production check of Worker version `6eb6b8d3-f626-4b65-811a-7d5a6ca59e5e` showed no sign-in on `/settings`. The console reported `Clerk was not loaded with Ui components`, and CSP blocked a Clerk protection script ([live evidence](phase-1-verification.md#production-deployment-and-first-live-observations)).
+
+**Cause, traced in the current SDK.** In the `@clerk/clerk-js@6` browser bundle served by the Frontend API, `load()` creates the component layer only when its options carry `ui.ClerkUI`, and `mountSignIn` then calls `assertComponentsReady`, which throws that exact message. The page loaded only `clerk.browser.js` and called `Clerk.load()` with no options. Clerk's current JavaScript quickstart (script-tag setup) loads `https://<Frontend API>/npm/@clerk/ui@1/dist/ui.browser.js` first and calls `Clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor } })`. The blocked script was this instance's protect loader. `/v1/environment` names it in `protect_config`: `https://cdn.protect.clerk.com/ins_3LKOqGARK9NsjTwXYqM0OWZ4OyN/c/{cid}/bootstrap.js`.
+
+| Change | Where |
+|---|---|
+| Load `@clerk/ui@1` before `@clerk/clerk-js@6`, both `defer` and `crossorigin="anonymous"`, as in Clerk's quickstart | `SETTINGS_HTML` in `src/settings.ts` |
+| `Clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor }, telemetry: false })`. A missing ClerkJS or UI bundle, a failed `load()` and a failed `mountSignIn` each show their reason in the status line. | `settingsMain` in `src/settings.ts` |
+| The browser code is a TypeScript function served by `toString()`, so tests run the code the browser gets. A one-line `__name` shim covers the helper that Wrangler's esbuild `keep_names` inserts. | `SETTINGS_JS` in `src/settings.ts` |
+| `script-src` adds the exact host `https://cdn.protect.clerk.com`. `connect-src` stays `'self'` and the Frontend API, since telemetry is off. | `CSP` in `src/api.ts` |
+
+The CSP after the fix is `default-src 'none'; script-src 'self' <Frontend API> https://challenges.cloudflare.com https://cdn.protect.clerk.com; connect-src 'self' <Frontend API>; img-src 'self' https://img.clerk.com; style-src 'self' 'unsafe-inline'; frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`. Clerk's CSP guide also lists `https://*.protect.clerk.com` for `script-src` and `frame-src`, and `https://*.protect.clerk.com:*` for `connect-src`. Those wildcards are left out. The protect bootstrap fetched for this instance, with an anonymous client id, returned a 121-byte stub that loads nothing else. If the browser reports another blocked protect host, add that exact host and port. `style-src 'unsafe-inline'` remains because Clerk's components inject runtime styles, as before.
+
+| Check | Result |
+|---|---|
+| `test/mcp-auth.test.ts`, "Settings page start-up" (3 tests) | Passes. A fake ClerkJS enforces the rule above. On the old start-up (`load()` without `ui`) the first test fails with `Sign-in could not start: Clerk was not loaded with Ui components`, the live message. |
+| Settings response test | The CSP has the exact `script-src`, and no `*`, bare `https:`, `'unsafe-eval'` or script `'unsafe-inline'` |
+| The served script from the production dry-run bundle, run in Node `vm` against the same fake | Mounted sign-in, passed `ui.ClerkUI` and `telemetry: false`; the bundle references no helper other than the shimmed `__name` |
+| `npm run check` | Typecheck and lint clean; 4 files, 38 tests passed |
+
+This shows the start-up follows ClerkJS's documented contract. It does not show that Clerk's UI renders in a real browser, which is Terra's check after redeploy. Owner, issuer, audience and `memory` scope checks are unchanged.
+
 ## Live gates still open
 
 - **G1, all of T1 to T6.** Needs real tokens from Claude Code and Codex against the deployed Worker. Terra reports that Clerk discovery publishes issuer `https://clerk.memory.wrick17.com`, which matches `CLERK_ISSUER`. The real access token must carry the resource in `aud` and `memory` in `scope` or `scp`; both stay required. If Clerk cannot satisfy them, the specified fallback (section 8) is the only alternative. Refresh (T4) is untested.
 - **G5.** Local real Claude Code, Codex and headless checks after the reviewed deployment, then a second machine later. Terra measured 1,024 dimensions from a synthetic live call and the parent confirmed the `kind` String metadata index; live vector retrieval through the Worker and the query-embedding latency are untested.
-- **Settings page in a browser.** Clerk sign-in needs the production domain.
+- **Settings page in a browser.** The correction is deployed and the sign-in form renders, but the console reports CSP violations for a blob image and a Clerk protection probe. The original author must address those before the clean-console check and device tests can pass. See [live evidence](phase-1-verification.md#settings-correction-redeployment-and-browser-check).
 - **G3 across physical machines.** The local test runs both callers in one process.
 
 ## Deviations and interpretations

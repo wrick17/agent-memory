@@ -35,9 +35,13 @@ async function body(request: Request): Promise<Record<string, unknown> | null> {
 	try { const v = JSON.parse(raw) as unknown; return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null; } catch { return null; }
 }
 
+// Clerk's documented needs (clerk.com/docs/guides/secure/best-practices/csp-headers), narrowed to exact hosts: the Frontend
+// API serves clerk-js, @clerk/ui and their chunks; this instance's protect loader is on cdn.protect.clerk.com (from
+// /v1/environment protect_config); Turnstile runs from challenges.cloudflare.com. Telemetry is off in the page, so
+// clerk-telemetry.com is not allowed. If the browser reports another blocked protect host, add that exact host.
 const CSP = (env: Env) => {
 	const clerk = env.CLERK_FRONTEND_API;
-	return [`default-src 'none'`, `script-src 'self' ${clerk} https://challenges.cloudflare.com`, `connect-src 'self' ${clerk}`,
+	return [`default-src 'none'`, `script-src 'self' ${clerk} https://challenges.cloudflare.com https://cdn.protect.clerk.com`, `connect-src 'self' ${clerk}`,
 		`img-src 'self' https://img.clerk.com`, `style-src 'self' 'unsafe-inline'`, `frame-src https://challenges.cloudflare.com`,
 		`worker-src 'self' blob:`, `form-action 'self'`, `base-uri 'none'`, `frame-ancestors 'none'`].join("; ");
 };

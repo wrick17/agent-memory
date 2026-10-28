@@ -39,3 +39,13 @@ Fresh private client directories under `/tmp/agent-memory-live-goBMur` initially
 Still pending: owner Settings login, actual client OAuth and claims, headless device creation and revocation, live save/recall and vector/fallback checks, T4 real refresh after expiry, and the deferred physical second-machine checks. BothQ and ordinary client configuration remain live and unchanged. Browser MCP returned `Transport closed` when closing the owned Settings tab; DevTools showed it closed and the nine baseline pages present. Group removal is unconfirmed. Codex unexpectedly opened an additional Helium authorization tab outside Browser MCP ownership; the interrupted login makes that tab stale, and it remains open because this session cannot close it through the authorized tab manager.
 
 At that checkpoint, the independent Sol recheck, parent clearance, deployment, G1 T1-T6, live G5, physical-machine and headless access were outstanding. The deployment and later observations are recorded below. Do not change `REQUIRED_SCOPE` or weaken audience checks to make a gate pass. The live BothQ system and client configurations remain unchanged.
+
+## Settings correction redeployment and browser check
+
+On 2026-10-28, Terra independently ran `npm run check` once against the cleared correction: typecheck and lint passed, with 4 files and 38 tests passed. `npx wrangler types --strict-vars=false --check` and `npx wrangler deploy --dry-run --env="" --outdir /tmp/agent-memory-ui-verify` passed. The dry-run bundle was 1326.89 KiB, 240.86 KiB gzipped, with SHA-256 `0a51e177fc8d34246d37342726f6fbc713c9cddc5614b8bc3df473841d571a8e`. The bundle hash is local evidence, not server-side artifact attestation.
+
+`npx wrangler deploy --env=""` deployed version `0b2ef0d6-2149-48df-8f26-c3e8184f9efc` to `memory.wrick17.com`, from the uncommitted correction atop `822d128d3c105d5a60d9b7f4d9b6d4269a6328a9`. Existing bindings and `REQUIRED_SCOPE=memory` remained configured.
+
+In an owned Helium tab, the real Clerk sign-in form rendered with email, password and Google sign-in. There was no Clerk initialization error. The console did report CSP violations: `img-src` blocked a `blob:` image and `connect-src` blocked an instance-specific `client.protect.clerk.com` probe. The requested clean-console check therefore failed and the CSP issue returns to the original author. No password was entered or read. The Settings tab remains open for the parent. The stale interrupted Codex authorization tab remains unowned and was not closed.
+
+No live device, OAuth, save/recall, vector, fallback, refresh or second-machine gate was established in this check. BothQ remains the live memory system.
