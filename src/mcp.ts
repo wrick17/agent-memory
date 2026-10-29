@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { AccountContext, AccountStore } from "./account/store";
 import { knowledgeTerms, stripPersonal } from "./domain/guard";
 import { requestHash } from "./domain/ids";
+import { legacyRequestHash } from "./domain/legacy";
 import { redactPayload } from "./domain/redact";
 import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, RELATIONS, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand } from "./domain/types";
 import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
@@ -111,9 +112,9 @@ export const TOOLS = [
 
 // Stubs typed with the stores' own signatures; every value crossing RPC is plain JSON-like data.
 export const profileStub = (env: Env, ref: ProfileRef) =>
-	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "write" | "read" | "ingest" | "captureState">;
+	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "write" | "read" | "ingest" | "captureState" | "importStep">;
 export const accountStub = (env: Env, userId: string) =>
-	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin">;
+	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin" | "bindImport" | "reserveImport">;
 
 const refOf = (c: ToolContext, name: string) => c.account.profiles.find((p) => p.profile === name);
 
@@ -152,6 +153,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	// result or the node. The profile filters again at its own boundary.
 	const { args, stripped } = withoutPersonal(op, redactPayload(raw));
 	const payloadHash = requestHash(op, args as Record<string, unknown>);
+	const legacyHash = legacyRequestHash(op, args as Record<string, unknown>);
 	const account = accountStub(c.env, c.caller.userId);
 	const { profile: explicit, repo, company_free: companyFree, ...rest } = args as SaveInput & { candidate_id?: string };
 	const targetId = (args as { memory_id?: string }).memory_id ?? (args as { candidate_id?: string }).candidate_id;
@@ -167,7 +169,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	}
 	let target: string, routedBy: string, newBinding = false;
 	if (args.request_id) {
-		const bound = await account.bindRequest({ requestId: args.request_id, profile: route.ok ? route.value.profile : null, op, payloadHash });
+		const bound = await account.bindRequest({ requestId: args.request_id, profile: route.ok ? route.value.profile : null, op, payloadHash, ...(legacyHash ? { legacyHash } : {}) });
 		if (!bound.ok) return bound;
 		if (!bound.value.profile) return route;
 		target = bound.value.profile;
@@ -196,7 +198,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 		review_candidates: { op: "candidate", args: rest }, record_knowledge: { op: "knowledge", args: rest } })[op] as WriteCommand;
 	const res = await profileStub(c.env, ref).write(ref, cmd, {
 		actor: "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
-		platform: c.platform, routedBy, payloadHash, userId: c.caller.userId,
+		platform: c.platform, routedBy, payloadHash, ...(legacyHash ? { legacyHash } : {}), userId: c.caller.userId,
 		// The profile runs the me guard inside its transaction, after checking for a committed replay.
 		...(target === "me" ? { meGuard: { explicit: explicit === "me", context: contextProfile(c.caller, c.account.rules, repo), companyFree: companyFree === true, sensitiveTerms: c.account.sensitiveTerms } } : {}),
 	});

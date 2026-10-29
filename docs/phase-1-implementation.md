@@ -256,6 +256,30 @@ Old flow means `src/mcp.ts`, `src/profile/store.ts`, `src/profile/index.ts` and 
 - A forced provider failure or timeout returns lexically by about 3 s.
 - `EMBEDDINGS=off` is unchanged.
 
+## Recall bound-parameter fix, 2026-10-29
+
+**Symptom.** On the rehearsal's 1,330 imported records, 20 of 30 prepared golden queries failed with `too many SQL variables at offset 303: SQLITE_ERROR`, and a `kinds` query failed too ([verification](import-verification.md)).
+
+**Cause.** Cloudflare's SQLite allows 100 bound parameters per statement ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/); section 6 already recorded it). The local `workerd` enforces the same cap. Recall passed its id lists one parameter per id, in three places:
+- `lexicalFilterIds` in `src/profile/store.ts` filters the vector hits by type, kinds, scope and history. It bound up to 100 ids plus each filter. With 100 hits, the first filter is the 101st parameter: offset 303 is exactly that `memory_type = ?` in G01's type-and-scope query, and a `kinds` filter fails the same way.
+- `fuse` in `src/profile/read.ts` read every fused candidate: up to 20 exact, 200 literal, 200 full-text and 100 vector ids. With more than 100 distinct candidates it failed at offset 240, the 101st id.
+- The vector-hit presence check in `src/profile/store.ts` bound up to 100 ids. It was at the cap, not over it.
+
+The `kinds` and other filter parameters stay bounded: at most five kinds (the MCP schema), plus type and scope.
+
+**Fix.** Each id list is now one JSON parameter: `id IN (SELECT value FROM json_each(?))`. Durable Objects' SQLite includes the JSON extension ([SQL API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)). Every candidate is still read and ranked in one statement, with no truncation and no batching. Channels, limits, filters, fusion, ordering, history, isolation and token packing are unchanged, and no option was added.
+
+| Regression in `test/isolation-recall.test.ts` | Before | After |
+|---|---|---|
+| 131 records share the query's words; the 100 vector hits and the lexical channels give more than 100 candidates. The exact-name record, created after the other 130, ranks first with all four channels; 100 distinct results, in score order. A `type: feedback` query returns its 21 records, and a `kinds: ["document"]` query its 100, each over 100 vector hits. | Both old sites: `too many SQL variables at offset 240`. Only the old vector filter: `… at offset 303`, the hosted G01 message | Passes |
+
+| Check | Result |
+|---|---|
+| `npx vitest run` on `isolation-recall`, `g3-contracts`, `write-details`, `capture` and `import` | 5 files, 54 tests passed |
+| `npx tsc --noEmit`, ESLint on the touched files | No errors |
+
+The live proof, a rerun of the prepared golden queries after deployment, is Terra's.
+
 ## Live gates still open
 
 - **G1, T1 to T6.** Real Claude and Codex tokens now authenticate in direct MCP requests, but actual CLI tool calls, headless client configuration, negative real-token cases and refresh remain open. Terra reports that Clerk discovery publishes issuer `https://clerk.memory.wrick17.com`, which matches `CLERK_ISSUER`. The real access token must carry the resource in `aud` and `memory` in `scope` or `scp`; both stay required. If Clerk cannot satisfy them, the specified fallback (section 8) is the only alternative. Refresh (T4) is untested.

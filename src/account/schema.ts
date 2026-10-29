@@ -21,4 +21,9 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 	"CREATE TABLE counters (day TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (day, name)) WITHOUT ROWID",
 	...DELETED_ROWS,
 	...Object.entries(KEYS).flatMap(([t, col]) => [`CREATE INDEX ${t}_seq ON ${t} (seq, ${col})`, ...tombstoneTriggers("account_meta", t, pk(col))]),
+], [
+	// v2: a binding imported from BothQ keeps BothQ's operation and request hash; a later call is checked with BothQ's rule.
+	"ALTER TABLE request_index ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
+	// Reserved for a record still being imported: every ordinary call with the id gets busy until its record is published.
+	"ALTER TABLE request_index ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
 ]];

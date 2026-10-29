@@ -8,7 +8,15 @@ const VENDOR_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat
 const AWS_KEY = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const KEY_VALUE = /\b(password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
-const URL_PASSWORD = /([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s/@]+(@)/gi;
+// A URL's user-info password, matched from its "://". The scheme is the run of scheme characters just before it and must
+// hold a letter, exactly as BothQ's `[a-z][a-z0-9+.-]*://` requires; scanning back once per "://" keeps a long run linear,
+// where retrying that pattern at every character was quadratic (a 1 MB run took minutes).
+const URL_PASSWORD = /(:\/\/[^\s:/@]+:)[^\s/@]+(@)/g;
+const SCHEME_CHAR = /[a-z0-9+.-]/i, LETTER = /[a-z]/i;
+export function schemeBefore(text: string, end: number): boolean {
+	for (let i = end - 1; i >= 0 && SCHEME_CHAR.test(text[i]!); i--) if (LETTER.test(text[i]!)) return true;
+	return false;
+}
 
 export function redactText(value: string): string {
 	return value
@@ -18,7 +26,7 @@ export function redactText(value: string): string {
 		.replace(AWS_KEY, REDACTED)
 		.replace(JWT, REDACTED)
 		.replace(KEY_VALUE, (_m, key: string, sep: string) => `${key}${sep}${REDACTED}`)
-		.replace(URL_PASSWORD, (_m, head: string, at: string) => `${head}${REDACTED}${at}`);
+		.replace(URL_PASSWORD, (m: string, head: string, at: string, offset: number, whole: string) => (schemeBefore(whole, offset) ? `${head}${REDACTED}${at}` : m));
 }
 
 /** A redacted copy; object keys that name secrets have their whole value replaced. */

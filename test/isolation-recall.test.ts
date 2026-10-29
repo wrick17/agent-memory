@@ -112,18 +112,23 @@ describe("recall channels and the vector fallback", () => {
 			await runDurableObjectAlarm(profileStub(c, "test"));
 			for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: j.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
 		};
+		const hash = async () => runInDurableObject(profileStub(c, "test"), (_i, s) => s.storage.sql.exec<{ card_hash: string; embed_hash: string | null }>(
+			"SELECT card_hash, embed_hash FROM nodes WHERE id = ?", j.memory_id).one());
 		await settle();
+		const first = await hash();
 		await call(c, "append_memory", { memory_id: j.memory_id, content: "distinctive zeppelin harbour notes", request_id: "f3-first" });
-		expect((await call(c, "get_memory", { memory_id: j.memory_id })).embedding_status).toBe("pending");
+		// The alarm may finish before the next read, so check the card itself: the prefix append changed it.
+		expect((await hash()).card_hash).not.toBe(first.card_hash);
 		await settle();
+		const fresh = await hash();
+		expect(fresh.embed_hash).toBe(fresh.card_hash);
 		const found = await call<{ results: { memory_id: string; matched_by: string[] }[] }>(c, "recall_memories", { keyword: "zeppelin harbour", profile: "test" });
 		expect(found.results.find((r) => r.memory_id === j.memory_id)?.matched_by).toContain("vector");
 		await call(c, "append_memory", { memory_id: j.memory_id, content: "x".repeat(1300), request_id: "f3-fill" });
 		await settle();
-		const hash = async () => runInDurableObject(profileStub(c, "test"), (_i, s) => s.storage.sql.exec<{ card_hash: string }>("SELECT card_hash FROM nodes WHERE id = ?", j.memory_id).one().card_hash);
 		const full = await hash();
 		await call(c, "append_memory", { memory_id: j.memory_id, content: "past the card prefix", request_id: "f3-tail" });
-		expect(await hash()).toBe(full);
+		expect(await hash()).toEqual({ card_hash: full.card_hash, embed_hash: full.card_hash }); // card unchanged, nothing became due
 		expect((await call(c, "get_memory", { memory_id: j.memory_id })).embedding_status).toBe("embedded");
 	});
 
@@ -185,6 +190,37 @@ describe("recall channels and the vector fallback", () => {
 		expect(lexical).toMatchObject({ lexical_only: true, diagnostics: { embedding: "off", test: { embedding: "off", vector: "off" } } });
 		expect(found(lexical)).toBeDefined();
 		expect(await fake()._calls()).toBe(calls);
+	});
+
+	it("fuses more candidates than one statement's 100 bound parameters, with and without filters, and keeps every one", async () => {
+		const c = await contextFor();
+		// 130 records share the query's words, so the lexical channels and the 100 vector hits pass 100 distinct candidates.
+		for (let i = 0; i < 130; i++) {
+			await call(c, "save_memory", { name: `wombat ledger ${i}`, type: i < 110 ? "reference" : "feedback", description: "wombat ledger", content: "wombat ledger", profile: "test" });
+		}
+		const target = await call(c, "save_memory", { name: "Wombat ledger", type: "feedback", description: "wombat ledger", content: "wombat ledger", profile: "test" });
+		const stub = profileStub(c, "test");
+		for (let i = 0; i < 40; i++) {
+			await runDurableObjectAlarm(stub);
+			if (!await runInDurableObject(stub, (_i, s) => s.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE embed_hash IS NOT card_hash AND status = 'active'").one().n)) break;
+		}
+		type R = { results: { memory_id: string; type: string; kind: string; score: number; matched_by: string[] }[]; diagnostics: Record<string, Record<string, string>> };
+		const recall = (extra: Record<string, unknown>) => call<R>(c, "recall_memories", { keyword: "wombat ledger", profile: "test", limit: 100, ...extra });
+		const all = await recall({});
+		expect(all.diagnostics.test!.vector).toBe("hits:100");
+		// The exact-name record was created after the other 130 candidates and still ranks first, over the full candidate set.
+		expect(all.results[0]).toMatchObject({ memory_id: target.memory_id, matched_by: ["exact", "fulltext", "literal", "vector"] });
+		expect(new Set(all.results.map((r) => r.memory_id)).size).toBe(100);
+		expect(all.results.every((r, i) => i === 0 || r.score <= all.results[i - 1]!.score)).toBe(true);
+		// Filters on 100 vector hits: the hosted G01 shape (type) and the kind filter.
+		const feedback = await recall({ type: "feedback" });
+		expect(feedback.results).toHaveLength(21);
+		expect(feedback.results[0]!.memory_id).toBe(target.memory_id);
+		expect(feedback.results.every((r) => r.type === "feedback")).toBe(true);
+		const documents = await recall({ kinds: ["document"] });
+		expect(documents.diagnostics.test!.vector).toBe("hits:100");
+		expect(documents.results).toHaveLength(100);
+		expect(documents.results.every((r) => r.kind === "document" && r.matched_by.includes("literal"))).toBe(true);
 	});
 
 	it("packs results to the token budget", async () => {

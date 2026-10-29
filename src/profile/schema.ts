@@ -164,4 +164,44 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	...tombstoneTriggers("profile_meta", "markers", (r) => `${r}.repo`),
 	...tombstoneTriggers("profile_meta", "maintenance", (r) => `CAST(${r}.id AS TEXT)`),
 	...tombstoneTriggers("profile_meta", "guard_terms", (r) => `${r}.term`),
+], [
+	// v3: the staged import (section 16). Revisions are rebuilt to take BothQ's own operations and keep each revision's
+	// original delta and source fields; SQLite cannot widen a CHECK in place. Every existing revision is copied unchanged.
+	`CREATE TABLE revisions_v3 (
+		node_id TEXT NOT NULL, revision INTEGER NOT NULL,
+		op TEXT NOT NULL CHECK (op IN ('saved','updated','retired','superseded','restored','moved','compacted','transferred_in','appended','legacy_adopted','legacy_snapshot')),
+		snapshot TEXT NOT NULL CHECK (json_valid(snapshot)),
+		request_id TEXT, actor TEXT NOT NULL, device_id TEXT, at TEXT NOT NULL, seq INTEGER NOT NULL,
+		delta TEXT CHECK (delta IS NULL OR json_valid(delta)), revision_id TEXT, content_hash TEXT, source_platform TEXT, source_platform_version TEXT,
+		PRIMARY KEY (node_id, revision)
+	) WITHOUT ROWID`,
+	"INSERT INTO revisions_v3 (node_id, revision, op, snapshot, request_id, actor, device_id, at, seq) SELECT node_id, revision, op, snapshot, request_id, actor, device_id, at, seq FROM revisions",
+	"DROP TABLE revisions",
+	"ALTER TABLE revisions_v3 RENAME TO revisions",
+	"CREATE INDEX revisions_seq ON revisions (seq, node_id, revision)",
+	...tombstoneTriggers("profile_meta", "revisions", KEYS.revisions!),
+	// Imported BothQ requests keep their original operation, hash and result; completed_at and any other source field too.
+	"ALTER TABLE requests ADD COLUMN completed_at TEXT",
+	"ALTER TABLE requests ADD COLUMN source TEXT CHECK (source IS NULL OR json_valid(source))",
+	// One row per imported record and per staged part. A record's rows stay invisible until its state is published:
+	// its node row does not exist before then, and replay refuses its requests.
+	`CREATE TABLE import_records (
+		record_id TEXT PRIMARY KEY, record_sha256 TEXT NOT NULL, parts INTEGER NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('staging','prepared','published')), node_sha256 TEXT,
+		staged_at TEXT NOT NULL, published_at TEXT, seq INTEGER NOT NULL
+	) WITHOUT ROWID`,
+	`CREATE TABLE import_parts (
+		part_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, part INTEGER NOT NULL, sha256 TEXT NOT NULL,
+		rows_written INTEGER NOT NULL, bytes INTEGER NOT NULL, staged_at TEXT NOT NULL, seq INTEGER NOT NULL
+	) WITHOUT ROWID`,
+	"CREATE UNIQUE INDEX import_parts_record ON import_parts (record_id, part)",
+	// Only publication may create the node of a record still being imported; every other creation path is refused.
+	`CREATE TRIGGER nodes_import_fence BEFORE INSERT ON nodes
+		WHEN NEW.origin <> 'import' AND EXISTS (SELECT 1 FROM import_records WHERE record_id = NEW.id AND state <> 'published')
+		BEGIN SELECT RAISE(ABORT, 'import_pending'); END`,
+	"CREATE INDEX requests_node ON requests (node_id)",
+	"CREATE INDEX import_records_seq ON import_records (seq, record_id)",
+	"CREATE INDEX import_parts_seq ON import_parts (seq, part_id)",
+	...tombstoneTriggers("profile_meta", "import_records", (r) => `${r}.record_id`),
+	...tombstoneTriggers("profile_meta", "import_parts", (r) => `${r}.part_id`),
 ]];

@@ -13,6 +13,7 @@ const NOTES: Kind[] = ["decision", "rule", "preference", "journal", "document"];
 /**
  * The endpoint table (section 4): the node kinds each typed relation may connect, from and to. `relates_to` and `other`
  * connect anything; `supersedes` needs the same kind on both ends. A judgment edge outside this table fails with validation.
+ * Memory supersession (save_memory's `supersedes`, the import's link) follows BothQ instead: any two memories.
  */
 export const RELATION_ENDPOINTS: Partial<Record<(typeof RELATIONS)[number], { from: Kind[]; to: Kind[] }>> = {
 	works_on: { from: ["person"], to: ["project", "component", ...TRACKER] },
@@ -135,6 +136,8 @@ export interface WriteContext {
 	routedBy: string;
 	/** BothQ-style request hash over the redacted arguments, computed by the Worker and bound in AccountStore. */
 	payloadHash: string;
+	/** BothQ's hash of the same call (domain/legacy.ts), compared instead when the request id was imported from BothQ. */
+	legacyHash?: string;
 	userId: string;
 	/** Inputs for the `me` guard; required on every write to `me`. Checked after a committed replay, before any change. */
 	meGuard?: { explicit: boolean; context: string | null; companyFree: boolean; sensitiveTerms: string[] };

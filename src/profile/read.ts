@@ -55,11 +55,13 @@ function contentPage(n: NodeRow, full: string, c?: { complete: boolean; cursor?:
 /** BothQ memory_history: a newest-first window of `limit`, returned oldest first, with next_before_revision. Appends carry their entry as the delta. */
 function history(sql: SqlStorage, n: NodeRow, h: { limit: number; beforeRevision?: number }) {
 	const before = h.beforeRevision ?? Number.MAX_SAFE_INTEGER;
-	const snaps = sql.exec<{ revision: number; op: string; snapshot: string; request_id: string | null; at: string; actor: string; device_id: string | null }>(
-		"SELECT revision, op, snapshot, request_id, at, actor, device_id FROM revisions WHERE node_id = ? AND revision < ? ORDER BY revision DESC LIMIT ?",
+	const snaps = sql.exec<{ revision: number; op: string; snapshot: string; delta: string | null; request_id: string | null; at: string; actor: string; device_id: string | null }>(
+		"SELECT revision, op, snapshot, delta, request_id, at, actor, device_id FROM revisions WHERE node_id = ? AND revision < ? ORDER BY revision DESC LIMIT ?",
 		n.id, before, h.limit + 1).toArray().map((r) => {
 		const snapshot = JSON.parse(r.snapshot) as Record<string, unknown>;
-		return { revision: r.revision, operation: r.op, content_hash: snapshot.content_hash, snapshot, request_id: r.request_id, created_at: r.at, actor: r.actor, device_id: r.device_id };
+		// An imported BothQ append keeps its own revision row, with BothQ's original delta.
+		return { revision: r.revision, operation: r.op, content_hash: snapshot.content_hash, snapshot, request_id: r.request_id, created_at: r.at, actor: r.actor, device_id: r.device_id,
+			...(r.delta ? { delta: JSON.parse(r.delta) as { content: string; separator: string } } : {}) } as { revision: number; delta?: { content: string; separator: string }; entry_seq?: number } & Record<string, unknown>;
 	});
 	const entryRows = sql.exec<{ revision: number; seq_no: number; chunk: number; separator: string | null; body: string; request_id: string | null; created_at: string; actor: string }>(
 		`SELECT revision, seq_no, chunk, separator, body, request_id, created_at, actor FROM texts
@@ -71,7 +73,13 @@ function history(sql: SqlStorage, n: NodeRow, h: { limit: number; beforeRevision
 		e.delta.content += r.body;
 		entries.set(r.revision, e);
 	}
-	const window = [...snaps, ...entries.values()].sort((a, b) => b.revision - a.revision);
+	// One item per revision: an entry joins the revision row of the same number when there is one (an imported append).
+	const byRevision = new Map<number, Record<string, unknown> & { revision: number }>(snaps.map((x) => [x.revision, x]));
+	for (const e of entries.values()) {
+		const s = byRevision.get(e.revision) as (typeof snaps)[number] | undefined;
+		if (s) { s.delta ??= e.delta; s.entry_seq = e.entry_seq; } else byRevision.set(e.revision, e);
+	}
+	const window = [...byRevision.values()].sort((a, b) => b.revision - a.revision);
 	const more = window.length > h.limit;
 	const kept = window.slice(0, h.limit);
 	return { revisions: kept.reverse(), next_before_revision: more ? kept[0]!.revision : null };
@@ -138,7 +146,8 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, channels: Record
 	if (!score.size) return [];
 	const norm = normalizeName(q.keyword);
 	const ids = [...score.keys()];
-	const nodes = new Map(sql.exec<NodeRow>(`SELECT rowid, * FROM nodes WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids).toArray().map((n) => [n.id, n]));
+	// All candidates (up to 520) as one JSON parameter: Cloudflare's SQLite allows 100 bound parameters per statement.
+	const nodes = new Map(sql.exec<NodeRow>("SELECT rowid, * FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(ids)).toArray().map((n) => [n.id, n]));
 	const ranked = ids.flatMap((id) => {
 		const n = nodes.get(id);
 		if (!n) return [];

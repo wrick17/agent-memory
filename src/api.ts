@@ -1,11 +1,15 @@
 // Owner-only REST: protected-resource metadata, whoami, device tokens and the minimal Settings page (sections 8 and 15).
 import type { AccountCommand } from "./account/store";
 import { authenticate, verifyJwt } from "./auth";
-import { SCOPES } from "./domain/types";
+import { canonicalJson, sha256 } from "./domain/ids";
+import { stripPersonal } from "./domain/personal";
+import { redactPayload } from "./domain/redact";
+import { MEMORY_KINDS, MEMORY_TYPES, SCOPES } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, profileStub } from "./mcp";
-import { routeWrite } from "./routing";
+import type { ImportStep } from "./profile/store";
+import { mayUse, routeWrite } from "./routing";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
@@ -87,9 +91,138 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
 }
 
+// ---------- staged import (section 16) ----------
+
+const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
+const id = z.string().min(1).max(128);
+const iso = z.string().min(1).max(64);
+const importText = z.object({ part: z.enum(["body", "entry"]), revision: z.number().int().min(0), seq_no: z.number().int().min(0), chunk: z.number().int().min(0),
+	body: z.string().min(1).max(16_000), separator: z.string().max(10_000).nullable().optional(), request_id: z.string().max(256).nullable().optional(), created_at: iso, live: z.boolean() }).strict();
+const importRevision = z.object({ revision: z.number().int().min(0),
+	op: z.enum(["saved", "updated", "retired", "superseded", "appended", "legacy_adopted", "legacy_snapshot"]), snapshot: z.string().min(2).max(1_000_000),
+	delta: z.string().max(1_000_000).nullable(), request_id: z.string().max(256).nullable(), at: iso, content_hash: z.string().max(128).nullable(),
+	revision_id: z.string().max(300).nullable(), source_platform: z.string().max(256).nullable(), source_platform_version: z.string().max(256).nullable() }).strict();
+const importRequest = z.object({ request_id: z.string().min(1).max(256), legacy_op: z.string().min(1).max(64), legacy_hash: hex64, result: z.string().max(100_000),
+	memory_id: z.string().max(128).nullable(), at: iso, completed_at: iso.nullable(), extra: z.record(z.string(), z.unknown()).optional() }).strict();
+const importNode = z.object({
+	id, kind: z.enum(MEMORY_KINDS), memory_type: z.enum(MEMORY_TYPES), scope: z.string().min(1).max(128), name: z.string().min(1).max(512), description: z.string().max(100_000),
+	why: z.string().max(100_000).nullable(), how_to_apply: z.string().max(100_000).nullable(), objective: z.string().max(100_000).nullable(),
+	steps: z.array(z.object({ order: z.number().int(), action: z.string().max(10_000), success_criteria: z.string().max(10_000) }).strict()).max(200).nullable(),
+	status: z.enum(["active", "retired", "superseded"]), origin: z.literal("import"), revision: z.number().int().min(1), chars: z.number().int().min(0), content_hash: hex64,
+	valid_from: iso.nullable(), valid_to: iso.nullable(), created_at: iso.nullable(), updated_at: iso.nullable(), source_platform: z.string().max(256).nullable(),
+	updated_source_platform: z.string().max(256).nullable(), attrs: z.record(z.string(), z.unknown()),
+}).strict();
+const importCommand = z.discriminatedUnion("op", [
+	z.object({ op: z.literal("stage"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), part: z.number().int().min(1), parts: z.number().int().min(1).max(1000),
+		rows: z.object({ texts: z.array(importText).max(1000), revisions: z.array(importRevision).max(1000), requests: z.array(importRequest).max(1000) }).strict(),
+		cost: z.object({ rows: z.number().int(), bytes: z.number().int() }).strict(), part_id: z.string().max(300), sha256: hex64 }).strict(),
+	z.object({ op: z.literal("finalize"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), node: importNode,
+		parts: z.array(z.object({ part_id: z.string().max(300), sha256: hex64 }).strict()).min(1).max(1000), request_ids: z.array(z.string().min(1).max(256)).max(5000), sha256: hex64 }).strict(),
+	z.object({ op: z.literal("link"), src: id, rel: z.literal("supersedes"), dst: id, basis: z.literal("identifier"), profile: z.string().regex(PROFILE_NAME), sha256: hex64 }).strict(),
+]);
+const importSchema = z.object({ import_id: z.string().max(128).optional(), batch: z.number().int().min(1).optional(), commands: z.array(importCommand).min(1).max(50) }).strict();
+type ImportCommand = z.infer<typeof importCommand>;
+
+const parsed = (s: string | null) => { try { return s ? JSON.parse(s) as unknown : s; } catch { return s; } };
+/** Whether the server's redactor would change anything a command carries, its stored JSON strings parsed. The server never rewrites; it refuses. */
+function needsRedaction(c: ImportCommand): boolean {
+	const sent = c.op === "stage"
+		? { texts: c.rows.texts, revisions: c.rows.revisions.map((r) => ({ ...r, snapshot: parsed(r.snapshot), delta: parsed(r.delta) })), requests: c.rows.requests.map((q) => ({ ...q, result: parsed(q.result) })) }
+		: c.op === "finalize" ? c.node : c;
+	return canonicalJson(redactPayload(sent)) !== canonicalJson(sent);
+}
+
+type Receipt = { index: number; op: string; record_id?: string; part_id?: string; status: string; reason?: string; message?: string; rows_written?: number; bytes?: number };
+
+/**
+ * `POST /v1/import`: at most 50 typed commands and 1,000,000 bytes, from the owner or an `import`-scoped device token.
+ * Each command runs on its own and gets a receipt; nothing here trusts the client's hashes, costs or redaction. A
+ * finalize prepares the record, binds its node and request ids in AccountStore in bounded batches, then publishes it;
+ * every step is idempotent, so a retry after a crash or a lost response resumes where it stopped.
+ */
+async function importBatch(request: Request, env: Env): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const account = accountStub(env, env.OWNER_USER_ID);
+	const ctx = await account.context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	const caller = ctx.value.caller;
+	if (caller.kind !== "owner" && !caller.scopes.includes("import")) return json({ error: { code: "forbidden", message: "this token cannot import" } }, 403);
+	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return json({ error: { code: "validation", message: "send JSON" } }, 400);
+	const raw = await request.text();
+	if (Buffer.byteLength(raw, "utf8") > 1_000_000) return json({ error: { code: "size_budget", message: "an import request may hold at most 1,000,000 bytes" } }, 413);
+	let input: z.infer<typeof importSchema>;
+	try {
+		const r = importSchema.safeParse(JSON.parse(raw));
+		if (!r.success) return json({ error: { code: "validation", message: r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+		input = r.data;
+	} catch { return json({ error: { code: "validation", message: "the body is not JSON" } }, 400); }
+	const receipts: Receipt[] = [];
+	for (const [index, c] of input.commands.entries()) {
+		const base = { index, op: c.op, ...(c.op === "link" ? { record_id: c.src } : { record_id: c.record_id }), ...(c.op === "stage" ? { part_id: c.part_id } : {}) };
+		const refused = (reason: string, message: string) => receipts.push({ ...base, status: "refused", reason, message: message.slice(0, 300) });
+		const { sha256: claimed, ...body } = c as ImportCommand & { part_id?: string };
+		const hashed = c.op === "stage" ? (({ part_id: _p, ...rest }) => rest)(body as typeof body & { part_id: string }) : body;
+		if (sha256(canonicalJson(hashed)) !== claimed) { refused("hash_mismatch", "the command does not match its sha256"); continue; }
+		if (c.op === "stage" && c.part_id !== `${c.record_id}:${c.record_sha256.slice(0, 16)}:${c.part}`) { refused("part_id", "the part id does not name this record and part"); continue; }
+		if (c.op === "finalize" && c.node.id !== c.record_id) { refused("node_id", "the node id must be the record id"); continue; }
+		// No automatic me: the import never writes to me.
+		if (c.profile === "me") { refused("me", "the import never writes to me"); continue; }
+		// Each deployment names the profiles it takes imports into: production none until its copy is enabled, the
+		// rehearsal Worker only `test`. A rehearsal plan can never land in production's indexes.
+		if (!(env.IMPORT_PROFILES ?? "").split(",").map((x) => x.trim()).includes(c.profile)) { refused("import_disabled", `this deployment does not take imports into '${c.profile}'`); continue; }
+		const ref = ctx.value.profiles.find((p) => p.profile === c.profile);
+		if (!ref) { refused("profile", `profile '${c.profile}' is not active`); continue; }
+		if (!mayUse(caller, c.profile)) { refused("forbidden", `this caller may not use profile '${c.profile}'`); continue; }
+		if (needsRedaction(c)) { refused("needs_redaction", "the command holds text the redactor would change; it is refused, never rewritten"); continue; }
+		// The personal-field rule for every node (section 4): an import that would lose an attribute to it is refused, never rewritten.
+		if (c.op === "finalize" && stripPersonal(c.node.kind, c.node.attrs).stripped.length) { refused("personal_fields", "the node carries attributes the personal-field rule removes; it is refused, never rewritten"); continue; }
+		const stub = profileStub(env, ref);
+		const step = async (s: ImportStep) => stub.importStep(ref, s);
+		const take = (r: Awaited<ReturnType<typeof step>>) => {
+			if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); return null; }
+			return r.value;
+		};
+		if (c.op === "stage") {
+			// Reserve the part's request ids account-wide first, so no ordinary call in any profile can take one before publication.
+			const wanted = c.rows.requests.map((q) => ({ request_id: q.request_id, op: q.legacy_op, hash: q.legacy_hash }));
+			let reserved = true;
+			for (let i = 0; i < wanted.length; i += 400) {
+				const r = await account.reserveImport({ profile: c.profile, requests: wanted.slice(i, i + 400) });
+				if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); reserved = false; break; }
+			}
+			if (!reserved) continue;
+			const r = take(await step({ op: "stage", record_id: c.record_id, record_sha256: c.record_sha256, part: c.part, parts: c.parts, part_id: c.part_id, sha256: c.sha256, rows: c.rows }));
+			if (r) receipts.push({ ...base, status: r.status, rows_written: r.rows_written ?? 0, bytes: r.bytes ?? 0 });
+			continue;
+		}
+		if (c.op === "link") {
+			const r = take(await step({ op: "link", src: c.src, dst: c.dst }));
+			if (r) receipts.push({ ...base, status: r.status });
+			continue;
+		}
+		const fin = { record_id: c.record_id, record_sha256: c.record_sha256, node: c.node, parts: c.parts, request_ids: c.request_ids };
+		const prep = take(await step({ op: "prepare", ...fin }));
+		if (!prep) continue;
+		if (prep.status === "published") { receipts.push({ ...base, status: "replayed" }); continue; }
+		// Bindings come before publication, so no new call can take one of these request ids once the record is visible.
+		const all = prep.requests ?? [];
+		let bound = true;
+		for (let i = 0; i === 0 || i < all.length; i += 400) {
+			const r = await account.bindImport({ profile: c.profile, recordId: c.record_id, requests: all.slice(i, i + 400) });
+			if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); bound = false; break; }
+		}
+		if (!bound) continue;
+		const pub = take(await step({ op: "publish", ...fin }));
+		if (pub) receipts.push({ ...base, status: pub.status, rows_written: pub.rows_written ?? 0, bytes: pub.bytes ?? 0 });
+	}
+	return json({ ...(input.import_id ? { import_id: input.import_id } : {}), ...(input.batch ? { batch: input.batch } : {}), receipts });
+}
+
 export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
+	if (url.pathname === "/v1/import" && request.method === "POST") return importBatch(request, env);
 	if (url.pathname === "/settings" && request.method === "GET") {
 		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}

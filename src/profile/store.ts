@@ -5,12 +5,14 @@ import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
 import { candidates, fuse, get, inventory, lexicalChannels } from "./read";
 import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
+import { runImport, type ImportResult, type ImportStep } from "./import";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, type Who } from "./write";
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { APPEND_MAX, NOTE_MAX } from "./write";
+export type { ImportStep } from "./import";
 
 const RETRY_MS = 60_000;
 
@@ -50,6 +52,7 @@ export class ProfileStore extends DurableObject<Env> {
 			return ok({ ...out.result, created: out.created });
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
+			if (e instanceof Error && e.message.includes("import_pending")) return { ok: false, error: { code: "busy", message: "a record with this id is still being imported; retry later" } };
 			throw e;
 		}
 	}
@@ -68,6 +71,19 @@ export class ProfileStore extends DurableObject<Env> {
 	}
 
 	/** Capture digests and manifests (section 10). Never through the memory write path: digests are not memories. */
+	/** One step of the staged import (stage, prepare, publish, link), in one transaction. Publishing an active record schedules its embedding. */
+	async importStep(who: Who, step: ImportStep): Promise<Outcome<ImportResult>> {
+		try {
+			this.bind(who);
+			const out = runImport(this.ctx.storage, step);
+			if (out.embed && embeddingsOn(this.env) && !(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now());
+			return ok(out);
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
 	async ingest(who: Who, batch: IngestBatch): Promise<Outcome<ItemResult[]>> {
 		this.bind(who);
 		return ok(ingest(this.ctx.storage, who, batch));
@@ -140,7 +156,7 @@ export class ProfileStore extends DurableObject<Env> {
 				const prefix = `g${who.generation}:`;
 				const ids = res.matches.map((m) => m.id).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length));
 				const sql = this.ctx.storage.sql;
-				const present = new Set(ids.length ? sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids).toArray().map((r) => r.id) : []);
+				const present = new Set(ids.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(ids)).toArray().map((r) => r.id) : []);
 				const gone = ids.filter((id) => !present.has(id));
 				// Lazy cleanup, only of this generation's own ids.
 				if (gone.length) this.ctx.waitUntil(this.env.VECTORS!.deleteByIds(gone.map((id) => vectorId(who, id))).then(() => undefined, () => undefined));
@@ -181,10 +197,11 @@ function filterVector(sql: SqlStorage, q: Extract<ReadQuery, { kind: "recall" }>
 
 function lexicalFilterIds(sql: SqlStorage, q: Extract<ReadQuery, { kind: "recall" }>, ids: string[]): Set<string> {
 	const status = q.includeHistory ? "status IN ('active','retired','superseded')" : "status = 'active'";
-	const extra: string[] = [], params: SqlStorageValue[] = [...ids];
+	// The ids as one JSON parameter, so up to 100 vector hits plus the filters stay within the 100 bound parameters per statement.
+	const extra: string[] = [], params: SqlStorageValue[] = [JSON.stringify(ids)];
 	if (q.type !== "all") { extra.push("memory_type = ?"); params.push(q.type); }
 	if (q.kinds?.length) { extra.push(`kind IN (${q.kinds.map(() => "?").join(",")})`); params.push(...q.kinds); }
 	if (q.scope !== undefined) { extra.push("scope = ?"); params.push(q.scope.trim().toLowerCase()); }
-	return new Set(sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (${ids.map(() => "?").join(",")}) AND memory_type IS NOT NULL AND ${[status, ...extra].join(" AND ")}`, ...params).toArray().map((r) => r.id));
+	return new Set(sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND memory_type IS NOT NULL AND ${[status, ...extra].join(" AND ")}`, ...params).toArray().map((r) => r.id));
 }
 

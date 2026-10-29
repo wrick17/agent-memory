@@ -32,7 +32,9 @@
 		"EMBEDDINGS": "on",
 		"ROUTING_DEFAULTS": "github.com/Sequoia-Engineering/*=work,github.com/Sequoia-US/*=work,github.com/pratyush-poddar_seq/*=work,github.com/wrick17/*=personal",
 		// The one owner user in the production Clerk instance (public identifier, not a secret).
-		"OWNER_USER_ID": "user_3LKQ6KGbDJZfXH8o4UfNqcq6mig"
+		"OWNER_USER_ID": "user_3LKQ6KGbDJZfXH8o4UfNqcq6mig",
+		// Profiles this deployment takes /v1/import into. Empty: production imports stay off until the reviewed copy is enabled.
+		"IMPORT_PROFILES": ""
 	},
 	"env": {
 		// Test-only environment: AI and Vectorize are replaced by local fakes in vitest.config.ts.
@@ -54,7 +56,36 @@
 				"DASHBOARD_ORIGIN": "https://memory.test",
 				"EMBEDDINGS": "on",
 				"ROUTING_DEFAULTS": "github.com/Sequoia-Engineering/*=work,github.com/wrick17/*=personal,path:/Users/test/work=work",
-				"OWNER_USER_ID": "user_testowner0000000000000000"
+				"OWNER_USER_ID": "user_testowner0000000000000000",
+				"IMPORT_PROFILES": "test,personal,work"
+			}
+		},
+		// The import rehearsal (docs/import-implementation.md): the same code as a separate Worker, so its Durable Objects,
+		// Vectorize index and R2 generation ledger are its own. The full rehearsal keeps BothQ's original ids and request ids
+		// without taking them in production's AccountStore indexes, vectors or ledger. Provisioned and deployed by Terra.
+		"rehearsal": {
+			"name": "agent-memory-rehearsal",
+			"routes": [{ "pattern": "memory-rehearsal.wrick17.com", "custom_domain": true }],
+			"durable_objects": {
+				"bindings": [
+					{ "name": "ACCOUNT", "class_name": "AccountStore" },
+					{ "name": "PROFILE", "class_name": "ProfileStore" }
+				]
+			},
+			"ai": { "binding": "AI" },
+			"vectorize": [{ "binding": "VECTORS", "index_name": "agent-memory-cards-rehearsal" }],
+			"r2_buckets": [{ "binding": "BACKUPS", "bucket_name": "agent-memory-rehearsal-ledger" }],
+			"vars": {
+				"RESOURCE_URL": "https://memory-rehearsal.wrick17.com/mcp",
+				"CLERK_ISSUER": "https://clerk.memory.wrick17.com",
+				"CLERK_FRONTEND_API": "https://clerk.memory.wrick17.com",
+				"CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsubWVtb3J5LndyaWNrMTcuY29tJA",
+				"REQUIRED_SCOPE": "memory",
+				"DASHBOARD_ORIGIN": "https://memory-rehearsal.wrick17.com",
+				"EMBEDDINGS": "on",
+				"ROUTING_DEFAULTS": "github.com/Sequoia-Engineering/*=work,github.com/Sequoia-US/*=work,github.com/pratyush-poddar_seq/*=work,github.com/wrick17/*=personal",
+				"OWNER_USER_ID": "user_3LKQ6KGbDJZfXH8o4UfNqcq6mig",
+				"IMPORT_PROFILES": "test"
 			}
 		}
 	}

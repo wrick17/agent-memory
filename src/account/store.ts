@@ -141,10 +141,13 @@ export class AccountStore extends DurableObject<Env> {
 	 * Binds a request_id to the profile and payload hash of its first use, or returns the existing binding.
 	 * With `profile: null` it only looks up. A changed payload is refused before any write.
 	 */
-	async bindRequest(r: { requestId: string; profile: string | null; op: string; payloadHash: string }): Promise<Outcome<{ profile: string | null; existing: boolean }>> {
-		const row = this.sql.exec<{ profile: string; op: string; payload_hash: string }>("SELECT profile, op, payload_hash FROM request_index WHERE request_id = ?", r.requestId).toArray()[0];
+	async bindRequest(r: { requestId: string; profile: string | null; op: string; payloadHash: string; legacyHash?: string }): Promise<Outcome<{ profile: string | null; existing: boolean }>> {
+		const row = this.sql.exec<{ profile: string; op: string; payload_hash: string; legacy: number; pending: number }>("SELECT profile, op, payload_hash, legacy, pending FROM request_index WHERE request_id = ?", r.requestId).toArray()[0];
 		if (row) {
-			if (row.payload_hash !== r.payloadHash || row.op !== r.op) {
+			if (row.pending) return fail("busy", `request_id '${r.requestId}' belongs to a record that is still being imported; retry later`);
+			// A binding imported from BothQ is checked with BothQ's hash of the call, before the modern hash could refuse it.
+			const same = row.legacy ? row.payload_hash === r.legacyHash : row.payload_hash === r.payloadHash && row.op === r.op;
+			if (!same) {
 				return fail("idempotency_mismatch", `request_id '${r.requestId}' was already used with different arguments`, { request_id: r.requestId });
 			}
 			return ok({ profile: row.profile, existing: true });
@@ -158,6 +161,53 @@ export class AccountStore extends DurableObject<Env> {
 	/** Drops a binding this request created when the profile refused the write, so a corrected retry is not refused (BothQ rolls its request node back). */
 	async releaseRequest(requestId: string, payloadHash: string): Promise<void> {
 		this.write(() => this.sql.exec("DELETE FROM request_index WHERE request_id = ? AND payload_hash = ?", requestId, payloadHash));
+	}
+
+	/** Imported request ids already held: missing ones, and a refusal if any is bound to another call or profile. */
+	private importBindings(profile: string, requests: { request_id: string; op: string; hash: string }[]): Outcome<{ missing: typeof requests; pending: string[] }> {
+		const missing: typeof requests = [], pending: string[] = [];
+		for (const q of requests) {
+			const row = this.sql.exec<{ profile: string; op: string; payload_hash: string; legacy: number; pending: number }>("SELECT profile, op, payload_hash, legacy, pending FROM request_index WHERE request_id = ?", q.request_id).toArray()[0];
+			if (!row) missing.push(q);
+			else if (!(row.legacy === 1 && row.profile === profile && row.op === q.op && row.payload_hash === q.hash)) {
+				return fail("idempotency_mismatch", `request_id '${q.request_id}' is already bound to another call or profile`, { reason: "request_conflict", request_id: q.request_id });
+			} else if (row.pending) pending.push(q.request_id);
+		}
+		return ok({ missing, pending });
+	}
+
+	/**
+	 * Reserves a staged part's imported request ids account-wide before the part is staged (at most 400 per call, one
+	 * transaction). From then on an ordinary call with one of them gets busy in every profile. An identical reservation or
+	 * binding is kept, so a retry after a crash repairs; any other existing binding refuses the call, which writes nothing.
+	 */
+	async reserveImport(b: { profile: string; requests: { request_id: string; op: string; hash: string }[] }): Promise<Outcome<{ reserved: number }>> {
+		if (b.requests.length > 400) return fail("validation", "reserve at most 400 imported requests per call");
+		const held = this.importBindings(b.profile, b.requests);
+		if (!held.ok) return held;
+		if (held.value.missing.length) {
+			this.write((seq) => { for (const q of held.value.missing) this.sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy, pending) VALUES (?, ?, ?, ?, ?, ?, 1, 1)", q.request_id, b.profile, q.op, q.hash, now(), seq); });
+		}
+		return ok({ reserved: held.value.missing.length });
+	}
+
+	/**
+	 * Binds an imported record's node id and request ids to its profile before the record is published (at most 400
+	 * requests per call, one transaction each), turning their reservations into bindings. An identical binding is kept;
+	 * any other existing binding refuses the whole call, which then writes nothing.
+	 */
+	async bindImport(b: { profile: string; recordId: string; requests: { request_id: string; op: string; hash: string }[] }): Promise<Outcome<{ bound: number }>> {
+		if (b.requests.length > 400) return fail("validation", "bind at most 400 imported requests per call");
+		const node = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", b.recordId).toArray()[0];
+		if (node && node.profile !== b.profile) return fail("validation", `node '${b.recordId}' already belongs to profile '${node.profile}'`, { reason: "node_conflict" });
+		const held = this.importBindings(b.profile, b.requests);
+		if (!held.ok) return held;
+		this.write((seq) => {
+			if (!node) this.sql.exec("INSERT INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", b.recordId, b.profile, seq);
+			for (const q of held.value.missing) this.sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy) VALUES (?, ?, ?, ?, ?, ?, 1)", q.request_id, b.profile, q.op, q.hash, now(), seq);
+			for (const id of held.value.pending) this.sql.exec("UPDATE request_index SET pending = 0, seq = ? WHERE request_id = ?", seq, id);
+		});
+		return ok({ bound: held.value.missing.length + held.value.pending.length });
 	}
 
 	async recordNodes(profile: string, ids: string[]): Promise<void> {

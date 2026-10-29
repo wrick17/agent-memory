@@ -35,8 +35,13 @@ const PATTERNS = [
 	[/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, () => REDACTED],
 	[/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, () => REDACTED],
 	[/\b(password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, (_m, k, s) => `${k}${s}${REDACTED}`],
-	[/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s/@]+(@)/gi, (_m, h, a) => `${h}${REDACTED}${a}`],
+	// From the "://", with the scheme checked by one backward scan (see src/domain/redact.ts).
+	[/(:\/\/[^\s:/@]+:)[^\s/@]+(@)/g, (m, h, a, offset, whole) => (schemeBefore(whole, offset) ? `${h}${REDACTED}${a}` : m)],
 ];
+function schemeBefore(text, end) {
+	for (let i = end - 1; i >= 0 && /[a-z0-9+.-]/i.test(text[i]); i--) if (/[a-z]/i.test(text[i])) return true;
+	return false;
+}
 export const redact = (s) => PATTERNS.reduce((t, [re, f]) => t.replace(re, f), s);
 
 // ---------- hook ----------

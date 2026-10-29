@@ -429,7 +429,7 @@ One list in `src/domain/types.ts` defines the ontology. The zod schemas, the SQL
 | Weak | `relates_to` | anything |
 | Escape | `other` with `other_label` | anything |
 
-`src/domain/types.ts` also holds a short endpoint table per relation (`RELATION_ENDPOINTS`; for example `reviewed` is person to pr, and `supersedes` joins two nodes of one kind). A write that breaks it fails with `validation` and names the allowed kinds, or the agent uses `other`. A `node` evidence pointer must name a node of the same profile.
+`src/domain/types.ts` also holds a short endpoint table per relation (`RELATION_ENDPOINTS`; for example `reviewed` is person to pr, and `supersedes` joins two nodes of one kind). The table governs judgment edges. A supersession from `save_memory` or the import follows BothQ and joins any two memories. A write that breaks the table fails with `validation` and names the allowed kinds, or the agent uses `other`. A `node` evidence pointer must name a node of the same profile.
 
 ### Every edge says how it was made
 
@@ -644,7 +644,9 @@ Every base table has a `seq` column and an index on `(seq, primary key)`. Each w
 ```sql
 -- profile/schema.ts. Each version is a migration that runs once per object at startup.
 -- v1 (phase 1): profile_meta, nodes, texts, texts_fts, texts_tri, edges, evidence, revisions, requests, activity, cursors, deleted_rows.
--- v2 (phase 2): captures_fts, markers, maintenance, guard_terms. v3 (phase 3): archive, transfers, transfer_parts.
+-- v2 (phase 2): captures_fts, markers, maintenance, guard_terms. v3 (import vertical, 2026-10-29): revisions rebuilt for BothQ's
+-- operations and source fields, requests.completed_at and source, import_records, import_parts. v4 (phase 3): archive, transfers,
+-- transfer_parts (planned as v3 before the import vertical took that number).
 -- Control state not exported (rebuilt after a restore): cursors, transfer_parts. profile_meta goes into the export manifest.
 CREATE TABLE profile_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; -- user_id, profile, generation, schema_version, write_seq
 
@@ -876,7 +878,7 @@ Sizing for the busiest profile, `work`, after one year at measured volume (about
 | Per object | 10 GB | The FAQ says 1 GB; the limits table says 10 GB | Decades on Paid. On Free, `work` would near 1 GB in about two years. |
 | Per account | Unlimited | 5 GB | Three profiles use under 1 GB in year 1 |
 | Row or blob | 2 MB | 2 MB | Largest row is a 16k-character chunk, an 8 KB digest, or a transfer part of at most 512 KB |
-| SQL statement, bound parameters | 100 KB, 100 | same | Chunks cap bound text at 16k characters; batch inserts stay under 100 parameters |
+| SQL statement, bound parameters | 100 KB, 100 | same | Chunks cap bound text at 16k characters; batch inserts stay under 100 parameters; recall passes each id list as one JSON parameter (`json_each`) |
 
 Size caps run in the write path, whatever the source:
 
@@ -1211,7 +1213,7 @@ flowchart LR
 | Vector | The profile queries `VECTORS` with the keyword's vector, `namespace: "<userId>:<profile>:g<generation>"` of the active generation, `topK: 100`, no metadata returned, and a `kind` filter when the caller passed `kinds`. Ids are hydrated from SQLite after the generation prefix is checked; ids with no active node are skipped and deleted lazily, by their own generation-qualified id. | 100 |
 
 - Overlap and time limit (decision of 2026-10-28): semantic enrichment has one 3 s deadline, set by the Worker when it fans out. Each profile requests the keyword's embedding first. It runs the exact, literal and full-text channels while that is in flight, and sends its Vectorize query when the embedding arrives. Fusion waits for that chain only until the deadline. A slow or failing embedding or Vectorize call never stalls recall past the deadline: the answer comes from the lexical channels, and `diagnostics` names the stage that timed out or failed. A late answer is dropped. Three seconds is a product budget, not a latency guarantee. **Superseded:** the earlier 300 ms Vectorize wait, and the separate 1 s query-embedding bound added in phase 1. Live checks on this account measured about 0.2 to 1.5 s for the query embedding and 0.6 to 1.4 s for the Vectorize query, so those limits excluded every observed semantic result ([live diagnosis](phase-1-implementation.md#live-vector-channel-diagnosis)). The keyword is embedded in each profile of the read set, so a work-plus-`me` recall makes two small embedding calls.
-- Fusion: RRF k=60 per channel, BothQ's literal boosts (+2 exact name, +1 name contains), origin weight (stated 1.0, agent 0.9, upload 0.8, inferred 0.7). Captures are excluded unless `include_captures` is set. Superseded, retired and moved nodes are excluded unless `include_history` is set or `as_of` falls in their valid time.
+- Fusion: RRF k=60 per channel, BothQ's literal boosts (+2 exact name, +1 name contains), origin weight (stated 1.0, agent 0.9, upload 0.8, inferred 0.7). Every candidate, up to 520 across the four channels, is read and ranked; filtering the vector hits and reading the candidates each pass their ids as one JSON parameter, inside the 100-parameter limit (section 6). *Fixed 2026-10-29:* one parameter per id failed past 100 on the rehearsal corpus ([fix](phase-1-implementation.md#recall-bound-parameter-fix-2026-10-29)). Captures are excluded unless `include_captures` is set. Superseded, retired and moved nodes are excluded unless `include_history` is set or `as_of` falls in their valid time.
 - Empty keyword: the profile skips the channels and lists records in row order (stable creation order) after the cursor's position, and the Worker returns `next_cursor` holding each profile's last position.
 - Link expansion: the top 10 fused nodes seed a one-hop walk, inside the read set only (links into other profiles are not followed in recall), over current edges with basis `identifier` or `judgment` in the structural, work and reasoning classes, reading at most 1,000 edge rows. A neighbor scores the sum of its seeds' scores times a relation weight (reasoning 1.0, work 0.8, structural 0.6), divided by `1 + log(degree)` so hubs do not flood the list. Neighbors join as a `graph` channel, and each carries `via {from, rel, basis, reason}`. `expand: false` turns this off.
 - Passages: 700 characters around the best match in the best chunk, from FTS5 `snippet()` offsets.
@@ -1491,20 +1493,36 @@ The pipeline is one-time work on the owner's machine, run in the foreground. Mec
 | 5. Mechanical pass | Luna | Name normalization, exact-hash dedupe, schema validation of every record, chunking above 16k characters, and the `me` guard run locally so blocked records go to the review list instead of failing at import. |
 | 6. Route | Terra's proposal plus routing rules | Records with no rule match or low confidence go to the review list |
 | 7. Session digests | The local digest builder (section 10), no model | The corpus's `session_messages`, `session_decisions` and `user_directives` become one digest per session, with positions that point into the local corpus file. No message text leaves the machine. |
-| 8. Import | `agent-memory migrate upload` | Batches of 50 commands to `/v1/import` (`import` token, actor `migration`). `request_id = migrate:<source>:<source id>:<content hash>`. Every imported `MemoryRequest` id is also bound in `AccountStore.request_index` to the record's profile. |
+| 8. Import | `local/upload.mjs` | Batches of at most 50 commands and 1,000,000 bytes to `/v1/import` (`import` token or owner, actor `migration`), in the staged protocol below. Command and part ids come from the record's content hash, so a rerun replays. Every imported `MemoryRequest` id is bound in `AccountStore.request_index` to the record's profile before the record is published. |
 | 9. Embed | Cloudflare | Alarm steps embed the imported cards into each profile's active namespace (about 2,600 neurons once) |
 
 Every batch writes its output file atomically and records itself in `migration/state.json` (source cursor, batch number, request ids sent). A rerun skips finished batches, and the server replays any request it already applied, so a sleep, crash or network drop loses nothing and a rerun creates no duplicates.
 
+### The staged import protocol
+
+Implemented 2026-10-29 (`src/profile/import.ts`, `/v1/import` in `src/api.ts`, `docs/import-implementation.md`). A record crosses two objects, its profile and `AccountStore`, so it cannot land in one transaction. It lands in ordered, idempotent steps instead, and is invisible until the last one:
+
+1. **Stage.** First `AccountStore` reserves the part's request ids account-wide (pending bindings, at most 400 per transaction); from then on an ordinary call with one of them gets `busy` in every profile, and an identical reservation is kept, so a retry after a crash repairs. Then each part is one profile transaction: text, revision and request rows under the record id, plus an `import_parts` ledger row. The same part id with the same hash replays; another hash is refused. A record that is already staged or imported with different content, an existing node (checked for every new part), or a request id already held elsewhere is refused, never overwritten.
+2. **Prepare.** One profile transaction checks that every part is staged with its hash, that the node matches the record, and that the staged requests are the ones listed. It then marks the record `prepared` with the node's hash and returns the request ids, operations and BothQ hashes.
+3. **Bind.** `AccountStore` binds the node id and turns every reservation into a binding, at most 400 per transaction. An identical existing binding is kept; any other refuses that batch whole.
+4. **Publish.** One profile transaction writes the node row and its head, which makes the record searchable, readable and replayable at once, and schedules its embedding. A hosted write that took the same identity meanwhile makes publication refuse; the import never replaces it.
+5. **Link.** A supersession is written between two different published memories of the profile, of any kinds. BothQ and `save_memory` let one memory type replace another, so a feedback rule can replace a project decision. The planner links only to a record the plan publishes in the same profile. Any other supersession, and any refused link, is listed for review; BothQ's raw relationship stays in the record's provenance. *Corrected 2026-10-29:* this step required one kind on both ends, the judgment-edge rule of section 4. That refused five genuine BothQ supersessions in the hosted rehearsal ([link fix](import-implementation.md#link-contract-fix-2026-10-29)).
+
+Before publication the record has no node row, so `get`, history, name lookup, inventory, full-text, trigram and vector channels cannot see it. No ordinary write can create a node with its id: a trigger on `nodes` refuses every creation path but publication, and the write returns `busy`. A call that reuses one of its request ids gets `busy`, never a write. A crash or a lost response at any step is repaired by sending the same command again: each step resumes or replays. Every step counts what it writes, as Cloudflare reports it per statement (`rowsWritten`: the row and its index entries, and the full-text and trigram rows a live text adds), plus the UTF-8 bytes of its parameters, with live text counted three times for its two index copies, and rolls back whole past 1,000 rows or 1,000,000 bytes; the client's cost is never trusted. This is the bound section 5 needs: it caps the `seq`-stamped base-table rows, and their index entries, that one transaction adds for the export to read. It does not bound every internal SQLite mutation: full-text segment writes that SQLite defers to commit are not attributed to a statement, and SQLite's connection-wide `total_changes()` counts more (3,499 against 956 surfaced for one 190-live-row part in the import review). Neither is exported, and Cloudflare documents no 1,000-row transaction limit; the bound is this design's own. The server also refuses any command its redactor would change, and any node the personal-field rule (section 4) would change; it never rewrites one. Imports into `me` are refused, and each deployment lists the profiles it accepts imports into (`IMPORT_PROFILES`).
+
 ### Replaying a BothQ-era request
 
-When a call arrives with a `request_id` that has an imported request record, the profile checks it with BothQ's own rule: the SHA-256 of `{"operation": op, "arguments": args without request_id}` over the redacted arguments, with BothQ's operation names. An Agent Memory call maps to them as BothQ's tools did: `save_memory` without identity is `save`, with identity is `update`, with `retire: true` is `retire`, and `append_memory` is `append`. A matching hash replays the stored BothQ result. A different hash returns `idempotency_mismatch`. Requests first seen in Agent Memory use the Agent Memory hash.
+When a call arrives with a `request_id` that has an imported request record, the profile checks it with BothQ's own rule: the SHA-256 of `{"operation": op, "arguments": args without request_id}` over the redacted arguments, with BothQ's operation names. An Agent Memory call maps to them as BothQ's tools did: `save_memory` without identity is `save`, with identity is `update`, with `retire: true` is `retire`, and `append_memory` is `append`. Arguments that only Agent Memory sends (`profile`, `repo`, `company_free`, and `retire` for a retire) are left out, since BothQ never received them. A matching hash replays the stored BothQ result. A different hash returns `idempotency_mismatch`. Requests first seen in Agent Memory use the Agent Memory hash. `AccountStore` makes the same check first, on the binding it imported, so the modern hash never refuses a legitimate BothQ-era retry.
+
+### Rehearsal isolation
+
+Imported records keep BothQ's ids, and their request ids are bound account-wide. A full rehearsal into production's `test` profile would therefore take those ids in production's `AccountStore`, and since rehearsal data is never deleted, the later copy into `work` and `personal` would collide with it. The rehearsal runs instead on a separate Worker with the same code, `agent-memory-rehearsal` (`env.rehearsal` in `wrangler.jsonc`, `memory-rehearsal.wrick17.com`). It has its own Durable Objects (its own `AccountStore` with its own devices, node index, request index and generation mirror), its own Vectorize index `agent-memory-cards-rehearsal`, and its own R2 bucket `agent-memory-rehearsal-ledger` for its generation ledger. The rehearsal keeps every original id and result, and production's indexes, vectors and ledger never see them; production's later recovery reconciliation never reads the rehearsal ledger. Its `IMPORT_PROFILES` is `test` only, production's is empty until the reviewed copy is enabled, and the uploader sends a rehearsal plan only to a config marked `rehearsal`, never following a redirect. The rehearsal Worker uses the same Clerk instance. Its `import` device token comes from an owner OAuth access token for the rehearsal resource (an isolated CLI login, audience `https://memory-rehearsal.wrick17.com/mcp`, scope `memory`) sent to the existing owner API `POST /api/devices`, which accepts such a token; no Settings origin, satellite domain or new endpoint is needed (decision of 2026-10-29). A live check must show Clerk binds that resource into the token's audience. If it does not, the fallback is a nested host under Clerk's root, `rehearsal.memory.wrick17.com`, with owner sign-in on its Settings page; the rehearsal's own audience and scope checks are never relaxed. This is not backup or restore.
 
 ### Rehearsals during the build
 
 | When | What runs | What it can check |
 |---|---|---|
-| Import vertical (owner priority, 2026-10-29) | Steps 1, 2, 4, 5, 6, 8 and 9 plus the curated Markdown files, first into `test`, then into the hosted profiles as the reviewable copy | Verification 1, 2 and 5 to 8 below, plus the import checks of section 22 |
+| Import vertical (owner priority, 2026-10-29) | Steps 1, 2, 4, 5, 6, 8 and 9 plus the curated Markdown files, first into the `test` profile of the separate rehearsal Worker (rehearsal isolation, above), then into the production profiles as the reviewable copy | Verification 1, 2 and 5 to 8 below, plus the import checks of section 22 |
 | Phase 2 | Steps 1 to 9 into the `test` profile, with the corpus session tables only | Verification 1 to 9 below. Verification 10, the restore drill, waits for the final backup stage (owner decision, 2026-10-29) |
 | After phase 3 | The full pipeline again, now with graph tools and transfers built | Verification 1 to 9 |
 | Final backup stage | The restore drill on the rehearsal data | Verification 10 |
@@ -1923,24 +1941,27 @@ Added by the owner priority of 2026-10-29. It makes the existing memory availabl
 - **Depends on:** phase 1 and the capture vertical's review fixes (a stable shared core). A read-only source inventory (`research/05-current-memory-import.md`) refreshes the counts and paths of `research/02` first.
 - **Builds:**
 	- `agent-memory migrate`: export (step 1, read-only Cypher and read-only file reads), history import (2), dates (4), mechanical pass with the local `me` guard (5), routing with the review list (6), upload (8), with `migration/state.json` cursors so a rerun resumes and skips finished batches.
-	- `/v1/import` with the `import` scope and actor `migration`: node ids are the BothQ `memory_id`s; revisions keep their original numbers, operations and dates; `MemoryRequest`s become `requests` rows with `legacy_op`, `legacy_hash` and the stored result, bound in `AccountStore.request_index`; each batch within the 1,000-row and 1 MB bound. The `me` guard, routing and personal-field stripping apply as on every write.
+	- `/v1/import` with the `import` scope (or the owner) and actor `migration`, in the staged protocol of section 16: node ids are the BothQ `memory_id`s; revisions keep their original numbers, operations, snapshots, deltas and dates; `MemoryRequest`s become `requests` rows with `legacy_op`, `legacy_hash` and the stored result, bound in `AccountStore.request_index` before publication; each command within 1,000 rows and 1,000,000 bytes, counted by the server. Schema v3 (profile) and v2 (account) carry it. Nothing is imported into `me`.
+	- `local/upload.mjs`, the foreground uploader: a private config and token file, an acknowledgement saved after each batch, bounded retries, and a stop with a report on any refusal.
+	- The rehearsal Worker configuration (section 16, "Rehearsal isolation").
 	- BothQ-era replay (section 16, "Replaying a BothQ-era request").
 	- Curated Markdown files as records with their path and SHA-256 as provenance, byte-exact content, `attrs.validity = "unknown"` and the file's own date only as `attrs.first_recorded_at`; no valid date is invented.
 	- The BothQ compatibility tests for the memory tools.
-- **Checks**, first into `test`, then into the hosted profiles:
+- **Checks**, first into the rehearsal Worker's `test` profile, then into the production profiles:
 	- Migration verification 1, 2 and 5 to 8 (section 16), and every memory-tool row of the BothQ checklist (section 7).
 	- Every curated Markdown file comes back byte for byte through `get_memory` with `complete: true`, and its hash matches the manifest.
 	- A run killed mid-batch resumes with no duplicates. A second full run changes nothing: every request replays and every count is unchanged.
 	- The BothQ database and every Markdown file have the same hashes after the run as before.
 	- Records the `me` guard blocks, unrouted records and low-confidence routes are in the review list, not imported into a guessed profile.
 	- Verification 4 (the 30 golden queries) runs once the owner has chosen them.
+- **Copy into production.** After the independent review and a passing rehearsal, records that are routed with confidence and pass every check are copied into `work` and `personal` without a further owner prompt; the owner authorized the non-deleting ingest. Only held or ambiguous records (missing or mixed scope, an ambiguous or unrouted path, a redaction hold, an identity conflict, a reference candidate) wait, for classification from existing evidence or, failing that, an owner question.
 
 ### Phase 3: knowledge graph, cleanup, transfers and wipe
 
 - **Depends on:** phase 2 and the import vertical.
 - **Builds:**
 	- Identifier extraction and structural relations, similarity edges, `explore`, `trace` and `timeline` with work budgets and explicit cross-profile following, and link-expanded recall.
-	- Schema v3 (`archive`, `transfers`, `transfer_parts`), `maintenance_next` and `maintenance_complete`, and the daily batch on the phase-2 confined runtime.
+	- Schema v4 (`archive`, `transfers`, `transfer_parts`; planned as v3 until the import vertical took that number on 2026-10-29), `maintenance_next` and `maintenance_complete`, and the daily batch on the phase-2 confined runtime.
 	- TTL (90 days), purge (300 days), exact dedupe and size caps, with undo for every op.
 	- The transfer protocol and its own crash recovery. The reconciliation's transfer rules, which run after a restore, arrive in the final backup stage.
 	- The full `me` guard with sensitive terms updated in the same request, the model of the owner, `dangling_link` items, and the profile wipe.

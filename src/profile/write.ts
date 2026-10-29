@@ -119,10 +119,10 @@ export function cardText(n: { kind: string; name: string; description: string; w
 	return [`${n.kind}: ${n.name}`, n.description, n.why ?? "", body.slice(0, CARD_PREFIX)].filter(Boolean).join("\n");
 }
 
-const headText = (n: { name: string; description: string; why: string | null; how_to_apply: string | null; objective: string | null }, steps: Step[]) =>
+export const headText = (n: { name: string; description: string; why: string | null; how_to_apply: string | null; objective: string | null }, steps: Step[]) =>
 	[n.name, n.description, n.why, n.how_to_apply, n.objective, ...steps.map((s) => `${s.order}. ${s.action} (${s.success_criteria})`)].filter(Boolean).join("\n");
 
-const chunks = (text: string) => {
+export const chunks = (text: string) => {
 	const out: string[] = [];
 	for (let i = 0; i < text.length; i += CHUNK) out.push(text.slice(i, i + CHUNK));
 	return out.length ? out : [""];
@@ -574,9 +574,12 @@ export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteComm
 		const sql = storage.sql;
 		const requestId = cmd.args.request_id ?? null;
 		if (requestId) {
-			const row = sql.exec<{ payload_hash: string; result: string }>("SELECT payload_hash, result FROM requests WHERE request_id = ?", requestId).toArray()[0];
+			const row = sql.exec<{ payload_hash: string; result: string; legacy_hash: string | null; state: string | null }>(
+				`SELECT r.payload_hash, r.result, r.legacy_hash, i.state FROM requests r LEFT JOIN import_records i ON i.record_id = r.node_id WHERE r.request_id = ?`, requestId).toArray()[0];
 			if (row) {
-				if (row.payload_hash !== ctx.payloadHash) {
+				// An imported request replays only once its record is published, and only for the same call by BothQ's own hash.
+				if (row.state && row.state !== "published") throw Fail.of("busy", `request_id '${requestId}' belongs to a record that is still being imported; retry later`);
+				if (row.payload_hash !== (row.legacy_hash ? ctx.legacyHash : ctx.payloadHash)) {
 					throw Fail.of("idempotency_mismatch", `request_id '${requestId}' was already used with different arguments`, { request_id: requestId });
 				}
 				return { result: { ...(JSON.parse(row.result) as Record<string, unknown>), action: "replayed" }, created: [], embedDue: false };

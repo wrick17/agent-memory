@@ -53,11 +53,15 @@ function journal(id, { appends = 120, size = 3000, scope = "personal" } = {}) {
 		props: { ...fields, content, rule: content, content_hash: m.bothqContentHash({ ...fields, content }), _version: rev }, revisions, requests });
 }
 
+/** A synthetic export bundle with a manifest that pins its bytes, as `export` writes one. */
 function makeExport(records, files = []) {
 	const dir = fs.mkdtempSync(path.join(tmp, "export-"));
 	writeJsonl(path.join(dir, "bothq", "records.jsonl"), records);
 	writeJsonl(path.join(dir, "markdown", "files.jsonl"), files);
-	fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ version: 1, synthetic: dir }));
+	const hash = (f) => sha256(fs.readFileSync(f, "utf8"));
+	fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ version: 1, synthetic: dir,
+		bothq: { records: records.length, records_jsonl_sha256: hash(path.join(dir, "bothq", "records.jsonl")) },
+		markdown: { distinct: files.length, files_sha256: sha256(files.map((f) => `${f.realpath}\t${f.sha256}`).join("\n")), files_jsonl_sha256: hash(path.join(dir, "markdown", "files.jsonl")) } }));
 	return dir;
 }
 const planned = (dir, sub = "plan") => readJsonl(path.join(dir, sub, "commands.jsonl"));
@@ -82,6 +86,14 @@ describe("BothQ compatibility", () => {
 		assert.equal(uuid5("sequoia:project:some name"), "31275195-8a2d-598e-ab30-bf8616ecb301");
 	});
 
+	it("redaction stays linear on a long run and still redacts URL passwords", async () => {
+		const { redactText } = await import("../src/domain/redact.ts");
+		const t0 = performance.now();
+		assert.equal(redactText("x".repeat(1_000_000)), "x".repeat(1_000_000));
+		assert.ok(performance.now() - t0 < 2000, "a 1 MB run took minutes before the scheme was bounded");
+		assert.equal(redactText("see https://user:hunter2@host/x"), "see https://user:[REDACTED]@host/x");
+	});
+
 	it("the exporter rereads a record that changed during its read and reports one that vanished", () => {
 		const r = spawnSync("python3", [path.join(import.meta.dirname, "migrate", "export_bothq.py"), "--self-test"], { encoding: "utf8" });
 		assert.equal(r.status, 0, r.stderr);
@@ -91,7 +103,7 @@ describe("BothQ compatibility", () => {
 
 describe("plan", () => {
 	it("splits a huge journal into parts inside the budget and keeps its text, revisions and requests byte for byte", async () => {
-		const j = journal("11111111-1111-5111-8111-111111111111");
+		const j = journal("11111111-1111-5111-8111-111111111111", { appends: 400 });
 		const dir = makeExport([j]);
 		const r = await m.plan({ exportDir: dir });
 		assert.equal(r.manifest.planned, 1);
@@ -224,5 +236,159 @@ describe("markdown", () => {
 		assert.deepEqual((await m.verify({ exportDir: dir, sources: src, bothq: false })).markdown, { changed: 1, added: 0, vanished: 0 });
 		assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
 		assert.equal(fs.statSync(path.join(dir, "markdown", "files.jsonl")).mode & 0o777, 0o600);
+	});
+});
+
+// Review E1-E6 (docs/review-sol-import-export-2026-10-29.md), each from the reviewer's counterexample.
+describe("export review fixes", () => {
+	const legacy = (name, props = {}, extra = {}) => record({ eid: `eid-${name}`, legacyId: uuid5(`personal:project:${name}`), scope: "personal", name, props: { content: "safe", ...props }, ...extra });
+
+	it("E1: holds a record whose provenance or stored request result carries a secret, by pattern or by key", async () => {
+		const b = legacy("private-result");
+		b.requests = [{ request_id: "fake-req", operation: "save", request_hash: sha256("fake-hash"), result: JSON.stringify({ password: "FAKE-REVIEW-VALUE" }), _created: dt("2026-01-01T00:00:00Z") }];
+		const dir = makeExport([legacy("private-provenance", { source_note: "token=FAKE-REVIEW-VALUE" }), b]);
+		const r = await m.plan({ exportDir: dir });
+		assert.deepEqual([r.manifest.planned, r.manifest.holds], [0, 2]);
+		assert.deepEqual(reviewOf(dir).map((x) => x.reasons), [["needs_redaction"], ["needs_redaction"]]);
+		for (const f of ["commands.jsonl", "review.jsonl", "manifest.json"]) assert.ok(!fs.readFileSync(path.join(dir, "plan", f), "utf8").includes("FAKE-REVIEW-VALUE"), f);
+		for (const h of fs.readdirSync(path.join(dir, "plan", "holds"))) assert.ok(!fs.readFileSync(path.join(dir, "plan", "holds", h), "utf8").includes("FAKE-REVIEW-VALUE"), "the held copy is redacted too");
+	});
+
+	it("E2: holds a Claude folder name that more than one existing checkout encodes to", () => {
+		const base = fs.mkdtempSync(path.join(tmp, "amb-"));
+		const work = path.join(base, "a", "b"), personal = path.join(base, "a-b");
+		for (const [d, remote] of [[work, "git@github.com:Sequoia-Engineering/review.git"], [personal, "git@github.com:wrick17/review.git"]]) {
+			fs.mkdirSync(d, { recursive: true });
+			spawnSync("git", ["init", "-q", d]);
+			spawnSync("git", ["-C", d, "remote", "add", "origin", remote]);
+		}
+		const project = personal.replace(/[/._]/g, "-");
+		assert.equal(project, work.replace(/[/._]/g, "-"));
+		assert.deepEqual(m.decodeProjectDirs(project), [work, personal].sort());
+		const it = m.markdownItem({ system: "claude", project, rel: "topic.md", category: "claude_topic", content: "Personal project note", realpath: path.join(base, "t.md"), paths: [],
+			sha256: sha256("Personal project note"), bytes: 21, birthtime: "2026-01-01T00:00:00Z", mtime: "2026-01-01T00:00:00Z" }, m.defaultRouting());
+		assert.equal(it.route, null);
+		assert.deepEqual(it.review, ["ambiguous_project_path"]);
+	});
+
+	it("E3: never accepts a Markdown body that was rewritten during its read", () => {
+		const root = fs.mkdtempSync(path.join(tmp, "race-"));
+		const file = path.join(root, "raw_memories.md");
+		const old = "A".repeat(1_048_576), fresh = "B".repeat(1_048_576);
+		fs.writeFileSync(file, old);
+		const orig = fs.readSync;
+		let fired = 0;
+		// The rewrite lands after the first half of the first read, as in the review's repro; then once more on the retry.
+		fs.readSync = function (fd, buffer, offset, length, position) {
+			const n = orig.call(this, fd, buffer, offset, Math.min(length, 524_288), position);
+			if (fired < 1) { fired++; fs.writeFileSync(file, fresh); }
+			return n;
+		};
+		let got;
+		try { got = m.enumerateMarkdown({ claudeRoots: [], codexRoot: root }).files[0]; } finally { fs.readSync = orig; }
+		assert.equal(got.sha256, sha256(fresh), "the stable reread, never a mix");
+		assert.equal(got.content, fresh);
+		// A file that never holds still for a read is held with no content.
+		fs.readSync = function (fd, buffer, offset, length, position) { const n = orig.call(this, fd, buffer, offset, Math.min(length, 524_288), position); fs.writeFileSync(file, `${Date.now()}${Math.random()}`.repeat(1000)); return n; };
+		try { got = m.enumerateMarkdown({ claudeRoots: [], codexRoot: root }).files[0]; } finally { fs.readSync = orig; }
+		assert.deepEqual([got.unstable, got.content, got.sha256], [true, undefined, null]);
+		assert.deepEqual(m.markdownItem(got, m.defaultRouting()).review.includes("unstable_read"), true);
+	});
+
+	it("E4: keeps a supersession's raw relationship and properties in provenance as well as the link", async () => {
+		const oldId = uuid5("personal:project:old");
+		const rel = { type: "SUPERSEDES", outgoing: true, props: { _created: dt("2026-01-01T00:00:00Z"), reason: "renamed" }, other_memory_id: oldId, other_eid: "old-eid", other_labels: ["MemoryRecord"] };
+		const item = m.bothqItem(legacy("successor", {}, { rels: [rel] }));
+		assert.deepEqual(item.node.attrs.source.relationships, [rel]);
+		assert.deepEqual(item.supersedes, [oldId]);
+	});
+
+	it("links a supersession only to a record the plan publishes in the same profile, and lists the rest for review", async () => {
+		const rel = (id) => ({ type: "SUPERSEDES", outgoing: true, props: {}, other_memory_id: id, other_eid: `eid-${id}`, other_labels: ["MemoryRecord"] });
+		const [old, big, work] = [uuid5("personal:project:old"), uuid5("personal:project:oversize-old"), uuid5("sequoia:project:work-old")];
+		const dir = makeExport([legacy("new", {}, { rels: [rel(old), rel(big), rel(work)] }), legacy("old"), legacy("oversize-old", { legacy_notes: "x".repeat(1_020_000) }),
+			record({ eid: "eid-work-old", legacyId: work, scope: "sequoia", name: "work-old", props: { content: "safe" } })]);
+		await m.plan({ exportDir: dir });
+		assert.deepEqual(planned(dir).filter((c) => c.op === "link").map((c) => c.dst), [old]);
+		assert.deepEqual(reviewOf(dir).filter((x) => x.reasons.includes("link_endpoint_unresolved")).map((x) => x.link.dst).sort(), [big, work].sort());
+	});
+
+	it("E5: holds a record whose finalize command would not fit one request, and dry-run checks every command and batch", async () => {
+		const dir = makeExport([legacy("oversize-finalize", { legacy_notes: "x".repeat(1_020_000) }), legacy("ordinary")]);
+		const r = await m.plan({ exportDir: dir });
+		assert.equal(r.manifest.planned, 1);
+		assert.deepEqual(reviewOf(dir).find((x) => x.key === "bothq:eid-oversize-finalize").reasons, ["oversize_command"]);
+		const d = m.dryRun({ exportDir: dir });
+		assert.deepEqual([d.over_budget_parts, d.over_budget_commands, d.over_budget_batches], [0, 0, 0]);
+		assert.ok(d.max_command_bytes < m.BUDGET.bytes);
+	});
+
+	it("E6: refuses an export whose files changed after their manifest was written, before reuse or planning", async () => {
+		const r = legacy("rewrite", { content: "before" });
+		const dir = makeExport([r]);
+		await m.plan({ exportDir: dir });
+		r.props.content = "after";
+		writeJsonl(path.join(dir, "bothq", "records.jsonl"), [r]);
+		await assert.rejects(m.plan({ exportDir: dir }), /does not match its manifest \(bothq\/records\.jsonl hash\)/);
+		await assert.rejects(m.plan({ exportDir: dir, force: true }), /does not match its manifest/);
+		const md = makeExport([], [{ system: "codex", rel: "MEMORY.md", category: "codex_memory", realpath: "~/x/MEMORY.md", paths: ["~/x/MEMORY.md"], content: "one", sha256: sha256("one"), bytes: 3 }]);
+		const files = readJsonl(path.join(md, "markdown", "files.jsonl"));
+		files[0].content = "two";
+		writeJsonl(path.join(md, "markdown", "files.jsonl"), files);
+		await assert.rejects(m.plan({ exportDir: md }), /markdown\/files\.jsonl hash/);
+	});
+});
+
+// Closure review (docs/review-sol-import-export-fixes-2026-10-29.md): E2 with consecutive separators, and the URL scheme cap.
+describe("export closure fixes", () => {
+	it("E2: every reading of consecutive separators is listed, hidden folders included, and the record is held", () => {
+		const base = fs.mkdtempSync(path.join(tmp, "amb2-"));
+		const dirs = ["a/.b", "a--b", "a._b", "a_-b"].map((d) => path.join(base, d));
+		for (const d of dirs) fs.mkdirSync(d, { recursive: true });
+		const project = path.join(base, "a--b").replace(/[/._]/g, "-");
+		for (const d of dirs) assert.equal(d.replace(/[/._]/g, "-"), project, "all four encode to one folder name");
+		assert.deepEqual(m.decodeProjectDirs(project), [...dirs].sort());
+		const it = m.markdownItem({ system: "claude", project, rel: "t.md", category: "claude_topic", content: "note", realpath: path.join(base, "t.md"), paths: [],
+			sha256: sha256("note"), bytes: 4, birthtime: "2026-01-01T00:00:00Z", mtime: "2026-01-01T00:00:00Z" }, m.defaultRouting());
+		assert.deepEqual([it.route, it.review], [null, ["ambiguous_project_path"]]);
+		// A search that outgrows its bound reports no candidates rather than a partial set.
+		assert.equal(m.decodeProjectDirs(project, 3), null);
+	});
+
+	it("URL passwords redact for every scheme length, as the original pattern did, and a long run stays fast", async () => {
+		const { redactText } = await import("../src/domain/redact.ts");
+		const { redact } = await import("./agent-memory.mjs");
+		// BothQ's original pattern, unbounded: correct, but quadratic on long runs, so it only sees short inputs here.
+		const original = (s) => s.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s/@]+(@)/gi, (_m, h, a) => `${h}[REDACTED]${a}`);
+		const cases = ["see https://user:hunter2@host/x", `${"a".repeat(64)}://u:pw@h/p`, `a${"1".repeat(64)}://u:pw@h/p`, "1111://u:pw@h/p", "+.-://u:pw@h",
+			"x1a://u:pw@h and B2://v:qq@k", "a://u:p@b://v:q@c", "AB+c.d-e://U:P@H", "mailto:u@h", "no url here", "://u:p@h", "a ://u:p@h"];
+		for (const c of cases) {
+			assert.equal(redactText(c), original(c), c);
+			assert.equal(redact(c), original(c), `local mirror: ${c}`);
+		}
+		assert.ok(!redactText(`a${"1".repeat(64)}://user:SECRETPW@host/p`).includes("SECRETPW"), "the 65-character scheme");
+		for (const big of ["x".repeat(1_000_000), `a${"1".repeat(1_000_000)}://u:SECRETPW@h`]) {
+			const t0 = performance.now();
+			const out = redactText(big), local = redact(big);
+			assert.ok(performance.now() - t0 < 2000, "linear on a 1 MB run");
+			assert.equal(out, local);
+			assert.ok(!out.includes("SECRETPW"));
+		}
+	});
+
+	it("S2: dry-run refuses a batch schedule that was changed, renumbered or left without its hash", async () => {
+		const dir = makeExport(Array.from({ length: 30 }, (_, i) => record({ eid: `b${i}`, legacyId: uuid5(`personal:project:n${i}`), scope: "personal", name: `n${i}`, props: { content: `c${i}` } })));
+		await m.plan({ exportDir: dir, rehearsal: "test" });
+		assert.equal(m.dryRun({ exportDir: dir, rehearsal: "test" }).batches, 2);
+		const sub = path.join(dir, "plan-rehearsal-test");
+		const batches = readJsonl(path.join(sub, "batches.jsonl"));
+		writeJsonl(path.join(sub, "batches.jsonl"), [batches[0], { ...batches[1], batch: 1 }]);
+		assert.throws(() => m.dryRun({ exportDir: dir, rehearsal: "test" }), /batches\.jsonl is missing or does not match/);
+		// Resealed in the manifest, the renumbered schedule still fails its coverage check.
+		const manifest = JSON.parse(fs.readFileSync(path.join(sub, "manifest.json"), "utf8"));
+		fs.writeFileSync(path.join(sub, "manifest.json"), JSON.stringify({ ...manifest, batches_sha256: sha256(fs.readFileSync(path.join(sub, "batches.jsonl"), "utf8")) }));
+		assert.throws(() => m.dryRun({ exportDir: dir, rehearsal: "test" }), /exactly once, in order/);
+		fs.writeFileSync(path.join(sub, "manifest.json"), JSON.stringify({ ...manifest, batches_sha256: undefined }));
+		assert.throws(() => m.dryRun({ exportDir: dir, rehearsal: "test" }), /missing or does not match/);
 	});
 });
