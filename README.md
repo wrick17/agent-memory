@@ -10,7 +10,7 @@ The private MCP server is running for owner testing. Selected memory reads and r
 
 The [feature manifest](docs/feature-manifest.md) has feature-level status and evidence. Checked items below are specific milestones, not completed features.
 
-The immediate priority is to verify the main MCP as a replacement for BothQ. A rehearsal copy of existing memories has been imported and audited. The updated core server is built, reviewed, locally verified and integrated into the project. It has not been deployed; hosted preservation, recall and client checks remain before an owner trial and cutover. Detailed evidence is in [import verification](docs/import-verification.md#combined-candidate-and-private-routing-proof-2026-10-29).
+The immediate priority is to verify the main MCP as a replacement for BothQ. A rehearsal copy of existing memories has been imported and audited. The reviewed core is deployed to a separate, empty trial. Public metadata and the authentication challenge pass with curl, but isolated client login is not yet complete. Import, hosted preservation, recall and client checks remain open. Detailed evidence is in [import verification](docs/import-verification.md#isolated-core-trial-2026-10-30).
 
 The older rehearsal dashboard page is reachable, but signed-in use has not been verified. Dashboard work is deferred until after the main MCP. The planned dashboard will let the owner explore memory connections and try unsaved what-if changes on a visual canvas; those experiments must not change stored memories.
 
@@ -40,7 +40,7 @@ The older rehearsal dashboard page is reachable, but signed-in use has not been 
 - [x] Close the six graph fixes in scoped source review, including MCP and ingest checks.
 - [ ] Verify the graph fixes on the updated hosted build.
 - [x] Close seven transfer and wipe findings in independent review of frozen source.
-- [ ] Verify transfer and wipe on the updated hosted build; neither is deployed.
+- [ ] Verify transfer and wipe on the updated hosted build.
 - [x] Close the earlier maintenance review findings and fix undo for edges changed within the same millisecond.
 - [x] Complete a synthetic local job through the real model, job token, Worker and database; verify scope refusals and a skip that leaves work queued.
 - [ ] Verify maintenance and undo on the updated hosted build, including jobs, leases, saves, and owner actions.

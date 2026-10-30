@@ -8,6 +8,8 @@ This is the commitment index. [Confirmed requirements](../research/00-requiremen
 
 **Core source adoption, 2026-10-30:** The owner-authorized root now contains accepted CORE719 source. Independent shared/privacy and exact-integration reviews are CLEAR; Terra's full local check passed 278 Worker and 76 local tests with one intentional native skip, plus four work-upload tests, types and both offline dry runs. This [dated source/local receipt](module-contracts.md#core-mcp-source-adoption-2026-10-30) supersedes the earlier private/not-in-root and pending-source/combined labels for the adopted core slices below. No runtime, deployment, preservation-rehearsal or full-feature completion follows; BothQ remains live.
 
+**Isolated core trial, 2026-10-30:** The owner approved a separate Worker and storage/search resources, followed by the retained-memory copy only after authentication passes. CORE719 is deployed to that new trial. Protected-resource discovery and the MCP authentication challenge passed through the ordinary client, and the `kind` String metadata index is confirmed. Isolated OAuth has not passed: the first CLI input closed before the callback, and a fresh login awaits reconnection of the owner's browser. No memory import or synthetic write occurred. The retained 1,330-record audit, unchanged 30-query recall gate and isolated client checks remain open ([trial evidence](import-verification.md#isolated-core-trial-2026-10-30)). Existing deployments, DNS, capture and cutover are unchanged; BothQ remains live.
+
 ## Commitments
 
 | ID and feature | Promised behavior and invariant | Phase | Status / evidence and source |
