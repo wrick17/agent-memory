@@ -10,7 +10,7 @@ The private MCP server is running for owner testing. Selected memory reads and r
 
 The [feature manifest](docs/feature-manifest.md) has feature-level status and evidence. Checked items below are specific milestones, not completed features.
 
-The immediate priority is to verify the main MCP as a replacement for BothQ. A rehearsal copy of existing memories has been imported and audited. The reviewed core is deployed to a separate, empty trial. Public metadata and the authentication challenge pass with curl, but isolated client login is not yet complete. Import, hosted preservation, recall and client checks remain open. Detailed evidence is in [import verification](docs/import-verification.md#isolated-core-trial-2026-10-30).
+The immediate priority is to verify the main MCP as a replacement for BothQ. The reviewed core is deployed to a separate trial. Its isolated authentication checks passed, the retained 1,330-record copy matched the import audit, and the owner-selected recall gate passed 29 of 30. Synthetic client writes and replay passed in the trial. Production migration, refresh, capture and cutover remain open. Detailed evidence is in [import verification](docs/import-verification.md#isolated-core-trial-2026-10-30).
 
 The older rehearsal dashboard page is reachable, but signed-in use has not been verified. Dashboard work is deferred until after the main MCP. The planned dashboard will let the owner explore memory connections and try unsaved what-if changes on a visual canvas; those experiments must not change stored memories.
 
@@ -26,7 +26,7 @@ The older rehearsal dashboard page is reachable, but signed-in use has not been 
 - [x] Exercise 100 recovered request replay calls in the rehearsal.
 - [x] Complete all 60 rehearsal batches and check supersession links and kind filtering.
 - [x] Audit the rehearsal test profile: 1,330 records, 4,678 revisions, and 3,182 requests matched with no mismatch, extra, or drift.
-- [ ] Run the owner-selected 30-query recall gate on the updated hosted build. An earlier run on an older build matched 29 of 30.
+- [x] Run the owner-selected 30-query recall gate on the isolated updated build: 29 of 30 matched the expected top-five result.
 - [x] Close the three refresh review findings on the corrected frozen source.
 - [ ] Verify refresh, rollback, and write bounds on the updated hosted build.
 - [x] Validate the reviewed routing input locally: 158 bindings plan, two identity conflicts remain held, and all 969 earlier record hashes stay unchanged.
