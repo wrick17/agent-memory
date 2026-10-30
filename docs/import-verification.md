@@ -275,3 +275,10 @@ Clerk's [production deployment guide](https://clerk.com/docs/guides/development/
 Unauthenticated public Frontend API `/v1/environment` requests from the primary and rehearsal origins returned HTTP 200 for both GET and OPTIONS. An unrelated `.invalid` origin received HTTP 400 for OPTIONS and HTTP 200 for GET; all three responses echoed their request origins. These HTTP results do not prove ClerkJS initialization, OAuth sign-in or session-cookie behavior on the rehearsal host. This was the earlier uncertainty. The architect subsequently selected path A above; its live audience gate remains open. No hostname or security change was made here.
 
 The later path A decision replaces the Settings-session route with isolated CLI OAuth and the owner API, after the current clearance and live audience gates, without another general permission request. Interactive MFA, if prompted, still requires the owner. No credential was created in this preparation pass.
+
+
+## Existing fixture preflight, 2026-10-31
+
+A read-only preflight of the existing isolated fixture found the expected deployed version, namespaces, binding metadata, variables and saved configuration pins. Current signed owner claims and own-resource `whoami` passed. The import audit found the same seven synthetic IDs: one published and six staged. The test profile was active, and its current generation was recorded.
+
+A separate local SQLite upgrade from profile schema v5 to v6 preserved synthetic staged records, a refresh shadow, pending account reservation, requests, generation and sequence; the account schema was unchanged. This does not prove the retained live shadow or pending reservation. The deployed read-only import audit does not expose those rows, the earlier receipt did not record the generation, and the account script list returned a null routes field. Deployment is held until those prerequisites can be verified through a supported, properly attributed method. No hosted write or deployment followed this preflight.

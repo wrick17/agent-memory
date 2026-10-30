@@ -76,7 +76,7 @@ Codex may open a browser during setup. Sign-in uses Clerk; scoped device access 
 
 ## Privacy and capture
 
-The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Capture is still being developed and is not running automatically.
+The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. A private ChatGPT sign-in works, but automatic capture remains off while model compatibility is checked.
 
 ## Explore the project
 
