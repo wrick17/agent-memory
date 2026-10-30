@@ -629,7 +629,7 @@ describe("self-host setup", () => {
 		delete lock.version; delete lock.packages[""].version; delete lock.packages[""].engines;
 		assert.deepEqual(lock, sourceLock, "packaging preserves the pinned dependency graph");
 		assert.deepEqual(manifest.scripts, { setup: "node local/setup.mjs" });
-		assert.deepEqual(fs.readdirSync(path.join(stage, "local")), ["setup.mjs"]);
+		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-refresh.mjs", "corpus-upload.mjs", "setup.mjs"]);
 		for (const file of ["wrangler.jsonc", "agent-memory.setup.json", RECEIPTS_FILE, "agent-memory.setup.lock", ".dev.vars", "research", "test"])
 			assert.equal(fs.existsSync(path.join(stage, file)), false, file);
 		const readme = fs.readFileSync(path.join(stage, "README.md"), "utf8");

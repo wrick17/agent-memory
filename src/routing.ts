@@ -40,6 +40,9 @@ export function contextProfile(caller: Caller, rules: RoutingRule[], repo?: Repo
 
 export interface Route { profile: string; routedBy: string; context: string | null }
 
+/** `known` holds only active profiles; a rule or device default may still name one that is being wiped. */
+const inactive = (profile: string, by: string) => fail("profile_wiped", `profile '${profile}' (${by}) is not active`, { profile });
+
 /** Steps 2 to 5 of section 9; step 1 (a bound request_id) is applied by the Worker through AccountStore. */
 export function routeWrite(caller: Caller, rules: RoutingRule[], known: string[], input: { profile?: string; repo?: RepoRef }): Outcome<Route> {
 	const context = contextProfile(caller, rules, input.repo);
@@ -54,12 +57,13 @@ export function routeWrite(caller: Caller, rules: RoutingRule[], known: string[]
 			: undefined;
 	if (!chosen) return fail("route_required", "no routing rule or device default matched; pass profile explicitly, or repo {remote, path}");
 	if (!mayUse(caller, chosen.profile)) return fail("forbidden", `this caller may not use profile '${chosen.profile}' (${chosen.routedBy})`);
+	if (!known.includes(chosen.profile)) return inactive(chosen.profile, chosen.routedBy);
 	return ok({ ...chosen, context });
 }
 
 /** Reads use the same order to pick the primary profile; with no match they read `me` only. */
 export function readSet(caller: Caller, rules: RoutingRule[], known: string[], input: { profile?: string; repo?: RepoRef }): Outcome<ReadSet & { routedBy: string }> {
-	const withMe = (primary: string) => primary !== "me" && mayUse(caller, "me");
+	const withMe = (primary: string) => primary !== "me" && mayUse(caller, "me") && known.includes("me");
 	if (input.profile !== undefined) {
 		if (!known.includes(input.profile)) return fail("validation", `unknown profile '${input.profile}'`, { known });
 		if (!mayUse(caller, input.profile)) return fail("forbidden", `this caller may not read profile '${input.profile}'`);
@@ -69,8 +73,10 @@ export function readSet(caller: Caller, rules: RoutingRule[], known: string[], i
 	const primary = rule?.profile ?? (caller.defaultProfile && caller.defaultProfile !== "me" ? caller.defaultProfile : undefined);
 	if (primary) {
 		if (!mayUse(caller, primary)) return fail("forbidden", `this caller may not read profile '${primary}'`);
+		if (!known.includes(primary)) return inactive(primary, rule ? `rule:${rule.pattern}` : "device");
 		return ok({ primary, withMe: withMe(primary), routedBy: rule ? `rule:${rule.pattern}` : "device" });
 	}
 	if (!mayUse(caller, "me")) return fail("route_required", "no routing rule or device default matched; pass profile explicitly");
+	if (!known.includes("me")) return inactive("me", "default:me");
 	return ok({ primary: "me", withMe: false, routedBy: "default:me" });
 }

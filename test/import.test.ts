@@ -10,6 +10,7 @@ import { migrate } from "../src/storage";
 import { PROFILE_MIGRATIONS } from "../src/profile/schema";
 import { runWrite } from "../src/profile/write";
 import { ACCOUNT_MIGRATIONS } from "../src/account/schema";
+import historicalShapes from "./fixtures/import-historical-shapes.json";
 import shapes from "./fixtures/import-part-shapes.json";
 import { call, contextFor, deviceToken, outcome } from "./helpers";
 
@@ -81,7 +82,8 @@ describe("profile schema v3 and v4", () => {
 			sql.exec("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES ('r-v2', 'save_memory', 'h', '{\"ok\":true}', 'n-v2', ?, 7)", AT);
 			const act = Number(sql.exec("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'agent', 'saved', 'v2 row', '[\"n-v2\"]', 7) RETURNING id", AT).one().id);
 			migrate(s.storage, "profile_meta", PROFILE_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("5");
+			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("6");
+			expect(sql.exec("EXPLAIN QUERY PLAN SELECT id FROM archive WHERE activity_id = 1").toArray().map((r) => String(r.detail)).join(" ")).toContain("archive_activity");
 			expect(sql.exec("SELECT summary, redacted FROM activity WHERE id = ?", act).one()).toEqual({ summary: "v2 row", redacted: null });
 			expect(sql.exec("SELECT node_id, revision, op, snapshot, request_id, actor, device_id, at, seq, delta, revision_id FROM revisions WHERE node_id = 'n-v2'").toArray())
 				.toEqual([{ node_id: "n-v2", revision: 1, op: "saved", snapshot: '{"content":"kept"}', request_id: "r-v2", actor: "agent", device_id: "d1", at: AT, seq: 7, delta: null, revision_id: null }]);
@@ -621,4 +623,21 @@ describe("import audit", () => {
 		}
 		expect((await auditGet(token, { profile: "test", after: "ffffffff" })).data).toMatchObject({ profile: "test", records: [], next_after: null });
 	});
+});
+
+
+it("reads pinned normalized legacy and append history without inventing unknown fields", async () => {
+	const c = await contextFor(), {token} = await deviceToken("historical-normalized", ["import"], ["test"], "test");
+	for (const item of historicalShapes) {
+		const rows: [Table, Row][] = [...item.texts.map((r): [Table, Row] => ["texts", r]), ...item.revisions.map((r): [Table, Row] => ["revisions", r])];
+		const cmd = commandsFor("test", item.node, rows);
+		expect((await send(token, [...cmd.stages, cmd.finalize])).data.receipts.at(-1)).toMatchObject({status: "published"});
+		const get = (as_of: string) => call(c, "get_memory", {memory_id: item.id, as_of});
+		if (item.node.name === "Synthetic legacy history") {
+			expect(await get("2026-01-03T00:00:00Z")).toMatchObject({name: item.node.name, description: "retained description", content: "known legacy body", freshness: {valid_from: null}, as_of: {content_known: true}});
+		} else {
+			expect(await get("2026-01-03T00:00:00Z")).toMatchObject({content: "start", revision: 1});
+			expect(await get("2026-02-02T00:00:00Z")).toMatchObject({description: "retained description", content: "start\nmore", revision: 2, freshness: {created_at: item.node.created_at, valid_from: null}});
+		}
+	}
 });

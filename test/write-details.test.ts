@@ -3,7 +3,8 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { Fail, type ProfileRef, type WriteCommand } from "../src/domain/types";
+import { Fail, type Outcome, type ProfileRef, type WriteCommand } from "../src/domain/types";
+import { sha256 } from "../src/domain/ids";
 import { callTool, type ToolContext } from "../src/mcp";
 import type { ProfileStore } from "../src/profile/store";
 import { enqueue, next } from "../src/profile/maintenance";
@@ -713,4 +714,226 @@ describe("save_memory evidence and links", () => {
 		expect(await inProfile(c, "personal", "SELECT id FROM nodes WHERE name = ?", name)).toEqual([]);
 		expect(await inProfile(c, "personal", "SELECT count(*) AS n FROM evidence WHERE ref LIKE 'wrick17/x:src/%'")).toEqual([{ n: 0 }]);
 	});
+});
+
+describe("as_of reads (valid time, section 4)", () => {
+	const tick = async () => { await new Promise((r) => setTimeout(r, 5)); const at = new Date().toISOString(); await new Promise((r) => setTimeout(r, 5)); return at; };
+	type Got = { content: string | null; revision: number; status: string; name: string; description: string; revisions?: { revision: number; created_at: string }[]; as_of?: Record<string, unknown> };
+
+	it("get_memory returns the stored state at as_of, never later revisions, entries or the current row", async () => {
+		const c = await contextFor();
+		const before = await tick();
+		const j = await call(c, "save_memory", { name: "asof journal", type: "project", kind: "journal", description: "first description", content: "v1", profile: "personal" });
+		const t1 = await tick();
+		await call(c, "append_memory", { memory_id: j.memory_id, content: "e1", request_id: "asof-e1" });
+		const t2 = await tick();
+		await call(c, "save_memory", { memory_id: j.memory_id, content: "v2", description: "second description" });
+		const t3 = await tick();
+		await call(c, "save_memory", { memory_id: j.memory_id, retire: true });
+		const t4 = await tick();
+		const at = (as_of: string, more: Record<string, unknown> = {}) => call<Got>(c, "get_memory", { memory_id: j.memory_id, as_of, ...more });
+		expect(await outcome(c, "get_memory", { memory_id: j.memory_id, as_of: before })).toMatchObject({ ok: false, error: { code: "not_found", details: { reason: "not_recorded_by_as_of" } } });
+		expect(await at(t1, { history: { limit: 10 } })).toMatchObject({ content: "v1", revision: 1, status: "active", description: "first description", as_of: { at: t1, revision: 1, content_known: true } });
+		expect((await at(t1, { history: { limit: 10 } })).revisions!.map((r) => r.revision)).toEqual([1]);
+		expect(await at(t2)).toMatchObject({ content: "v1\ne1", revision: 2, description: "first description" });
+		expect(await at(t3)).toMatchObject({ content: "v2", revision: 3, description: "second description" });
+		expect(await outcome(c, "get_memory", { memory_id: j.memory_id, as_of: t4 })).toMatchObject({ ok: false, error: { code: "not_found", details: { reason: "not_active_at_as_of" } } });
+		expect(await at(t4, { include_retired: true })).toMatchObject({ status: "retired", revision: 4, content: "v2" });
+		// The same instant written with an offset is the same boundary: a revision recorded exactly then is included, a millisecond earlier is not.
+		const r2 = (await call<Got>(c, "get_memory", { memory_id: j.memory_id, include_retired: true, history: { limit: 10 } })).revisions!.find((r) => r.revision === 3)!.created_at;
+		const offset = (iso: string, ms = 0) => new Date(Date.parse(iso) + 2 * 3_600_000 + ms).toISOString().replace("Z", "+02:00");
+		expect(await at(offset(r2))).toMatchObject({ revision: 3, content: "v2" });
+		expect(await at(offset(r2, -1))).toMatchObject({ revision: 2, content: "v1\ne1" });
+		// A date alone is 00:00 UTC that day; an unparseable or out-of-range value is refused, never ignored.
+		expect(await outcome(c, "get_memory", { memory_id: j.memory_id, as_of: "not a date" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		expect(await outcome(c, "get_memory", { memory_id: j.memory_id, as_of: "+010000-01-01T00:00:00Z" })).toMatchObject({ ok: false, error: { code: "validation" } });
+	});
+
+	it("rebuilds a compacted journal at as_of and says when an undo makes the past content unknown", async () => {
+		const c = await contextFor(), j = await journal(c, "asof compacted journal");
+		await call(c, "append_memory", { memory_id: j.memory_id, content: "alpha", request_id: "asof-c1" });
+		await call(c, "append_memory", { memory_id: j.memory_id, content: "beta", request_id: "asof-c2" });
+		await call(c, "save_memory", { memory_id: j.memory_id, expected_revision: 3, request_id: "asof-compact", compact: { through_seq: 1, summary: "alpha summary" } });
+		await call(c, "append_memory", { memory_id: j.memory_id, content: "gamma", request_id: "asof-c3" });
+		const now = await tick();
+		const current = await call<Got>(c, "get_memory", { memory_id: j.memory_id });
+		expect(await call<Got>(c, "get_memory", { memory_id: j.memory_id, as_of: now })).toMatchObject({ content: current.content, revision: current.revision, as_of: { content_known: true } });
+		const appended = await call<{ activity_id: number }>(c, "append_memory", { memory_id: j.memory_id, content: "delta", request_id: "asof-c4" });
+		const t = await tick();
+		const ref = c.account.profiles.find((p) => p.profile === "personal")!;
+		const undone = await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:personal:${ref.generation}`)) as DurableObjectStub<ProfileStore>,
+			(_i, state) => undo(state.storage, { userId: ref.userId, profile: "personal", generation: ref.generation }, appended.activity_id, { actor: "owner", platform: "test", routedBy: "explicit", userId: ref.userId }));
+		expect(undone.result).toMatchObject({ action: "undone" });
+		// The undone entry left for the archive, so the state between the append and the undo is not rebuilt from what remains.
+		expect(await call<Got>(c, "get_memory", { memory_id: j.memory_id, as_of: t })).toMatchObject({ content: null, complete: false, as_of: { content_known: false } });
+	});
+
+	it("recall_memories and the inventory read the records and text of as_of, lexical only", async () => {
+		const c = await contextFor();
+		const old = await call(c, "save_memory", { name: "asof quokka rule", type: "feedback", description: "the quokka rule", content: "quokka early text", profile: "personal" });
+		const t1 = await tick();
+		await call(c, "save_memory", { memory_id: old.memory_id, new_name: "asof wombat rule", content: "wombat later text" });
+		await call(c, "save_memory", { name: "asof quokka newcomer", type: "feedback", description: "created after t1", content: "quokka newcomer", profile: "personal" });
+		type Recall = { results: { memory_id: string; name: string; passage: string; revision: number }[]; lexical_only: boolean; as_of: string | null; next_cursor: string | null };
+		const past = await call<Recall>(c, "recall_memories", { keyword: "quokka", profile: "personal", as_of: t1 });
+		expect(past.as_of).toBe(t1);
+		expect(past.lexical_only).toBe(true);
+		expect(past.results.map((r) => [r.memory_id, r.name, r.revision])).toEqual([[old.memory_id, "asof quokka rule", 1]]);
+		expect(past.results[0]!.passage).toContain("quokka early text");
+		// Text written after as_of matches nothing then; the current name matches only now.
+		expect((await call<Recall>(c, "recall_memories", { keyword: "wombat", profile: "personal", as_of: t1 })).results).toEqual([]);
+		expect((await call<Recall>(c, "recall_memories", { keyword: "wombat", profile: "personal" })).results.map((r) => r.memory_id)).toContain(old.memory_id);
+		const listed = await call<Recall>(c, "recall_memories", { keyword: "", profile: "personal", as_of: t1, limit: 100 });
+		const mine = listed.results.filter((r) => r.name?.startsWith("asof ") && r.name.includes("rule") || r.name?.includes("newcomer"));
+		expect(mine.map((r) => r.name)).toEqual(["asof quokka rule"]);
+		// A cursor belongs to its as_of.
+		const page = await call<Recall>(c, "recall_memories", { keyword: "", profile: "personal", as_of: t1, limit: 1 });
+		expect(await outcome(c, "recall_memories", { keyword: "", profile: "personal", limit: 1, cursor: page.next_cursor })).toMatchObject({ ok: false, error: { code: "validation" } });
+	});
+
+	it("review_candidates list reports each capture's status at as_of, unknown when the history cannot say", async () => {
+		const c = await contextFor();
+		const cap = await call<{ capture_id: string }>(c, "capture_memory", { content: "asof capture text", name: "asof capture", profile: "test", request_id: "asof-cap-1" });
+		const t1 = await tick();
+		await call(c, "review_candidates", { action: "dismiss", candidate_id: cap.capture_id, reason: "not useful here", profile: "test" });
+		const t2 = await tick();
+		const later = await call<{ capture_id: string }>(c, "capture_memory", { content: "asof later capture", name: "asof later", profile: "test", request_id: "asof-cap-2" });
+		type List = { candidates: { capture_id: string; status: string; reason?: string }[]; as_of?: string };
+		const list = async (as_of: string, status = "all") => (await call<List>(c, "review_candidates", { action: "list", status, limit: 100, profile: "test", as_of })).candidates.filter((x) => [cap.capture_id, later.capture_id].includes(x.capture_id));
+		expect(await list(t1)).toEqual([expect.objectContaining({ capture_id: cap.capture_id, status: "pending" })]);
+		expect((await list(t1))[0]).not.toHaveProperty("reason");
+		expect(await list(t1, "pending")).toHaveLength(1);
+		expect(await list(t1, "dismissed")).toHaveLength(0);
+		expect(await list(t2)).toEqual([expect.objectContaining({ capture_id: cap.capture_id, status: "dismissed", reason: "not useful here" })]);
+	});
+});
+
+describe("get_memory compaction fence and imported history", () => {
+	const tick = async () => { await new Promise((r) => setTimeout(r, 5)); const at = new Date().toISOString(); await new Promise((r) => setTimeout(r, 5)); return at; };
+	type Fence = { compacted_through: number | null; summary_revision: number | null; latest_entry_seq: number };
+
+	it("reports a journal's fence now and at as_of, and says unknown once an undo restored an older one", async () => {
+		const c = await contextFor(), j = await journal(c, "fence journal");
+		const fence = async (as_of?: string) => (await call<{ compaction: Fence }>(c, "get_memory", { memory_id: j.memory_id, ...(as_of ? { as_of } : {}) })).compaction;
+		expect(await fence()).toEqual({ compacted_through: 0, summary_revision: null, latest_entry_seq: 0 });
+		for (const [i, text] of ["one", "two", "three"].entries()) await call(c, "append_memory", { memory_id: j.memory_id, content: text, request_id: `fence-${i}` });
+		const before = await tick();
+		const compacted = await call<{ activity_id: number }>(c, "save_memory", { memory_id: j.memory_id, expected_revision: 4, request_id: "fence-compact", compact: { through_seq: 2, summary: "one and two" } });
+		const after = await tick();
+		expect(await fence()).toEqual({ compacted_through: 2, summary_revision: 5, latest_entry_seq: 3 });
+		expect(await fence(before)).toEqual({ compacted_through: 0, summary_revision: null, latest_entry_seq: 3 });
+		expect(await fence(after)).toEqual({ compacted_through: 2, summary_revision: 5, latest_entry_seq: 3 });
+		const ref = c.account.profiles.find((p) => p.profile === "personal")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:personal:${ref.generation}`)) as DurableObjectStub<ProfileStore>,
+			(_i, state) => undo(state.storage, { userId: ref.userId, profile: "personal", generation: ref.generation }, compacted.activity_id, { actor: "owner", platform: "test", routedBy: "explicit", userId: ref.userId }));
+		const undone = await tick();
+		expect(await fence()).toEqual({ compacted_through: 0, summary_revision: null, latest_entry_seq: 3 });
+		expect(await fence(undone)).toEqual({ compacted_through: null, summary_revision: null, latest_entry_seq: 3 });
+		// Rows a record without journal history keeps nothing else: only journals carry the field.
+		expect(await call(c, "get_memory", { memory_id: (await call<{ memory_id: string }>(c, "save_memory", { ...note, name: "fence note" })).memory_id })).not.toHaveProperty("compaction");
+	});
+
+	it("reads BothQ-shaped imported history at as_of: full snapshot fields survive an append snapshot, and unknown history fails closed", async () => {
+		const r = await registered("personal");
+		const T = (min: number) => new Date(Date.UTC(2026, 2, 1, 12, min)).toISOString();
+		const id = "imp-asof-1", full = { memory_id: id, name: "Imported log", memory_type: "project", scope: "bot_hq", description: "first description", content: "start", why: "", how_to_apply: "",
+			objective: "", status: "active", _version: 1, _valid_from: T(0), _valid_until: null, _created: T(0), _updated: T(0), steps: [], relationships: { belongs_to: "bot_hq" }, content_hash: "h1" };
+		// An append snapshot holds only identity, scope, status, version, hash and relationships (BothQ memory_store._write_revision).
+		const append = { memory_id: id, name: "Imported log renamed", memory_type: "project", scope: "bot_hq", status: "active", _version: 2, content_hash: "h2", relationships: { belongs_to: "bot_hq" } };
+		await runInDurableObject(r.stub, (_i, s) => s.storage.transactionSync(() => {
+			const sql = s.storage.sql;
+			sql.exec(`INSERT INTO nodes (id, kind, memory_type, scope, name, norm_name, description, status, origin, revision, chars, content_hash, card_hash, valid_from, recorded_at, created_at, updated_at, seq)
+				VALUES (?, 'journal', 'project', 'bot_hq', 'Imported log renamed', 'imported log renamed', 'first description', 'active', 'import', 2, 11, 'h2', 'c', ?, ?, ?, ?, 1)`, id, T(5), new Date().toISOString(), T(0), T(5));
+			sql.exec("INSERT INTO texts (node_id, part, revision, chunk, body, actor, created_at, seq) VALUES (?, 'body', 1, 0, 'start', 'migration', ?, 1)", id, T(0));
+			sql.exec("INSERT INTO texts (node_id, part, revision, seq_no, chunk, body, separator, actor, created_at, seq) VALUES (?, 'entry', 2, 1, 0, 'more', '\n', 'migration', ?, 1)", id, T(5));
+			sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, 1, 'saved', ?, 'migration', ?, 1)", id, JSON.stringify(full), T(0));
+			sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, delta, actor, at, seq) VALUES (?, 2, 'appended', ?, ?, 'migration', ?, 1)", id, JSON.stringify(append), JSON.stringify({ content: "more", separator: "\n" }), T(5));
+		}));
+		const get = async (asOf: string) => r.stub.read(r.who, { kind: "get", target: { memory_id: id }, includeRetired: false, asOf });
+		expect(await get(T(1))).toMatchObject({ ok: true, value: { name: "Imported log", description: "first description", content: "start", revision: 1, content_hash: "h1" } });
+		expect(await get(T(6))).toMatchObject({ ok: true, value: { name: "Imported log renamed", description: "first description", content: "start\nmore", revision: 2, content_hash: "h2",
+			freshness: { valid_from: T(0), created_at: T(0) }, as_of: { content_known: true } } });
+		// A history step this rebuild does not know, or an append whose entry is gone, leaves the content unknown, never guessed.
+		await runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, 3, 'legacy_snapshot', '{}', 'migration', ?, 1)", id, T(7)));
+		await runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("UPDATE nodes SET revision = 3 WHERE id = ?", id));
+		expect(await get(T(8))).toMatchObject({ ok: true, value: { revision: 3, content: null, description: "first description", as_of: { content_known: false } } });
+		expect(await get(T(6))).toMatchObject({ ok: true, value: { content: "start\nmore" } });
+		await runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("UPDATE texts SET revision = 99 WHERE node_id = ? AND part = 'entry'", id));
+		expect(await get(T(6))).toMatchObject({ ok: true, value: { content: null, as_of: { content_known: false } } });
+	});
+});
+
+it("does not acknowledge a whole capture range from one incomplete consolidated part", async () => {
+ const p = await registered("test");
+ const session = { client: "codex" as const, id: "review_partial" };
+ const range_id = "codex:review_partial:01234567:0-100";
+ const body = JSON.stringify({asks: [], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: {asks: 0, decisions: 0, corrections: 0}});
+ const stored = await p.stub.ingest(p.who, {session, digests: [{range_id, capture_status: "consolidated", part_id: "0-50", sha256: sha256(body), body}], manifests: []});
+ expect(stored).toMatchObject({ok: true, value: [{status: "stored"}]});
+ const r = await p.stub.read(p.who, {kind: "markers", repo: null, session}) as Outcome<unknown>;
+ expect(r.ok).toBe(true);
+ if (!r.ok) return;
+ const completed = await p.stub.ingest(p.who, {session, digests: [{range_id, capture_status: "consolidated", part_id: "50-100", sha256: sha256(body), body}], manifests: [{range_id, parts: [{part_id: "0-50", sha256: sha256(body)}, {part_id: "50-100", sha256: sha256(body)}]}]});
+ expect(completed).toMatchObject({ok: true, value: [{status: "stored"}, {status: "stored"}]});
+ expect(await p.stub.read(p.who, {kind: "markers", repo: null, session})).toMatchObject({ok: true, value: {captures: {acknowledged: {"01234567": {digested_to: 100, consolidated_to: 100}}}}});
+ expect(r.value).toMatchObject({captures: {ranges: [{heuristic: false, consolidated: false}], acknowledged: {"01234567": {digested_to: 0, consolidated_to: 0}}}});
+ // Losing an upload response is safe: replay the stored manifest and read its coverage.
+ expect(await p.stub.ingest(p.who, {session, digests: [], manifests: [{range_id, parts: [{part_id: "0-50", sha256: sha256(body)}, {part_id: "50-100", sha256: sha256(body)}]}]})).toMatchObject({ok: true, value: [{status: "replayed"}]});
+ // A durable manifest with a missing part, or an invalid manifest body, cannot acknowledge coverage.
+ await runInDurableObject(p.stub, (_i, state) => state.storage.sql.exec("DELETE FROM texts WHERE range_id = ? AND capture_part = '50-100'", range_id));
+ expect(await p.stub.read(p.who, {kind: "markers", repo: null, session})).toMatchObject({ok: true, value: {captures: {acknowledged: {"01234567": {digested_to: 0, consolidated_to: 0}}}}});
+ await runInDurableObject(p.stub, (_i, state) => state.storage.sql.exec("UPDATE texts SET body = '{}' WHERE range_id = ? AND capture_part = 'manifest'", range_id));
+ expect(await p.stub.captureState(p.who, [range_id])).toMatchObject({ok: true, value: {[range_id]: {consolidated: false}}});
+ const digest = (range_id: string) => ({range_id, capture_status: "heuristic" as const, part_id: "-", sha256: sha256(body), body});
+ await p.stub.ingest(p.who, {session, digests: [digest("codex:review_partial:01234567:0-40"), digest("codex:review_partial:01234567:60-100")], manifests: []});
+ expect(await p.stub.read(p.who, {kind: "markers", repo: null, session})).toMatchObject({ok: true, value: {captures: {acknowledged: {"01234567": {digested_to: 40}}}}});
+ await p.stub.ingest(p.who, {session, digests: [digest("codex:review_partial:01234567:40-60")], manifests: []});
+ expect(await p.stub.read(p.who, {kind: "markers", repo: null, session})).toMatchObject({ok: true, value: {captures: {acknowledged: {"01234567": {digested_to: 100, consolidated_to: 0}}}}});
+});
+
+it("does not traverse an edge recorded after the map as_of", async () => {
+ const p = await registered("test");
+ const early = "2026-01-01T00:00:00.000Z", late = "2026-03-01T00:00:00.000Z";
+ await runInDurableObject(p.stub, (_i, state) => {
+  const sql = state.storage.sql;
+  for (const id of ["review-a", "review-b", "review-c"]) sql.exec(`INSERT INTO nodes (id, kind, name, norm_name, status, origin, content_hash, card_hash, recorded_at, created_at, updated_at, seq) VALUES (?, 'project', ?, ?, 'active', 'agent', 'h', 'h', ?, ?, ?, 1)`, id, id, id, early, early, early);
+  for (const [src, dst, at] of [["review-a", "review-b", late], ["review-b", "review-c", early]]) sql.exec(`INSERT INTO edges (src, rel, dst, dst_profile, basis, reason, recorded_at, actor, seq) VALUES (?, 'relates_to', ?, '', 'judgment', 'synthetic review edge', ?, 'agent', 1)`, src!, dst!, at!);
+ });
+ expect(await p.stub.read(p.who, {kind: "map", center: {id: "review-a"}, depth: 1, asOf: "2026-02-01T00:00:00.000Z", known: ["test"]})).toMatchObject({ok: true, value: {nodes: [{id: "review-a"}], links: []}});
+ const r = await p.stub.read(p.who, {kind: "map", center: {id: "review-a"}, depth: 2, asOf: "2026-02-01T00:00:00.000Z", known: ["test"]}) as Outcome<unknown>;
+ expect(r.ok).toBe(true);
+ if (!r.ok) return;
+ expect(r.value).toMatchObject({nodes: [{id: "review-a"}], links: []});
+ // Other graph consumers retain their accepted valid-time-only policy.
+ expect(await p.stub.read(p.who, {kind: "explore", node: {id: "review-a"}, depth: 2, maxEdges: 5000, known: ["test"], asOf: "2026-02-01T00:00:00.000Z"})).toMatchObject({ok: true, value: {links: expect.arrayContaining([expect.objectContaining({src: "review-a", dst: "review-b"})])}});
+ // Eligible historical edges must still reach their own frontier, without reaching B/C through the future A-B.
+ await runInDurableObject(p.stub, (_i, state) => {
+  const sql = state.storage.sql;
+  for (const id of ["review-d", "review-e"]) sql.exec(`INSERT INTO nodes (id, kind, name, norm_name, status, origin, content_hash, card_hash, recorded_at, created_at, updated_at, seq) VALUES (?, 'project', ?, ?, 'active', 'agent', 'h', 'h', ?, ?, ?, 1)`, id, id, id, early, early, early);
+  for (const [src, dst] of [["review-a", "review-d"], ["review-d", "review-e"]]) sql.exec(`INSERT INTO edges (src, rel, dst, dst_profile, basis, recorded_at, actor, seq) VALUES (?, 'relates_to', ?, '', 'identifier', ?, 'agent', 1)`, src!, dst!, early);
+ });
+ expect(await p.stub.read(p.who, {kind: "map", center: {id: "review-a"}, depth: 2, asOf: "2026-02-01T00:00:00.000Z", known: ["test"]})).toMatchObject({ok: true, value: {nodes: [{id: "review-a"}, {id: "review-d"}, {id: "review-e"}], links: [expect.objectContaining({from: {id: "review-a", readable: true}, to: {id: "review-d", readable: true}}), expect.objectContaining({from: {id: "review-d", readable: true}, to: {id: "review-e", readable: true}})]}});
+
+});
+
+it("searches historical tokens after the current body was replaced", async () => {
+ const c = await contextFor();
+ const saved = await call(c, "save_memory", {name: "review token history", type: "reference", description: "synthetic fixture", content: "quokka separated wombat", profile: "personal"});
+ const ref = c.account.profiles.find(p => p.profile === "personal")!;
+ const ps = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as DurableObjectStub<ProfileStore>;
+ await call(c, "save_memory", {memory_id: saved.memory_id, content: "replacement unrelated body"});
+ await runInDurableObject(ps, (_i, state) => {
+  const sql = state.storage.sql;
+  sql.exec("UPDATE nodes SET valid_from = ?, created_at = ?, recorded_at = ? WHERE id = ?", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", saved.memory_id as string);
+  sql.exec("UPDATE revisions SET at = CASE revision WHEN 1 THEN ? ELSE ? END WHERE node_id = ?", "2026-01-01T00:00:00.000Z", "2026-03-01T00:00:00.000Z", saved.memory_id as string);
+ });
+ expect(await call(c, "get_memory", {memory_id: saved.memory_id, as_of: "2026-02-01T00:00:00.000Z"})).toMatchObject({content: "quokka separated wombat", revision: 1});
+ const control = await call<{results: {memory_id: string}[]}>(c, "recall_memories", {keyword: "quokka", profile: "personal", as_of: "2026-02-01T00:00:00.000Z", expand: false});
+ expect(control.results.map(r => r.memory_id)).toContain(saved.memory_id);
+ const got = await call<{results: {memory_id: string; matched_by: string[]}[]}>(c, "recall_memories", {keyword: "quokka wombat", profile: "personal", as_of: "2026-02-01T00:00:00.000Z", expand: false});
+ expect(got.results.map(r => r.memory_id)).toContain(saved.memory_id);
+ expect(got.results.find(r => r.memory_id === saved.memory_id)?.matched_by).toContain("fulltext");
+ expect(got.results.find(r => r.memory_id === saved.memory_id)?.matched_by).not.toContain("literal");
+ const current = await call<{results: {memory_id: string}[]}>(c, "recall_memories", {keyword: "quokka wombat", profile: "personal", expand: false});
+ expect(current.results.map(r => r.memory_id)).not.toContain(saved.memory_id);
 });

@@ -137,10 +137,31 @@ export interface KnowledgeArgs {
  * One uploaded work item (section 10), already validated, redacted and stripped of personal fields by the Worker. `repo` is
  * the GitHub namespace `Org/repo`; `request_id` is the item's natural id, so a repeat replays and a changed item is refused.
  */
-export interface UploadArgs { item: "commit"; repo: string; sha: string; at: string; title: string; author?: string; request_id: string }
+export interface CommitUploadArgs { item: "commit"; repo: string; sha: string; at: string; title: string; author?: string; request_id: string }
+/**
+ * A PR snapshot at GitHub's `updated_at`, read locally with gh. Handles and full SHAs are lowercase, `closes` holds the
+ * `github:<repo>#<n>` keys of GitHub's closingIssuesReferences, `unknown` names fields gh could not supply in full, and
+ * `review_requested_from_owner` is present only when the caller named the owner's login. `as_of` is when it was read.
+ */
+export interface PRUploadArgs {
+	item: "pr"; repo: string; number: number; title: string; state: "open" | "closed"; updated_at: string; head: string; author?: string;
+	reviewers: string[]; commits: string[]; closes: string[]; unknown: string[]; review_requested_from_owner?: boolean; as_of: string; request_id: string;
+}
+/**
+ * A Jira ticket snapshot at Jira's own `updated` time, read locally through the read-only connector (work only). `key` is
+ * `PROJECT-N`; `type` is Jira's issue type name and `kind` its ontology kind. Handles are Jira account ids, never names or
+ * emails. `blocked_by` and `blocks` come from Jira's directional blocks links and `related` from its other links. A field the
+ * connector could not read is named in `unknown`; an absent optional field (no priority, unassigned) is known to be empty.
+ */
+export interface TicketUploadArgs {
+	item: "ticket"; key: string; kind: "bug" | "feature" | "ticket"; type: string; title: string; updated_at: string; state?: "open" | "closed"; status?: string;
+	priority?: string; due?: string; assignee?: string; reporter?: string; assignee_is_owner?: boolean; blocked_by: string[]; blocks: string[]; related: string[];
+	unknown: string[]; as_of: string; request_id: string;
+}
+export type UploadArgs = CommitUploadArgs | PRUploadArgs | TicketUploadArgs;
 
 export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs } | { op: "undo"; args: { activity_id: number; request_id: string } }
-	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs };
+	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs } | { op: "restore"; args: { activity_id: number; request_id: string } };
 /** The owner's dashboard actions on one node (section 15). */
 export interface OwnerArgs { action: "pin" | "unpin" | "forget" | "unflag"; memory_id: string; request_id?: string }
 
@@ -161,15 +182,26 @@ export interface WriteContext {
 export interface Identity { memory_id?: string; name?: string; scope?: string; type?: MemoryType }
 
 export type ReadQuery =
-	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string } }
-	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number; expand: boolean }
-	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean }
+	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string }; asOf?: string }
+	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number; expand: boolean; asOf?: string }
+	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; asOf?: string }
 	| { kind: "has"; id: string }
-	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number }
+	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number; asOf?: string }
 	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" }
 	| { kind: "batch_status" }
 	| { kind: "owner_model"; after: string | null; limit: number }
-	| ExploreQuery | TraceQuery | TimelineQuery | BoardQuery;
+	| ExploreQuery | TraceQuery | TimelineQuery | BoardQuery
+	// The owner's page reads (section 15); src/profile/pages.ts takes the same shapes.
+	| { kind: "entity"; node: { id: string } | { key: string }; asOf?: string; before?: number; content?: { cursor?: string }; known: string[] }
+	| { kind: "journals"; after: string | null; limit: number }
+	| { kind: "journal"; id: string; after: number; limit: number }
+	| { kind: "map"; center?: { id: string } | { key: string }; depth: number; asOf?: string; known: string[] }
+	| { kind: "page_timeline"; from: string; to: string; node?: { id: string } | { key: string }; kinds?: NodeKind[]; limit: number; known: string[] }
+	| { kind: "activity"; before: number | null; limit: number; actor?: string }
+	| { kind: "shown"; ids: string[] }
+	| { kind: "archive"; before: number | null; limit: number }
+	// GET /v1/markers (section 7): `repo` is the GitHub namespace, or null for another remote.
+	| { kind: "markers"; repo: string | null; session?: { client: "claude-code" | "codex"; id: string } };
 
 // Graph reads (section 7), defined here so domain/ imports nothing from a store; src/profile/graph.ts takes the same shapes.
 type GraphRef = { id: string } | { key: string } | { name: string; kind?: NodeKind; scope?: string };
@@ -182,12 +214,15 @@ export interface TimelineQuery { kind: "timeline"; from: string; to: string; nod
 /** work_board (section 13); src/profile/board.ts takes the same shape. The Worker supplies asOf. */
 export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[] }
 
+/** With as_of, the record's stored state then: a field its history does not hold is null, never the current value. */
 export interface RecallHit {
-	memory_id: string; profile: string; kind: string; type: string | null; name: string; scope: string; origin: string;
-	status: string; revision: number; passage: string; matched_by: string[]; score: number;
+	memory_id: string; profile: string; kind: string; type: string | null; name: string | null; scope: string | null; origin: string;
+	status: string | null; revision: number; passage: string; matched_by: string[]; score: number;
 	objective: string | null; step_count: number;
-	provenance: { source_platform: string | null; updated_source_platform: string | null; source_hash: string };
-	freshness: { created_at: string; updated_at: string; valid_from: string | null; valid_until: string | null };
+	provenance: { source_platform: string | null; updated_source_platform: string | null; source_hash: string | null };
+	freshness: { created_at: string | null; updated_at: string | null; valid_from: string | null; valid_until: string | null };
+	/** Set with as_of: when the revision in effect was recorded, whether the record was valid then, and whether its content was rebuilt. */
+	as_of?: { recorded_at: string; valid: boolean; content_known: boolean };
 	/** Row position, used by the inventory cursor. */
 	row: number;
 	/** Set only on a non-inferred preference a profile returns from below its recall cap: its true position there. */

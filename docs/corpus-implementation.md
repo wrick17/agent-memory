@@ -1,6 +1,6 @@
 # Corpus vertical: storage, uploader and queries (AM-14, source only)
 
-**Status, 2026-10-30.** The first corpus vertical is integrated locally, first written on the cleared root (126 files, aggregate `91e01937…`) and ported by R0 onto CODE719 (root `c4d42da`) with one resolved hunk in `src/profile/store.ts`. It has passed scoped and combined local checks. The original vertical received a bounded source review with three P2 findings. R1 is retained in the guard-term layer; R2 and R3 are fixed in the continuation below. A fresh independent source review cleared all three fixes. The reviewed R0 port is now adopted on root `6ddd8df`; Terra's combined local verification passed. This adoption establishes no hosted or runtime verification, deployment or real upload. It covers five Git-history families. AM-14 is not complete. The full corpus load and corpus backups stay in the final stages ([architecture](architecture.md#14-corpus-module-paid-only)).
+**Status, 2026-10-30.** The first corpus vertical is integrated locally, first written on the cleared root (126 files, aggregate `91e01937…`) and ported by R0 onto CODE719 (root `c4d42da`) with one resolved hunk in `src/profile/store.ts`. It has passed scoped and combined local checks. The original vertical received a bounded source review with three P2 findings. R1 is retained in the guard-term layer; R2 and R3 are fixed in the continuation below. A fresh independent source review cleared all three fixes. The reviewed R0 port is now adopted on root `6ddd8df`; Terra's combined local verification passed. This adoption establishes no hosted or runtime verification, deployment or real upload. F1 refresh is now independently source-cleared and adopted locally over root b238096 ([F1 evidence](#f1-refresh-source-adoption-2026-10-30)); the prior combined result covers R0 only. It covers five Git-history families. AM-14 is not complete. The full corpus load and corpus backups stay in the final stages ([architecture](architecture.md#14-corpus-module-paid-only)).
 
 Evidence: the retained-schema inventory `corpus-schema.json` (SHA-256 `4575c22a…`) and its privacy-lineage follow-up `privacy-lineage.json` (`12121454…`). No row of the owner's corpus file was read for this work. Every check used synthetic rows.
 
@@ -14,18 +14,18 @@ All code, config and test bytes and modes match that reviewed map. Current READM
 
 Terra's [combined local receipt](/tmp/am-r0-terra-BuExVZ/receipt.txt) passed typecheck, lint, 291 Worker tests and 79 local tests (one native sandbox test skipped), generated types, and production, rehearsal and test dry runs. All 95 runtime, configuration and test paths match the tested source in bytes and physical modes. This does not prove hosted or real-corpus behavior.
 
-The [revision 2 refresh contract](/var/folders/mm/dwsn1_0j0cb2scdpkdw6_4rm0000gp/T/am-corpus-refresh-design-r2-opus-o3k9ArV6/MANIFEST.sha256), SHA-256 `c80a5a819755f9687f01562a73273a3b26a808f83c5afa8aa2597bbb661a7494`, is independently [CLEAR](/private/tmp/am-corpus-refresh-r2-review-sol-20261030-k7p4/review.txt) and accepted by the parent, with U8 and U9: reads pause during a plan and recovery, and can remain closed indefinitely if no source can observe an outstanding table. Implementation and its checks remain pending.
+The [revision 2 refresh contract](/var/folders/mm/dwsn1_0j0cb2scdpkdw6_4rm0000gp/T/am-corpus-refresh-design-r2-opus-o3k9ArV6/MANIFEST.sha256), SHA-256 `c80a5a819755f9687f01562a73273a3b26a808f83c5afa8aa2597bbb661a7494`, is independently [CLEAR](/private/tmp/am-corpus-refresh-r2-review-sol-20261030-k7p4/review.txt) and accepted by the parent, with U8 and U9: reads pause during a plan and recovery, and can remain closed indefinitely if no source can observe an outstanding table. At R0 adoption, implementation and its checks remained pending; the later [F1 source adoption](#f1-refresh-source-adoption-2026-10-30) supersedes that status.
 
-Production and rehearsal remain `CORPUS: "off"`, unbound and on unchanged migrations; only `env.test` binds `CORPUS_STORE` with migration `v2`. All 94 held names, including raw session text, stay held. F1 refresh implementation remains pending. AM-14, runtime acceptance, real sample/load, `explore` and final backup gates remain open. BothQ stays running and readable; this adoption activates no caller or capture and changes no cutover decision.
+Production and rehearsal remain `CORPUS: "off"`, unbound and on unchanged migrations; only `env.test` binds `CORPUS_STORE` with migration `v2`. All 94 held names, including raw session text, stay held. F1 implementation was still pending at this R0 checkpoint; its later local adoption is recorded below. AM-14, runtime acceptance, real sample/load, `explore` and final backup gates remain open. BothQ stays running and readable; this adoption activates no caller or capture and changes no cutover decision.
 
 ## What exists
 
 | Part | File | What it does |
 |---|---|---|
 | Families and hold list | `src/corpus/families.ts` | The approved families with their original DDL, projection, key and search mapping. Every other source table appears with its hold reason. The row check is here too. |
-| Store | `src/corpus/store.ts` | `CorpusStore`: one SQLite Durable Object per (user, profile, generation), named `userId:profile:generation` on `CORPUS_STORE`. Methods: `importChunk`, `status`, `query`, `wipe`. |
+| Store | `src/corpus/store.ts` | `CorpusStore`: one SQLite Durable Object per (user, profile, generation), named `userId:profile:generation` on `CORPUS_STORE`. Methods: `importChunk`, `status`, `query`, `refresh`, `wipe`. |
 | Reads | `src/corpus/query.ts` | Search, exact get, and read-only SQL, each with `as_of` per table read. |
-| Worker | `src/corpus-tools.ts`, `src/api.ts`, `src/mcp.ts` | The `corpus` MCP tool (scope `read`). `POST /v1/corpus/import` and `GET /v1/corpus/status` take the owner or an `import` device. |
+| Worker | `src/corpus-tools.ts`, `src/api.ts`, `src/mcp.ts` | The `corpus` MCP tool (scope `read`). `POST /v1/corpus/import`, `POST /v1/corpus/refresh` and `GET /v1/corpus/status` take the owner or an `import` device. |
 | Wipe | `src/profile/store.ts` | `ProfileStore.purgeOrigin` closes and clears the generation's corpus before its own `close` and `clear` steps. |
 | Uploader | `local/corpus-upload.mjs`, `local/corpus-cli.mjs` | The shared core and the foreground CLI: `node local/corpus-cli.mjs --db FILE --profile test --tables repos,commits --as-of ISO`. |
 | Tests | `test/corpus.test.ts`, `local/corpus-upload.test.mjs` | Real local Worker, Durable Objects and SQLite. Node for the CLI's SQLite source and HTTP client. |
@@ -101,7 +101,7 @@ Every hold is listed by name in `HELD`, and nothing below loads:
 The five approved families and the 94 held names together are exactly the 99 tables of the retained schema.
 
 **Still open in this vertical:**
-- Refresh of changed rows and deletes: a loaded table is a dated snapshot, and changing it is refused. The refresh protocol (`markers` per repo, `analysis_head`, replaced `(repo, path)` rows) needs scanners that do not exist yet.
+- F1 per-repo refresh from a committed SQLite snapshot is source-cleared and locally adopted below. Its combined, hosted and actual CLI-process checks remain open. Git/scanner acquisition, scheduling and analysis-head automation are not built.
 - The corpus export cut for the final backup stage.
 - `explore` integration.
 - The `agent-memory corpus-upload` subcommand wiring.
@@ -148,11 +148,32 @@ All local; logs in the private capsule.
 
 ## Gates before AM-14 can close
 
-1. Independent source review and sole-integrator adoption are complete for R0 only ([adoption evidence](#r0-source-adoption-2026-10-30)).
-2. Runtime checks; the combined local check passed.
+1. Independent source review and sole-integrator adoption are complete for R0 and F1 ([R0 evidence](#r0-source-adoption-2026-10-30), [F1 evidence](#f1-refresh-source-adoption-2026-10-30)).
+2. F1 combined affected-flow and runtime checks; only the earlier R0 combined local check passed.
 3. An owner-approved bounded sample from the real file into `test`, with row counts compared.
 4. Projection checks for each remaining family.
-5. The refresh protocol and scanners.
+5. F1 combined, hosted and actual CLI-process acceptance; Git/scanner sources and scheduling.
 6. `explore` integration.
 7. The full load and wipe in the final rehearsal.
 8. Corpus backups in the final stage.
+
+
+## F1 refresh source adoption, 2026-10-30
+
+The owner-authorized sole integrator adopted the eleven reviewed F1 runtime/local/test paths over root `b238096a8a0a25da90d029bb852f54a056cb44c8`. Each path matches the cleared candidate in bytes and physical mode. The additive patch applies and reverses with zero fuzz or offsets. Current R0/self-host source, package scripts and dependency graph are preserved; no private historical docs, AGENTS or research replaced current files. The separate core API/read and Jira candidates remain private and are not included.
+
+The accepted [source map](/private/tmp/am-f1-fix-sol-1nwh2br9/capsule/source-map.json) pins the historical 142-file candidate: bytes `dd638d768d07ef6bf72784321e482a2ebb3ab60621f616f1bcf3d7f691f6fcde` and bytes plus physical modes `8d067f37b44c8c6e8d3cea9d8cad27c0c63fa904a0f9a742f6fc60c775c4c7d7`. Its [capsule manifest](/private/tmp/am-f1-fix-sol-1nwh2br9/capsule/MANIFEST.sha256) is `5e5c053684b3ee94160a3b1b989b75006d8139c869b19fec4baace49a73b4489`. The [additive patch](/private/tmp/am-f1-fix-sol-1nwh2br9/capsule/f1-additive.patch) is `41dc2171dbcb527cc181baca91f6cc643cdf9c8bf30d346541be7205b6cdfaa5`. These pins identify the reviewed input, not the current root's whole-file identity.
+
+The fresh [independent I1-I4 recheck](/private/tmp/am-f1-recheck-sol-ounk5f7q/review.txt), SHA-256 `10157c0b4bdc1b29fbe2fd83386d451e72f0e8c6b600ac279e49f13237c972d2`, is SOURCE CLEAR, accepted by the parent. Seven scoped real Worker checks, one actual two-handle SQLite check and all three patch reconstructions passed. The [author receipt](/private/tmp/am-f1-fix-sol-1nwh2br9/capsule/receipt.json) reports ten scoped Worker refresh cases, five local cases, types and touched lint. These existing greens are reused; this integration runs mechanical checks only. Historical 179-pass/exit-zero Worker evidence still contains an uncaught Vitest-global-state diagnostic and is not clean combined proof. The author's known shared-dependency results-cache write remains documented in its handoff; this adoption neither repeats nor restores it.
+
+One repo refreshes all five approved projections through `POST /v1/corpus/refresh` with inspect, begin, hash-chained parts and finish. Plans are saved before begin, bind the source and observed time, maintain partition digests transactionally and publish only after their targets verify. Stored receipt text replays byte for byte behind current access, generation and wipe fences. Removal keeps zero-row partitions to refuse older source cuts. Per-table as-of values report oldest/newest observations and declared, observed or mixed basis; exact repo gets add repo_as_of. Put rows in work register the existing guarded term pages before storage.
+
+I1-I4 fixes enforce the shared table-only/exact-DDL/required-column rule before any new target read or saved plan; derive validation, rows and source hash from one committed SQLite snapshot including WAL; report cursor and receipt writes in rows_written; and reconcile an uncertain failure's authoritative cursor/chain before halving an unapplied HTTP 5xx/network slice. A failing single operation stops. The internal adapter is async: await sqliteSource, pass source.fileSha256, and close it in finally. A saved exact plan keeps its original identity without rereading a replacement source. Declared --as-of remains normalized ISO UTC, not an invented builder time.
+
+U8 closes all corpus reads from begin until verified publication, including recovery. U9 permits a same-repo takeover only when it observes every outstanding changed table. Reads can stay closed indefinitely if the required source is unavailable; no timer or held-family fallback opens them. All 94 held tables, including raw session text, remain held. Snapshot acquisition needs temporary disk space for a full copy in a 0700 directory and 0600 file. Normal close and setup failure remove it; process death can leave it. Legacy bulk checkpoints tied to a separately hashed main file may refuse source_changed and are never silently rebound. This temporary acquisition is not the AM-15 backup feature.
+
+Mechanical packaging reconciliation adds local/corpus-refresh.mjs and its local/corpus-upload.mjs dependency to both existing self-host lists and updates the exact package-content expectation. The existing recursive src/ inclusion already covers src/corpus/refresh.ts. Package scripts still expose only setup in the staged archive. The foreground CLI and its migration/config adapters remain source-tree tools, as before; no installer or caller is activated. The earlier AM-18 archive/install/fixture facts remain historical evidence for their earlier package. No new package/install run is claimed here.
+
+The [integration handoff](/private/tmp/am-f1-adopt-sol-flhnhk49/capsule/HANDOFF.md) and source/mode maps record the exact adopted root, packaging-only delta and future src/api.ts, src/corpus-tools.ts and src/corpus/query.ts three-way merge bases. README and import-verification remain untouched and Terra-owned. No index/ref, commit/push, deployment, real corpus, account, model, native, capture, caller or lifecycle change is included. BothQ remains the ordinary live writer, running and readable; shutdown is excluded.
+
+AM-14 remains incomplete. Terra's one final combined affected flow waits for compatible core/Jira interfaces. The actual CLI subprocess against a server, hosted CPU/storage/FTS/account behavior, real sample/full load, explore, Git/scanner adapters, scheduling, cross-machine acceptance and final backups remain open. Dashboard remains last and backups follow the feature work.

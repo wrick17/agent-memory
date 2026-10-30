@@ -1,0 +1,188 @@
+[
+  {
+    "key": "bothq:synthetic-23232323-0000-5000-8000-000000000001",
+    "source": "bothq",
+    "id": "23232323-0000-5000-8000-000000000001",
+    "route": {
+      "profile": "personal",
+      "rule": "scope:personal"
+    },
+    "node": {
+      "id": "23232323-0000-5000-8000-000000000001",
+      "kind": "document",
+      "memory_type": "reference",
+      "scope": "personal",
+      "name": "Synthetic legacy history",
+      "description": "retained description",
+      "why": null,
+      "how_to_apply": null,
+      "objective": null,
+      "steps": null,
+      "status": "active",
+      "origin": "import",
+      "revision": 1,
+      "chars": 17,
+      "content_hash": "70c8752a250d1021310e6ec98e7bbfa327996ac89d3c9ccc504291a68eca055a",
+      "valid_from": null,
+      "valid_to": null,
+      "created_at": "2026-01-02T03:04:05+00:00",
+      "updated_at": "2026-01-02T03:04:05+00:00",
+      "source_platform": null,
+      "updated_source_platform": null,
+      "attrs": {
+        "validity": "unknown",
+        "first_recorded_at": "2026-01-02T03:04:05+00:00",
+        "source": {
+          "system": "bothq",
+          "adopted": false,
+          "element_id": "synthetic-23232323-0000-5000-8000-000000000001",
+          "labels": [
+            "Resource",
+            "Entity"
+          ],
+          "content_from": "content",
+          "fingerprint": {
+            "version": 1
+          },
+          "properties": {},
+          "anchors": [],
+          "relationships": [],
+          "raw_steps": []
+        }
+      }
+    },
+    "texts": [
+      {
+        "part": "body",
+        "revision": 1,
+        "seq_no": 0,
+        "chunk": 0,
+        "body": "known legacy body",
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "live": true
+      }
+    ],
+    "revisions": [
+      {
+        "revision": 1,
+        "op": "legacy_snapshot",
+        "snapshot": "{\"content_chars\":17,\"content_hash\":\"70c8752a250d1021310e6ec98e7bbfa327996ac89d3c9ccc504291a68eca055a\",\"description\":\"retained description\",\"how_to_apply\":\"\",\"memory_type\":\"reference\",\"name\":\"Synthetic legacy history\",\"objective\":\"\",\"scope\":\"personal\",\"status\":\"active\",\"steps\":[],\"why\":\"\"}",
+        "delta": null,
+        "request_id": null,
+        "at": "2026-01-02T03:04:05+00:00",
+        "content_hash": "70c8752a250d1021310e6ec98e7bbfa327996ac89d3c9ccc504291a68eca055a",
+        "revision_id": null,
+        "source_platform": null,
+        "source_platform_version": null
+      }
+    ],
+    "requests": [],
+    "supersedes": [],
+    "review": [],
+    "content": "known legacy body"
+  },
+  {
+    "key": "bothq:synthetic-23232323-0000-5000-8000-000000000002",
+    "source": "bothq",
+    "id": "23232323-0000-5000-8000-000000000002",
+    "route": {
+      "profile": "personal",
+      "rule": "scope:personal"
+    },
+    "node": {
+      "id": "23232323-0000-5000-8000-000000000002",
+      "kind": "document",
+      "memory_type": "reference",
+      "scope": "personal",
+      "name": "Synthetic appended history",
+      "description": "retained description",
+      "why": null,
+      "how_to_apply": null,
+      "objective": null,
+      "steps": null,
+      "status": "active",
+      "origin": "import",
+      "revision": 2,
+      "chars": 10,
+      "content_hash": "cd10fc2e7be77c65cba15d7b8798149d3398103bbd68cde50fe648c3937d5959",
+      "valid_from": "2026-02-01T00:00:00+00:00",
+      "valid_to": null,
+      "created_at": "2026-01-02T03:04:05+00:00",
+      "updated_at": "2026-01-02T03:04:05+00:00",
+      "source_platform": null,
+      "updated_source_platform": null,
+      "attrs": {
+        "source": {
+          "system": "bothq",
+          "adopted": true,
+          "element_id": "synthetic-23232323-0000-5000-8000-000000000002",
+          "labels": [
+            "Resource",
+            "Entity",
+            "MemoryRecord"
+          ],
+          "content_from": "content",
+          "fingerprint": {
+            "version": 1
+          },
+          "properties": {},
+          "anchors": [],
+          "relationships": [],
+          "raw_steps": []
+        }
+      }
+    },
+    "texts": [
+      {
+        "part": "body",
+        "revision": 1,
+        "seq_no": 0,
+        "chunk": 0,
+        "body": "start",
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "live": true
+      },
+      {
+        "part": "entry",
+        "revision": 2,
+        "seq_no": 1,
+        "chunk": 0,
+        "body": "more",
+        "separator": "\n",
+        "request_id": null,
+        "created_at": "2026-02-01T00:00:00+00:00",
+        "live": true
+      }
+    ],
+    "revisions": [
+      {
+        "revision": 1,
+        "op": "saved",
+        "snapshot": "{\"name\":\"Synthetic appended history\",\"memory_type\":\"reference\",\"description\":\"retained description\",\"why\":\"\",\"how_to_apply\":\"\",\"objective\":\"\",\"memory_id\":\"23232323-0000-5000-8000-000000000002\",\"scope\":\"personal\",\"status\":\"active\",\"content\":\"start\",\"_version\":1}",
+        "delta": null,
+        "request_id": null,
+        "at": "2026-01-02T03:04:05+00:00",
+        "content_hash": "74fe081a750b054274c781bae05207741090b7feadec1bebcb2e54788f11bdfa",
+        "revision_id": null,
+        "source_platform": null,
+        "source_platform_version": null
+      },
+      {
+        "revision": 2,
+        "op": "appended",
+        "snapshot": "{\"memory_id\":\"23232323-0000-5000-8000-000000000002\",\"_version\":2}",
+        "delta": "{\"content\":\"more\",\"separator\":\"\\n\"}",
+        "request_id": null,
+        "at": "2026-02-01T00:00:00+00:00",
+        "content_hash": "cd10fc2e7be77c65cba15d7b8798149d3398103bbd68cde50fe648c3937d5959",
+        "revision_id": null,
+        "source_platform": null,
+        "source_platform_version": null
+      }
+    ],
+    "requests": [],
+    "supersedes": [],
+    "review": [],
+    "content": "start\nmore"
+  }
+]

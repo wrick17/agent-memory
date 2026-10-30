@@ -8,6 +8,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { fileSha256, httpClient, sqliteSource } from "./corpus-cli.mjs";
+import { chains, FAMILIES, planIdOf, planOps, rowHash, seedOf } from "./corpus-refresh.mjs";
 import { chunkHash, uploadCorpus } from "./corpus-upload.mjs";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-corpus-test-"));
@@ -72,7 +73,7 @@ describe("corpus CLI source", () => {
 	it("reads exact DDL for tables only, pages by the stable key, and never writes the file", async () => {
 		const file = sourceFile();
 		const before = await fileSha256(file);
-		const s = sqliteSource(file);
+		const s = await sqliteSource(file);
 		assert.equal(s.schema("commits"), COMMITS);
 		assert.equal(s.schema("refs"), null);
 		assert.deepEqual(s.columns("contributors"), ["repo", "rank", "commits", "name", "email"]);
@@ -88,7 +89,7 @@ describe("corpus CLI source", () => {
 	it("uploads redacted key-ordered chunks, resumes from the server, and refuses forbidden or held tables before reading", async () => {
 		const file = sourceFile();
 		const server = fakeServer(), state = {};
-		const s = sqliteSource(file);
+		const s = await sqliteSource(file);
 		const run = (tables, client = server) => uploadCorpus({ source: s, client, profile: "test", tables, asOf: "2026-08-12T13:30:59.154Z", fileSha256: "ab".repeat(32), state, chunkRows: 2 });
 		assert.deepEqual(await run(["session_messages"]), { status: "refused", table: "session_messages", reason: "never_import" });
 		assert.deepEqual(await run(["refs"]), { status: "refused", table: "refs", reason: "unknown_table" });
@@ -102,6 +103,34 @@ describe("corpus CLI source", () => {
 		assert.equal(server.sent.length, 3);
 		assert.deepEqual(await run(["commits"], { ...server, status: async () => ({ ...(await server.status()), generation: "g2" }) }), { status: "refused", reason: "generation_changed" });
 		s.close();
+	});
+
+	it("pins validation, rows and identity to one committed SQLite cut including WAL, without changing the original", async () => {
+		const file = path.join(fs.mkdtempSync(path.join(tmp, "wal-")), "sample.sqlite");
+		const writer = new DatabaseSync(file);
+		writer.exec("PRAGMA journal_mode=WAL; CREATE TABLE repos(full_name TEXT PRIMARY KEY, head_sha TEXT); CREATE TABLE refs(repo TEXT, refname TEXT, target_sha TEXT); INSERT INTO repos VALUES('acme/web','old'); INSERT INTO refs VALUES('acme/web','main','old'); PRAGMA wal_checkpoint(TRUNCATE)");
+		const mainHash = await fileSha256(file), source = await sqliteSource(file);
+		try {
+			assert.deepEqual(source.repoRows("repos", ["full_name", "head_sha"], "acme/web"), [["acme/web", "old"]]);
+			writer.exec("BEGIN; UPDATE repos SET head_sha='new'; UPDATE refs SET target_sha='new'; ALTER TABLE refs ADD COLUMN extra TEXT; COMMIT");
+			const walHash = await fileSha256(`${file}-wal`);
+			assert.equal(await fileSha256(file), mainHash);
+			assert.deepEqual(source.repoRows("refs", ["repo", "refname", "target_sha"], "acme/web"), [["acme/web", "main", "old"]]);
+			assert.equal(source.columns("refs").includes("extra"), false);
+			assert.doesNotMatch(source.schema("refs"), /extra/);
+			const fresh = await sqliteSource(file), same = await sqliteSource(file);
+			try {
+				assert.deepEqual(fresh.repoRows("repos", ["full_name", "head_sha"], "acme/web"), [["acme/web", "new"]]);
+				assert.deepEqual(fresh.repoRows("refs", ["repo", "refname", "target_sha"], "acme/web"), [["acme/web", "main", "new"]]);
+				assert.equal(fresh.columns("refs").includes("extra"), true);
+				assert.match(fresh.schema("refs"), /extra/);
+				assert.match(fresh.fileSha256, /^[a-f0-9]{64}$/);
+				assert.notEqual(fresh.fileSha256, source.fileSha256);
+				assert.equal(fresh.fileSha256, same.fileSha256);
+				assert.equal(await fileSha256(file), mainHash);
+				assert.equal(await fileSha256(`${file}-wal`), walHash);
+			} finally { fresh.close(); same.close(); }
+		} finally { source.close(); writer.close(); }
 	});
 });
 
@@ -117,5 +146,44 @@ describe("corpus CLI client", () => {
 		assert.deepEqual(calls, Array(2).fill(["https://memory.test/v1/corpus/status?profile=test", "manual", "Bearer am_x_id_secret"]));
 		const redirecting = httpClient({ config, sleep: async () => {}, fetchImpl: async () => new Response(null, { status: 302, headers: { location: "https://evil.example/" } }) });
 		await assert.rejects(redirecting.send({ table: "commits" }), /redirect refused/);
+		const posts = [];
+		const refreshing = httpClient({ config, sleep: async () => {}, fetchImpl: async (url, init) => { posts.push([String(url), init.method, init.body]); return Response.json({ receipt: { status: "stored" } }); } });
+		assert.deepEqual(await refreshing.refresh({ command: "finish" }), { receipt: { status: "stored" } });
+		assert.deepEqual(posts, [["https://memory.test/v1/corpus/refresh", "POST", '{"command":"finish"}']]);
+		const unavailable = httpClient({ config, sleep: async () => {}, fetchImpl: async () => new Response(null, { status: 503 }) });
+		await assert.rejects(unavailable.refresh({ command: "part" }), /^Error: HTTP 503$/);
+		const disconnected = httpClient({ config, sleep: async () => {}, fetchImpl: async () => { throw Object.assign(new Error("offline"), { code: "ECONNRESET" }); } });
+		await assert.rejects(disconnected.refresh({ command: "part" }), /^Error: network: ECONNRESET$/);
+	});
+});
+
+describe("corpus refresh planner", () => {
+	it("reads one repo's rows from the file and plans the server's ordered delta, keeping the smallest matched contributor rowids", async () => {
+		const file = sourceFile();
+		const s = await sqliteSource(file);
+		assert.deepEqual(s.repoRows("contributors", ["repo", "rank", "commits", "name"], "acme/web"), [["acme/web", 1, 2, "Alice"], ["acme/web", 2, 1, "Bob"]]);
+		assert.deepEqual(s.repoRows("commits", ["repo", "sha"], "acme/api"), [["acme/api", "1".repeat(40)]]);
+		s.close();
+		const fams = Object.fromEntries(FAMILIES.map((t) => [t, { schema_sha256: sha256(t), columns: t === "contributors" ? ["repo", "rank", "commits", "name"] : t === "commits" ? ["repo", "sha", "subject"]
+			: t === "commit_paths" ? ["repo", "sha", "path", "top_component", "extension"] : t === "refs" ? ["repo", "refname", "subject"] : ["full_name", "description"] }]));
+		const h = (t, v) => rowHash(t, fams[t].schema_sha256, v);
+		const alice = ["acme/web", 1, 2, "Alice"], bob = ["acme/web", 2, 1, "Bob"];
+		const base = { repos: [[[], h("repos", ["acme/web", "old"])]], commits: [[["1".repeat(40)], h("commits", ["acme/web", "1".repeat(40), "one"])], [["2".repeat(40)], h("commits", ["acme/web", "2".repeat(40), "two"])]],
+			refs: [], commit_paths: [[["2".repeat(40), "a.ts"], h("commit_paths", ["acme/web", "2".repeat(40), "a.ts", "", "ts"])]],
+			contributors: [[[9], h("contributors", alice)], [[5], h("contributors", alice)], [[7], h("contributors", bob)]] };
+		const target = { repos: [["acme/web", "new"]], commits: [["acme/web", "1".repeat(40), "one"], ["acme/web", "3".repeat(40), "three"]], refs: [["acme/web", "main", "x"]], commit_paths: [],
+			contributors: [alice, ["acme/web", 3, 1, "Cy"]] };
+		assert.deepEqual(planOps(fams, base, target).map((op) => [op[0], op[1], op[0] === "d" ? op[2] : op[2].at(-1)]), [
+			["d", "commit_paths", ["2".repeat(40), "a.ts"]], ["d", "commits", ["2".repeat(40)]], ["d", "contributors", [7]], ["d", "contributors", [9]],
+			["p", "repos", "new"], ["p", "commits", "three"], ["p", "refs", "x"], ["p", "contributors", "Cy"]]);
+		// The acyclic identity (design revision 2): a zero-op chain is the seed, and the plan id binds the final header with its chain.
+		const header = { version: "corpus-refresh/1", repo: "acme/web", intent: "refresh", base: { kind: "published", epoch: 0 }, source: { kind: "sqlite-file", id: "ab".repeat(32), scope: "complete-repo-projection" },
+			projection: "corpus-projection/1", schemas: Object.fromEntries(FAMILIES.map((t) => [t, fams[t].schema_sha256])), observed: FAMILIES, observed_at: "2026-09-07T10:26:00.162Z",
+			targets: Object.fromEntries(FAMILIES.map((t) => [t, { rows: 0, sum: "0".repeat(64) }])), op_count: 0, chain: "" };
+		const seed = seedOf("test", "g1", header);
+		assert.deepEqual(chains(seed, []), [seed]);
+		assert.equal(seedOf("test", "g1", { ...header, chain: seed }), seed);
+		assert.notEqual(planIdOf("test", "g1", { ...header, chain: seed }), seed);
+		assert.notEqual(planIdOf("test", "g1", { ...header, chain: seed }), planIdOf("test", "g2", { ...header, chain: seed }));
 	});
 });

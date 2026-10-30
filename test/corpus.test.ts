@@ -4,7 +4,11 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256 } from "../src/domain/ids";
+import { refresh as reviewedRefresh } from "../src/corpus/refresh";
+import type { Outcome } from "../src/domain/types";
 import worker from "../src/worker";
+// @ts-expect-error local/ is plain JavaScript without declarations
+import { chains, refreshCorpus, seedOf } from "../local/corpus-refresh.mjs";
 // @ts-expect-error local/ is plain JavaScript without declarations
 import { uploadCorpus } from "../local/corpus-upload.mjs";
 import { contextFor, deviceToken, OWNER } from "./helpers";
@@ -45,7 +49,7 @@ async function isolated() {
 	};
 	const tool = async (args: Json) => {
 		const r = (await rpc("tools/call", { name: "corpus", arguments: { profile: name, ...args } })).result as { content: { text: string }[]; isError?: boolean };
-		return { error: r.isError === true, value: JSON.parse(r.content[0]!.text) as Json, bytes: Buffer.byteLength(r.content[0]!.text) };
+		return { error: r.isError === true, value: (r.isError ? JSON.parse(r.content[0]!.text) : JSON.parse(r.content[0]!.text).data) as Json, bytes: Buffer.byteLength(r.content[0]!.text) };
 	};
 	const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${generation}`));
 	const inCorpus = <T,>(f: (sql: SqlStorage) => T) => runInDurableObject(store, (_i, s) => f(s.storage.sql));
@@ -64,6 +68,7 @@ async function syntheticSource(fill: (sql: SqlStorage) => void = seed) {
 			columns: (t: string) => inSource((sql) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?)", t).toArray().map((r) => r.name)),
 			rows: (t: string, cols: string[], key: string[], after: unknown[] | null, limit: number) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t}${after ? ` WHERE (${key.join(", ")}) > (${after.map(() => "?").join(", ")})` : ""} ORDER BY ${key.join(", ")} LIMIT ?`,
 				...(after ?? []) as SqlStorageValue[], limit).raw()]),
+			repoRows: (t: string, cols: string[], repo: string) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${t === "repos" ? "full_name" : "repo"} = ?`, repo).raw()]),
 		},
 	};
 }
@@ -108,7 +113,9 @@ describe("corpus main flow", () => {
 			commits: [{ repo: "acme/web", sha: sha(1), subject: "Fix the token refresh loop", message: "Fix the token refresh loop\n\nCo-authored-by: Bob <[REDACTED]>\ntoken=[REDACTED]", pr_number: 12 }] });
 		expect(got.value.commits[0]).not.toHaveProperty("author_email");
 		expect(got.value.paths.map((r: Json) => r.path)).toEqual(["src/app.ts", "src/auth/token.ts"]);
-		expect(got.value.as_of).toEqual({ commit_paths: { as_of: AS_OF, refresh: "snapshot", complete: true, rows: 3, source_sha256: FILE }, commits: { as_of: AS_OF, refresh: "snapshot", complete: true, rows: 2, source_sha256: FILE } });
+		const snapshot = { as_of: AS_OF, as_of_max: AS_OF, basis: "declared_snapshot", refresh: "snapshot", complete: true, source_sha256: FILE, partitions: 1 };
+		expect(got.value.as_of).toEqual({ commit_paths: { ...snapshot, rows: 3 }, commits: { ...snapshot, rows: 2 } });
+		expect(got.value.repo_as_of).toEqual({ commits: AS_OF, commit_paths: AS_OF });
 
 		const found = await p.tool({ action: "search", query: "token" });
 		expect(found.value.results.map((r: Json) => r.evidence_id).sort()).toEqual([`commit:commits:acme/web@${sha(1)}`, "path:commit_paths:acme/web:src/auth/token.ts"]);
@@ -265,7 +272,7 @@ describe("corpus read-only SQL", () => {
 		expect((await p.tool({ action: "sql", sql: "SELECT sha FROM commits ORDER BY sha" })).value.rows).toEqual([[sha(1)], [sha(2)]]);
 		const tables = (await p.tool({ action: "sql", sql: "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name" })).value.rows.flat();
 		expect(tables).not.toContain("nodes");
-		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos"]);
+		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_partitions", "corpus_refresh", "corpus_refresh_parts", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos"]);
 		expect(tables).toContain("corpus_search_fts");
 		// Held kinds and me are refused by the tool; the search index reports its source tables' as_of.
 		expect((await p.tool({ action: "get", kind: "pr", key: "acme/web#1" })).error).toBe(true);
@@ -487,6 +494,31 @@ describe("corpus review regressions", () => {
 		expect(await again({})).toMatchObject({ status: "done", tables: { contributors: { rows: 2, complete: true } } });
 	});
 
+	it("wraps corpus data at transport only and refuses an envelope that crosses the shared byte limit", async () => {
+		const p = await isolated();
+		const result = (await p.rpc("tools/call", {name: "corpus", arguments: {profile: p.name, action: "sql", sql: "SELECT 1 AS n"}})).result;
+		const raw = JSON.parse(result.content[0].text);
+		expect(Object.keys(raw).sort()).toEqual(["data", "origin"]);
+		expect(raw.origin).toEqual({system: "agent-memory", trust: "untrusted"});
+		expect(raw.data.rows).toEqual([[1]]);
+		const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${p.generation}`));
+		const head = {profile: p.name, routed_by: "explicit", action: "sql"};
+		const columns = Array.from({length: 10}, (_, i) => `c${i}`);
+		const seed = await store.query(p.who, {action: "sql", sql: "SELECT " + columns.map((c) => `'' AS ${c}`).join(", ")}, head) as Outcome<Json>;
+		if (!seed.ok) throw new Error("synthetic corpus control failed");
+		const room = 1_000_000 - Buffer.byteLength(JSON.stringify(seed.value));
+		// SQL keeps each cell at 100k characters; ten bounded cells exercise the whole answer limit.
+		const sql = "SELECT " + columns.map((c, i) => `printf('%${i < 9 ? 100_000 : room - 900_000 - 20}s', '') AS ${c}`).join(", ");
+		const domain = await store.query(p.who, {action: "sql", sql}, head) as Outcome<Json>;
+		expect(domain).toMatchObject({ok: true, value: {truncated: false}});
+		if (!domain.ok) return;
+		expect(Buffer.byteLength(JSON.stringify(domain.value))).toBe(999_980);
+		expect(domain.value).not.toHaveProperty("data");
+		const over = await p.tool({action: "sql", sql});
+		expect(over).toMatchObject({error: true, value: {error: {code: "size_budget", details: {reason: "envelope_bytes"}}}});
+		expect(over.bytes).toBeLessThanOrEqual(1_000_000);
+	});
+
 	it("keeps every corpus answer within 1,000,000 UTF-8 bytes, cutting whole rows and saying so", async () => {
 		const p = await loaded();
 		const wide = "replace(printf('%100000s', ''), ' ', '漢')";
@@ -516,5 +548,340 @@ describe("corpus review regressions", () => {
 		expect(got.value).toMatchObject({ found: true, truncated: true });
 		expect(got.value.commits).toHaveLength(1);
 		expect((await p.tool({ action: "get", kind: "commit", key: `acme/web@${sha(1)}` })).value).toMatchObject({ found: true, truncated: false, paths_truncated: false });
+	});
+});
+
+// Refresh (design revision 2): the real client, Worker route and CorpusStore, synthetic rows only.
+const CUT = "2026-09-07T10:26:00.162Z", LATER = "2026-09-08T00:00:00.000Z", EARLIER = "2026-09-01T00:00:00.000Z";
+const FILE2 = "cd".repeat(32);
+
+/** acme/web from seed, plus an untouched second repo, acme/api. */
+function twoRepos(sql: SqlStorage) {
+	seed(sql);
+	sql.exec(`INSERT INTO repos (rowid, full_name, owner, name, description, archived, private, language, default_branch, updated_at, url, commit_count, ref_count, head_sha, earliest_date, latest_date, empty)
+		VALUES (2, 'acme/api', 'acme', 'api', 'The API', 0, 1, 'Go', 'main', '2026-08-02T00:00:00Z', 'https://github.com/acme/api', 1, 1, ?, '2026-08-02', '2026-08-02', 0)`, sha(9));
+	sql.exec("INSERT INTO commits VALUES ('acme/api', ?, '[]', 'Dana', NULL, '2026-08-02T10:00:00Z', 'Dana', NULL, '2026-08-02T10:00:00Z', 'Serve health checks', 'Serve health checks', 0, 0, NULL, NULL)", sha(9));
+	sql.exec("INSERT INTO refs VALUES ('acme/api', 'refs/heads/main', 'heads', 'main', ?, 'commit', '2026-08-02T10:00:00Z', 'Dana', NULL, 'Serve health checks')", sha(9));
+	sql.exec("INSERT INTO commit_paths VALUES ('acme/api', ?, 'cmd/health.go', 'cmd', 'go')", sha(9));
+	sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name, email) VALUES (3, 'acme/api', 1, 1, 'Dana', NULL)");
+}
+
+/** The next cut of acme/web: a reworded message, a commit gone with its paths, a new commit that now represents token.ts, the ref moved, contributors reshuffled. */
+function nextCut(sql: SqlStorage) {
+	twoRepos(sql);
+	sql.exec("UPDATE commits SET message = 'Fix the token refresh loop with a flux capacitor' WHERE repo = 'acme/web' AND sha = ?", sha(1));
+	sql.exec("DELETE FROM commits WHERE repo = 'acme/web' AND sha = ?", sha(2));
+	sql.exec("DELETE FROM commit_paths WHERE repo = 'acme/web' AND (sha = ? OR path = 'src/app.ts' OR (sha = ? AND path = 'src/auth/token.ts'))", sha(2), sha(1));
+	sql.exec("INSERT INTO commits VALUES ('acme/web', ?, '[]', 'Cy', NULL, '2026-09-01T09:00:00Z', 'Cy', NULL, '2026-09-01T09:00:00Z', 'Move token code into core', 'Move token code into core', 0, 0, NULL, NULL)", sha(3));
+	sql.exec("INSERT INTO commit_paths VALUES ('acme/web', ?, 'src/auth/token.ts', 'core', 'ts')", sha(3));
+	sql.exec("UPDATE refs SET target_sha = ?, subject = 'Move token code into core' WHERE repo = 'acme/web'", sha(3));
+	sql.exec("UPDATE repos SET description = 'The web app', commit_count = 2 WHERE full_name = 'acme/web'");
+	sql.exec("DELETE FROM contributors WHERE repo = 'acme/web'");
+	sql.exec("INSERT INTO contributors (repo, rank, commits, name, email) VALUES ('acme/web', 1, 1, 'Alice', NULL), ('acme/web', 1, 1, 'Alice', NULL), ('acme/web', 2, 1, 'Cy', NULL)");
+}
+
+/** A loaded corpus of twoRepos, the refresh client for it, and raw route calls. */
+async function refreshable(fill: (sql: SqlStorage) => void = twoRepos) {
+	const p = await isolated();
+	const { source } = await syntheticSource(fill);
+	expect(await uploadCorpus({ source, client: p.client, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {} })).toMatchObject({ status: "done" });
+	const route = (b: Json) => p.http(p.importer, "/v1/corpus/refresh", { profile: p.name, generation: p.generation, ...b });
+	const refresher = { status: p.client.status, refresh: async (b: Json) => (await p.http(p.importer, "/v1/corpus/refresh", b)).data };
+	const hashes = async (repo: string) => Object.fromEntries(await Promise.all(TABLES.map(async (t) => [t, (await route({ command: "inspect", table: t, repo, after: null })).data.page.rows])));
+	return { ...p, route, refresher, hashes };
+}
+
+describe("corpus refresh", () => {
+	it("refreshes one repo through the client, Worker and store: rows, search, rowids and as_of change there only", async () => {
+		const p = await refreshable();
+		const api = await p.hashes("acme/api");
+		const { source } = await syntheticSource(nextCut);
+		const state: Json = {};
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published", receipt: { epoch: 1, observed_at: CUT } });
+		expect(state.plan).toBeNull();
+		// Search follows the new rows: the reworded message and the new representative path appear; the deleted commit and the last-row path disappear.
+		const hits = async (q: string) => (await p.tool({ action: "search", query: q })).value.results.map((r: Json) => r.key);
+		expect(await hits("flux")).toEqual([`acme/web@${sha(1)}`]);
+		expect(await hits("backoff")).toEqual([]);
+		expect(await hits("core")).toEqual(expect.arrayContaining(["acme/web:src/auth/token.ts", `acme/web@${sha(3)}`]));
+		expect(await hits("app")).not.toContain("acme/web:src/app.ts");
+		const got = await p.tool({ action: "get", kind: "commit", key: `acme/web@${sha(3)}` });
+		expect(got.value).toMatchObject({ found: true, repo_as_of: { commits: CUT, commit_paths: CUT } });
+		expect(got.value.as_of.commits).toEqual({ as_of: AS_OF, as_of_max: CUT, basis: "mixed", refresh: "refresh", complete: true, rows: 3, source_sha256: null, partitions: 2 });
+		expect((await p.tool({ action: "get", kind: "commit", key: `acme/web@${sha(2)}` })).value.found).toBe(false);
+		expect((await p.tool({ action: "get", kind: "repo", key: "acme/api" })).value.repo_as_of).toEqual({ repos: AS_OF, contributors: AS_OF });
+		// Matched rows keep their rowids; the excess Bob row goes by rowid; new occurrences get server rowids after the current maximum.
+		const sql = async (q: string) => (await p.tool({ action: "sql", sql: q })).value.rows;
+		expect(await sql("SELECT rowid, name FROM contributors WHERE repo = 'acme/web' ORDER BY rowid")).toEqual([[1, "Alice"], [4, "Alice"], [5, "Cy"]]);
+		expect(await sql("SELECT rowid, description FROM repos WHERE full_name = 'acme/web'")).toEqual([[1, "The web app"]]);
+		expect(await p.hashes("acme/api")).toEqual(api);
+		expect(await sql("SELECT table_name, part, basis, observed_at FROM corpus_partitions WHERE table_name = 'refs' ORDER BY part")).toEqual([
+			["refs", '"acme/api"', "declared_snapshot", AS_OF], ["refs", '"acme/web"', "observed", CUT]]);
+		// An unchanged later cut confirms with no operations: only that repo's dates move, and the client's inspect audit agrees with every digest.
+		const again = await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state });
+		expect(again).toMatchObject({ status: "published", receipt: { epoch: 2 } });
+		expect((await p.tool({ action: "get", kind: "ref", key: "acme/web:refs/heads/main" })).value).toMatchObject({ repo_as_of: { refs: LATER }, as_of: { refs: { as_of: AS_OF, as_of_max: LATER } } });
+	});
+
+	it("closes every corpus read while a plan applies; a lost acknowledgement or changed retry writes nothing twice; receipts replay after publication", async () => {
+		const p = await refreshable();
+		const { source } = await syntheticSource(nextCut);
+		let parts = 0;
+		const lossy = { ...p.refresher, refresh: async (b: Json) => { const r = await p.refresher.refresh(b); if (b.command === "part" && ++parts === 1) throw new Error("connection reset"); return r; } };
+		const state: Json = {};
+		expect(await refreshCorpus({ source, client: lossy, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state, partOps: 3 })).toMatchObject({ status: "stopped", reason: "connection reset" });
+		const plan = structuredClone(state.plan) as Json, steps = chains(seedOf(p.name, p.generation, plan.header), plan.ops) as string[];
+		// Search, get and SQL (bookkeeping tables through a CTE included) answer busy; a bulk chunk and the bulk uploader stop too.
+		for (const args of [{ action: "search", query: "token" }, { action: "get", kind: "repo", key: "acme/web" }, { action: "sql", sql: "WITH x AS (SELECT * FROM corpus_partitions) SELECT count(*) FROM x" }])
+			expect(await p.tool(args)).toMatchObject({ error: true, value: { error: { code: "busy", details: { reason: "corpus_refreshing" } } } });
+		expect(await p.http(p.importer, "/v1/corpus/import", await body(p, "commits", [], { final: true }))).toMatchObject({ status: 503, data: { error: { details: { reason: "corpus_refreshing" } } } });
+		expect(await uploadCorpus({ source, client: p.client, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {} })).toEqual({ status: "stopped", reason: "corpus_refreshing" });
+		expect((await p.client.status(p.name)).refresh).toMatchObject({ plan_id: plan.plan_id, repo: "acme/web", state: "applying", next_op: 3, op_count: plan.ops.length, chain: steps[3], base_epoch: 0, unpublished: ["commit_paths"] });
+		// The lost part replays its stored receipt; changed bytes at that start conflict; a start inside the applied prefix reports the cursor.
+		const first = { command: "part", plan_id: plan.plan_id, start: 0, ops: plan.ops.slice(0, 3) };
+		const replay = await p.route(first);
+		expect(replay).toMatchObject({ status: 200, data: { receipt: { status: "stored", start: 0, count: 3, next_op: 3, chain: steps[3] } } });
+		expect(await p.route({ ...first, ops: plan.ops.slice(0, 2) })).toMatchObject({ status: 409, data: { error: { code: "idempotency_mismatch", details: { reason: "part_changed" } } } });
+		expect(await p.route({ ...first, start: 1, ops: plan.ops.slice(1, 3) })).toMatchObject({ status: 400, data: { error: { details: { reason: "stale_part", next_op: 3, chain: steps[3] } } } });
+		expect((await p.client.status(p.name)).refresh.next_op).toBe(3);
+		// The saved plan resumes at the server's cursor and publishes.
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state, partOps: 3 })).toMatchObject({ status: "published" });
+		const maxRowid = async () => (await p.tool({ action: "sql", sql: "SELECT max(rowid) FROM contributors" })).value.rows;
+		expect(await maxRowid()).toEqual([[5]]);
+		// After publication every receipt replays unchanged, and nothing is applied again.
+		expect(await p.route(first)).toEqual(replay);
+		const fin = await p.route({ command: "finish", plan_id: plan.plan_id });
+		expect(fin).toMatchObject({ status: 200, data: { receipt: { status: "published", plan_id: plan.plan_id, epoch: 1, observed_at: CUT } } });
+		expect(await p.route({ command: "finish", plan_id: plan.plan_id })).toEqual(fin);
+		expect(await p.route({ command: "begin", header: plan.header })).toMatchObject({ status: 200, data: { receipt: { status: "active", plan_id: plan.plan_id, next_op: 0, chain: steps[0] } } });
+		expect(await maxRowid()).toEqual([[5]]);
+		expect((await p.client.status(p.name)).refresh).toBeNull();
+	});
+
+	it("takes a lost plan over for the same repo only, and keeps every table the old chain changed until a takeover observes it", async () => {
+		const p = await refreshable();
+		const { source } = await syntheticSource(nextCut);
+		let parts = 0;
+		const dies = { ...p.client, refresh: async (b: Json) => { if (b.command === "part" && ++parts === 2) throw new Error("machine lost"); return p.refresher.refresh(b); } };
+		const lost: Json = {};
+		expect(await refreshCorpus({ source, client: dies, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state: lost, partOps: 4 })).toMatchObject({ status: "stopped" });
+		const old = lost.plan as Json, st = (await p.client.status(p.name)).refresh;
+		expect(st).toMatchObject({ plan_id: old.plan_id, next_op: 4, unpublished: ["commits", "commit_paths"] });
+		const base = { kind: "active", plan_id: st.plan_id, next_op: st.next_op, chain: st.chain };
+		const zero = (h: Json) => ({ ...h, op_count: 0, chain: seedOf(p.name, p.generation, { ...h, op_count: 0 }) });
+		const reason = async (header: Json) => (await p.route({ command: "begin", header })).data.error?.details;
+		expect(await reason(zero({ ...old.header, repo: "acme/api", base }))).toMatchObject({ reason: "repo_mismatch" });
+		expect(await reason(zero({ ...old.header, base, observed: ["repos", "refs", "contributors"] }))).toEqual({ reason: "unobserved_changed", tables: ["commits", "commit_paths"] });
+		expect(await reason(zero({ ...old.header, base: { ...base, next_op: 3 } }))).toMatchObject({ reason: "base_changed" });
+		expect((await p.client.status(p.name)).refresh).toMatchObject({ plan_id: old.plan_id, state: "applying", next_op: 4 });
+		// With its plan gone, the client takes the chain over from status and publishes the complete target.
+		const state: Json = {};
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published" });
+		expect(state.published.plan_id).not.toBe(old.plan_id);
+		expect((await p.tool({ action: "sql", sql: "SELECT rowid, name FROM contributors WHERE repo = 'acme/web' ORDER BY rowid" })).value.rows).toEqual([[1, "Alice"], [4, "Alice"], [5, "Cy"]]);
+		expect((await p.tool({ action: "search", query: "flux" })).value.results.map((r: Json) => r.key)).toEqual([`acme/web@${sha(1)}`]);
+		// The superseded plan's stored part still replays; a new slice of it does not apply.
+		expect(await p.route({ command: "part", plan_id: old.plan_id, start: 0, ops: old.ops.slice(0, 4) })).toMatchObject({ status: 200, data: { receipt: { status: "stored", next_op: 4 } } });
+		expect(await p.route({ command: "part", plan_id: old.plan_id, start: 4, ops: old.ops.slice(4, 5) })).toMatchObject({ status: 400, data: { error: { details: { reason: "plan_not_applying", state: "superseded" } } } });
+		// A later confirm audits every inspected page against the maintained digests and publishes with no operations.
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state })).toMatchObject({ status: "published", receipt: { epoch: 2 } });
+	});
+
+	it("removes a repo into zero-row partitions that keep its observation, refusing an older cut and accepting a newer one", async () => {
+		const p = await refreshable();
+		expect(await refreshCorpus({ source: null, client: p.refresher, profile: p.name, repo: "acme/api", intent: "remove", observedAt: CUT, sourceId: FILE2, state: {} })).toMatchObject({ status: "published" });
+		const parts = async () => (await p.tool({ action: "sql", sql: "SELECT table_name, rows, basis, observed_at FROM corpus_partitions WHERE part = '\"acme/api\"' ORDER BY table_name" })).value.rows;
+		expect(await parts()).toEqual(["commit_paths", "commits", "contributors", "refs", "repos"].map((t) => [t, 0, "observed", CUT]));
+		// Zero-row partitions do not date the table; acme/web's snapshot alone covers its rows.
+		expect((await p.tool({ action: "get", kind: "commit", key: `acme/web@${sha(1)}` })).value.as_of.commits).toMatchObject({ as_of: AS_OF, as_of_max: AS_OF, basis: "declared_snapshot", rows: 2, partitions: 1 });
+		expect((await p.tool({ action: "get", kind: "repo", key: "acme/api" })).value).toMatchObject({ found: false, repo_as_of: { repos: CUT, contributors: CUT } });
+		const { source } = await syntheticSource(twoRepos);
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/api", observedAt: EARLIER, sourceId: FILE2, state: {} })).toMatchObject({ status: "refused", reason: "stale_observation" });
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/api", observedAt: LATER, sourceId: FILE2, state: {} })).toMatchObject({ status: "published" });
+		expect((await p.tool({ action: "get", kind: "repo", key: "acme/api" })).value).toMatchObject({ found: true, repo_as_of: { repos: LATER } });
+		// An empty target for a loaded repo is refused unless the removal is explicit.
+		const { source: empty } = await syntheticSource(() => {});
+		expect(await refreshCorpus({ source: empty, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state: {} })).toMatchObject({ status: "refused", reason: "removal_needs_intent" });
+	});
+
+	it("holds parts to 5,000 operations, 1,000,000 request bytes, 900,000-byte rows and 5,000,000 expanded bytes, in key order, reporting rows written", async () => {
+		const bigText = (i: number) => `big ${i}${" ".repeat(400_000)}`;
+		const p = await refreshable((sql) => { twoRepos(sql); for (let i = 0; i < 8; i++) sql.exec("INSERT INTO commits VALUES ('acme/big', ?, '[]', 'Eve', NULL, '2026-08-03T00:00:00Z', 'Eve', NULL, '2026-08-03T00:00:00Z', ?, ?, 0, 0, NULL, NULL)", sha(100 + i), `big ${i}`, bigText(i)); });
+		// Seven ~400 KB deletes, each with its ~400 KB document, are over 5,000,000 expanded bytes: refused whole, then halved slices apply.
+		const sent: Json[] = [];
+		const watch = { ...p.refresher, refresh: async (b: Json) => { const r = await p.refresher.refresh(b); if (b.command === "part") sent.push({ start: b.start, count: b.ops.length, ...(r.error ? { error: r.error.details.reason } : { rows_written: r.receipt.rows_written, expanded: r.receipt.expanded_bytes }) }); return r; } };
+		const { source } = await syntheticSource((sql) => { twoRepos(sql); sql.exec("INSERT INTO commits VALUES ('acme/big', ?, '[]', 'Eve', NULL, '2026-08-03T00:00:00Z', 'Eve', NULL, '2026-08-03T00:00:00Z', ?, ?, 0, 0, NULL, NULL)", sha(100), "big 0", bigText(0)); });
+		expect(await refreshCorpus({ source, client: watch, profile: p.name, repo: "acme/big", observedAt: CUT, sourceId: FILE2, state: {} })).toMatchObject({ status: "published" });
+		expect(sent.map((s) => [s.start, s.count, s.error ?? "stored"])).toEqual([[0, 7, "expanded_bytes"], [0, 4, "stored"], [4, 3, "stored"]]);
+		for (const s of sent.slice(1)) { expect(s.rows_written).toBeGreaterThan(s.count); expect(s.expanded).toBeLessThanOrEqual(5_000_000); }
+		expect((await p.tool({ action: "sql", sql: "SELECT count(*) FROM commits WHERE repo = 'acme/big'" })).value.rows).toEqual([[1]]);
+		// Wire bounds refuse before any store sees the part.
+		const pid = "e".repeat(64);
+		expect(await p.route({ command: "part", plan_id: pid, start: 0, ops: Array.from({ length: 5001 }, () => ["d", "commits", [sha(1)], pid]) })).toMatchObject({ status: 400 });
+		expect(await p.route({ command: "finish", plan_id: pid, pad: "x".repeat(1_000_001) })).toMatchObject({ status: 413, data: { error: { details: { reason: "request_bytes" } } } });
+		// A put row over 900,000 bytes and a part out of key order each refuse whole, with no receipt.
+		const st = await p.client.status(p.name);
+		const fams = Object.fromEntries(st.families.map((f: Json) => [f.table, f]));
+		const page = async (repo: string) => (await p.route({ command: "inspect", table: "commits", repo, after: null })).data.page;
+		const header = (ops: Json[], base: Json) => {
+			const h: Json = { version: "corpus-refresh/1", repo: "acme/big", intent: "refresh", base, source: { kind: "sqlite-file", id: FILE2, scope: "complete-repo-projection" }, projection: "corpus-projection/1",
+				schemas: Object.fromEntries(TABLES.map((t) => [t, fams[t].schema_sha256])), observed: TABLES, observed_at: LATER,
+				targets: Object.fromEntries(TABLES.map((t) => [t, { rows: t === "commits" ? 1 : 0, sum: (t === "commits" ? "1" : "0").repeat(64) }])), op_count: ops.length, chain: "" };
+			h.chain = (chains(seedOf(p.name, p.generation, h), ops) as string[]).at(-1);
+			return h;
+		};
+		const huge = ["p", "commits", ["acme/big", sha(200), "[]", "Eve", "2026-08-03T00:00:00Z", "Eve", "2026-08-03T00:00:00Z", "huge", `huge${" ".repeat(950_000)}`, 0, 0, null, null], null];
+		const h1 = header([huge], { kind: "published", epoch: (await page("acme/big")).binding.epoch });
+		const b1 = (await p.route({ command: "begin", header: h1 })).data.receipt;
+		expect(await p.route({ command: "part", plan_id: b1.plan_id, start: 0, ops: [huge] })).toMatchObject({ status: 413, data: { error: { details: { reason: "row_bytes" } } } });
+		const rows = (await page("acme/big")).rows as [string[], string][];
+		const misordered = [["d", "commits", rows[0]![0], rows[0]![1]], ["d", "commits", [sha(99)], rows[0]![1]]];
+		const { binding } = await page("acme/big");
+		const h2 = header(misordered, { kind: "active", ...binding });
+		const b2 = (await p.route({ command: "begin", header: h2 })).data.receipt;
+		expect(await p.route({ command: "part", plan_id: b2.plan_id, start: 0, ops: misordered })).toMatchObject({ status: 400, data: { error: { details: { reason: "order" } } } });
+		expect((await p.client.status(p.name)).refresh).toMatchObject({ plan_id: b2.plan_id, next_op: 0 });
+		expect(await p.inCorpus((sql) => sql.exec("SELECT count(*) AS n FROM commits WHERE repo = 'acme/big'").one().n)).toBe(1);
+	});
+
+	it("in work, registers put rows' people before the store sees a part, and fences every part and replay by account state, generation and wipe", async () => {
+		const w = await workAccount();
+		const { source } = await syntheticSource(people);
+		expect(await uploadCorpus({ source, client: w.client, profile: "work", tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {} })).toMatchObject({ status: "done" });
+		const route = async (b: Json) => (await w.http("/v1/corpus/refresh", b)).data;
+		const bodies: Json[] = [];
+		const client = { status: w.client.status, refresh: async (b: Json) => { if (b.command === "part") bodies.push(b); return route(b); } };
+		const { source: next } = await syntheticSource((sql) => { people(sql); sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name, email) VALUES (3, 'acme/web', 3, 1, 'Dee Developer', NULL)"); });
+		// The me guard is down: the part's new person cannot be confirmed, so nothing is stored and the cursor stays.
+		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'me'"));
+		const state: Json = {};
+		expect(await refreshCorpus({ source: next, client, profile: "work", repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "stopped", reason: "unavailable" });
+		expect((await w.client.status("work")).refresh.next_op).toBe(0);
+		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'active' WHERE name = 'me'"));
+		expect(await refreshCorpus({ source: next, client, profile: "work", repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published" });
+		expect(await w.guard()).toEqual(expect.arrayContaining([{ term: "Dee Developer", source: "work" }]));
+		const stored = bodies.at(-1)!;
+		expect((await route(stored)).receipt).toMatchObject({ status: "stored" });
+		// Recovery stops even an exact replay before the store; another generation and a closed corpus refuse it too.
+		await w.onAccount((sql) => sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'reconciling')"));
+		expect((await route(stored)).error).toMatchObject({ code: "busy" });
+		await w.onAccount((sql) => sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'"));
+		expect((await w.http("/v1/corpus/refresh", { ...stored, generation: "elsewhere" }))).toMatchObject({ status: 409, data: { error: { code: "profile_wiped" } } });
+		await (w.corpus() as unknown as { wipe: (who: unknown, op: string) => Promise<unknown> }).wipe(w.ref("work"), "close");
+		expect((await route(stored)).error).toMatchObject({ code: "profile_wiped" });
+		expect((await route({ profile: "work", generation: w.ref("work").generation, command: "finish", plan_id: state.published.plan_id })).error).toMatchObject({ code: "profile_wiped" });
+	});
+});
+
+
+
+describe("F1 implementation fix regressions", () => {
+	it("reconciles an uncertain HTTP failure before halving an unapplied slice and stops at one failing operation", async () => {
+		const p = await refreshable();
+		const { source } = await syntheticSource(sql => { twoRepos(sql); sql.exec("INSERT INTO contributors (repo,rank,commits,name) VALUES ('acme/web',3,1,'Zed'), ('acme/web',4,1,'Yan')"); });
+		const state: Json = {}, lengths: number[] = [], events: string[] = [];
+		const client = { status: async (profile: string) => { events.push("status"); return p.refresher.status(profile); }, refresh: async (b: Json) => {
+			if (b.command === "part") { events.push(`part:${b.ops.length}`); lengths.push(b.ops.length); if (b.ops.length > 1) throw new Error("HTTP 503"); }
+			return p.refresher.refresh(b);
+		} };
+		expect(await refreshCorpus({ source, client, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published" });
+		expect(lengths).toEqual([2, 1, 1]);
+		expect(events.slice(events.indexOf("part:2"), events.indexOf("part:2") + 3)).toEqual(["part:2", "status", "part:1"]);
+		expect((await p.client.status(p.name)).refresh).toBeNull();
+
+		const q = await refreshable(), failed: Json = {}, attempts: number[] = [];
+		const blocked = { ...q.refresher, refresh: async (b: Json) => {
+			if (b.command === "part") { attempts.push(b.ops.length); throw new Error("HTTP 503"); }
+			return q.refresher.refresh(b);
+		} };
+		expect(await refreshCorpus({ source, client: blocked, profile: q.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state: failed })).toMatchObject({ status: "stopped", reason: "HTTP 503" });
+		expect(attempts).toEqual([2, 1]);
+		expect(failed.plan.ops).toHaveLength(2);
+		expect((await q.client.status(q.name)).refresh.next_op).toBe(0);
+		expect(await q.tool({ action: "sql", sql: "SELECT 1" })).toMatchObject({ error: true, value: { error: { code: "busy" } } });
+	});
+
+	it("uses the committed cursor after a lost HTTP acknowledgement and refuses a mismatched chain before re-slicing", async () => {
+		const p = await refreshable();
+		const { source } = await syntheticSource(sql => { twoRepos(sql); sql.exec("INSERT INTO contributors (repo,rank,commits,name) VALUES ('acme/web',3,1,'Zed'), ('acme/web',4,1,'Yan')"); });
+		const sent: Json[] = [], state: Json = {};
+		const lossy = { ...p.refresher, refresh: async (b: Json) => {
+			const result = await p.refresher.refresh(b);
+			if (b.command === "part") { sent.push(b); throw new Error("HTTP 503"); }
+			return result;
+		} };
+		expect(await refreshCorpus({ source, client: lossy, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published" });
+		expect(sent).toHaveLength(1);
+		expect(sent[0]!.ops).toHaveLength(2);
+		const replay = await p.route(sent[0]!);
+		expect(await p.route(sent[0]!)).toEqual(replay);
+		expect(await p.route({ ...sent[0], ops: sent[0]!.ops.slice(0, 1) })).toMatchObject({ status: 409, data: { error: { code: "idempotency_mismatch" } } });
+		expect((await p.tool({ action: "sql", sql: "SELECT count(*) FROM contributors WHERE repo = 'acme/web'" })).value.rows).toEqual([[4]]);
+
+		const q = await refreshable();
+		let failed = false, attempts = 0;
+		const changed = { status: async (profile: string) => {
+			const status = await q.refresher.status(profile);
+			if (failed) status.refresh.chain = "0".repeat(64);
+			return status;
+		}, refresh: async (b: Json) => {
+			if (b.command === "part") { failed = true; attempts++; throw new Error("HTTP 503"); }
+			return q.refresher.refresh(b);
+		} };
+		expect(await refreshCorpus({ source, client: changed, profile: q.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state: {} })).toMatchObject({ status: "refused", reason: "chain_mismatch" });
+		expect(attempts).toBe(1);
+		expect((await q.client.status(q.name)).refresh.next_op).toBe(0);
+	});
+	it("refuses a held-text view, changed DDL and missing projected columns before reading targets or persisting a plan", async () => {
+		const p = await refreshable();
+		const s = await syntheticSource(twoRepos);
+		await s.inSource(sql => {
+			sql.exec("DROP TABLE refs");
+			sql.exec("CREATE TABLE session_messages (repo TEXT, body TEXT)");
+			sql.exec("INSERT INTO session_messages VALUES ('acme/web', 'SYNTHETIC_HELD_SESSION_CANARY')");
+			sql.exec("CREATE VIEW refs AS SELECT repo, 'refs/heads/main' AS refname, 'heads' AS namespace, 'main' AS short_name, '0000000000000000000000000000000000000001' AS target_sha, 'commit' AS object_type, '2026-09-01T00:00:00Z' AS creator_date, 'Alice' AS author_name, body AS subject FROM session_messages");
+		});
+		expect(await s.source.schema("refs")).toBeNull();
+		const fresh = await isolated();
+		expect(await uploadCorpus({source:s.source,client:fresh.client,profile:fresh.name,tables:["refs"],asOf:AS_OF,fileSha256:FILE2,state:{}})).toMatchObject({status:"refused",reason:"schema_mismatch"});
+		let reads=0, saves=0, begins=0;
+		const client={...p.refresher,refresh:async(b:Json)=>{if(b.command==="begin") begins++;return p.refresher.refresh(b);}};
+		const source={...s.source,repoRows:async(...args:Parameters<typeof s.source.repoRows>)=>{reads++;return s.source.repoRows(...args);}};
+		const state:Json={};
+		const run=(selected=source)=>refreshCorpus({source:selected,client,profile:p.name,repo:"acme/web",observedAt:CUT,sourceId:FILE2,state,save:()=>{saves++;}});
+		expect(await run()).toMatchObject({status:"refused",table:"refs",reason:"schema_mismatch"});
+		const original=await syntheticSource(twoRepos);
+		expect(await run({...source,schema:async(t:string)=>(await original.source.schema(t))+" "})).toMatchObject({status:"refused",reason:"schema_mismatch"});
+		expect(await run({...source,schema:original.source.schema,columns:async()=>[]})).toMatchObject({status:"refused",reason:"columns"});
+		expect({reads,saves,begins,state}).toEqual({reads:0,saves:0,begins:0,state:{}});
+		expect((await p.tool({action:"get",kind:"ref",key:"acme/web:refs/heads/main"})).value.refs[0].subject).not.toBe("SYNTHETIC_HELD_SESSION_CANARY");
+		expect((await p.client.status(p.name)).refresh).toBeNull();
+	});
+	it("counts cursor and receipt writes in the exact stored and replayed receipt on real SQLite", async () => {
+		const p = await refreshable();
+		const s = await syntheticSource(sql=>{twoRepos(sql);sql.exec("INSERT INTO contributors (repo,rank,commits,name) VALUES ('acme/web',3,1,'Zed')");});
+		const state:Json={};
+		const halted={...p.refresher,refresh:async(b:Json)=>{if(b.command==="part") throw new Error("hold before part"); return p.refresher.refresh(b);}};
+		expect(await refreshCorpus({source:s.source,client:halted,profile:p.name,repo:"acme/web",observedAt:CUT,sourceId:FILE2,state})).toMatchObject({status:"stopped"});
+		expect(state.plan.ops).toHaveLength(1);
+		const store=env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${p.generation}`));
+		const measured=await runInDurableObject(store,(_i,s)=>{
+			const writes:Json[]=[];
+			const measuredSql={exec:(q:string,...a:SqlStorageValue[])=>{
+				const c=s.storage.sql.exec(q,...a),rows=c.toArray();
+				if(c.rowsWritten) writes.push({statement:q.split(/\s+/).slice(0,4).join(" "),rows:c.rowsWritten});
+				return {toArray:()=>rows,rowsWritten:c.rowsWritten};
+			}} as unknown as SqlStorage;
+			const text=s.storage.transactionSync(()=>reviewedRefresh(measuredSql,p.who,{command:"part",plan_id:state.plan.plan_id,start:0,ops:state.plan.ops}));
+			const stored=s.storage.sql.exec<{receipt:string}>("SELECT receipt FROM corpus_refresh_parts WHERE plan_id = ? AND start = 0",state.plan.plan_id).one().receipt;
+			const replay=s.storage.transactionSync(()=>reviewedRefresh(measuredSql,p.who,{command:"part",plan_id:state.plan.plan_id,start:0,ops:state.plan.ops}));
+			return {receipt:JSON.parse(text as string),text,stored,replay,writes,actual:writes.reduce((n,w)=>n+w.rows,0)};
+		});
+		expect(measured.receipt.rows_written).toBe(3);
+		expect(measured.receipt.rows_written).toBe(measured.actual);
+		expect(measured.text).toBe(measured.stored);
+		expect(measured.text).toBe(measured.replay);
+		expect(measured.writes.slice(-2).map(w=>w.statement)).toEqual(["UPDATE corpus_refresh SET next_op","INSERT INTO corpus_refresh_parts (plan_id,"]);
+
 	});
 });

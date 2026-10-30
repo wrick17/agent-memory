@@ -7,11 +7,13 @@ import { Fail, ok, type Outcome, type ProfileRef } from "../domain/types";
 import { migrate, type Migration } from "../storage";
 import { chunkHash, checkChunk, FAMILIES, manifest, named, requestIdOf, SEARCH_DDL, type Key, type Value } from "./families";
 import { get, runSql, search, type CorpusQuery, type Head } from "./query";
+import { addToPartitions, META, MIGRATION, refresh, refreshActive, refreshStatus, type RefreshCommand } from "./refresh";
 
 export { CHUNK_ROWS, checkChunk, chunkTerms, FAMILIES, FORBIDDEN, HELD, manifest, refusal } from "./families";
+export { PART_OPS, refreshTerms } from "./refresh";
 export type { CorpusQuery } from "./query";
+export type { Op, PlanHeader, RefreshCommand } from "./refresh";
 
-const META = "corpus_store_meta";
 /** 90% of the 10 GB Paid object limit. */
 const SIZE_LIMIT = 9_000_000_000;
 
@@ -23,11 +25,12 @@ export const CORPUS_MIGRATIONS: Migration[] = [[
 		rows INTEGER NOT NULL, last_key TEXT, complete INTEGER NOT NULL, updated_at TEXT NOT NULL) WITHOUT ROWID`,
 	`CREATE TABLE corpus_requests (request_id TEXT PRIMARY KEY, table_name TEXT NOT NULL, sha256 TEXT NOT NULL, rows INTEGER NOT NULL,
 		last_key TEXT, complete INTEGER NOT NULL, received_at TEXT NOT NULL) WITHOUT ROWID`,
-]];
+], MIGRATION];
 
 export interface CorpusChunk { table: string; schema_sha256: string; source: { file_sha256: string }; as_of: string; columns: string[]; after: Key | null; rows: Value[][]; final: boolean; sha256: string }
 export interface ChunkReceipt { status: "stored" | "replayed"; request_id: string; table: string; rows: number; last_key: Key | null; complete: boolean; sha256: string; rows_written?: number }
 export interface CorpusStatus { tables: { table: string; rows: number; last_key: Key | null; complete: boolean; as_of: string; refresh: string; source_sha256: string }[] }
+const refreshing = () => Fail.of("busy", "the corpus is refreshing; it reopens when the refresh publishes", { reason: "corpus_refreshing" });
 
 const closedState = (sql: SqlStorage) => {
 	sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);
@@ -38,6 +41,7 @@ const assertOpen = (sql: SqlStorage) => { if (closedState(sql)) throw Fail.of("p
 /** One chunk in one transaction: replay or refuse by request id, then check order, source and every row before writing. */
 function applyChunk(sql: SqlStorage, c: CorpusChunk): ChunkReceipt {
 	assertOpen(sql);
+	if (refreshActive(sql)) throw refreshing();
 	const { f, rows, keys } = checkChunk(c);
 	const requestId = requestIdOf(c.table, keys[0] ?? null);
 	const hash = chunkHash(c);
@@ -69,6 +73,7 @@ function applyChunk(sql: SqlStorage, c: CorpusChunk): ChunkReceipt {
 		written += doc.rowsWritten;
 		if (id !== undefined) run("INSERT INTO corpus_search_fts (rowid, key, repo, title, detail) VALUES (?, ?, ?, ?, ?)", id, d.key, d.repo, d.title, d.detail);
 	}
+	addToPartitions(sql, run, c.table, rows, c.source.file_sha256, c.as_of);
 	const last = keys.length ? JSON.stringify(keys.at(-1)) : meta?.last_key ?? null;
 	const now = new Date().toISOString();
 	run(`INSERT INTO corpus_meta (table_name, source, as_of, refresh, schema_sha256, rows, last_key, complete, updated_at) VALUES (?, ?, ?, 'snapshot', ?, ?, ?, ?, ?)
@@ -118,7 +123,7 @@ export class CorpusStore extends DurableObject<Env> {
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
-	async status(who: ProfileRef): Promise<Outcome<CorpusStatus & { families: ReturnType<typeof manifest> }>> {
+	async status(who: ProfileRef): Promise<Outcome<CorpusStatus & { families: ReturnType<typeof manifest> } & ReturnType<typeof refreshStatus>>> {
 		try {
 			await this.access(who);
 			this.bind(who, true);
@@ -126,7 +131,7 @@ export class CorpusStore extends DurableObject<Env> {
 				"SELECT table_name, rows, last_key, complete, as_of, refresh, source FROM corpus_meta ORDER BY table_name").toArray()
 				.map((m) => ({ table: m.table_name, rows: m.rows, last_key: m.last_key === null ? null : JSON.parse(m.last_key) as Key, complete: m.complete === 1, as_of: m.as_of, refresh: m.refresh,
 					source_sha256: (JSON.parse(m.source) as { file_sha256: string }).file_sha256 }));
-			return ok({ families: manifest(), tables });
+			return ok({ families: manifest(), tables, ...refreshStatus(this.ctx.storage.sql) });
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
@@ -136,11 +141,22 @@ export class CorpusStore extends DurableObject<Env> {
 			await this.access(who);
 			this.bind(who, true);
 			const sql = this.ctx.storage.sql;
+			// The read gate (design 4.3): no await separates this check from the synchronous read below.
+			if (refreshActive(sql)) throw refreshing();
 			switch (q.action) {
 				case "search": return ok(search(sql, q, head));
 				case "get": return ok(get(sql, q, head));
 				case "sql": return ok(runSql(this.ctx.storage, q.sql, head));
 			}
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** One refresh command (design revision 2), after the same access and generation checks as a chunk, in one transaction. */
+	async refresh(who: ProfileRef, cmd: RefreshCommand): Promise<Outcome<string | Record<string, unknown>>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			return ok(this.ctx.storage.transactionSync(() => { assertOpen(this.ctx.storage.sql); return refresh(this.ctx.storage.sql, who, cmd); }));
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 

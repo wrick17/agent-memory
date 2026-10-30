@@ -21,11 +21,11 @@ export interface Manifest { range_id: string; parts: { part_id: string; sha256: 
 export interface IngestBatch { session: { client: "claude-code" | "codex"; id: string }; digests: DigestPart[]; manifests: Manifest[] }
 export type ItemResult = { range_id: string; part_id: string; status: "stored" | "replayed" | "refused"; reason?: string };
 
-export function parseRange(rangeId: string): { client: string; session: string; start: number; end: number } | null {
+export function parseRange(rangeId: string): { client: string; session: string; epoch: string; start: number; end: number } | null {
 	const m = RANGE_ID.exec(rangeId);
 	if (!m) return null;
 	const start = Number(m[4]), end = Number(m[5]);
-	return end > start ? { client: m[1]!, session: m[2]!, start, end } : null;
+	return end > start ? { client: m[1]!, session: m[2]!, epoch: m[3]!, start, end } : null;
 }
 
 // The digest schema shared by heuristic digests and consolidated parts, strict at every level: no field outside it, and every
@@ -57,7 +57,7 @@ export function checkBody(text: string): { body?: Body; reason?: string } {
 	return { body: parsed.data };
 }
 
-const sessionKey = (s: IngestBatch["session"]) => `session:${s.client}:${s.id}`;
+export const sessionKey = (s: IngestBatch["session"]) => `session:${s.client}:${s.id}`;
 
 /** The session node, created once. Sessions are found by identifier and full text, so they never get an embedding card. */
 function sessionNode(sql: SqlStorage, s: IngestBatch["session"], seq: number, now: string): string {
@@ -169,6 +169,27 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 	return out;
 }
 
+/** A manifest acknowledges only the tiled parts still durably held, including after capture TTL or an interrupted restore. */
+function completeRange(sql: SqlStorage, id: string): boolean {
+	const range = parseRange(id), text = manifestBody(sql, id), manifest = stored(sql, id, "consolidated", "manifest");
+	if (!range || !text || !manifest || sha256(text) !== manifest.sha256) return false;
+	try {
+		const m = JSON.parse(text) as Manifest;
+		if (m.range_id !== id || !Array.isArray(m.parts) || !m.parts.length || m.parts.length > 512) return false;
+		let at = range.start;
+		for (const p of m.parts) {
+			const span = typeof p.part_id === "string" ? SPAN.exec(p.part_id) : null;
+			if (!span || Number(span[1]) !== at || Number(span[2]) <= at || Number(span[2]) > range.end) return false;
+			const row = stored(sql, id, "consolidated", p.part_id);
+			if (!row || row.sha256 !== p.sha256 || sha256(row.body) !== p.sha256) return false;
+			const body = checkBody(row.body).body;
+			if (!body || body.dropped.decisions || body.dropped.corrections) return false;
+			at = Number(span[2]);
+		}
+		return at === range.end;
+	} catch { return false; }
+}
+
 /** What the server holds for each range, so a client that lost its part files adopts these and digests only the gaps. */
 export function captureState(sql: SqlStorage, rangeIds: string[]): Record<string, { parts: { part_id: string; sha256: string }[]; heuristic: boolean; consolidated: boolean }> {
 	const out: ReturnType<typeof captureState> = {};
@@ -177,8 +198,8 @@ export function captureState(sql: SqlStorage, rangeIds: string[]): Record<string
 			"SELECT capture_status, capture_part, sha256 FROM texts WHERE range_id = ? ORDER BY rowid", id).toArray();
 		out[id] = {
 			parts: rows.filter((r) => r.capture_status === "consolidated" && r.capture_part !== "manifest").map((r) => ({ part_id: r.capture_part, sha256: r.sha256 })),
-			heuristic: rows.some((r) => r.capture_status === "heuristic"),
-			consolidated: rows.some((r) => r.capture_part === "manifest"),
+			heuristic: rows.some((r) => r.capture_status === "heuristic" && r.capture_part === "-"),
+			consolidated: completeRange(sql, id),
 		};
 	}
 	return out;

@@ -4,7 +4,7 @@ import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArg
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
-import { candidates, fuse, get, inventory, lexicalChannels } from "./read";
+import { candidates, filterIds, fuse, get, inventory, lexicalChannels, markers } from "./read";
 import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
 import { expandLinks, explore, timeline, trace } from "./graph";
 import { board } from "./board";
@@ -13,11 +13,13 @@ import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
 import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
+import { activity, entity, journal, journals, map, pageTimeline, shownIds } from "./pages";
+import { archivedNodeIds, archivePage } from "./archive";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
-import { commitKey, putMarker } from "./work-upload";
+import { commitKey, putMarker, uploadKey } from "./work-upload";
 import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
 
 // The profile module's public surface: callers outside src/profile import only from here.
@@ -28,11 +30,12 @@ export type { OpOutcome } from "./maintenance";
 export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLink, type NodeRef, type NodeSummary } from "./graph";
 export { bundleTexts, type Entry, type TransferOut, type TransferStep } from "./transfer";
 export type { Page, PurgeResult, WipeOut, WipeStep } from "./wipe";
-export { commitArgs, repoNamespace, TITLE_MAX, uploadTerms } from "./work-upload";
+export { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms } from "./work-upload";
 
 /** One work upload request: items already validated and normalized by the Worker, and the repo marker to move after them. */
-export interface WorkBatch { repo: string; commits: UploadArgs[]; marker?: { head: string; as_of: string } }
-export type WorkItemResult = { key: string; status: "stored" | "replayed" | "refused"; reason?: string };
+export interface WorkBatch { repo: string | null; commits: UploadArgs[]; prs?: UploadArgs[]; tickets?: UploadArgs[]; marker?: { head: string; as_of: string } }
+/** A PR or ticket item also names its updated_at. `flagged`: held, but its protected node was flagged for the owner instead of changed. */
+export type WorkItemResult = { key: string; status: "stored" | "replayed" | "stale" | "flagged" | "refused"; updated_at?: string; reason?: string };
 export type MarkerResult = ReturnType<typeof putMarker>;
 
 import { foldDue, foldStep } from "./compact";
@@ -99,7 +102,8 @@ export class ProfileStore extends DurableObject<Env> {
 	 */
 	async write(who: Who, cmd: WriteCommand, ctx: WriteContext): Promise<Outcome<Record<string, unknown> & { created: string[] }>> {
 		try {
-			await this.access(who, writeIds(who, cmd));
+			// A restore's ids are the archived records, checked against the account's wipe ledger like any other write's.
+			await this.access(who, cmd.op === "restore" ? archivedNodeIds(this.ctx.storage.sql, cmd.args.activity_id) : writeIds(who, cmd));
 			this.bind(who);
 			const out = this.metered(runWrite(this.ctx.storage, who, cmd, ctx));
 			if (((out.embedDue && embeddingsOn(this.env)) || foldDue(this.ctx.storage.sql)) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
@@ -211,10 +215,10 @@ export class ProfileStore extends DurableObject<Env> {
 	 * wipe-ledger check for its ids, so a refusal or failure leaves nothing behind and a retry starts clean. The repo marker moves
 	 * only when every item of the request is held.
 	 */
-	async upload(who: Who, batch: WorkBatch, ctx: Omit<WriteContext, "actor" | "payloadHash">): Promise<Outcome<{ commits: WorkItemResult[]; marker?: MarkerResult; created: string[] }>> {
+	async upload(who: Who, batch: WorkBatch, ctx: Omit<WriteContext, "actor" | "payloadHash">): Promise<Outcome<{ commits: WorkItemResult[]; prs?: WorkItemResult[]; tickets?: WorkItemResult[]; marker?: MarkerResult; created: string[] }>> {
 		if (who.profile === "me") return { ok: false, error: { code: "forbidden", message: "uploads never go to me" } };
 		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
-		const commits: WorkItemResult[] = [], created: string[] = [];
+		const commits: WorkItemResult[] = [], prs: WorkItemResult[] = [], tickets: WorkItemResult[] = [], created: string[] = [];
 		const refused = (key: string, e: unknown): WorkItemResult => {
 			if (e instanceof Fail) return { key, status: "refused", reason: e.failure.code };
 			if (e instanceof Error && e.message.includes("import_pending")) return { key, status: "refused", reason: "busy" };
@@ -222,14 +226,20 @@ export class ProfileStore extends DurableObject<Env> {
 		};
 		const register = (ids: string[]) => this.register(who, ids);
 		let embedDue = false;
-		for (const args of batch.commits) {
-			const key = commitKey(args.repo, args.sha);
-			const cmd = { op: "upload", args: { ...args, request_id: `upload:${who.profile}:${key}` } } as const;
-			const payloadHash = requestHash("upload_commit", { ...cmd.args });
+		for (const args of [...batch.commits, ...(batch.prs ?? []), ...(batch.tickets ?? [])]) {
+			const key = uploadKey(args), items = args.item === "commit" ? commits : args.item === "pr" ? prs : tickets, op = `upload_${args.item}`;
+			// A snapshot's revision is its source's updated time; when it was read stays out of the hash.
+			const revision = args.item === "commit" ? {} : { updated_at: args.updated_at };
+			const cmd = { op: "upload" as const, args: { ...args, request_id: `upload:${who.profile}:${key}${args.item === "commit" ? "" : `:${args.updated_at}`}` } };
+			const payloadHash = requestHash(op, args.item === "commit" ? { ...cmd.args } : { ...cmd.args, as_of: undefined });
+   if(args.item!=="commit") {
+    const prior=this.ctx.storage.sql.exec<{payload_hash:string}>("SELECT payload_hash FROM requests WHERE request_id = ?",cmd.args.request_id).toArray()[0];
+    if(prior && prior.payload_hash!==payloadHash) cmd.args.request_id+=`:${payloadHash}`;
+   }
 			let newBinding = false, committed = false;
 			try {
 				await this.access(who, writeIds(who, cmd));
-				const bound = await account.bindRequest({ requestId: cmd.args.request_id, profile: who.profile, op: "upload_commit", payloadHash, generation: who.generation });
+				const bound = await account.bindRequest({ requestId: cmd.args.request_id, profile: who.profile, op, payloadHash, generation: who.generation });
 				if (!bound.ok) throw new Fail(bound.error);
 				newBinding = !bound.value.existing;
 				if (bound.value.profile !== who.profile) throw Fail.of("idempotency_mismatch", "upload belongs to another profile");
@@ -240,33 +250,34 @@ export class ProfileStore extends DurableObject<Env> {
 				await register((out.result.node_ids ?? []) as string[]);
 				created.push(...out.created);
 				embedDue ||= out.embedDue;
-				commits.push({ key, status: out.result.action === "replayed" ? "replayed" : "stored" });
+				const action = String(out.result.action);
+				items.push({ key, ...revision, status: action === "replayed" || action === "stale" || action === "flagged" ? action : "stored" });
 			} catch (e) {
 				if (newBinding && !committed) await account.releaseRequest(cmd.args.request_id, payloadHash);
-				commits.push(refused(key, e));
+				items.push({ ...refused(key, e), ...revision });
 			}
 		}
 		let marker: MarkerResult | undefined;
 		if (batch.marker) {
-			if (commits.some((c) => c.status === "refused")) marker = { status: "refused", reason: "commits_not_held" };
+			if ([...commits, ...prs, ...tickets].some((c) => c.status === "refused")) marker = { status: "refused", reason: "commits_not_held" };
 			else {
 				try {
 					await this.access(who);
 					this.bind(who);
 					// Marker-only included: a registration that failed after its upload committed completes before anything is acknowledged.
-					const head = this.ctx.storage.sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ? AND op = 'upload'", `upload:${who.profile}:${commitKey(batch.repo, batch.marker.head)}`).toArray()[0];
+					const head = this.ctx.storage.sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ? AND op = 'upload'", `upload:${who.profile}:${commitKey(batch.repo!, batch.marker.head)}`).toArray()[0];
 					if (head) await register((JSON.parse(head.result) as { node_ids?: string[] }).node_ids ?? []);
-					marker = this.metered(putMarker(this.ctx.storage, batch.repo, batch.marker));
-				} catch (e) { const r = refused(batch.repo, e); marker = { status: "refused", ...(r.reason ? { reason: r.reason } : {}) }; }
+					marker = this.metered(putMarker(this.ctx.storage, batch.repo!, batch.marker));
+				} catch (e) { const r = refused(batch.repo!, e); marker = { status: "refused", ...(r.reason ? { reason: r.reason } : {}) }; }
 			}
 		}
-		if (commits.some((c) => c.status === "stored")) {
+		if ([...commits, ...prs, ...tickets].some((c) => c.status === "stored")) {
 			const alarm = await this.ctx.storage.getAlarm();
 			await this.access(who);
 			if (embedDue && embeddingsOn(this.env) && (alarm ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
 			else if (alarm === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
 		}
-		return ok({ commits, ...(marker ? { marker } : {}), created });
+		return ok({ commits, ...(batch.prs ? { prs } : {}), ...(batch.tickets ? { tickets } : {}), ...(marker ? { marker } : {}), created });
 	}
 
 	async captureState(who: Who, rangeIds: string[]): Promise<Outcome<ReturnType<typeof captureState>>> {
@@ -280,7 +291,7 @@ export class ProfileStore extends DurableObject<Env> {
 	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
 		try {
 			await this.access(who);
-			this.bind(who, q.kind === "import_audit" || q.kind === "batch_status" || q.kind === "owner_model" || q.kind === "board");
+			this.bind(who, ["import_audit", "batch_status", "owner_model", "board", "entity", "journals", "journal", "map", "page_timeline", "activity", "shown", "archive", "markers"].includes(q.kind));
 			const sql = this.ctx.storage.sql;
 			switch (q.kind) {
 				case "get":
@@ -308,6 +319,24 @@ export class ProfileStore extends DurableObject<Env> {
 					return ok(batchStatus(sql));
 				case "owner_model":
 					return ok(ownerModel(sql, q));
+				case "entity":
+					return ok(entity(sql, q));
+				case "journals":
+					return ok(journals(sql, q));
+				case "journal":
+					return ok(journal(sql, q));
+				case "map":
+					return ok(map(sql, q));
+				case "page_timeline":
+					return ok(pageTimeline(sql, q));
+				case "activity":
+					return ok(activity(sql, q));
+				case "shown":
+					return ok(shownIds(sql, q));
+				case "archive":
+					return ok(archivePage(sql, q));
+				case "markers":
+					return ok(markers(sql, q));
 			}
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -323,7 +352,8 @@ export class ProfileStore extends DurableObject<Env> {
 	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>): Promise<RecallPage> {
 		const diagnostics: Record<string, string> = {};
 		let stage: "embedding" | "vector" = "embedding";
-		const semantic = q.semantic && this.env.AI && this.env.VECTORS ? (async () => {
+		// Vectors hold only current cards, so a read at as_of is lexical over the text stored by then.
+		const semantic = q.semantic && !q.asOf && this.env.AI && this.env.VECTORS ? (async () => {
 			const out = (await this.env.AI!.run(EMBED_MODEL, { text: [q.keyword] })) as { data?: number[][] };
 			const vector = out.data?.[0];
 			if (!vector?.length) throw new Error("empty embedding");
@@ -337,7 +367,7 @@ export class ProfileStore extends DurableObject<Env> {
 		const channels = lexicalChannels(this.ctx.storage.sql, q, diagnostics);
 		let vectorUsed = false;
 		if (!semantic) {
-			diagnostics.embedding = q.semantic ? "unavailable" : "off";
+			diagnostics.embedding = q.asOf ? "off:as_of" : q.semantic ? "unavailable" : "off";
 			diagnostics.vector = "off";
 		} else {
 			const timeout = Symbol("timeout");
@@ -370,8 +400,9 @@ export class ProfileStore extends DurableObject<Env> {
 		if (q.expand && hits.length) {
 			// The graph channel (section 11): one hop from the top 10, inside this profile, under the same filters.
 			// Seeds are the capped hits only; preferences from below the cap never widen the graph walk.
-			const g = expandLinks(sql, hits.filter((h) => h.rank === undefined).map((h) => ({ id: h.memory_id, score: h.score })));
-			const allowed = g.neighbors.length ? lexicalFilterIds(sql, q, g.neighbors.map((n) => n.id)) : new Set<string>();
+			// With as_of the walk follows links valid then, and fuse checks each neighbour's stored state then.
+			const g = expandLinks(sql, hits.filter((h) => h.rank === undefined).map((h) => ({ id: h.memory_id, score: h.score })), q.asOf);
+			const allowed = !g.neighbors.length ? new Set<string>() : q.asOf ? filterIds(sql, q, g.neighbors.map((n) => n.id)) : lexicalFilterIds(sql, q, g.neighbors.map((n) => n.id));
 			const graph = g.neighbors.filter((n) => allowed.has(n.id));
 			diagnostics.graph = graph.length ? `hits:${graph.length}` : "no_results";
 			if (g.budget.exhausted) diagnostics.graph_budget = `stopped:${g.budget.stopped}:${g.budget.edges_read}`;

@@ -15,6 +15,15 @@ const bytes = (s) => new TextEncoder().encode(s).length;
 /** The server's chunk hash (src/corpus/families.ts chunkHash): one fixed tuple. */
 export const chunkHash = (c) => sha256(JSON.stringify([c.table, c.schema_sha256, c.source.file_sha256, c.as_of, c.columns, c.after, c.rows, c.final]));
 
+/** Both acquisition paths require the original table DDL and every projected column before reading rows. */
+export async function validateSource(source, fam) {
+	const ddl = await source.schema(fam.table);
+	if (ddl === null || sha256(ddl) !== fam.schema_sha256) return "schema_mismatch";
+	const have = new Set(await source.columns(fam.table));
+	if (fam.columns.some((c) => c !== "rowid" && !have.has(c))) return "columns";
+	return null;
+}
+
 /**
  * source: { schema(table) -> CREATE TABLE text or null, columns(table) -> names, rows(table, columns, key, after, limit) -> arrays }, sync or async
  * client: { status(profile) -> status body, send(chunk) -> { receipt } | { error } }. Returns done, or refused/stopped with a reason.
@@ -26,6 +35,8 @@ export async function uploadCorpus({ source, client, profile, tables, asOf, file
 	if (forbidden) return { status: "refused", table: forbidden, reason: "never_import" };
 	const st = await client.status(profile);
 	if (st.error) return { status: TRANSIENT.includes(st.error.code) ? "stopped" : "refused", reason: st.error.details?.reason ?? st.error.code };
+	// A refresh holds the corpus: never report a completed load (or send a chunk) while one is applying.
+	if (st.refresh) return { status: "stopped", reason: "corpus_refreshing" };
 	for (const [k, v] of [["generation", st.generation], ["source", fileSha256], ["as_of", asOf]]) {
 		if (state[k] !== undefined && state[k] !== v) return { status: "refused", reason: k === "generation" ? "generation_changed" : `${k}_changed` };
 	}
@@ -34,10 +45,8 @@ export async function uploadCorpus({ source, client, profile, tables, asOf, file
 	for (const table of tables) {
 		const fam = st.families.find((f) => f.table === table);
 		if (!fam) return { status: "refused", table, reason: st.held?.[table] ?? "unknown_table" };
-		const ddl = await source.schema(table);
-		if (ddl === null || sha256(ddl) !== fam.schema_sha256) return { status: "refused", table, reason: "schema_mismatch" };
-		const have = new Set(await source.columns(table));
-		if (fam.columns.some((c) => c !== "rowid" && !have.has(c))) return { status: "refused", table, reason: "columns" };
+		const invalid = await validateSource(source, fam);
+		if (invalid) return { status: "refused", table, reason: invalid };
 		const progress = st.tables.find((t) => t.table === table);
 		// Identity first: a stored load from another file or as_of is never reported as this upload, complete or not.
 		if (progress && (progress.source_sha256 !== fileSha256 || progress.as_of !== asOf)) return { status: "refused", table, reason: "source_changed" };

@@ -143,3 +143,46 @@ export function archiveNode(tx: ArchiveTx, activityId: number, id: string, purge
 		...archiveRows(tx, activityId, "nodes", sql.exec<Row>("SELECT * FROM nodes WHERE id = ?", id).toArray(), purgeAfterAt),
 	];
 }
+
+/**
+ * The removals an owner may restore from the archive: a forget, the 90-day capture TTL, and an undo of a restore. Other undo,
+ * transfer and purge rows are not: their archived rows are an inverse or a moved record's leftovers.
+ */
+export const REMOVALS = ["forget", "ttl"];
+export const ARCHIVE_PAGE_MAX = 50;
+
+/** The node ids one removal archived. */
+export const archivedNodeIds = (sql: SqlStorage, activityId: number): string[] =>
+	sql.exec<{ id: string }>("SELECT json_extract(payload, '$.id') AS id FROM archive WHERE activity_id = ? AND source = 'nodes' ORDER BY id", activityId).toArray().map((r) => r.id);
+
+/**
+ * The owner's archive page (section 15): removals not yet restored, newest first, each with when it purges, what it holds and
+ * whether a restore can still run (not wipe-redacted and not partly purged). Names are stored text, cut to 280 characters.
+ */
+export function archivePage(sql: SqlStorage, q: { before: number | null; limit: number }) {
+	const limit = Math.min(Math.max(1, Math.trunc(q.limit)), ARCHIVE_PAGE_MAX);
+	const acts = sql.exec<{ id: number; at: string; actor: string; op: string; summary: string; redacted: string | null; undo: string | null }>(
+		`SELECT id, at, actor, op, summary, redacted, undo FROM activity a WHERE (op IN (SELECT value FROM json_each(?)) OR (op = 'undo' AND EXISTS (SELECT 1 FROM activity r WHERE r.id = a.undo_of AND r.op = 'restore')))
+		AND undone_by IS NULL AND id < ? ORDER BY id DESC LIMIT ?`,
+		JSON.stringify(REMOVALS), q.before ?? Number.MAX_SAFE_INTEGER, limit + 1).toArray();
+	const page = acts.slice(0, limit);
+	const rows = page.length ? sql.exec<{ activity_id: number; id: number; source: ArchiveSource; purge_after: string; payload: string }>(
+		"SELECT activity_id, id, source, purge_after, CASE WHEN source = 'nodes' THEN payload END AS payload FROM archive WHERE activity_id IN (SELECT value FROM json_each(?))",
+		JSON.stringify(page.map((a) => a.id))).toArray() : [];
+	return {
+		items: page.map((a) => {
+			const mine = rows.filter((r) => r.activity_id === a.id), wanted = (JSON.parse(a.undo ?? "{}") as { archived?: number[] }).archived ?? [];
+			const held = new Set(mine.map((r) => r.id)), complete = wanted.length > 0 && wanted.every((id) => held.has(id));
+			return {
+				activity_id: a.id, at: a.at, actor: a.actor, op: a.op, summary: a.summary, purge_after: mine.map((r) => r.purge_after).sort()[0] ?? null,
+				rows: Object.fromEntries(ARCHIVE_SOURCES.map((s) => [s, mine.filter((r) => r.source === s).length]).filter(([, n]) => n)),
+				nodes: mine.filter((r) => r.source === "nodes").map((r) => {
+					const n = JSON.parse(r.payload) as Row;
+					return { id: n.id, kind: n.kind, other_label: n.other_label, type: n.memory_type, scope: n.scope, status: n.status, name: String(n.name ?? "").slice(0, 280) };
+				}),
+				restorable: !a.redacted && complete, ...(a.redacted ? { reason: "undo_redacted" } : !complete ? { reason: "purged" } : {}),
+			};
+		}),
+		next_before: acts.length > limit ? page.at(-1)!.id : null,
+	};
+}

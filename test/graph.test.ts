@@ -3,7 +3,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { call, contextFor, deviceToken, devicePrincipal, outcome } from "./helpers";
+import { map } from "../src/profile/pages";
+import { registered, call, contextFor, deviceToken, devicePrincipal, outcome } from "./helpers";
 import { identifiers, resolveMentions, resolveMentionsAlone, structuralEdges, type TxLike } from "../src/profile/extract";
 import { EDGE_ROWS, EXPAND_ROWS, expandLinks, explore, trace, timeline, LEVEL_NODES } from "../src/profile/graph";
 import { SETTLE_MS, similarStep } from "../src/profile/similar";
@@ -631,4 +632,28 @@ it("payload SQL gates hidden sources before selecting reasons",async()=>{
 });
 
 
+});
+
+it("historical map bounds future-edge discovery reads", async () => {
+ const p = await registered("test");
+ const out = await runInDurableObject(p.stub, (_i, s) => {
+  const sql=s.storage.sql, early="2026-01-01T00:00:00.000Z", late="2026-03-01T00:00:00.000Z";
+  sql.exec(`INSERT INTO nodes (id,kind,name,norm_name,status,origin,content_hash,card_hash,recorded_at,created_at,updated_at,seq) VALUES ('hub','project','hub','hub','active','agent','h','h',?,?,?,1)`,early,early,early);
+  sql.exec(`WITH RECURSIVE nums(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM nums WHERE i<6000) INSERT INTO edges (src,rel,dst,dst_profile,basis,recorded_at,actor,seq) SELECT 'hub','relates_to','leaf-'||i,'','identifier',?,'test',1 FROM nums`,late);
+  const cursors: SqlStorageCursor<Record<string,SqlStorageValue>>[]=[];
+  const measured = {exec(q:string,...v:SqlStorageValue[]){const r=sql.exec(q,...v); if(q.startsWith("SELECT id, src") || q.startsWith("SELECT id FROM nodes WHERE id IN")) cursors.push(r);return r;}} as SqlStorage;
+  const control=map(sql,{kind:"map",center:{id:"hub"},depth:2,known:["test"]});
+  const result=map(measured,{kind:"map",center:{id:"hub"},depth:2,asOf:"2026-02-01T00:00:00.000Z",known:["test"]});
+  return {scanned:cursors.reduce((n,c)=>n+c.rowsRead,0),result,control:{budget:control.budget,truncated:control.truncated}};
+ });
+ console.log("FUTURE-EDGE-METER",JSON.stringify(out));
+ expect(out.control.budget.edges_read).toBeLessThanOrEqual(5000);
+ expect(out.control.budget.exhausted).toBe(true);
+ expect(out.control.truncated).toBe(true);
+ expect(out.result.links).toHaveLength(0);
+ expect(out.result.budget.edges_read).toBeLessThanOrEqual(5000);
+ expect(out.scanned).toBeLessThanOrEqual(5000);
+ expect(out.result.budget.edges_read).toBeGreaterThanOrEqual(out.scanned);
+ expect(out.result.budget.exhausted).toBe(true);
+ expect(out.result.truncated).toBe(true);
 });

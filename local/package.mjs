@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 export function stageSelfHost(root, target) {
 	fs.mkdirSync(target, { mode: 0o700 });
-	for (const file of ["src", "local/setup.mjs", "docs/self-host.md", "wrangler.example.jsonc"]) {
+	for (const file of ["src", "local/setup.mjs", "local/corpus-refresh.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc"]) {
 		fs.mkdirSync(path.dirname(path.join(target, file)), { recursive: true, mode: 0o700 });
 		fs.cpSync(path.join(root, file), path.join(target, file), { recursive: true });
 	}

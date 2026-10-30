@@ -5,11 +5,12 @@
 import { fenceOf, queueFold, Unfold } from "./compact";
 import { normalizeName, requestHash } from "../domain/ids";
 import { Fail, type ErrorCode, type WriteCommand, type WriteContext } from "../domain/types";
-import { archiveNode, archiveRows, purgeAfter, putRow, restoreArchived, type ArchiveTx, type Row } from "./archive";
+import { archivedNodeIds, archiveNode, archiveRows, purgeAfter, putRow, REMOVALS, restoreArchived, type ArchiveTx, type Row } from "./archive";
 import { readNode, runWrite, snapshot, type Who, type WriteOutput } from "./write";
 import type { Consumed } from "./extract";
 import { assertWritable } from "./transfer";
 import { assertNotWiped } from "./wipe";
+import { snapshotEdges, uploadKey, uploadNodeKeys } from "./work-upload";
 
 /** At most this many candidate nodes, and edges around them, are imaged; a write that changes anything else stores no undo. */
 const MAX_IMAGES = 200;
@@ -29,6 +30,8 @@ export interface Inverse {
 	nodes?: { id: string; expect: number; row: Row; texts: Row[] }[];
 	/** Nodes it created: archived. */
 	created?: { id: string; expect: number }[];
+	/** Standalone text rows restored on an existing session: archived while the row and owner remain unchanged. */
+	texts?: { rowid: number; node_id: string; expect: number; ownerSeq: number }[];
 	/** Edges it added between nodes that existed before: archived with their evidence. */
 	edges?: number[];
 	/** Evidence it added or overwrote on nodes and edges that existed before: archived. */
@@ -58,9 +61,12 @@ export function beforeImages(sql: SqlStorage, cmd: WriteCommand): Before {
 	for (const v of [a.memory_id, a.candidate_id, ...(Array.isArray(a.supersedes) ? a.supersedes : [a.supersedes])]) if (typeof v === "string") ids.add(v);
 	name(a.name);
 	if (cmd.op === "upload") {
-		keys.add(`github:${cmd.args.repo}`);
-		keys.add(`git:${cmd.args.repo}@${cmd.args.sha}`);
-		if (cmd.args.author) keys.add(`person:github:${cmd.args.author}`);
+		for (const k of uploadNodeKeys(cmd.args)) keys.add(k);
+		if (cmd.args.item !== "commit") {
+			// A newer snapshot may end its node's structural identifier edges; undo reopens them.
+			const node = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved' LIMIT 1", uploadKey(cmd.args)).toArray()[0];
+			if (node) ends.push(...snapshotEdges(sql, cmd.args.item, node.id).map((e) => e.id));
+		}
 	}
 	if (cmd.op === "knowledge") {
 		for (const n of cmd.args.nodes ?? []) { name(n.name); if (n.key) keys.add(n.key); }
@@ -95,7 +101,7 @@ export function beforeImages(sql: SqlStorage, cmd: WriteCommand): Before {
 export function inverseOf(before: Before, after: { created: string[]; consumed?: Consumed[] }, tx: ArchiveTx): Inverse | null {
 	const { sql, seq, now } = tx;
 	const created = new Set(after.created);
-	const inv: Required<Omit<Inverse, "seq">> & { seq: number } = { seq, nodes: [], created: [], edges: [], evidence: [], evidenceRows: [], reopen: [], archived: [], flags: [], mentions: [] };
+	const inv: Required<Omit<Inverse, "seq">> & { seq: number } = { seq, nodes: [], created: [], edges: [], evidence: [], evidenceRows: [], reopen: [], archived: [], flags: [], mentions: [], texts: [] };
 	for (const n of sql.exec<{ id: string; revision: number }>("SELECT id, revision FROM nodes WHERE seq = ?", seq).toArray()) {
 		if (created.has(n.id)) { inv.created.push({ id: n.id, expect: n.revision }); continue; }
 		const b = before.nodes[n.id];
@@ -103,6 +109,10 @@ export function inverseOf(before: Before, after: { created: string[]; consumed?:
 		// A row is kept only if it is still the imaged one: SQLite may have given its rowid to a row this write inserted.
 		const now = new Map(sql.exec<{ rowid: number; seq: number }>("SELECT rowid, seq FROM texts WHERE rowid IN (SELECT value FROM json_each(?))", JSON.stringify(b.texts.map((t) => t.rowid))).toArray().map((r) => [r.rowid, r.seq]));
 		inv.nodes.push({ id: n.id, expect: n.revision, row: b.row, texts: b.texts.filter((t) => now.get(Number(t.rowid)) !== t.seq) });
+	}
+	const covered = new Set([...created, ...inv.nodes.map((n) => n.id)]);
+	for (const t of sql.exec<{ rowid: number; node_id: string; revision: number; owner_seq: number }>("SELECT t.rowid, t.node_id, n.revision, n.seq AS owner_seq FROM texts t JOIN nodes n ON n.id = t.node_id WHERE t.seq = ?", seq).toArray()) {
+		if (!covered.has(t.node_id)) inv.texts.push({ rowid: t.rowid, node_id: t.node_id, expect: t.revision, ownerSeq: t.owner_seq });
 	}
 	const newEdges = new Set<number>();
 	for (const e of sql.exec<{ id: number; src: string; dst: string; recorded_at: string; ended_at: string | null }>("SELECT id, src, dst, recorded_at, ended_at FROM edges WHERE seq = ?", seq).toArray()) {
@@ -139,7 +149,7 @@ export function recordUndo(tx: ArchiveTx, before: Before, out: Pick<WriteOutput,
 	if (typeof id !== "number") return;
 	const inv = inverseOf(before, out, tx);
 	const targets = tx.sql.exec<{ targets: string }>("SELECT targets FROM activity WHERE id = ?", id).one().targets;
-	const dependencies = [...new Set<string>([...JSON.parse(targets), ...(inv?.mentions ?? []).map((m) => String(m.row.owner).slice(2))])];
+	const dependencies = [...new Set<string>([...JSON.parse(targets), ...(inv?.mentions ?? []).map((m) => String(m.row.owner).slice(2)), ...(inv?.texts ?? []).map((t) => t.node_id)])];
 	tx.run("UPDATE activity SET undo = ?, targets = ? WHERE id = ?", inv && JSON.stringify(inv), JSON.stringify(dependencies), id);
 }
 
@@ -150,10 +160,10 @@ export function recordUndo(tx: ArchiveTx, before: Before, out: Pick<WriteOutput,
  * meets the me guard with the terms registered by now. A wipe-redacted change returns undo_redacted. What undo removes goes to the archive, so nothing but the
  * 300-day purge is lost.
  */
-export function revert(tx: UndoTx, args: { activity_id: number }): WriteOutput {
+export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: "undo", summary: `undid activity ${args.activity_id}` }): WriteOutput {
 	const sql = tx.sql, of = args.activity_id;
-	const a = sql.exec<{ undo: string | null; redacted: string | null; undone_by: number | null; targets: string }>(
-		"SELECT undo, redacted, undone_by, targets FROM activity WHERE id = ?", of).toArray()[0];
+	const a = sql.exec<{ op: string; undo: string | null; redacted: string | null; undone_by: number | null; targets: string }>(
+		"SELECT op, undo, redacted, undone_by, targets FROM activity WHERE id = ?", of).toArray()[0];
 	if (!a) throw Fail.of("not_found", `no activity ${of}`);
 	// wiring: ErrorCode gains "undo_redacted".
 	if (a.redacted) throw Fail.of("undo_redacted" as ErrorCode, "a wipe removed this change's content; it cannot be undone", { reason: "undo_redacted" });
@@ -166,6 +176,11 @@ export function revert(tx: UndoTx, args: { activity_id: number }): WriteOutput {
 		if (cur?.revision !== n.expect) throw conflict({ node: n.id, expected_revision: n.expect, actual_revision: cur?.revision ?? null });
 	}
 	const S = inv.seq, any = (q: string, ...p: SqlStorageValue[]) => sql.exec(q, ...p).toArray().length > 0;
+	for (const t of inv.texts ?? []) {
+		assertNotWiped(sql, t.node_id);
+		assertWritable(sql, t.node_id);
+		if (!any("SELECT 1 FROM texts t JOIN nodes n ON n.id = t.node_id WHERE t.rowid = ? AND t.node_id = ? AND t.seq = ? AND n.revision = ? AND n.seq = ? AND n.status NOT IN ('moved','moving','incoming')", t.rowid, t.node_id, S, t.expect, t.ownerSeq)) throw conflict({ text: t.rowid, node: t.node_id });
+	}
 	const around = "SELECT 'e:' || id FROM edges WHERE src = ?1 OR (dst = ?1 AND dst_profile = '')";
 	for (const c of inv.created ?? []) {
 		if (any(`SELECT 1 FROM edges WHERE (src = ?1 OR (dst = ?1 AND dst_profile = '')) AND seq <> ?2`, c.id, S)
@@ -192,10 +207,11 @@ export function revert(tx: UndoTx, args: { activity_id: number }): WriteOutput {
 		const F = fenceOf(sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", n.id).one().attrs), old = fenceOf(String(n.row.attrs));
 		if (old < F && any("SELECT 1 FROM texts WHERE node_id = ? AND part = 'entry' AND live = 2 AND seq_no > ? AND seq_no <= ? LIMIT 1", n.id, old, F)) throw new Unfold(n.id, old, F);
 	}
-	const activityId = Number(tx.run("INSERT INTO activity (at, actor, device_id, op, summary, targets, undo_of, seq) VALUES (?, ?, ?, 'undo', ?, ?, ?, ?) RETURNING id",
-		tx.now, tx.ctx.actor, tx.ctx.deviceId ?? null, `undid activity ${of}`, a.targets, of, tx.seq).one().id);
+	const activityId = Number(tx.run("INSERT INTO activity (at, actor, device_id, op, summary, targets, undo_of, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+		tx.now, tx.ctx.actor, tx.ctx.deviceId ?? null, label.op, label.summary, a.targets, of, tx.seq).one().id);
 	const keep = purgeAfter(tx.now);
 	let embedDue = false;
+	if (inv.texts?.length) archiveRows(tx, activityId, "texts", sql.exec<Row>("SELECT * FROM texts WHERE rowid IN (SELECT value FROM json_each(?))", JSON.stringify(inv.texts.map((t) => t.rowid))).toArray(), keep);
 	for (const c of inv.created ?? []) archiveNode(tx, activityId, c.id, keep);
 	for (const id of inv.edges ?? []) {
 		const edge = sql.exec<Row>("SELECT * FROM edges WHERE id = ?", id).toArray();
@@ -219,6 +235,10 @@ export function revert(tx: UndoTx, args: { activity_id: number }): WriteOutput {
 	}
 	if (inv.archived?.length) embedDue = restoreArchived(tx, inv.archived).nodes.length > 0 || embedDue;
 	for (const f of inv.flags ?? []) tx.run("UPDATE nodes SET flagged = ?, seq = ? WHERE id = ?", f.flagged, tx.seq, f.id);
+	// Undoing a restore removes the records again: like the removal it reverses, it stays restorable from the archive.
+	if (a.op === "restore") {
+		tx.run("UPDATE activity SET undo = ? WHERE id = ?", JSON.stringify({ seq: tx.seq, archived: sql.exec<{ id: number }>("SELECT id FROM archive WHERE activity_id = ? AND seq = ?", activityId, tx.seq).toArray().map((r) => r.id) }), activityId);
+	}
 	tx.run("UPDATE activity SET undone_by = ?, seq = ? WHERE id = ?", activityId, tx.seq, of);
 	return { result: { ok: true, action: "undone", activity_id: activityId, undo_of: of }, created: [], embedDue };
 }
@@ -278,4 +298,26 @@ export function undo(storage: DurableObjectStorage, who: Who, activityId: number
 	const args = { activity_id: activityId, request_id: `undo:${activityId}` };
 	// wiring: WriteCommand gains { op: "undo"; args: { activity_id: number; request_id: string } }, dispatched to revert(tx, cmd.args).
 	return runWrite(storage, who, { op: "undo", args } as unknown as WriteCommand, { ...ctx, payloadHash: requestHash("undo", args) });
+}
+
+/**
+ * The owner's archive restore (section 15): one removal (a forget or a capture TTL) put back exactly as archived, through undo's
+ * own checks inside the common write: wipe-redacted, already restored, purged, a key or identity taken since (revision_conflict),
+ * the me guard, and the write's row and size budget. A record wiped or moving now is refused before anything changes. The restore
+ * is itself a write with its activity row and undo: undoing it archives the records again.
+ */
+export function restore(tx: UndoTx, args: { activity_id: number }): WriteOutput {
+	if (tx.ctx.actor !== "owner") throw Fail.of("forbidden", "only the owner restores from the archive");
+	const a = tx.sql.exec<{ op: string; undid: string | null }>("SELECT op, (SELECT u.op FROM activity u WHERE u.id = activity.undo_of) AS undid FROM activity WHERE id = ?", args.activity_id).toArray()[0];
+	if (!a || !(REMOVALS.includes(a.op) || (a.op === "undo" && a.undid === "restore"))) throw Fail.of("not_found", `activity ${args.activity_id} is not a removal in the archive`, { reason: "not_a_removal" });
+	const ids = archivedNodeIds(tx.sql, args.activity_id);
+	const owners = tx.sql.exec<{ id: string }>("SELECT DISTINCT json_extract(payload, '$.node_id') AS id FROM archive WHERE activity_id = ? AND source = 'texts'", args.activity_id).toArray().map((r) => r.id);
+	for (const id of owners.filter((id) => !ids.includes(id))) {
+		assertNotWiped(tx.sql, id);
+		assertWritable(tx.sql, id);
+		if (!readNode(tx.sql, id) || readNode(tx.sql, id)!.status === "moved") throw Fail.of("revision_conflict", "the archived text's owner is missing", { node: id });
+	}
+	for (const id of ids) { assertNotWiped(tx.sql, id); assertWritable(tx.sql, id); }
+	const out = revert(tx, args, { op: "restore", summary: `restored ${ids.length} records removed by activity ${args.activity_id}` });
+	return { result: { ok: true, action: "restored", activity_id: out.result.activity_id, restored_from: args.activity_id, nodes: ids }, created: ids, embedDue: out.embedDue };
 }

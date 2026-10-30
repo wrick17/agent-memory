@@ -4,14 +4,14 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { requestHash } from "../src/domain/ids";
+import { requestHash, sha256 } from "../src/domain/ids";
 import { foldDue, foldStep, queueFold } from "../src/profile/compact";
 import { get, lexicalChannels } from "../src/profile/read";
 import { readContent, readPrefix } from "../src/profile/write";
 import { redactText } from "../src/domain/redact";
-import type { WriteCommand, WriteContext } from "../src/domain/types";
+import type { Outcome, WriteCommand, WriteContext } from "../src/domain/types";
 import { MAINTENANCE_TOOLS } from "../src/maintenance-tools";
-import { archiveNode, archiveRows, BudgetTx, purgeAfter, restoreArchived, type Row } from "../src/profile/archive";
+import { archiveNode, archivePage, archiveRows, BudgetTx, purgeAfter, restoreArchived, type Row } from "../src/profile/archive";
 import { cleanupPurge, housekeep, OBJECT_LIMIT, sizeLevel, type Stage } from "../src/profile/housekeeping";
 import { complete, enqueue, finishBatch, next } from "../src/profile/maintenance";
 import { mayChange } from "../src/profile/protect";
@@ -1797,4 +1797,144 @@ it("core job context hides fenced subjects and incoming candidate reasons while 
 		expect(JSON.stringify(ownCapture.context)).toContain("CORE_CAPTURE_OWN_BODY");
 		expect(JSON.stringify(ownCapture.context)).toContain("CORE_JOB_PRIVATE_CANDIDATE_REASON");
 	} finally { await runInDurableObject(stub, (_i, s) => s.storage.deleteAlarm()); }
+});
+
+describe("owner archive restore", () => {
+	const owner = (who: Who, cmd: WriteCommand) => ({ actor: "owner" as const, platform: "test", routedBy: "explicit", userId: who.userId, payloadHash: requestHash(cmd.op, cmd.args as never) });
+	const run = (storage: DurableObjectStorage, who: Who, cmd: WriteCommand) => runWrite(storage, who, cmd, owner(who, cmd)).result as Record<string, unknown>;
+	const fails = (storage: DurableObjectStorage, who: Who, cmd: WriteCommand) => { try { run(storage, who, cmd); } catch (e) { return (e as { failure?: { code: string; details?: { reason?: string } } }).failure; } return null; };
+	const restoreCmd = (activity_id: number, request_id = `restore:${activity_id}`): WriteCommand => ({ op: "restore", args: { activity_id, request_id } });
+	const forget = (storage: DurableObjectStorage, who: Who, id: string) => Number(run(storage, who, { op: "owner", args: { action: "forget", memory_id: id } }).activity_id);
+	/** Every row a record owns, without the write stamp a restore renews (and the embedding mark it resets). */
+	const rows = (sql: SqlStorage, id: string) => {
+		const drop = (r: Record<string, unknown>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== "seq" && k !== "embed_hash"));
+		const edges = sql.exec("SELECT * FROM edges WHERE src = ? OR dst = ? ORDER BY id", id, id).toArray().map(drop);
+		return {
+			node: sql.exec("SELECT * FROM nodes WHERE id = ?", id).toArray().map(drop), edges,
+			texts: sql.exec("SELECT * FROM texts WHERE node_id = ? ORDER BY rowid", id).toArray().map(drop),
+			revisions: sql.exec("SELECT * FROM revisions WHERE node_id = ? ORDER BY revision", id).toArray().map(drop),
+			evidence: sql.exec("SELECT * FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) ORDER BY owner, kind, ref", JSON.stringify([`n:${id}`, ...edges.map((e) => `e:${String(e.id)}`)])).toArray().map(drop),
+		};
+	};
+
+	it("lists a forget with its purge date and restores body, entries, summary, links and evidence exactly, with replay and undo", () => inStore((storage, who) => {
+		const sql = storage.sql;
+		const j = String(wired(storage, who, { op: "save", args: { name: "Archived journal", type: "project", kind: "journal", description: "work log", content: "opening body" } }).memory_id);
+		for (const [i, text] of ["first entry", "second entry", "third entry"].entries()) wired(storage, who, { op: "append", args: { memory_id: j, content: text, request_id: `arch-e${i}` } });
+		run(storage, who, { op: "save", args: { memory_id: j, expected_revision: 4, request_id: "arch-compact", compact: { through_seq: 1, summary: "first summary" } } });
+		const other = String(wired(storage, who, save({ name: "Archive neighbour" })).memory_id);
+		wired(storage, who, { op: "save", args: { memory_id: j, links: [{ rel: "relates_to", to: { id: other }, reason: "the neighbour explains it", evidence: [{ kind: "file", ref: "notes.md" }] }], evidence: [{ kind: "url", ref: "https://example.com/j" }] } });
+		const before = rows(sql, j), content = readContent(sql, j);
+		const removal = forget(storage, who, j);
+		expect(sql.exec("SELECT 1 FROM nodes WHERE id = ?", j).toArray()).toHaveLength(0);
+		const page = archivePage(sql, { before: null, limit: 20 });
+		expect(page.items[0]).toMatchObject({ activity_id: removal, op: "forget", restorable: true, nodes: [{ id: j, name: "Archived journal", kind: "journal" }] });
+		expect(Date.parse(page.items[0]!.purge_after!) - Date.now()).toBeGreaterThan(299 * 86_400_000);
+		const restored = run(storage, who, restoreCmd(removal));
+		expect(restored).toMatchObject({ action: "restored", restored_from: removal, nodes: [j] });
+		expect(rows(sql, j)).toEqual(before);
+		expect(readContent(sql, j)).toBe(content);
+		expect(archivePage(sql, { before: null, limit: 20 }).items.map((i) => i.activity_id)).not.toContain(removal);
+		expect(run(storage, who, restoreCmd(removal))).toMatchObject({ action: "replayed" });
+		expect(fails(storage, who, restoreCmd(removal, "restore-again"))).toMatchObject({ code: "validation", details: { reason: "already_undone" } });
+		// Undoing the restore removes the record again; that removal is listed and restores the same rows.
+		const undone = undo(storage, who, Number(restored.activity_id), owner(who, restoreCmd(0))).result;
+		expect(sql.exec("SELECT 1 FROM nodes WHERE id = ?", j).toArray()).toHaveLength(0);
+		expect(archivePage(sql, { before: null, limit: 20 }).items[0]).toMatchObject({ activity_id: undone.activity_id, op: "undo", restorable: true, nodes: [{ id: j }] });
+		expect(run(storage, who, restoreCmd(Number(undone.activity_id)))).toMatchObject({ action: "restored", nodes: [j] });
+		expect(rows(sql, j)).toEqual(before);
+	}));
+
+	it("refuses a taken identity, a record moving or wiped now, a redacted or purged removal, other activity, a non-owner and a full profile", () => inStore((storage, who) => {
+		const sql = storage.sql;
+		const make = (name: string) => String(wired(storage, who, save({ name, content: `${name} body` })).memory_id);
+		const unchanged = (removal: number) => expect(archivePage(sql, { before: null, limit: 50 }).items.find((i) => i.activity_id === removal)).toMatchObject({ restorable: true });
+		// The same identity saved again since: its key is taken, nothing changes.
+		const a = make("Taken name"), ra = forget(storage, who, a);
+		expect(make("Taken name")).toBe(a);
+		expect(fails(storage, who, restoreCmd(ra))).toMatchObject({ code: "revision_conflict" });
+		unchanged(ra);
+		// Moving now: refused with moving before anything is written.
+		run(storage, who, save({ memory_id: a, retire: true }));
+		sql.exec("UPDATE nodes SET status = 'moving' WHERE id = ?", a);
+		expect(fails(storage, who, restoreCmd(ra))).toMatchObject({ code: "moving" });
+		// Wiped since: the wipe ledger refuses it.
+		const b = make("Wiped later"), rb = forget(storage, who, b);
+		sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, '1')", `wiped:${b}`);
+		expect(fails(storage, who, restoreCmd(rb))).toMatchObject({ code: "profile_wiped" });
+		// Redacted by a wipe, or partly purged: listed as not restorable, and refused.
+		const c = make("Redacted"), rc = forget(storage, who, c);
+		sql.exec("UPDATE activity SET redacted = 'wipe:test:now' WHERE id = ?", rc);
+		const d = make("Purged"), rd = forget(storage, who, d);
+		sql.exec("DELETE FROM archive WHERE id = (SELECT min(id) FROM archive WHERE activity_id = ?)", rd);
+		const listed = archivePage(sql, { before: null, limit: 50 }).items;
+		expect([listed.find((i) => i.activity_id === rc), listed.find((i) => i.activity_id === rd)]).toMatchObject([{ restorable: false, reason: "undo_redacted" }, { restorable: false, reason: "purged" }]);
+		expect(fails(storage, who, restoreCmd(rc))).toMatchObject({ code: "undo_redacted" });
+		expect(fails(storage, who, restoreCmd(rd))).toMatchObject({ code: "not_found", details: { reason: "archive_missing" } });
+		// Not a removal, not the owner, or a profile at 90% of its limit.
+		const e = make("Plain update");
+		const updated = Number(run(storage, who, save({ memory_id: e, content: "changed" })).activity_id);
+		expect(fails(storage, who, restoreCmd(updated))).toMatchObject({ code: "not_found", details: { reason: "not_a_removal" } });
+		const f = make("Owner only"), rf = forget(storage, who, f);
+		expect(() => runWrite(storage, who, restoreCmd(rf), { ...owner(who, restoreCmd(rf)), actor: "maintenance" })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "forbidden" }) }));
+		const full = { sql: new Proxy(sql, { get(t, k) { const v = k === "databaseSize" ? OBJECT_LIMIT : Reflect.get(t, k, t); return typeof v === "function" ? v.bind(t) : v; } }),
+			transactionSync: storage.transactionSync.bind(storage) } as DurableObjectStorage;
+		expect(() => runWrite(full, who, restoreCmd(rf), owner(who, restoreCmd(rf)))).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "size_budget" }) }));
+		unchanged(rf);
+		expect(run(storage, who, restoreCmd(rf))).toMatchObject({ action: "restored", nodes: [f] });
+	}));
+});
+
+it("undo of a TTL digest restore archives the restored text again", async () => {
+ const p = await registered("test");
+ const range_id = "codex:review_ttl:01234567:0-100";
+ const body = JSON.stringify({asks: [], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: {asks: 0, decisions: 0, corrections: 0}});
+ expect(await p.stub.ingest(p.who, {session: {client: "codex", id: "review_ttl"}, digests: [{range_id, capture_status: "heuristic", part_id: "-", sha256: sha256(body), body}], manifests: []})).toMatchObject({ok: true, value: [{status: "stored"}]});
+ const removal = await runInDurableObject(p.stub, (_i, state) => {
+  const sql = state.storage.sql, now = Date.now();
+  sql.exec("UPDATE texts SET created_at = ? WHERE range_id = ?", new Date(now - 91 * 86400000).toISOString(), range_id);
+  for (const stage of ["dedupe", "purge", "queue"]) sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?)", stage, now + 86400000);
+  sql.exec("INSERT INTO cursors (stage, cursor, due_at) VALUES ('ttl', ?, 0)", JSON.stringify({lane: "texts", after: 0}));
+  expect(housekeep(state.storage, p.who, now).stage).toBe("ttl");
+  expect(sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(0);
+  return Number(sql.exec("SELECT id FROM activity WHERE op = 'ttl'").one().id);
+ });
+ const write = (cmd: WriteCommand) => p.stub.write(p.who, cmd, {actor: "owner", platform: "test", routedBy: "explicit", userId: p.userId, payloadHash: requestHash(cmd.op, cmd.args as never)}) as Promise<Outcome<Record<string, unknown>>>;
+ // Re-ingesting a TTL range before restore must refuse a duplicate, leaving the removal restorable.
+ await p.stub.ingest(p.who, {session: {client: "codex", id: "review_ttl"}, digests: [{range_id, capture_status: "heuristic", part_id: "-", sha256: sha256(body), body}], manifests: []});
+ expect(await write({op: "restore", args: {activity_id: removal, request_id: `restore:${removal}`}})).toMatchObject({ok: false, error: {code: "revision_conflict"}});
+ await runInDurableObject(p.stub, (_i, state) => state.storage.sql.exec("DELETE FROM texts WHERE range_id = ?", range_id));
+ const restored = await write({op: "restore", args: {activity_id: removal, request_id: `restore:${removal}`}});
+ expect(restored).toMatchObject({ok: true, value: {action: "restored"}});
+ if (!restored.ok) return;
+ await runInDurableObject(p.stub, (_i, state) => expect(state.storage.sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(1));
+ const id = Number(restored.value.activity_id);
+ expect(await write({op: "undo", args: {activity_id: id, request_id: `undo:${id}`}})).toMatchObject({ok: true, value: {action: "undone"}});
+ await runInDurableObject(p.stub, (_i, state) => expect(state.storage.sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(0));
+ const undone = await write({op: "undo", args: {activity_id: id, request_id: `undo:${id}`}});
+ expect(undone).toMatchObject({ok: true, value: {action: "replayed"}});
+ if (!undone.ok) return;
+ const removalAgain = Number(undone.value.activity_id);
+ const again = await write({op: "restore", args: {activity_id: removalAgain, request_id: "restore-again"}});
+ expect(again).toMatchObject({ok: true, value: {action: "restored"}});
+ if (!again.ok) return;
+ expect(await write({op: "restore", args: {activity_id: removalAgain, request_id: "restore-again"}})).toMatchObject({ok: true, value: {action: "replayed", activity_id: again.value.activity_id}});
+ const restoreId = Number(again.value.activity_id);
+ const session = await runInDurableObject(p.stub, (_i, state) => {
+  const sql = state.storage.sql;
+  expect(sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(1);
+  const n = sql.exec<{id: string; seq: number}>("SELECT n.id, n.seq FROM nodes n JOIN texts t ON n.id = t.node_id WHERE t.range_id = ?", range_id).one();
+  sql.exec("UPDATE nodes SET seq = seq + 1 WHERE id = ?", n.id);
+  return n;
+ });
+ const inverse = {op: "undo" as const, args: {activity_id: restoreId, request_id: "guarded-text-undo"}};
+ expect(await write(inverse)).toMatchObject({ok: false, error: {code: "revision_conflict"}});
+ await runInDurableObject(p.stub, (_i, state) => state.storage.sql.exec("UPDATE nodes SET seq = ?, status = 'moving' WHERE id = ?", session.seq, session.id));
+ expect(await write(inverse)).toMatchObject({ok: false, error: {code: "moving"}});
+ await runInDurableObject(p.stub, (_i, state) => {
+  state.storage.sql.exec("UPDATE nodes SET status = 'active' WHERE id = ?", session.id);
+  state.storage.sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, '1')", `wiped:${session.id}`);
+ });
+ expect(await write(inverse)).toMatchObject({ok: false, error: {code: "profile_wiped"}});
+ await runInDurableObject(p.stub, (_i, state) => expect(state.storage.sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(1));
 });

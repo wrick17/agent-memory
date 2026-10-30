@@ -16,7 +16,7 @@ import { readableNodeIds } from "./graph";
 export const MAX_ITEMS = 40;
 export const MAX_LEASE_S = 900;
 export const MAX_OPS = 10;
-const BATCH_GAP_MS = 20 * 3_600_000;
+export const BATCH_GAP_MS = 20 * 3_600_000;
 const MAX_ATTEMPTS = 3;
 export const ALLOWED_OPS = ["save", "compact", "link", "end_link", "supersede", "flag", "dismiss"] as const;
 /** Each item kind's ops: inference reads correction or capture digests; promotion also takes a preference a similarity pair names. */

@@ -247,4 +247,7 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	`CREATE TRIGGER nodes_refresh_fence BEFORE INSERT ON nodes
 		WHEN EXISTS (SELECT 1 FROM import_refreshes WHERE shadow_id = NEW.id)
 		BEGIN SELECT RAISE(ABORT, 'import_pending'); END`,
+], [
+	// v6: the owner archive page and restore find one removal's rows by its activity id.
+	"CREATE INDEX archive_activity ON archive (activity_id, id)",
 ]];

@@ -4,13 +4,14 @@ import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
 import { redactPayload } from "./domain/redact";
-import { Fail, MEMORY_KINDS, MEMORY_TYPES, ok, SCOPES, type OwnerArgs, type ProfileRef, type WriteCommand } from "./domain/types";
+import { Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, profileStub } from "./mcp";
-import { chunkSchema, corpusOn, corpusStub } from "./corpus-tools";
-import { checkChunk, chunkTerms, HELD } from "./corpus/store";
-import { commitArgs, repoNamespace, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
+import { trace } from "./graph-tools";
+import { chunkSchema, corpusOn, corpusStub, refreshSchema } from "./corpus-tools";
+import { checkChunk, chunkTerms, HELD, refreshTerms, type RefreshCommand } from "./corpus/store";
+import { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
 import { mayUse, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
@@ -69,21 +70,43 @@ const ingestSchema = z.object({
 	manifests: z.array(z.object({ range_id: rangeId, parts: z.array(z.object({ part_id: z.string().max(64), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict()).min(1).max(512) }).strict()).max(16).default([]),
 }).strict();
 const stateSchema = z.object({ range_ids: z.array(rangeId).min(1).max(64), repo: ingestSchema.shape.repo, profile: ingestSchema.shape.profile }).strict();
-// Work uploads (section 10): a body naming commits or a marker. Strict and bounded: full SHAs, a GitHub login as author (never
-// an email), a title of at most 280 characters, and no field for diffs, paths or free text. Digests in the same body still need
-// their session. Bodies without these keys keep the capture schema above unchanged.
+// Work uploads (section 10): a body naming commits, PR or Jira ticket snapshots, or a marker. Strict and bounded: full SHAs,
+// GitHub logins and Jira account ids (never a name or an email), titles and branch names of at most 280 characters, and no field
+// for diffs, paths, review text, descriptions, comments or other free text. Snapshots carry the time they were read (`as_of`).
+// Jira tickets go only to the work profile, named explicitly. Digests in the same body still need their session. Bodies without
+// these keys keep the capture schema above unchanged.
 const sha = z.string().regex(/^[0-9a-f]{40}$/i);
+const login = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$/);
+const jiraKey = z.string().regex(/^[A-Z][A-Z0-9]{1,9}-[1-9]\d{0,6}$/), jiraAccount = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/);
+// A field the connector named unknown carries no value, and only a known assignee says whether it is the owner.
+const ticket = z.object({ key: jiraKey, kind: z.enum(["bug", "feature", "ticket"]), type: z.string().min(1).max(64), title: z.string().max(TITLE_MAX), updated_at: z.iso.datetime({ offset: true }),
+	state: z.enum(["open", "closed"]).optional(), status: z.string().max(64).optional(), priority: z.string().max(64).optional(), due: z.iso.date().optional(),
+	assignee: jiraAccount.optional(), reporter: jiraAccount.optional(), assignee_is_owner: z.boolean().optional(),
+	blocked_by: z.array(jiraKey).max(100), blocks: z.array(jiraKey).max(100), related: z.array(jiraKey).max(100),
+	unknown: z.array(z.enum(["status", "priority", "due", "assignee", "reporter", "issuelinks"])).max(6) }).strict()
+	.refine((t) => ![...t.blocked_by, ...t.blocks, ...t.related].includes(t.key), { message: "a ticket does not link to itself" })
+	.refine((t) => (t.assignee_is_owner === true ? !!t.assignee : true) && !(t.unknown.includes("assignee") && (t.assignee || t.assignee_is_owner !== undefined))
+		&& !(t.unknown.includes("status") && (t.state || t.status !== undefined)) && !(t.unknown.includes("priority") && t.priority !== undefined)
+		&& !(t.unknown.includes("due") && t.due) && !(t.unknown.includes("reporter") && t.reporter), { message: "an unknown field carries no value" });
 const workSchema = ingestSchema.extend({
 	session: ingestSchema.shape.session.optional(),
-	commits: z.array(z.object({ sha, at: z.iso.datetime({ offset: true }), title: z.string().max(TITLE_MAX),
-		author: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$/).optional() }).strict()).max(50).default([]),
+	commits: z.array(z.object({ sha, at: z.iso.datetime({ offset: true }), title: z.string().max(TITLE_MAX), author: login.optional() }).strict()).max(50).default([]),
+	prs: z.array(z.object({ number: z.number().int().min(1).max(2_147_483_647), title: z.string().max(TITLE_MAX), state: z.enum(["open", "closed"]),
+		updated_at: z.iso.datetime({ offset: true }), head: z.string().max(TITLE_MAX), author: login.optional(), reviewers: z.array(login).max(100),
+		commits: z.array(sha).max(100), closes: z.array(z.string().regex(/^github:[A-Za-z0-9][\w.-]*\/[\w.-]+#[1-9]\d{0,9}$/)).max(100),
+		unknown: z.array(z.enum(["author", "reviews", "commits", "closingIssuesReferences", "reviewRequests"])).max(5),
+		review_requested_from_owner: z.boolean().optional() }).strict()).max(25).default([]),
+	tickets: z.array(ticket).max(20).default([]),
+	as_of: z.iso.datetime({ offset: true }).optional(),
 	marker: z.object({ head: sha, as_of: z.iso.datetime({ offset: true }) }).strict().optional(),
-}).strict().refine((v) => v.session || (!v.digests.length && !v.manifests.length), { path: ["session"], message: "digests and manifests need a session" });
+}).strict().refine((v) => v.session || (!v.digests.length && !v.manifests.length), { path: ["session"], message: "digests and manifests need a session" })
+	.refine((v) => (!v.prs.length && !v.tickets.length) || v.as_of, { path: ["as_of"], message: "PR and ticket snapshots need as_of" })
+	.refine((v) => !v.tickets.length || v.profile === "work", { path: ["profile"], message: "Jira tickets go only to profile \"work\", named explicitly" });
 
 /**
  * Capture upload and recovery for the job-scoped device token (scope `ingest`), routed like any write and never to `me`.
  * Only bounded digests and manifests are accepted: the strict body schema has no field for a raw transcript record, and every string is bounded.
- * The same token uploads bounded work items (commits and the repo marker) through the work schema.
+ * The same token uploads bounded work items (commits, PR and Jira ticket snapshots and the repo marker) through the work schema.
  */
 async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/capture"): Promise<Response> {
 	const auth = await authenticate(request, env, "resource", true);
@@ -92,7 +115,7 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot upload captures" } }, 403);
 	const raw = await body(request);
-	const work = path === "/v1/ingest" && !!raw && ("commits" in raw || "marker" in raw);
+	const work = path === "/v1/ingest" && !!raw && ("commits" in raw || "prs" in raw || "tickets" in raw || "marker" in raw);
 	const parsed = (path === "/v1/ingest" ? (work ? workSchema : ingestSchema) : stateSchema).safeParse(raw);
 	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
 	const input = parsed.data as z.infer<typeof stateSchema> & Partial<z.infer<typeof workSchema>>;
@@ -112,22 +135,52 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
  * names and handles guard me before the write, as record_knowledge's do. Capture digests in the body are stored first, unchanged.
  */
 async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, routedBy: string, input: Partial<z.infer<typeof workSchema>>): Promise<Response> {
-	const repo = repoNamespace(input.repo?.remote ?? "");
-	if (!repo) return json({ error: { code: "validation", message: "commits and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
+	const repo = repoNamespace(input.repo?.remote ?? ""), tickets = (input.tickets ?? []).map((t) => ticketArgs(t, input.as_of!));
+	if (!repo && (input.commits?.length || input.prs?.length || input.marker || !tickets.length)) return json({ error: { code: "validation", message: "commits, PRs and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
+	if (tickets.length && ref.profile !== "work") return json({ error: { code: "forbidden", message: "Jira tickets go only to the work profile" } }, 403);
 	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [] }) : ok([]);
 	if (!results.ok) return json({ error: results.error }, 400);
 	if (input.marker && results.value.some((r) => r.status !== "stored" && r.status !== "replayed")) return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: [], marker: { status: "refused", reason: "capture_not_held" } });
-	const commits = (input.commits ?? []).map((c) => commitArgs(repo, c));
-	const terms = ref.profile === "work" ? uploadTerms(repo, commits) : [];
+	const commits = (input.commits ?? []).map((c) => commitArgs(repo!, c)), prs = (input.prs ?? []).map((p) => prArgs(repo!, p, input.as_of!));
+	const terms = ref.profile === "work" ? uploadTerms(repo, [...commits, ...prs, ...tickets]) : [];
 	if (terms.length) {
 		const added = await accountStub(env, account.caller.userId).admin({ op: "addSensitiveTerms", terms });
 		if (!added.ok) return json({ error: added.error }, 400);
 	}
-	const res = await profileStub(env, ref).upload(ref, { repo, commits, ...(input.marker ? { marker: input.marker } : {}) },
+	const res = await profileStub(env, ref).upload(ref, { repo, commits, ...(prs.length ? { prs } : {}), ...(tickets.length ? { tickets } : {}), ...(input.marker ? { marker: input.marker } : {}) },
 		{ platform: "upload", routedBy, userId: account.caller.userId, ...(account.caller.deviceId ? { deviceId: account.caller.deviceId } : {}) });
 	if (!res.ok) return json({ error: res.error }, 400);
 	
-	return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: res.value.commits, ...(res.value.marker ? { marker: res.value.marker } : {}) });
+	return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: res.value.commits, ...(res.value.prs ? { prs: res.value.prs } : {}),
+		...(res.value.tickets ? { tickets: res.value.tickets } : {}), ...(res.value.marker ? { marker: res.value.marker } : {}) });
+}
+
+const markersQuery = z.object({ repo: z.string().min(1).max(512).optional(), path: z.string().min(1).max(1024).optional(), profile: z.string().regex(PROFILE_NAME).optional(),
+	session: z.string().regex(/^(claude-code|codex):[A-Za-z0-9._:-]{1,128}$/).optional() }).strict();
+
+/**
+ * `GET /v1/markers` (section 7) for the job-scoped token (scope `ingest`), routed like an upload and never to `me`: the repo marker,
+ * one session's acknowledged capture cursors and the daily slot. Read-only: it moves, acknowledges and binds nothing.
+ */
+async function markersRead(request: Request, env: Env): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot read upload markers" } }, 403);
+	const q = markersQuery.safeParse(Object.fromEntries(new URL(request.url).searchParams));
+	if (!q.success) return json({ error: { code: "validation", message: q.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+	const repo = q.data.repo || q.data.path ? { ...(q.data.repo ? { remote: q.data.repo } : {}), ...(q.data.path ? { path: q.data.path } : {}) } : undefined;
+	const route = routeWrite(ctx.value.caller, ctx.value.rules, ctx.value.known, { ...(q.data.profile ? { profile: q.data.profile } : {}), ...(repo ? { repo } : {}) });
+	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
+	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "uploads never go to me" } }, 403);
+	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile);
+	if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 400);
+	const [client, ...id] = (q.data.session ?? "").split(":");
+	const r = await profileStub(env, ref).read(ref, { kind: "markers", repo: q.data.repo ? repoNamespace(q.data.repo) : null,
+		...(q.data.session ? { session: { client: client as "claude-code" | "codex", id: id.join(":") } } : {}) });
+	return r.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(r.value as Record<string, unknown>) })
+		: json({ error: r.error }, r.error.code === "busy" ? 503 : 400);
 }
 
 // ---------- staged import (section 16) ----------
@@ -262,6 +315,27 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 
 const boardQuery = z.object({ as_of: z.string().max(40).refine((s) => !Number.isNaN(Date.parse(s)), "must be an ISO date").optional(),
 	limit: z.coerce.number().int().min(1).max(200).optional() }).strict();
+// Owner page reads (section 15). Entity: before pages revision history, content=all with cursor pages the whole content. Journals:
+// after pages the list; id with entries_after pages one journal's entries, at most 25 a page. The rest bound their own windows.
+const asOfParam = boardQuery.shape.as_of;
+const entityQuery = z.object({ as_of: asOfParam, before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+	content: z.literal("all").optional(), cursor: z.string().min(1).max(2048).optional() }).strict().refine((v) => (v.cursor === undefined || v.content === "all") && (v.before === undefined || v.content === undefined));
+const journalsQuery = z.object({ after: z.string().min(1).max(512).optional(), limit: z.coerce.number().int().min(1).max(100).optional(), id: id.optional(),
+	entries_after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() }).strict()
+	.refine((v) => (v.id === undefined ? v.entries_after === undefined : v.after === undefined && (v.limit ?? 1) <= 25));
+const mapQuery = z.object({ center: id.optional(), center_key: z.string().min(1).max(256).optional(), depth: z.coerce.number().int().min(1).max(2).optional(), as_of: asOfParam }).strict().refine((q) => !(q.center && q.center_key), "pass center or center_key");
+const pathQuery = z.object({ from: id, to: id, max_depth: z.coerce.number().int().min(2).max(4).optional(), as_of: asOfParam }).strict();
+const timelineQuery = z.object({ from: z.string().min(1).max(40), to: z.string().min(1).max(40), node: id.optional(),
+	kinds: z.string().max(400).transform((v) => v.split(",")).pipe(z.array(z.enum(NODE_KINDS)).min(1).max(NODE_KINDS.length)).optional(),
+	limit: z.coerce.number().int().min(1).max(500).optional() }).strict();
+const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(100).optional(),
+	actor: z.enum(["agent", "owner", "keep", "index", "maintenance", "migration", "transfer"]).optional() }).strict();
+const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
+const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
+const decoded = (s: string) => { try { return decodeURIComponent(s); } catch { return null; } };
+const isoOf = (s: string | undefined) => (s ? new Date(s).toISOString() : undefined);
+const TIMELINE_DAYS = 90;
+
 const auditQuery = z.object({ profile: z.string().regex(PROFILE_NAME), after: z.string().min(1).max(300).optional(), limit: z.coerce.number().int().min(1).max(200).optional(),
 	record: id.optional(), rows: z.enum(["revisions", "requests"]).optional() }).strict();
 
@@ -349,6 +423,41 @@ async function corpusImport(request: Request, env: Env): Promise<Response> {
 	return r.ok ? json({ profile: ref.profile, generation: ref.generation, receipt: r.value }) : json({ error: r.error }, corpusStatusCode(r.error.code));
 }
 
+/**
+ * POST /v1/corpus/refresh (refresh design revision 2): inspect a repo, or begin, apply a part of or finish its plan, for the generation
+ * the client pinned. A part's put rows pass their row checks and, in work, register their repos and people as me guard terms before
+ * the store sees the part. Receipts are the store's stored text and travel byte for byte.
+ */
+async function corpusRefresh(request: Request, env: Env): Promise<Response> {
+	const ctx = await corpusCaller(request, env);
+	if (ctx instanceof Response) return ctx;
+	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return json({ error: { code: "validation", message: "send JSON" } }, 400);
+	const raw = await request.text();
+	if (Buffer.byteLength(raw, "utf8") > 1_000_000) return json({ error: { code: "size_budget", message: "a refresh request may hold at most 1,000,000 bytes", details: { reason: "request_bytes" } } }, 413);
+	let input: z.infer<typeof refreshSchema>;
+	try {
+		const r = refreshSchema.safeParse(JSON.parse(raw));
+		if (!r.success) return json({ error: { code: "validation", message: r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+		input = r.data;
+	} catch { return json({ error: { code: "validation", message: "the body is not JSON" } }, 400); }
+	const ref = corpusProfile(env, ctx, input.profile);
+	if (ref instanceof Response) return ref;
+	if (input.generation !== ref.generation) return json({ error: { code: "profile_wiped", message: "this profile is on another generation; start a fresh refresh", details: { reason: "generation_changed" } } }, 409);
+	if (input.command === "part") {
+		let terms: string[];
+		try { terms = refreshTerms(input.ops); } catch (e) { if (e instanceof Fail) return json({ error: e.failure }, corpusStatusCode(e.failure.code)); throw e; }
+		for (let i = 0; ref.profile === "work" && i < terms.length; i += TERM_PAGE) {
+			const added = await accountStub(env, ctx.caller.userId).admin({ op: "addSensitiveTerms", terms: terms.slice(i, i + TERM_PAGE), profile: ref.profile, generation: ref.generation });
+			if (!added.ok) return json({ error: added.error }, corpusStatusCode(added.error.code));
+		}
+	}
+	const { profile: _p, generation: _g, ...cmd } = input;
+	const r = await corpusStub(env, ref).refresh(ref, cmd as RefreshCommand);
+	if (!r.ok) return json({ error: r.error }, corpusStatusCode(r.error.code));
+	const head = `{"profile":${JSON.stringify(ref.profile)},"generation":${JSON.stringify(ref.generation)}`;
+	return new Response(typeof r.value === "string" ? `${head},"receipt":${r.value}}` : `${head},"page":${JSON.stringify(r.value)}}`, { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+}
+
 /** GET /v1/corpus/status?profile=: the generation to pin, the accepted families with their hashes, the hold list and each table's progress. */
 async function corpusStatus(request: Request, env: Env): Promise<Response> {
 	const ctx = await corpusCaller(request, env);
@@ -363,9 +472,11 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if (corpusOn(env) && url.pathname === "/v1/corpus/import" && request.method === "POST") return corpusImport(request, env);
 	if (corpusOn(env) && url.pathname === "/v1/corpus/status" && request.method === "GET") return corpusStatus(request, env);
+	if (corpusOn(env) && url.pathname === "/v1/corpus/refresh" && request.method === "POST") return corpusRefresh(request, env);
 	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
 	if (url.pathname === "/v1/import" && request.method === "POST") return importBatch(request, env);
 	if (url.pathname === "/v1/import/audit" && request.method === "GET") return importAudit(request, env);
+	if (url.pathname === "/v1/markers" && request.method === "GET") return markersRead(request, env);
 	if (url.pathname === "/settings" && request.method === "GET") {
 		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}
@@ -417,6 +528,25 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			...(name === "me" ? { meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: ctx.value.sensitiveTerms } } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, r.error.code === "not_found" ? 404 : r.error.code === "revision_conflict" ? 409 : 400);
 	}
+	// Restore one removal from the archive (section 15): an ordinary owner write with its activity row, undo and replay as
+	// request "restore:<activity id>". This is the owner archive, not backup or point-in-time restore.
+	const rst = /^\/api\/profiles\/([^/]+)\/archive\/restore$/.exec(url.pathname);
+	if (rst && request.method === "POST") {
+		const ref = PROFILE_NAME.test(rst[1]!) ? ctx.value.profiles.find((p) => p.profile === rst[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${rst[1]}' is not active` } }, 404);
+		const b = restoreBody.safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send JSON with activity_id, the removal to restore" } }, 400);
+		const args = { activity_id: b.data.activity_id, request_id: `restore:${b.data.activity_id}` };
+		const r = await profileStub(env, ref).write(ref, { op: "restore", args }, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: auth.principal.userId,
+			payloadHash: requestHash("restore", args), ...(ref.profile === "me" ? { meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: ctx.value.sensitiveTerms } } : {}) });
+		if (!r.ok) {
+			const code = r.error.code;
+			return json({ error: r.error }, code === "not_found" ? 404 : code === "revision_conflict" || code === "moving" ? 409 : code === "size_budget" ? 413 : 400);
+		}
+		const { created, ...value } = r.value;
+		if (created.length) await account.recordNodes(ref.profile, created);
+		return json(value);
+	}
 	// The daily batch's last lease and last skip or park, for the dashboard's profile card (section 15).
 	const batch = /^\/api\/profiles\/([^/]+)\/batch$/.exec(url.pathname);
 	if (batch && request.method === "GET") {
@@ -443,6 +573,59 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200" } }, 400);
 		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
+	}
+	// Owner page reads (section 15), all read-only: a node's entity page by id or key, the map, a path, a timeline, journals and
+	// activity. A link into another profile stays {id, readable: false}: a page reads another profile only when the owner opens it there.
+	const ent = /^\/api\/profiles\/([^/]+)\/nodes\/(by-key\/)?([^/]+)$/.exec(url.pathname);
+	const page = /^\/api\/profiles\/([^/]+)\/(journals|map|path|timeline|activity|archive)$/.exec(url.pathname);
+	if ((ent || page) && request.method === "GET") {
+		const name = (ent ?? page)![1]!;
+		const ref = PROFILE_NAME.test(name) ? ctx.value.profiles.find((p) => p.profile === name) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${name}' is not active` } }, 404);
+		const params = Object.fromEntries(url.searchParams), known = ctx.value.known;
+		const bad = (message: string) => json({ error: { code: "validation", message } }, 400);
+		let q: ReadQuery;
+		if (ent) {
+			const target = decoded(ent[3]!), p = entityQuery.safeParse(params);
+			if (target === null || target.length > (ent[2] ? 256 : 128) || !p.success) return bad("a node id of at most 128 or a key of at most 256 characters; as_of an ISO date; before a revision; cursor with content=all");
+			q = { kind: "entity", node: ent[2] ? { key: target } : { id: target }, ...(p.data.as_of ? { asOf: isoOf(p.data.as_of)! } : {}),
+				...(p.data.before ? { before: p.data.before } : {}), ...(p.data.content ? { content: p.data.cursor ? { cursor: p.data.cursor } : {} } : {}), known };
+		} else if (page![2] === "journals") {
+			const p = journalsQuery.safeParse(params);
+			if (!p.success) return bad("after pages the list; id with entries_after pages one journal, limit 1 to 25");
+			q = p.data.id !== undefined ? { kind: "journal", id: p.data.id, after: p.data.entries_after ?? 0, limit: p.data.limit ?? 20 }
+				: { kind: "journals", after: p.data.after ?? null, limit: p.data.limit ?? 50 };
+		} else if (page![2] === "map") {
+			const p = mapQuery.safeParse(params);
+			if (!p.success) return bad("center a node id or center_key a key; depth 1 or 2; as_of an ISO date");
+			q = { kind: "map", ...(p.data.center ? { center: { id: p.data.center } } : p.data.center_key ? { center: { key: p.data.center_key } } : {}), depth: p.data.depth ?? 1, ...(p.data.as_of ? { asOf: isoOf(p.data.as_of)! } : {}), known };
+		} else if (page![2] === "timeline") {
+			const p = timelineQuery.safeParse(params);
+			const from = p.success ? Date.parse(p.data.from) : NaN, to = p.success ? Date.parse(p.data.to) : NaN;
+			if (!p.success || Number.isNaN(from) || Number.isNaN(to) || from >= to || to - from > TIMELINE_DAYS * 86_400_000) return bad(`from before to, at most ${TIMELINE_DAYS} days apart; kinds a comma list of node kinds; limit 1 to 500`);
+			q = { kind: "page_timeline", from: new Date(from).toISOString(), to: new Date(to).toISOString(), ...(p.data.node ? { node: { id: p.data.node } } : {}),
+				...(p.data.kinds ? { kinds: p.data.kinds } : {}), limit: p.data.limit ?? 100, known };
+		} else if (page![2] === "archive") {
+			const p = archiveQuery.safeParse(params);
+			if (!p.success) return bad("before an activity id; limit 1 to 50");
+			q = { kind: "archive", before: p.data.before ?? null, limit: p.data.limit ?? 20 };
+		} else if (page![2] === "activity") {
+			const p = activityQuery.safeParse(params);
+			if (!p.success) return bad("before an activity id; limit 1 to 100; actor one of the write actors");
+			q = { kind: "activity", before: p.data.before ?? null, limit: p.data.limit ?? 50, ...(p.data.actor ? { actor: p.data.actor } : {}) };
+		} else {
+			// A path runs the graph tool's bidirectional search between two nodes this profile shows: up to 3 paths of at most 4 hops.
+			const p = pathQuery.safeParse(params);
+			if (!p.success) return bad("from and to node ids; max_depth 2 to 4; as_of an ISO date");
+			const held = await profileStub(env, ref).read(ref, { kind: "shown", ids: [p.data.from, p.data.to] });
+			if (!held.ok) return json({ error: held.error }, held.error.code === "not_found" ? 404 : 400);
+			if ((held.value as string[]).length !== new Set([p.data.from, p.data.to]).size) return json({ error: { code: "not_found", message: "from and to must be nodes this profile shows" } }, 404);
+			const r = await trace({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard" },
+				{ from: { id: p.data.from }, to: { id: p.data.to }, mode: "path", ...(p.data.max_depth ? { max_depth: p.data.max_depth } : {}), ...(p.data.as_of ? { as_of: p.data.as_of } : {}), profile: name });
+			return r.ok ? json(r.value) : json({ error: r.error }, r.error.code === "not_found" ? 404 : 400);
+		}
+		const r = await profileStub(env, ref).read(ref, q);
+		return r.ok ? json(r.value) : json({ error: r.error }, r.error.code === "not_found" ? 404 : r.error.code === "busy" ? 503 : 400);
 	}
 	if (m && request.method === "POST" && m[2] === "revoke") return run({ op: "revokeDevice", id: m[1]! });
 	// Owner only, like every route here; the typed name must equal the profile (section 9, wipe).

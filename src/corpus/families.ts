@@ -160,6 +160,15 @@ export const HELD: Record<string, string> = {
 
 export const CHUNK_ROWS = 5000;
 export const schemaSha = (f: Family) => sha256(f.ddl);
+/** The order every refresh tuple lists the families in. */
+export const FAMILY_ORDER = Object.keys(FAMILIES);
+export const PROJECTION = "corpus-projection/1";
+/** A family as refresh sees it: its projection without rowid, keyed by its natural key (repos by full name, contributors by none). */
+export const REFRESH: Record<string, Family> = Object.fromEntries(Object.entries(FAMILIES).map(([t, f]) => [t, {
+	...f, columns: Object.fromEntries(Object.entries(f.columns).filter(([c]) => c !== "rowid")), key: t === "repos" ? ["full_name"] : t === "contributors" ? [] : f.key,
+}]));
+/** The row hash both ends compute (design section 3): table, DDL hash, projection version and the approved values without rowid. */
+export const rowHash = (table: string, values: Value[]) => sha256(JSON.stringify([table, schemaSha(FAMILIES[table]!), PROJECTION, values]));
 // A forbidden table's legacy evidence id (`session:session_messages:…`) inside an uploaded value means copied search payload.
 // Only that exact form: commit text may name the tables themselves.
 const LINEAGE = new RegExp(`\\b(?:session|decision|directive):(?:${FORBIDDEN.join("|")}):`, "i");

@@ -14,14 +14,29 @@ export const ANSWER_BYTES = 1_000_000;
 const SOURCES: Record<string, string> = { commit: "commits", ref: "refs", repo: "repos", path: "commit_paths" };
 const SEARCH = ["corpus_search_documents", "corpus_search_fts", "corpus_search_fts_data", "corpus_search_fts_idx", "corpus_search_fts_docsize", "corpus_search_fts_config"];
 
-export type AsOf = Record<string, { as_of: string; refresh: string; complete: boolean; rows: number; source_sha256: string } | null>;
-/** Per table: its load's as_of, refresh mode and completeness, or null when nothing of it is loaded. */
+export type AsOf = Record<string, { as_of: string; as_of_max: string; basis: "declared_snapshot" | "observed" | "mixed"; refresh: string; complete: boolean; rows: number;
+	source_sha256: string | null; partitions: number } | null>;
+/**
+ * Per table: the oldest and newest observation of the repo partitions holding rows, whether they are the declared bulk snapshot,
+ * refreshed observations or a mix, and the source hash only while one source covers them all; null when nothing is loaded.
+ */
 export function asOf(sql: SqlStorage, tables: string[]): AsOf {
-	const meta = new Map(sql.exec<{ table_name: string; source: string; as_of: string; refresh: string; complete: number; rows: number }>(
-		"SELECT table_name, source, as_of, refresh, complete, rows FROM corpus_meta WHERE table_name IN (SELECT value FROM json_each(?))", JSON.stringify(tables)).toArray()
-		.map((m) => [m.table_name, { as_of: m.as_of, refresh: m.refresh, complete: m.complete === 1, rows: m.rows, source_sha256: (JSON.parse(m.source) as { file_sha256: string }).file_sha256 }]));
+	const meta = new Map(sql.exec<{ table_name: string; source: string; as_of: string; refresh: string; complete: number; rows: number; min_at: string | null; max_at: string | null;
+		parts: number | null; sources: number | null; observed: number | null; one_source: string | null }>(
+		`SELECT m.table_name, m.source, m.as_of, m.refresh, m.complete, m.rows, p.min_at, p.max_at, p.parts, p.sources, p.observed, p.one_source FROM corpus_meta m
+		LEFT JOIN (SELECT table_name, min(observed_at) AS min_at, max(observed_at) AS max_at, count(*) AS parts, count(DISTINCT source_id) AS sources,
+			sum(basis = 'observed') AS observed, min(source_id) AS one_source FROM corpus_partitions WHERE rows > 0 GROUP BY table_name) p USING (table_name)
+		WHERE m.table_name IN (SELECT value FROM json_each(?))`, JSON.stringify(tables)).toArray()
+		.map((m) => [m.table_name, { as_of: m.min_at ?? m.as_of, as_of_max: m.max_at ?? m.as_of,
+			basis: !m.observed ? "declared_snapshot" as const : m.observed === m.parts && m.sources === 1 ? "observed" as const : "mixed" as const,
+			refresh: m.observed ? "refresh" : m.refresh, complete: m.complete === 1, rows: m.rows,
+			source_sha256: m.parts ? (m.sources === 1 ? m.one_source : null) : (JSON.parse(m.source) as { file_sha256: string }).file_sha256, partitions: m.parts ?? 0 }]));
 	return Object.fromEntries([...new Set(tables)].sort().map((t) => [t, meta.get(t) ?? null]));
 }
+
+/** One repo's last observation per table, zero-row partitions included, or null where it was never loaded or observed. */
+const repoAsOf = (sql: SqlStorage, tables: string[], repo: string) => Object.fromEntries(tables.map((t) => [t,
+	sql.exec<{ observed_at: string }>("SELECT observed_at FROM corpus_partitions WHERE table_name = ? AND part = ?", t, JSON.stringify(repo)).toArray()[0]?.observed_at ?? null]));
 
 const projection = (table: string) => Object.keys(FAMILIES[table]!.columns).join(", ");
 /** The Worker's fields of the answer (profile, routed_by, action), counted with it. */
@@ -88,19 +103,21 @@ export function get(sql: SqlStorage, q: { kind: "commit" | "repo" | "ref" | "per
 			const [repo, sha] = [q.key.slice(0, at), q.key.slice(at + 1)];
 			const commits = rows("commits", "repo = ? AND sha = ?", repo, sha);
 			const paths = commits.length ? rows("commit_paths", `repo = ? AND sha = ? ORDER BY path LIMIT ${SQL_ROWS + 1}`, repo, sha) : [];
-			return fit({ ...head, kind: q.kind, key: q.key, found: commits.length > 0, commits, paths: paths.slice(0, SQL_ROWS), paths_truncated: paths.length > SQL_ROWS, as_of: asOf(sql, ["commits", "commit_paths"]) }, ["commits", "paths"]);
+			return fit({ ...head, kind: q.kind, key: q.key, found: commits.length > 0, commits, paths: paths.slice(0, SQL_ROWS), paths_truncated: paths.length > SQL_ROWS, as_of: asOf(sql, ["commits", "commit_paths"]),
+				repo_as_of: repoAsOf(sql, ["commits", "commit_paths"], repo) }, ["commits", "paths"]);
 		}
 		case "repo": {
 			const repos = rows("repos", "full_name = ?", q.key);
 			const contributors = rows("contributors", `repo = ? ORDER BY rank, rowid LIMIT ${SQL_ROWS}`, q.key);
-			return fit({ ...head, kind: q.kind, key: q.key, found: repos.length > 0, repos, contributors, as_of: asOf(sql, ["repos", "contributors"]) }, ["repos", "contributors"]);
+			return fit({ ...head, kind: q.kind, key: q.key, found: repos.length > 0, repos, contributors, as_of: asOf(sql, ["repos", "contributors"]),
+				repo_as_of: repoAsOf(sql, ["repos", "contributors"], q.key) }, ["repos", "contributors"]);
 		}
 		case "ref": {
 			// Git refnames never contain ':', so the first one ends the repo.
 			const at = q.key.indexOf(":");
 			if (at < 1) throw Fail.of("validation", "a ref key is repo:refname");
 			const refs = rows("refs", "repo = ? AND refname = ?", q.key.slice(0, at), q.key.slice(at + 1));
-			return fit({ ...head, kind: q.kind, key: q.key, found: refs.length > 0, refs, as_of: asOf(sql, ["refs"]) }, ["refs"]);
+			return fit({ ...head, kind: q.kind, key: q.key, found: refs.length > 0, refs, as_of: asOf(sql, ["refs"]), repo_as_of: repoAsOf(sql, ["refs"], q.key.slice(0, at)) }, ["refs"]);
 		}
 		case "person": {
 			const contributors = rows("contributors", `name = ? ORDER BY repo, rank, rowid LIMIT ${SQL_ROWS}`, q.key);

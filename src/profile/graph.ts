@@ -57,10 +57,10 @@ export type NodeSummary = {
 };
 const EDGE_COLS = "id, src, dst, dst_profile, rel, other_label, basis, reason, score, weight, valid_from, valid_to, recorded_at, ended_at";
 
-interface EdgeFilter { rels?: readonly string[]; bases?: string[]; asOf?: string; similarity: boolean; out?: boolean; known: string[] }
+interface EdgeFilter { rels?: readonly string[]; bases?: string[]; asOf?: string; recordedBy?: string; similarity: boolean; out?: boolean; known: string[] }
 
 /** Current, or valid at `asOf`: inside [valid_from, valid_to), and a link ended without a valid_to stops being valid when it ended. */
-function valid(e: { valid_from: string | null; valid_to: string | null; ended_at: string | null }, asOf?: string): boolean {
+export function valid(e: { valid_from: string | null; valid_to: string | null; ended_at: string | null }, asOf?: string): boolean {
 	if (!asOf) return e.ended_at === null;
 	const at = Date.parse(asOf), end = e.valid_to ?? e.ended_at;
 	return (!e.valid_from || Date.parse(e.valid_from) <= at) && (!end || Date.parse(end) > at);
@@ -73,6 +73,7 @@ function valid(e: { valid_from: string | null; valid_to: string | null; ended_at
 function edgesOf(sql: SqlStorage, ids: string[], f: EdgeFilter, b: Budget, where: string): EdgeRow[] {
 	if (!ids.length) return [];
 	const list = JSON.stringify(ids), rels = f.rels ? JSON.stringify(f.rels) : null, relCond = rels ? " AND rel IN (SELECT value FROM json_each(?))" : "";
+	// Time eligibility follows bounded discovery: a predicate before LIMIT can scan unbounded newer edges.
 	let query = `SELECT id, src FROM edges WHERE src IN (SELECT value FROM json_each(?))${relCond}`;
 	const params: SqlStorageValue[] = [list, ...(rels ? [rels] : [])];
 	let listed = ids.length + (f.rels?.length ?? 0);
@@ -98,7 +99,7 @@ function edgesOf(sql: SqlStorage, ids: string[], f: EdgeFilter, b: Budget, where
 	const payload = sql.exec<EdgeRow>(`SELECT ${EDGE_COLS} FROM edges WHERE id IN (SELECT value FROM json_each(?))`, JSON.stringify(kept));
 	const byId = new Map(payload.toArray().map(r => [r.id, r]));
 	b.edges_read += payload.rowsRead;
-	return kept.map(id => byId.get(id)!).filter(r => valid(r, f.asOf) && (f.bases ? f.bases.includes(r.basis) : f.similarity || r.basis !== "similarity"));
+	return kept.map(id => byId.get(id)!).filter(r => (!f.recordedBy || Date.parse(r.recorded_at) <= Date.parse(f.recordedBy)) && valid(r, f.asOf) && (f.bases ? f.bases.includes(r.basis) : f.similarity || r.basis !== "similarity"));
 }
 
 /** Gate the source before loading evidence or returning edge payloads. Targets may remain opaque. */
@@ -108,7 +109,7 @@ export function owned<T extends { src: string }>(sql: SqlStorage, rows: T[]): T[
 }
 
 /** Summaries of published local records only; all other endpoints remain opaque. */
-function summaries(sql: SqlStorage, ids: string[]): Map<string, NodeSummary> {
+export function summaries(sql: SqlStorage, ids: string[]): Map<string, NodeSummary> {
 	if (!ids.length) return new Map();
 	return new Map(sql.exec<NodeSummary>(`SELECT id, kind, other_label, key, name, memory_type AS type, scope, status, substr(description, 1, 280) AS description,
 		valid_from, valid_to, recorded_at, ended_at FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND ${READABLE_NODE}`, JSON.stringify(ids)).toArray().map((n) => [n.id, n]));
@@ -143,10 +144,10 @@ function resolve(sql: SqlStorage, ref: NodeRef): string {
 }
 
 /**
- * Breadth-first from `from`, up to `depth` levels. A level takes at most 200 new nodes; links that would add more are counted
- * in `skipped`. Only nodes of this profile are expanded further.
+ * Breadth-first from `from`, up to `depth` levels. A level takes at most `levelNodes` new nodes (200; the map's 300); links that
+ * would add more are counted in `skipped`. Only nodes of this profile are expanded further.
  */
-function walk(sql: SqlStorage, from: string[], depth: number, f: EdgeFilter, b: Budget, nodes: Map<string, NodeSummary>): GraphLink[] {
+export function walk(sql: SqlStorage, from: string[], depth: number, f: EdgeFilter, b: Budget, nodes: Map<string, NodeSummary>, levelNodes = LEVEL_NODES): GraphLink[] {
 	const out: (EdgeRow & { depth: number })[] = [], seen = new Set(from), seenEdge = new Set<number>();
 	let frontier = from;
 	for (let d = 1; d <= depth && frontier.length; d++) {
@@ -154,7 +155,7 @@ function walk(sql: SqlStorage, from: string[], depth: number, f: EdgeFilter, b: 
 		for (const e of edgesOf(sql, frontier, f, b, `level ${d} edges`)) {
 			if (seenEdge.has(e.id)) continue;
 			const add = [e.src, e.dst].filter((x) => !seen.has(x));
-			if (fresh.length + add.length > LEVEL_NODES) { b.skipped++; stop(b, `level ${d} nodes`); continue; }
+			if (fresh.length + add.length > levelNodes) { b.skipped++; stop(b, `level ${d} nodes`); continue; }
 			seenEdge.add(e.id);
 			out.push({ ...e, depth: d });
 			for (const x of add) { seen.add(x); fresh.push(x); }
@@ -266,10 +267,10 @@ export function timeline(sql: SqlStorage, q: TimelineQuery) {
  * structural, work and reasoning classes, inside this profile, reading at most 1,000 edge rows including the degree count.
  * A neighbour scores the sum of its seeds' scores times the relation weight, divided by 1 + ln(degree).
  */
-export function expandLinks(sql: SqlStorage, seeds: { id: string; score: number }[]) {
+export function expandLinks(sql: SqlStorage, seeds: { id: string; score: number }[], asOf?: string) {
 	const b = newBudget(EXPAND_ROWS), top = seeds.slice(0, SEEDS), score = new Map(top.map((s) => [s.id, s.score]));
 	const acc = new Map<string, { sum: number; best: number; via: { from: string; rel: Rel; basis: string; reason: string | null } }>();
-	for (const e of edgesOf(sql, top.map((s) => s.id), { rels: EXPAND_RELS, bases: ["identifier", "judgment"], similarity: false, known: [] }, b, "seed links")) {
+	for (const e of edgesOf(sql, top.map((s) => s.id), { rels: EXPAND_RELS, bases: ["identifier", "judgment"], similarity: false, known: [], ...(asOf ? { asOf } : {}) }, b, "seed links")) {
 		for (const [seed, n, out] of [[e.src, e.dst, true], [e.dst, e.src, false]] as const) {
 			// Recall never follows a link into another profile.
 			if (!score.has(seed) || (out && e.dst_profile !== "")) continue;

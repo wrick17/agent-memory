@@ -10,9 +10,9 @@ import { linkIdentifiers, resolveMentions, type Consumed } from "./extract";
 import { sizeLevel } from "./housekeeping";
 import { flagProtected, mayChange } from "./protect";
 import { assertWritable } from "./transfer";
-import { beforeImages, recordUndo, revert } from "./undo";
+import { beforeImages, recordUndo, restore, revert } from "./undo";
 import { assertNotWiped, assertOpen } from "./wipe";
-import { upload, uploadIds } from "./work-upload";
+import { upload, uploadIds, uploadKey } from "./work-upload";
 
 export interface Who { userId: string; profile: string; generation: string }
 
@@ -484,6 +484,11 @@ function protectedTargets(sql: SqlStorage, who: Who, cmd: WriteCommand, ctx: Wri
 	}
 	const ids = cmd.op === "save" ? [...primary, ...[cmd.args.supersedes ?? []].flat()]
 		: cmd.op === "append" ? primary : cmd.op === "owner" ? [cmd.args.memory_id] : cmd.op === "candidate" ? [cmd.args.candidate_id] : [];
+	// A snapshot upload changes an existing PR or ticket node; a commit upload never rewrites one.
+	if (cmd.op === "upload" && cmd.args.item !== "commit") {
+		const row = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved'", uploadKey(cmd.args)).toArray()[0];
+		if (row) ids.push(row.id);
+	}
 	if (cmd.op === "knowledge") {
 		for (const n of cmd.args.nodes ?? []) {
 			const row = n.key ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND status <> 'moved'", n.key).toArray()[0]
@@ -772,7 +777,7 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 			guard(cmd.args);
 		}
 		gate(sql, who, cmd, ctx);
-		if (cmd.op === "undo") unmoved(sql, cmd.args.activity_id);
+		if (cmd.op === "undo" || cmd.op === "restore") unmoved(sql, cmd.args.activity_id);
 		const seq = takeSeq(sql, "profile_meta");
 		const tx = new Tx(sql, seq.seq, new Date().toISOString(), ctx, requestId, guard);
 		tx.charge(seq.rows);
@@ -781,7 +786,7 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 		const before = cmd.op === "undo" || refused.length ? undefined : beforeImages(sql, cmd);
 		const flags = refused.map((n) => flagProtected(tx, n.id, n.why, cmd.op, ctx.actor));
 		const out: WriteOutput = flags.length ? { result: { action: "flagged", memory_id: refused[0]!.id, activity_id: flags.at(-1) }, created: [], embedDue: false }
-			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : candidate(tx, who, cmd.args);
+			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
 		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed });
 		if (requestId) {
