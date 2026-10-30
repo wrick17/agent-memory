@@ -1,6 +1,6 @@
 // AM-12 commit uploads through the real /v1/ingest with a job-scoped token, into the actual profile object, its graph and the board.
 // Each case uses its own profile and routing rule on the owner's account, so no other test file shares or closes it.
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256, uuid5 } from "../src/domain/ids";
@@ -674,6 +674,12 @@ describe("owner undo fences queued enrichment", () => {
 		const undoLast = async () => {
 			const rows = await receipts(), result = JSON.parse(rows.at(-1)!.result) as { activity_id: number };
 			await inside((st) => expect(undo(st, who, result.activity_id, { actor: "owner", platform: "test", routedBy: "test", userId: OWNER }).result.action).toBe("undone"));
+			// Settle scheduled and in-flight fixture work before the global replay snapshot.
+			const stub = env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:${who.profile}:${who.generation}`));
+			await runDurableObjectAlarm(stub);
+			await inside((st) => st.deleteAlarm());
+			await evictDurableObject(stub);
+			await inside((st) => st.deleteAlarm());
 		};
 		return { base, complete, partial, different, send, state, receipts, undoLast, at };
 	}

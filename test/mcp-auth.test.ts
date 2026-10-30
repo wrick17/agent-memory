@@ -1,3 +1,4 @@
+import { reviewedMarkdown } from "./fixtures/source-policy";
 // The Worker's /mcp path end to end: auth, both protocol eras, tools/list by scope, save then recall.
 // Tokens are signed with a test key; this proves the verifier's rules, not Clerk's real tokens (G1 stays open).
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
@@ -640,6 +641,29 @@ describe("owner page reads", () => {
 		expect([stale.status, stale.body.error?.code]).toEqual([400, "revision_conflict"]);
 	});
 
+	it("labels archival Entity prefixes and every current/as-of content page from untruncated reserved metadata",async()=>{
+		const f=reviewedMarkdown("~/entity-fixture/SKILL.md","archival text "+"b".repeat(200100),"archival_reference","p".repeat(5000));
+		const {token}=await deviceToken("entity-archive-import",["import"],["work"],"work");
+		const imported=await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/v1/import`,{method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify({commands:[...f.stages,f.finalize]})}));
+		expect(imported.status).toBe(200);expect((await imported.json() as any).receipts.at(-1).status).toBe("published");
+		const c=await contextFor(),key="fixture:archival-entity";
+		// Fixture-only key exercises the existing by-key read branch; the import format itself does not assign keys.
+		await runInDurableObject(store(c,"work"),(_i,s)=>s.storage.sql.exec("UPDATE nodes SET key = ? WHERE id = ?",key,f.node.id).toArray());
+		const get=await owner(),labels={classification:"archival_reference",trust:"untrusted",instruction_authority:false};
+		const byId=`/api/profiles/work/nodes/${f.node.id}`,byKey=`/api/profiles/work/nodes/by-key/${encodeURIComponent(key)}`,asOf="2026-02-01T00:00:00Z";
+		for(const base of [byId,byKey])for(const historical of [false,true]) {
+			const q=historical?`as_of=${encodeURIComponent(asOf)}`:"";
+			const prefix=await get(`${base}?${q}`);expect(prefix.status).toBe(200);expect(prefix.body).toMatchObject(labels);
+			if(historical){expect(prefix.body.node.attrs).toBeNull();expect(prefix.body.node.name).toBe(f.node.name);expect(prefix.body.node.scope).toBeNull();expect(prefix.body.current_delivery).toContain("instruction_authority");}
+			let cursor:string|null=null,content="",pages=0;
+			do {const page=await get(`${base}?${q}${q?"&":""}content=all${cursor?`&cursor=${encodeURIComponent(cursor)}`:""}`);expect(page.status).toBe(200);expect(page.body).toMatchObject(labels);if(historical)expect(page.body.current_delivery).toContain("classification");expect(Buffer.byteLength(JSON.stringify(page.body),"utf8")).toBeLessThanOrEqual(1000000);content+=page.body.content.content;cursor=page.body.content.cursor;pages++;}while(cursor);
+			expect(pages).toBe(3);expect(content).toBe(f.texts.map(t=>t.body).join(""));
+			const history=await get(`${base}?${q}${q?"&":""}before=2`);expect(history.body).toMatchObject(labels);
+		}
+		const first=(await get(`${byId}?content=all&as_of=${asOf}`)).body.content;
+		expect((await get(`${byId}?content=all&cursor=${encodeURIComponent(first.cursor)}`)).status).toBe(400);
+	});
+
 	it("lists the owner's archive and restores a forgotten record through the owner route, with replay, conflicts and device refusal", async () => {
 		const c = await contextFor(), tag = Date.now().toString(36);
 		const saved = await call<{ memory_id: string }>(c, "save_memory", { name: `Archived rule ${tag}`, type: "feedback", description: "kept", content: `rule body ${tag}`, profile: "personal" });
@@ -697,4 +721,33 @@ describe("owner page reads", () => {
 		expect(next.items[0].id).toBeLessThan(first.items[1].id);
 		expect((await get(`${base}/activity?actor=agent&limit=100`)).body.items.every((i: { actor: string }) => i.actor === "agent")).toBe(true);
 	});
+});
+
+it("staged archive owner transport preserves start replay bytes, exposes status, binds refusals and hands large Undo to the same operation",async()=>{
+	const c=await contextFor(),tag=crypto.randomUUID();
+	const saved=await call<{memory_id:string}>(c,"save_memory",{name:`staged owner ${tag}`,type:"reference",description:"synthetic",content:"owner transport body",profile:"personal"});
+	serveJwks();const token=await jwt({aud:undefined,scope:undefined,azp:env.DASHBOARD_ORIGIN}),origin=new URL(env.RESOURCE_URL).origin;
+	const http=async(path:string,method="GET",body?:unknown,t=token)=>{const r=await exports.default.fetch(new Request(origin+path,{method,headers:{authorization:`Bearer ${t}`,"content-type":"application/json"},...(body===undefined?{}:{body:JSON.stringify(body)})}));return {status:r.status,body:await r.json() as any};};
+	const base="/api/profiles/personal/archive/operations",args={action:"forget",memory_id:saved.memory_id,expected_revision:1,request_id:`staged-${tag}`};
+	const device=(await deviceToken(`staged-${tag}`,["read","write"],["personal"],"personal")).token;
+	expect((await http(base,"POST",args,device)).status).toBe(403);
+	expect((await http(base,"POST",{...args,extra:true})).status).toBe(400);
+	const refusedId=`refused-${tag}`;
+	expect((await http(base,"POST",{...args,expected_revision:99,request_id:refusedId})).status).toBe(409);
+	const begun=await http(base,"POST",args);expect(begun.status).toBe(200);expect(begun.body.action).toBe("forget_started");
+	expect((await http(begun.body.status_url,"GET",undefined,device)).status).toBe(403);
+	const originalCursor=begun.body.cursor;
+	let r=begun,steps=0;
+	while(r.body.state!=="complete"){
+		r=await http(`${base}/${begun.body.operation_id}/resume`,"POST",{cursor:r.body.cursor,request_id:`http-${tag}-${steps++}`});expect(r.status).toBe(200);expect(steps).toBeLessThan(50);
+	}
+	expect((await http(base,"POST",args)).body).toEqual({...begun.body,action:"replayed"});
+	expect((await http(begun.body.status_url)).body.state).toBe("complete");
+	expect((await http(`${base}/${begun.body.operation_id}/resume`,"POST",{cursor:originalCursor,request_id:`http-stale-${tag}`})).status).toBe(409);
+	expect((await http(`${base}/${begun.body.operation_id}/abort`,"POST",{cursor:r.body.cursor,request_id:`http-abort-${tag}`})).body.error.details.reason).toBe("published_use_undo");
+	const removed=r.body.activity_id;
+	const undo=await http(`/api/profiles/personal/activity/${removed}/undo`,"POST",{});
+	expect(undo.status).toBe(200);expect(undo.body.action).toBe("undo_started");expect((await http(`/api/profiles/personal/activity/${removed}/undo`,"POST",{})).body.action).toBe("replayed");
+	const ref=c.account.profiles.find(p=>p.profile === "personal")!;
+	await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(ref.userId)),(_i,s)=>{expect(s.storage.sql.exec("SELECT 1 FROM request_index WHERE request_id=?",refusedId).toArray()).toHaveLength(0);});
 });

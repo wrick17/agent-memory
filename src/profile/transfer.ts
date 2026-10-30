@@ -1,6 +1,7 @@
 // A profile's part of a transfer (section 9). The source fences the node, packs its bundle into hashed parts, and after the
 // target published, archives what moved and leaves a content-free tombstone. The target lands each part once, guards the
 // materialized rows, and publishes. Every step is one transaction, idempotent, and bounded by the 1,000-row, 1 MB budget.
+import { assertArchiveEndpoints } from "./archive-fence";
 import { guardTexts, meGuard } from "../domain/guard";
 import { sha256 } from "../domain/ids";
 import { Fail, ok, type Failure, type Outcome } from "../domain/types";
@@ -211,6 +212,7 @@ function landEntry(tx: BudgetTx, who: Who, s: Extract<TransferStep, { op: "land"
 			const old = String(r.id);
 			// '' means the edge's own profile: the source. A target in this profile becomes ''.
 			const dst = r.dst_profile === "" ? s.from : r.dst_profile === who.profile ? "" : r.dst_profile;
+			assertArchiveEndpoints(tx.sql,String(r.src),String(r.dst),String(dst),true);
 			const id = put(tx, "edges", { ...r, dst_profile: dst! });
 			edges[`e:${old}`] = `e:${String(id)}`;
 			return;
@@ -232,6 +234,7 @@ function landEntry(tx: BudgetTx, who: Who, s: Extract<TransferStep, { op: "land"
 				row.id = Math.min(0, next) - 1;
 				edges[old] = `e:${row.id}`;
 				row.dst_profile = row.dst_profile === "" ? s.from : row.dst_profile === who.profile ? "" : row.dst_profile!;
+				assertArchiveEndpoints(tx.sql,String(row.src),String(row.dst),String(row.dst_profile),true);
 			} else if (r.source === "evidence") {
 				const owner = edges[`a:${String(r.activity_id)}:${String(row.owner)}`] ?? String(row.owner);
 				mine(owner === `n:${s.nodeId}` || Object.entries(edges).some(([k, v]) => k.startsWith("a:") && v === owner));
@@ -430,8 +433,30 @@ function abortOut(sql: SqlStorage, s: Extract<TransferStep, { op: "abort"; side:
 	return { state: "aborted", done: true };
 }
 
+/** Runs inside apply's transaction, including cleanup and retained archive/part lanes. */
+function archiveExclusion(sql:SqlStorage,who:Who,s:TransferStep):void {
+	if(s.op === "status" || s.op === "part")return;
+	const terminal=transferRow(sql,s.id);
+	if(terminal&&["committed","aborted"].includes(terminal.state)&&!sql.exec("SELECT 1 FROM transfer_parts WHERE transfer_id=? LIMIT 1",s.id).toArray().length)return;
+	const nodeId=("nodeId" in s?s.nodeId:undefined)??transferRow(sql,s.id)?.node_id;
+	if(nodeId) {
+		assertArchiveEndpoints(sql,nodeId,nodeId,"",true);
+		for(const e of sql.exec<Row>("SELECT src,dst,dst_profile FROM edges WHERE src=?1 OR (dst_profile='' AND dst=?1)",nodeId))assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile),true);
+		for(const a of sql.exec<{payload:string}>("SELECT payload FROM archive WHERE source='edges' AND (json_extract(payload,'$.src')=?1 OR (json_extract(payload,'$.dst_profile')='' AND json_extract(payload,'$.dst')=?1))",nodeId)){
+			const e=JSON.parse(a.payload) as Row;assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile),true);
+		}
+	}
+	const payloads=s.op === "land"?[s.payload]:sql.exec<{payload:string}>("SELECT payload FROM transfer_parts WHERE transfer_id=?",s.id).toArray().map(p=>p.payload);
+	for(const payload of payloads){const entries=JSON.parse(payload) as unknown;if(!Array.isArray(entries))continue;
+		for(const [table,row] of entries as Entry[]){const e=table === "edges"?row:table === "archive"&&row.source === "edges"?JSON.parse(String(row.payload)) as Row:null;
+			if(e){const dst=s.op === "land"?(e.dst_profile === ""?s.from:e.dst_profile === who.profile?"":String(e.dst_profile)):String(e.dst_profile);assertArchiveEndpoints(sql,String(e.src),String(e.dst),dst,true);}
+		}
+	}
+}
+
 function apply(sql: SqlStorage, who: Who, s: TransferStep): TransferOut {
 	assertOpen(sql);
+	archiveExclusion(sql,who,s);
 	const id = "nodeId" in s ? s.nodeId : transferRow(sql, s.id)?.node_id;
 	if (id) assertNotWiped(sql, id);
 	switch (s.op) {

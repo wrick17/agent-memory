@@ -1,7 +1,9 @@
 // A profile's part of a wipe (section 9, steps 3, 4 and 6). It lists the ids a wipe purges here, names their request ids so the
 // account can fence them first, purges them in bounded steps with their activity redacted first, reports hand-written matches
 // without touching them, and clears a wiped generation. The Worker keeps the content-free plan in R2 before any purge.
+import { archiveOperation, cancelArchivePage, nodeOperationAfter } from "./archive-operations";
 import { meGuard } from "../domain/guard";
+import { sha256 } from "../domain/ids";
 import { Fail, ok, type Outcome } from "../domain/types";
 import { nextSeq } from "../storage";
 import { BudgetTx, type Row } from "./archive";
@@ -10,7 +12,7 @@ import { bundleTexts } from "./transfer";
 import type { Who } from "./write";
 
 /** One page of a wipe: the wiped profile, its wipe time, at most 100 node ids, and the terms the wiped profile had. */
-/** keep: ids the me exception preserved in this wipe; never fenced, redacted or refused anywhere, so the survivor can still move. */
+/** keep: ids the me exception preserved in this wipe; never fenced, redacted or refused elsewhere, so the survivor can still move. */
 export interface OriginWipe { profile: string; at: string; ids: string[]; terms: string[]; keep?: string[] }
 export interface Page { ids: string[]; after: string | null }
 export interface PurgeResult { done: boolean; purged: string[]; redacted: number; preserved: string[] }
@@ -34,7 +36,8 @@ function originPage(sql: SqlStorage, who: Who, profile: string, after: string): 
 	const ids = sql.exec<{ id: string }>(`SELECT id FROM (
 		SELECT id FROM nodes WHERE source_profile = ? OR ?
 		UNION SELECT json_extract(payload, '$.id') AS id FROM archive WHERE source = 'nodes' AND (json_extract(payload, '$.source_profile') = ? OR ?)
-	) WHERE id > ? ORDER BY id LIMIT ${PAGE}`, profile, all, profile, all, after).toArray().map((r) => r.id);
+		UNION SELECT json_extract(value,'$.node') AS id FROM profile_meta WHERE key>='archive-node:' AND key<'archive-node:~' AND (json_extract(value,'$.origin')=? OR ?)
+	) WHERE id > ? ORDER BY id LIMIT ${PAGE}`, profile, all, profile, all, profile, all, after).toArray().map((r) => r.id);
 	return { ids, after: ids.length === PAGE ? ids.at(-1)! : null };
 }
 
@@ -50,21 +53,82 @@ function survives(sql: SqlStorage, who: Who, id: string, terms: string[]): boole
 	return meGuard({ context: null, companyFree: true, sensitiveTerms: terms, texts: bundleTexts(rows) }).ok;
 }
 
-/** The page's ids this profile holds, as a node or as archived rows, that do not survive. */
-function held(sql: SqlStorage, who: Who, w: OriginWipe): { here: string[]; preserved: string[] } {
+type Image = { wipe: string; terms: string; seq: number; key: string; entry: string; after: number; last?: true; clean?: true };
+type Scan = { tx: BudgetTx; left: number };
+
+/**
+ * A staged archive operation moves a survivor's texts and revisions into archive rows before its node goes, so the same check
+ * also reads those rows: every indexed operation's removal in key order, then the node's own unfinished operation, whose
+ * removal can still grow, up to its end in the deciding call. Fence spends one work budget per call across all ids (index
+ * entries, operation reads and archive rows) and keeps a fixed-size cursor against this wipe, its terms and the node's seq,
+ * which every operation start and publish changes; any other value starts again.
+ */
+function image(sql: SqlStorage, w: OriginWipe, id: string, scan?: Scan): "clean" | "pending" | "sensitive" {
+	if (!nodeOperationAfter(sql, id, "")) return "clean";
+	const n = sql.exec<Row>("SELECT seq, status, attrs FROM nodes WHERE id = ?", id).one();
+	const at = { wipe: marker(w), terms: sha256(JSON.stringify(w.terms)), seq: Number(n.seq) };
+	const stored = sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", `wipe-image:${id}`).toArray()[0];
+	let v = stored ? JSON.parse(stored.value) as Image : undefined;
+	if (!v || v.wipe !== at.wipe || v.terms !== at.terms || v.seq !== at.seq) v = { ...at, key: "", entry: "", after: 0 };
+	if (v.clean) return "clean";
+	if (!scan || scan.left <= 0) return "pending";
+	const fence = n.status === "moving" ? (JSON.parse(String(n.attrs)) as { archive_operation?: string }).archive_operation : undefined;
+	const own = fence ? archiveOperation(sql, fence) : undefined, active = own?.node === id ? own : undefined;
+	let verdict: "clean" | "pending" | "sensitive" = "pending";
+	while (scan.left > 0) {
+		let removal: number;
+		if (v.last) {
+			if (!active) { verdict = "clean"; break; }
+			removal = active.removal;
+		} else {
+			const e = nodeOperationAfter(sql, id, v.key); scan.left--;
+			if (!e) { v.last = true; v.after = 0; continue; }
+			if (e.key !== v.entry) { v.entry = e.key; v.after = 0; }
+			if (e.operation === active?.id) { v.key = e.key; continue; }
+			const o = archiveOperation(sql, e.operation); scan.left--;
+			// Missing operation state is unknown, never empty.
+			if (!o) { verdict = "sensitive"; break; }
+			removal = o.removal;
+			if (scan.left <= 0) break;
+		}
+		const take = scan.left;
+		const rows = sql.exec<{ id: number; source: string; payload: string }>("SELECT id, source, payload FROM archive WHERE activity_id = ? AND id > ? ORDER BY id LIMIT ?", removal, v.after, take).toArray();
+		scan.left -= Math.max(1, rows.length);
+		const material = rows.filter((a) => a.source === "nodes" || a.source === "texts" || a.source === "revisions").map((a) => JSON.parse(a.payload) as Row);
+		if (!meGuard({ context: null, companyFree: true, sensitiveTerms: w.terms, texts: bundleTexts(material) }).ok) { verdict = "sensitive"; break; }
+		if (rows.length) v.after = rows.at(-1)!.id;
+		if (rows.length < take) { if (v.last) { verdict = "clean"; break; } v.key = v.entry; v.after = 0; }
+	}
+	if (verdict === "sensitive") return verdict;
+	if (verdict === "clean") v.clean = true;
+	scan.tx.run("INSERT INTO profile_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `wipe-image:${id}`, JSON.stringify(v));
+	return verdict;
+}
+
+/**
+ * The page's ids this profile holds, as a node or as archived rows, that do not survive. A permanent fence never survives.
+ * Only fence scans; elsewhere an unread image counts as not surviving.
+ */
+function held(sql: SqlStorage, who: Who, w: OriginWipe, scan?: Scan): { here: string[]; preserved: string[]; pending: string[] } {
 	if (w.ids.length > PAGE || Buffer.byteLength(JSON.stringify(w)) > 100_000) throw Fail.of("validation", "a wipe page holds at most 100 ids and 100 KB");
 	const json = JSON.stringify(w.ids);
 	const present = new Set(sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?1))
 		UNION SELECT coalesce(json_extract(payload, '$.node_id'), json_extract(payload, '$.src'), json_extract(payload, '$.id')) AS id FROM archive
-		WHERE coalesce(json_extract(payload, '$.node_id'), json_extract(payload, '$.src'), json_extract(payload, '$.id')) IN (SELECT value FROM json_each(?1))`, json).toArray().map((r) => r.id));
-	const here: string[] = [], preserved: string[] = [];
-	for (const id of w.ids) if (present.has(id)) (who.profile !== w.profile && survives(sql, who, id, w.terms) ? preserved : here).push(id);
-	return { here, preserved };
+		WHERE coalesce(json_extract(payload, '$.node_id'), json_extract(payload, '$.src'), json_extract(payload, '$.id')) IN (SELECT value FROM json_each(?1))
+		UNION SELECT value AS id FROM json_each(?1) WHERE EXISTS (SELECT 1 FROM profile_meta WHERE key='wiped:'||json_each.value)`, json).toArray().map((r) => r.id));
+	const wiped = new Set(sql.exec<{ id: string }>("SELECT value AS id FROM json_each(?) WHERE EXISTS (SELECT 1 FROM profile_meta WHERE key='wiped:'||json_each.value)", json).toArray().map((r) => r.id));
+	const here: string[] = [], preserved: string[] = [], pending: string[] = [];
+	for (const id of w.ids) {
+		if (!present.has(id)) continue;
+		const verdict = who.profile === w.profile || wiped.has(id) || !survives(sql, who, id, w.terms) ? "sensitive" : image(sql, w, id, scan);
+		(verdict === "clean" ? preserved : verdict === "pending" && scan ? pending : here).push(id);
+	}
+	return { here, preserved, pending };
 }
 
-/** The page's ids this profile fences and redacts: all of them but the me exception's survivors. */
-function fenced(w: OriginWipe, preserved: string[]): string[] {
-	const spared = new Set([...preserved, ...(w.keep ?? [])]);
+/** The page's ids this profile fences and redacts: all of them but the me exception's survivors. me decides from its own image. */
+function fenced(who: Who, w: OriginWipe, spare: string[]): string[] {
+	const spared = new Set([...spare, ...(who.profile === "me" ? [] : w.keep ?? [])]);
 	return w.ids.filter((id) => !spared.has(id));
 }
 
@@ -74,10 +138,11 @@ function purge(sql: SqlStorage, who: Who, w: OriginWipe): PurgeResult {
 	const out: PurgeResult = { done: false, purged: [], redacted: 0, preserved };
 	const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 	// So a later write path can refuse to recreate a purged id here (assertNotWiped).
-	for (const id of fenced(w, preserved)) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${id}`, marker(w));
+	for (const id of fenced(who, w, preserved)) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${id}`, marker(w));
+	if(!cancelArchivePage(tx,fenced(who,w,preserved),10))return out;
 	// Any activity row naming a purged id may hold its content (an update's undo, a move's record): only content-free facts stay.
 	const activities = sql.exec<Row>(`SELECT id, op, targets FROM activity WHERE redacted IS NOT ? AND EXISTS
-		(SELECT 1 FROM json_each(activity.targets) WHERE value IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT 20`, marker(w), JSON.stringify(fenced(w, preserved))).toArray();
+		(SELECT 1 FROM json_each(activity.targets) WHERE value IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT 20`, marker(w), JSON.stringify(fenced(who, w, preserved))).toArray();
 	for (const a of activities) {
 		tx.run("UPDATE activity SET summary = ?, undo = NULL, redacted = ?, seq = ? WHERE id = ?",
 			`${String(a.op)}, ${(JSON.parse(String(a.targets)) as unknown[]).length} records, redacted by wipe of ${w.profile}`, marker(w), tx.seq, a.id!);
@@ -123,7 +188,7 @@ function purge(sql: SqlStorage, who: Who, w: OriginWipe): PurgeResult {
 function requestPage(sql: SqlStorage, who: Who, w: OriginWipe, after: string): Page {
 	const ids = sql.exec<{ request_id: string }>(`SELECT request_id FROM requests WHERE node_id IN (SELECT value FROM json_each(?)) AND request_id > ? ORDER BY request_id LIMIT ${PAGE}`,
 		// A survivor's request ids are shared with its old tombstones' copies; they stay bound to the survivor.
-		JSON.stringify(held(sql, who, w).here.filter((id) => !(w.keep ?? []).includes(id))), after).toArray().map((r) => r.request_id);
+		JSON.stringify(fenced(who,w,held(sql,who,w).preserved)), after).toArray().map((r) => r.request_id);
 	return { ids, after: ids.length === PAGE ? ids.at(-1)! : null };
 }
 
@@ -166,12 +231,15 @@ export async function purgeOrigin(storage: DurableObjectStorage, env: Env, who: 
 				storage.transactionSync(() => sql.exec("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('closed', 'wiping')"));
 				return ok({ cleared: 0 });
 			case "fence": {
-				return ok(storage.transactionSync(() => {
-					const { preserved } = held(sql, who, step.wipe);
+				for(let limit=25;;limit=Math.floor(limit/2))try{return ok(storage.transactionSync(() => {
 					const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
-					for (const id of fenced(step.wipe, preserved)) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${id}`, marker(step.wipe));
-					return { done: true, purged: [], redacted: 0, preserved };
-				}));
+					// A survivor is published to the driver's keep only once its whole image is read; until then the page is not done.
+					const { preserved, pending } = held(sql, who, step.wipe, { tx, left: limit });
+					const ids=fenced(who,step.wipe,[...preserved,...pending]);
+					for (const id of ids) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${id}`, marker(step.wipe));
+					tx.run("DELETE FROM profile_meta WHERE key IN (SELECT 'wipe-image:'||value FROM json_each(?))", JSON.stringify(ids));
+					return { done: cancelArchivePage(tx,ids,limit) && !pending.length, purged: [], redacted: 0, preserved };
+				}));}catch(e){if(!(e instanceof Fail)||e.failure.code!=="size_budget"||limit<=1)throw e;}
 			}
 			case "origin": return ok(originPage(sql, who, step.profile, step.after));
 			case "requests": return ok(requestPage(sql, who, step.wipe, step.after));

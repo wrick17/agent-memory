@@ -1,5 +1,6 @@
 // The archive (profile v4, section 5): a removed row is kept whole, as JSON of `SELECT *`, until purge_after. Every removal
 // except the 300-day purge can therefore be undone by putting the same columns back. Shared by C3 transfers and C4 cleanup.
+import { assertArchiveEndpoints } from "./archive-fence";
 import { Fail } from "../domain/types";
 
 export const ARCHIVE_DAYS = 300;
@@ -8,7 +9,7 @@ export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 export type Row = Record<string, SqlStorageValue>;
 
 /** Primary-key columns of each source, as declared in schema.ts. */
-const PK: Record<ArchiveSource, string[]> = {
+export const PK: Record<ArchiveSource, string[]> = {
 	nodes: ["id"], texts: ["rowid"], edges: ["id"], evidence: ["owner", "kind", "ref"], revisions: ["node_id", "revision"], requests: ["request_id"],
 };
 /** Restore order: a node before its texts, an edge before its evidence. */
@@ -23,6 +24,7 @@ export interface ArchiveTx {
 	readonly sql: SqlStorage;
 	readonly seq: number;
 	readonly now: string;
+	readonly archiveOperation?:string;
 	run(query: string, ...params: SqlStorageValue[]): { one(): Record<string, SqlStorageValue> };
 	guard(material: unknown): void;
 }
@@ -38,9 +40,11 @@ export class BudgetTx implements ArchiveTx {
 	/** Starts charged with the nextSeq allocation that gives the transaction its seq: one profile_meta row, measured. */
 	rows = 1;
 	bytes = 0;
+	archiveOperation?:string;
 	/** `guard` defaults to none: C4's own transactions remove or flag, they never restore content. */
 	constructor(readonly sql: SqlStorage, readonly seq: number, readonly now: string, readonly guard: (material: unknown) => void = () => {}) {}
 	run(query: string, ...params: SqlStorageValue[]): { one(): Record<string, SqlStorageValue>; all: Record<string, SqlStorageValue>[] } {
+		if (params.length > 100) throw Fail.of("size_budget", "one statement may bind at most 100 parameters");
 		const cursor = this.sql.exec(query, ...params);
 		const all = cursor.toArray();
 		this.rows += cursor.rowsWritten;
@@ -56,6 +60,14 @@ export class BudgetTx implements ArchiveTx {
 
 export const purgeAfter = (now: string, days = ARCHIVE_DAYS) => new Date(Date.parse(now) + days * 86_400_000).toISOString();
 
+function edgeFence(tx:ArchiveTx,source:ArchiveSource,row:Row):void {
+	const node=source === "nodes"?row.id:["texts","revisions","requests"].includes(source)?row.node_id:source === "evidence"&&String(row.owner).startsWith("n:")?String(row.owner).slice(2):undefined;
+	if(node!==undefined)assertArchiveEndpoints(tx.sql,String(node),String(node),"",false,tx.archiveOperation);
+	let edge=source === "edges"?row:undefined;
+	if(source === "evidence"&&String(row.owner).startsWith("e:"))edge=tx.sql.exec<Row>("SELECT src,dst,dst_profile FROM edges WHERE id=?",Number(String(row.owner).slice(2))).toArray()[0];
+	if(edge)assertArchiveEndpoints(tx.sql,String(edge.src),String(edge.dst),String(edge.dst_profile),false,tx.archiveOperation);
+}
+
 /**
  * Archives rows that this transaction read with `SELECT * FROM <source>`, then deletes them; their tombstones take this
  * write's seq. Returns the archive ids in input order, for the inverse `restore` command.
@@ -63,6 +75,7 @@ export const purgeAfter = (now: string, days = ARCHIVE_DAYS) => new Date(Date.pa
 export function archiveRows(tx: ArchiveTx, activityId: number, source: ArchiveSource, rows: Row[], purgeAfterAt: string): number[] {
 	if (!rows.length) return [];
 	const pk = PK[source];
+	for(const row of rows)edgeFence(tx,source,row);
 	const ids = rows.map((r) => {
 		if (pk.some((c) => r[c] === undefined || r[c] === null)) throw Fail.of("validation", `an archived ${source} row needs its key columns`);
 		return Number(tx.run("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
@@ -109,6 +122,7 @@ export function restoreArchived(tx: ArchiveTx, archiveIds: number[]): { nodes: s
  * edge returns its id. Any other key or unique identity taken since is a revision_conflict.
  */
 export function putRow(tx: ArchiveTx, source: ArchiveSource, image: Row): number | undefined {
+	edgeFence(tx,source,image);
 	const row: Row = { ...image, seq: tx.seq };
 	if (source === "texts" && tx.sql.exec("SELECT 1 FROM texts WHERE rowid = ?", row.rowid!).toArray().length) delete row.rowid;
 	if (source === "edges" && tx.sql.exec("SELECT 1 FROM edges WHERE id = ?", row.id!).toArray().length) delete row.id;
@@ -116,9 +130,9 @@ export function putRow(tx: ArchiveTx, source: ArchiveSource, image: Row): number
 	if (!cols.every((c) => COLUMN.test(c))) throw Fail.of("validation", `a ${source} row image has an invalid column`);
 	try {
 		// evidence, revisions and requests are WITHOUT ROWID, so only an edge returns its (possibly new) id.
-		const cursor = tx.run(`INSERT INTO ${source} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})${source === "edges" ? " RETURNING id" : ""}`,
+		const cursor = tx.run(`INSERT INTO ${source} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})${source === "edges" ? " RETURNING id" : source === "texts" ? " RETURNING rowid" : ""}`,
 			...cols.map((c) => row[c]!));
-		return source === "edges" ? Number(cursor.one().id) : undefined;
+		return source === "edges" ? Number(cursor.one().id) : source === "texts" ? Number(cursor.one().rowid) : undefined;
 	} catch (e) {
 		if (e instanceof Error && !(e instanceof Fail) && /constraint failed/i.test(e.message)) {
 			throw Fail.of("revision_conflict", "changed since; review by hand", { reason: "key_taken", source });
@@ -162,7 +176,7 @@ export const archivedNodeIds = (sql: SqlStorage, activityId: number): string[] =
 export function archivePage(sql: SqlStorage, q: { before: number | null; limit: number }) {
 	const limit = Math.min(Math.max(1, Math.trunc(q.limit)), ARCHIVE_PAGE_MAX);
 	const acts = sql.exec<{ id: number; at: string; actor: string; op: string; summary: string; redacted: string | null; undo: string | null }>(
-		`SELECT id, at, actor, op, summary, redacted, undo FROM activity a WHERE (op IN (SELECT value FROM json_each(?)) OR (op = 'undo' AND EXISTS (SELECT 1 FROM activity r WHERE r.id = a.undo_of AND r.op = 'restore')))
+		`SELECT id, at, actor, op, summary, redacted, undo FROM activity a WHERE (op IN (SELECT value FROM json_each(?)) OR (op = 'undo' AND (EXISTS (SELECT 1 FROM activity r WHERE r.id = a.undo_of AND r.op = 'restore') OR EXISTS (SELECT 1 FROM profile_meta m WHERE m.key='archive-op:'||json_extract(a.undo,'$.archive_operation') AND json_extract(m.value,'$.action')='forget'))))
 		AND undone_by IS NULL AND id < ? ORDER BY id DESC LIMIT ?`,
 		JSON.stringify(REMOVALS), q.before ?? Number.MAX_SAFE_INTEGER, limit + 1).toArray();
 	const page = acts.slice(0, limit);
@@ -171,8 +185,11 @@ export function archivePage(sql: SqlStorage, q: { before: number | null; limit: 
 		JSON.stringify(page.map((a) => a.id))).toArray() : [];
 	return {
 		items: page.map((a) => {
-			const mine = rows.filter((r) => r.activity_id === a.id), wanted = (JSON.parse(a.undo ?? "{}") as { archived?: number[] }).archived ?? [];
-			const held = new Set(mine.map((r) => r.id)), complete = wanted.length > 0 && wanted.every((id) => held.has(id));
+			const mine = rows.filter((r) => r.activity_id === a.id), inverse = JSON.parse(a.undo ?? "{}") as { archived?: number[]; archive_operation?:string }, wanted = inverse.archived ?? [];
+			const held = new Set(mine.map((r) => r.id));
+			const staged=inverse.archive_operation?sql.exec<{value:string}>("SELECT value FROM profile_meta WHERE key=?",`archive-op:${inverse.archive_operation}`).toArray()[0]:undefined;
+			const manifest=staged?JSON.parse(staged.value) as {state:string;action:string;rows:number}:undefined;
+			const complete = manifest ? manifest.state === "complete" && manifest.action === "forget" && manifest.rows === mine.length : wanted.length > 0 && wanted.every((id) => held.has(id));
 			return {
 				activity_id: a.id, at: a.at, actor: a.actor, op: a.op, summary: a.summary, purge_after: mine.map((r) => r.purge_after).sort()[0] ?? null,
 				rows: Object.fromEntries(ARCHIVE_SOURCES.map((s) => [s, mine.filter((r) => r.source === s).length]).filter(([, n]) => n)),

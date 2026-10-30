@@ -23,8 +23,11 @@ with a reason; supersede keeps one subject and retires the others; flag asks the
 infer_preference records a preference the owner showed through corrections, with name, description and 1 to 10 evidence
 pointers {kind: "node", ref} to the item's subjects; promote_to_me copies a company-free preference into the owner's personal
 profile, naming one preference subject in memory_id, or the index of an earlier infer_preference op of the same item in
-from_op, with company_free true only when the preference holds no employer, colleague, project or other work detail. Never
-invent ids, facts or evidence. Return exactly one result per item, with its item_id.`;
+from_op, with company_free true only when the preference holds no employer, colleague, project or other work detail.
+strategic_review writes the weekly review of one profile's work board from the item's board data only: a summary of at most 600
+characters, content, and links from the review to the subjects it discusses, each with a reason and 1 to 5 evidence pointers
+{kind: "node", ref} to subjects. Claim nothing beyond that board, its as_of and its coverage; say plainly when it is empty or
+partial. Never invent ids, facts or evidence. Return exactly one result per item, with its item_id.`;
 
 const str = { type: "string" }, nstr = { type: ["string", "null"] };
 const op = (name, props) => ({ type: "object", additionalProperties: false, required: ["op", ...Object.keys(props)], properties: { op: { enum: [name] }, ...props } });
@@ -44,6 +47,8 @@ export const OPS_SCHEMA = {
 			op("infer_preference", { name: str, description: str, why: nstr, how_to_apply: nstr, scope: nstr,
 				evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } }),
 			op("promote_to_me", { memory_id: nstr, from_op: { type: ["integer", "null"] }, company_free: { enum: [true] } }),
+			op("strategic_review", { summary: str, content: str, links: { type: "array", items: { type: "object", additionalProperties: false, required: ["to", "reason", "evidence"], properties: {
+				to: str, reason: str, evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } } } } }),
 		] } },
 	} } } },
 };
@@ -98,7 +103,9 @@ export function mcpJob(config, fetchImpl = fetch) {
  * earlier op of the item, which the server checks.
  */
 const named = (o) => ((o.op === "save" || o.op === "compact") ? [o.memory_id] : o.op === "link" ? [o.from, o.to] : o.op === "supersede" ? [o.keep, ...(Array.isArray(o.retire) ? o.retire : [])] : o.op === "flag" ? [o.node]
-	: o.op === "infer_preference" ? (Array.isArray(o.evidence) ? o.evidence.map((e) => e?.ref) : [undefined]) : o.op === "promote_to_me" && o.memory_id !== undefined ? [o.memory_id] : []);
+	: o.op === "infer_preference" ? (Array.isArray(o.evidence) ? o.evidence.map((e) => e?.ref) : [undefined])
+	: o.op === "strategic_review" ? (Array.isArray(o.links) ? o.links.flatMap((l) => [l?.to, ...(Array.isArray(l?.evidence) ? l.evidence.map((e) => e?.ref) : [undefined])]) : [undefined])
+	: o.op === "promote_to_me" && o.memory_id !== undefined ? [o.memory_id] : []);
 const deepRedact = (v) => (typeof v === "string" ? redact(v) : Array.isArray(v) ? v.map(deepRedact) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deepRedact(x)])) : v);
 
 /** Turns one run's output into wire ops: nulls dropped, only the items that run judged, their allowed ops and subjects kept, model text redacted. */

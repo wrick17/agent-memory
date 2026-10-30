@@ -1,10 +1,12 @@
+import { enqueue, next, complete } from "../src/profile/maintenance";
+import { reviewedMarkdown } from "./fixtures/source-policy";
 // The staged BothQ import through the real /v1/import endpoint, Workers SQLite Durable Objects and AccountStore
 // (docs/import-implementation.md). Synthetic records only; the part shapes are the real largest parts' lengths, no text.
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, newMemoryId, sha256 } from "../src/domain/ids";
-import { pack, type Table } from "../src/domain/import-cost";
+import { pack, PART_OVERHEAD, type Table } from "../src/domain/import-cost";
 import { legacyRequestHash } from "../src/domain/legacy";
 import { migrate } from "../src/storage";
 import { PROFILE_MIGRATIONS } from "../src/profile/schema";
@@ -33,13 +35,15 @@ function node(id: string, over: Row = {}): Row {
 /** Stage and finalize commands for one record, packed as the planner packs them (src/domain/import-cost.ts). */
 function commandsFor(profile: string, n: Row, rows: [Table, Row][], refresh?: { no: number; base_record_sha256: string; base_revision: number; base_content_hash: string; body_revision?: number }) {
 	const parts = pack(rows);
+	if(!parts.length) parts.push({rows:{texts:[],revisions:[],requests:[]},cost:{...PART_OVERHEAD}});
+	const policy = { ...((n.attrs as Row)?.import_review ? {policy_version:1} : {}), ...(((n.attrs as Row)?.source as Row)?.owner_classification ? {classification_version:1} : {}) };
 	const recordSha = sha256(canonicalJson({ profile, node: n, ...(refresh ? { base_record_sha256: refresh.base_record_sha256, refresh: refresh.no } : {}), parts: parts.map((p) => p.rows) }));
 	const stages = parts.map((p, i) => {
-		const body = { op: "stage", record_id: n.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
+		const body = { ...policy, op: "stage", record_id: n.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
 			...(refresh ? { refresh: { no: refresh.no, base_record_sha256: refresh.base_record_sha256 } } : {}) };
 		return { ...body, part_id: `${n.id}${refresh ? `#r${refresh.no}` : ""}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
 	});
-	const fin = { op: "finalize", record_id: n.id, record_sha256: recordSha, profile, node: n, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
+	const fin = { ...policy, op: "finalize", record_id: n.id, record_sha256: recordSha, profile, node: n, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
 		request_ids: rows.filter(([t]) => t === "requests").map(([, q]) => q.request_id), ...(refresh ? { refresh } : {}) };
 	return { stages, finalize: { ...fin, sha256: sha256(canonicalJson(fin)) } };
 }
@@ -618,8 +622,8 @@ describe("import audit", () => {
 		expect((await auditGet(personalOnly, { profile: "test" })).status).toBe(403);
 		expect((await auditGet(token, { profile: "me" })).status).toBe(400);
 		expect((await auditGet(token, { profile: "nosuch" })).status).toBe(404);
-		for (const q of <Record<string, string | number>[]>[{ profile: "test", sql: "SELECT 1" }, { profile: "test", limit: 51 }, { profile: "test", record: "x" }, { profile: "test", rows: "requests" }, { profile: "test", record: "x", rows: "texts" }, { profile: "test", record: "x", rows: "revisions", after: "abc" }]) {
-			expect((await auditGet(token, q)).status).toBe(400);
+		for (const q of <Record<string, string | number>[]>[{ profile: "test", sql: "SELECT 1" }, { profile: "test", limit: 51 }, { profile: "test", record: "x" }, { profile: "test", rows: "requests" }, { profile: "test", record: "x", rows: "nodes" }, { profile: "test", record: "x", rows: "texts", after: "abc" }, { profile: "test", record: "x", rows: "texts", limit: 201 }, { profile: "test", record: "x", rows: "revisions", after: "abc" }]) {
+			expect((await auditGet(token, q)).status, JSON.stringify(q)).toBe(400);
 		}
 		expect((await auditGet(token, { profile: "test", after: "ffffffff" })).data).toMatchObject({ profile: "test", records: [], next_after: null });
 	});
@@ -640,4 +644,213 @@ it("reads pinned normalized legacy and append history without inventing unknown 
 			expect(await get("2026-02-02T00:00:00Z")).toMatchObject({description: "retained description", content: "start\nmore", revision: 2, freshness: {created_at: item.node.created_at, valid_from: null}});
 		}
 	}
+});
+
+
+describe("source-policy import vertical",()=>{
+	it("publishes both suffixed sources, preserves original rows, and refuses changed policy, ledgers and wire on replay",async()=>{
+		const {token}=await deviceToken("source-policy-import",["import"],["work"],"work");
+		const a=reviewedMarkdown("~/fixture-one/MEMORY.md","original one","source_suffix"),b=reviewedMarkdown("~/fixture-two/MEMORY.md","original two","source_suffix");
+		for(const f of [a,b]) {
+			const oversized={...f.finalize,node:{...f.node,attrs:{...f.node.attrs,padding:"é".repeat(500000)}}};expect((await send(token,[...f.stages,oversized])).status).toBe(413);
+			expect(await profileSql("work",sql=>sql.exec("SELECT count(*) AS n FROM nodes WHERE id = ?",f.node.id).one().n)).toBe(0);
+			const r=await send(token,[...f.stages,f.finalize]);expect(r.status).toBe(200);expect(r.data.receipts.every(r=>r.status!=="refused")).toBe(true);
+			expect((await send(token,[...f.stages,f.finalize])).data.receipts.every(r=>r.status==="replayed")).toBe(true);
+			await profileSql("work",sql=>{expect(sql.exec("SELECT norm_name FROM nodes WHERE id = ?",f.node.id).one().norm_name).toBe(f.node.name.toLowerCase());expect(sql.exec("SELECT snapshot FROM revisions WHERE node_id = ?",f.node.id).one().snapshot).toBe(f.revisions[0]!.snapshot);expect(sql.exec("SELECT count(*) AS n FROM requests WHERE node_id = ? AND legacy_op IS NOT NULL",f.node.id).one().n).toBe(0);});
+			const changed={...f.finalize,node:{...f.node,name:"changed"}};changed.sha256=sha256(canonicalJson(Object.fromEntries(Object.entries(changed).filter(([k])=>k!=="sha256"))));expect((await send(token,[changed])).data.receipts[0]!.status).toBe("refused");
+			const missing={...f.finalize} as Row;delete missing.policy_version;missing.sha256=sha256(canonicalJson(Object.fromEntries(Object.entries(missing).filter(([k])=>k!=="sha256"))));expect((await send(token,[missing])).data.receipts[0]!.reason).toBe("policy_version");
+			const altered={...f.finalize,parts:[{...f.finalize.parts[0]!,sha256:"0".repeat(64)}]};altered.sha256=sha256(canonicalJson(Object.fromEntries(Object.entries(altered).filter(([k])=>k!=="sha256"))));expect((await send(token,[altered])).data.receipts[0]!.reason).toBe("policy_ledger_changed");
+		}
+		expect(a.node.id).not.toBe(b.node.id);expect(a.node.name).not.toBe(b.node.name);
+	});
+	it("refreshes exact source body versions including empty files, audits text/index drift, and retains source bodies through ordinary write and Undo",async()=>{
+		const c=await contextFor(),{token}=await deviceToken("policy-refresh-audit",["import"],["work"],"work"),path="~/refresh-fixture/MEMORY.md",first=reviewedMarkdown(path,"original UTF8 é","source_suffix");
+		expect((await send(token,[...first.stages,first.finalize])).data.receipts.at(-1)!.status).toBe("published");
+		let recordHash=first.finalize.record_sha256,hostedHash=first.node.content_hash,latest=first.node;
+		for(const [i,content] of ["changed source", ""].entries()) {
+			const f=reviewedMarkdown(path,content,"source_suffix"),revision=i+2,at=`2026-0${i+3}-01T00:00:00Z`;
+			f.node.revision=revision;f.node.updated_at=at;
+			(f.node.attrs.source as Row).mtime=at;const policy=f.node.attrs.import_review as {source_head:{revision:number};witness:{export_manifest_sha256:string;source_row_sha256:string}};policy.source_head.revision=revision;policy.witness.export_manifest_sha256=sha256(`fresh ${i}`);policy.witness.source_row_sha256=sha256(`fresh row ${i}`);
+			const rows:[Table,Row][]=[...f.texts.map(t=>["texts",{...t,revision}] as [Table,Row]),...f.revisions.map(r=>["revisions",{...r,revision,at}] as [Table,Row])];
+			const cmd=commandsFor("work",f.node as unknown as Row,rows,{no:i+1,base_record_sha256:recordHash,base_revision:revision-1,base_content_hash:hostedHash,body_revision:revision});
+			expect((await send(token,[...cmd.stages,cmd.finalize])).data.receipts.at(-1)!.status).toBe("published");
+			expect((await send(token,[cmd.finalize])).data.receipts[0]!.status).toBe("replayed");
+			recordHash=cmd.finalize.record_sha256;hostedHash=f.node.content_hash;latest=f.node;
+			const current=await call(c,"get_memory",{profile:"work",memory_id:first.node.id});expect(current.content).toBe(content);
+		}
+		const metadata=structuredClone(latest);(metadata.attrs.import_review as any).witness.export_manifest_sha256=sha256("metadata-only fresh export");
+		const only=commandsFor("work",metadata as unknown as Row,[],{no:3,base_record_sha256:recordHash,base_revision:3,base_content_hash:hostedHash});
+		expect((await send(token,[...only.stages,only.finalize])).data.receipts.at(-1)!.status).toBe("published");recordHash=only.finalize.record_sha256;
+		const then=await call(c,"get_memory",{profile:"work",memory_id:first.node.id,as_of:"2026-02-01T00:00:00Z",include_retired:true});expect(then).toMatchObject({content:"original UTF8 é",name:"synthetic source document",scope:null,content_hash:(first.node.attrs.import_review as any).source_head.content_hash});
+		const getAudit=async(q:string)=>{const r=await exports.default.fetch(new Request(`${origin}/v1/import/audit?profile=work&${q}`,{headers:{authorization:`Bearer ${token}`}}));expect(r.status).toBe(200);return await r.json() as any;};
+		const page=await getAudit(`record=${first.node.id}&rows=texts&limit=1`);expect(page.rows).toHaveLength(1);expect(page.record_sha256).toBe(recordHash);expect(page.rows[0].body_raw_utf8_sha256).toBe(sha256("original UTF8 é"));expect(page.rows[0].live).toBe(false);
+		const continuation=await getAudit(`record=${first.node.id}&rows=texts&limit=1&after=${encodeURIComponent(page.next_after)}`);expect(continuation.rows[0].revision).toBe(2);expect(continuation.node_sha256).toBe(page.node_sha256);
+		const summary=(await getAudit("limit=50")).records.find((r:any)=>r.record_id===first.node.id);expect(summary.node.identity_sha256).toBeTruthy();
+		await profileSql("work",sql=>{sql.exec("UPDATE nodes SET norm_name = 'corrupt index' WHERE id = ?",first.node.id);sql.exec("UPDATE texts SET body = 'corrupt body' WHERE node_id = ? AND part = 'body' AND revision = 1",first.node.id);});
+		expect((await getAudit(`record=${first.node.id}&rows=texts&limit=1`)).rows[0].body_raw_utf8_sha256).not.toBe(page.rows[0].body_raw_utf8_sha256);
+		expect((await getAudit("limit=50")).records.find((r:any)=>r.record_id===first.node.id).node.identity_sha256).not.toBe(summary.node.identity_sha256);
+		await profileSql("work",sql=>{sql.exec("UPDATE nodes SET norm_name = ? WHERE id = ?",first.node.name.toLowerCase(),first.node.id);sql.exec("UPDATE texts SET body = ? WHERE node_id = ? AND part = 'body' AND revision = 1","original UTF8 é",first.node.id);});
+		const edited=await call(c,"save_memory",{profile:"work",memory_id:first.node.id,content:"hosted replacement",request_id:"policy-hosted-replace"});
+		expect((await call(c,"get_memory",{profile:"work",memory_id:first.node.id,as_of:"2026-02-01T00:00:00Z",include_retired:true})).content).toBe("original UTF8 é");
+		const who=c.account.profiles.find(p=>p.profile==="work")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:work:${who.generation}`)),(_i,s)=>{runWrite(s.storage,who,{op:"undo",args:{activity_id:Number(edited.activity_id),request_id:"policy-undo-request"}},{actor:"owner",platform:"test",routedBy:"explicit",payloadHash:"policy-undo",userId:who.userId});expect(s.storage.sql.exec("SELECT count(*) AS n FROM texts WHERE node_id = ? AND actor = 'migration' AND part = 'body'",first.node.id).one().n).toBe(2);});
+
+		expect((await call(c,"get_memory",{profile:"work",memory_id:first.node.id,as_of:"2026-02-01T00:00:00Z",include_retired:true})).content).toBe("original UTF8 é");
+	});
+
+	it("keeps an archival reference labeled, blocks ordinary rewriting, and refuses published policy drift",async()=>{
+		const {token}=await deviceToken("archive-policy-import",["import"],["work"],"work"),f=reviewedMarkdown("~/fixture-archive/SKILL.md","untrusted archived reference");
+		expect((await send(token,[...f.stages,f.finalize])).data.receipts.at(-1)!.status).toBe("published");
+		const unsupported={...f.finalize,policy_version:2};expect((await send(token,[unsupported])).status).toBe(400);
+		const omitted=structuredClone(f.finalize);delete (omitted.node.attrs.import_review as any).profile_review_sha256;omitted.sha256=sha256(canonicalJson(Object.fromEntries(Object.entries(omitted).filter(([k])=>k!=="sha256"))));expect((await send(token,[omitted])).data.receipts[0]!.reason).toBe("policy_invalid");
+		const c=await contextFor();const got=await call(c,"get_memory",{memory_id:f.node.id,profile:"work"});expect(got).toMatchObject({classification:"archival_reference",trust:"untrusted",instruction_authority:false});
+		for(const as_of of [undefined,"2026-02-01T00:00:00Z"]){
+			const historical=await call(c,"get_memory",{memory_id:f.node.id,profile:"work",include_retired:true,...(as_of?{as_of}: {})});expect(historical).toMatchObject({classification:"archival_reference",trust:"untrusted",instruction_authority:false});
+			const recalled=await call<{results:Row[]}>(c,"recall_memories",{keyword:"untrusted archived reference",profile:"work",include_history:true,...(as_of?{as_of}: {})});expect(recalled.results.find(r=>r.memory_id===f.node.id)).toMatchObject({classification:"archival_reference",trust:"untrusted",instruction_authority:false});
+		}
+		const changed=await outcome(c,"save_memory",{memory_id:f.node.id,profile:"work",content:"rewrite",request_id:"archive-new-write"});expect(changed).toMatchObject({ok:false,error:{details:{reason:"archival_reference"}}});
+		expect(await accountSql(sql=>sql.exec("SELECT count(*) AS n FROM request_index WHERE request_id = 'archive-new-write'").one().n)).toBe(0);
+		expect(await outcome(c,"record_knowledge",{profile:"work",nodes:[{kind:"project",name:"forged source marker",attrs:{import_review:"forged"}}]})).toMatchObject({ok:false,error:{details:{reason:"reserved_import_policy"}}});
+		const who=c.account.profiles.find(p=>p.profile==="work")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:work:${who.generation}`)),(_i,s)=>{
+			enqueue(s.storage,[{kind:"preference_signal",subjects:[f.node.id]}]);const lease=next(s.storage,{kinds:["preference_signal"]});expect(JSON.stringify(lease.items[0]!.context)).not.toContain("untrusted archived reference");
+			const out=complete(s.storage,who,{lease_id:lease.lease_id!,results:[{item_id:lease.items[0]!.item_id,ops:[{op:"infer_preference",name:"fabricated preference",description:"derived from archive",evidence:[{kind:"node",ref:f.node.id}]}]}]},{platform:"test",userId:who.userId});expect(out.results[0]!.ops![0]).toMatchObject({status:"rejected",reason:"archival_reference"});
+		});
+		await profileSql("work",sql=>sql.exec("UPDATE nodes SET name = 'tampered' WHERE id = ?",f.node.id).toArray());expect((await send(token,[f.finalize])).data.receipts[0]!.reason).toBe("hosted_changed");
+		await profileSql("work",sql=>sql.exec("UPDATE nodes SET name = ?, attrs = json_set(attrs, '$.import_review.profile_review_sha256', ?) WHERE id = ?",f.node.name,"0".repeat(64),f.node.id).toArray());expect((await send(token,[f.finalize])).data.receipts[0]!.reason).toBe("hosted_changed");
+	});
+});
+
+describe("legacy Work owner classification import",()=>{
+	const rehash=(c:Row)=>({...c,sha256:sha256(canonicalJson(Object.fromEntries(Object.entries(c).filter(([k])=>k!=="sha256"))))});
+	const classified=(id:string,over:Row={},answer="synthetic: all old items go to work",fresh="")=>{
+		const eid=`lw-${id.slice(0,8)}`,owner={reference:"synthetic owner decision",answer,roster_sha256:sha256(`synthetic roster${fresh}`)};
+		const k={version:1,effect:"legacy_work_owner",profile:"work",owner_decision:owner,owner_decision_sha256:sha256(canonicalJson(owner)),
+			witness:{export_manifest_sha256:sha256(`synthetic export${fresh}`),source_key_sha256:sha256(`bothq:${eid}`),source_row_sha256:sha256(`synthetic row${fresh}`),id,scope:"personal",memory_type:"project"}};
+		return node(id,{attrs:{validity:"unknown",source:{system:"bothq",element_id:eid,owner_classification:k}},...over});
+	};
+	it("publishes only an exact Work classification and refuses another destination, wire version, witness or forged reserved field",async()=>{
+		const {token}=await deviceToken("legacy-work",["import"],["work","personal"],"work"),c=await contextFor();
+		const other=newMemoryId("test-user","test","personal","project","legacy-elsewhere"),elsewhere=commandsFor("personal",classified(other,{chars:5}),journal(other,0,()=>"").rows);
+		expect((await send(token,[...elsewhere.stages,elsewhere.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"classification_witness"});
+		const id=newMemoryId("test-user","test","personal","project","legacy-work"),j=journal(id,1,i=>`legacy-${i}`),n=classified(id,{revision:2,chars:j.content.length}),cmd=commandsFor("work",n,j.rows);
+		expect(cmd.stages.every(s=>s.classification_version===1)&&cmd.finalize.classification_version===1).toBe(true);
+		for(const st of cmd.stages) expect((await send(token,[st])).data.receipts[0]).toMatchObject({status:"stored"});
+		expect((await send(token,[{...cmd.finalize,classification_version:2}])).status).toBe(400);
+		const missing={...cmd.finalize} as Row;delete missing.classification_version;expect((await send(token,[rehash(missing)])).data.receipts[0]).toMatchObject({reason:"classification_version"});
+		const scoped=structuredClone(cmd.finalize);(scoped.node.attrs as any).source.owner_classification.witness.scope="sequoia";expect((await send(token,[rehash(scoped)])).data.receipts[0]).toMatchObject({reason:"classification_witness"});
+		const unsigned=structuredClone(cmd.finalize);(unsigned.node.attrs as any).source.owner_classification.owner_decision.answer="edited";expect((await send(token,[rehash(unsigned)])).data.receipts[0]).toMatchObject({reason:"classification_invalid"});
+		expect((await send(token,[cmd.finalize])).data.receipts[0]).toMatchObject({status:"published"});
+		expect((await send(token,[...cmd.stages,cmd.finalize])).data.receipts.every(r=>r.status==="replayed")).toBe(true);
+		const got=await call<{scope:string;name:string;revision:number}>(c,"get_memory",{profile:"work",memory_id:id});expect([got.scope,got.name,got.revision]).toEqual(["personal",n.name,2]);
+		const ordinary=commandsFor("work",node(id,{revision:2,chars:j.content.length}),j.rows);expect((await send(token,[ordinary.finalize])).data.receipts[0]).toMatchObject({reason:"classification_version"});
+		const forged={kind:"project",name:"forged owner classification",attrs:{source:{owner_classification:{}}}};
+		expect(await outcome(c,"record_knowledge",{profile:"work",nodes:[forged]})).toMatchObject({ok:false,error:{code:"validation"}});
+		const who=c.account.profiles.find(p=>p.profile==="work")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:work:${who.generation}`)),(_i,s)=>{
+			expect(()=>runWrite(s.storage,who,{op:"knowledge",args:{nodes:[forged as never],request_id:"forged-owner-classification"}},{actor:"owner",platform:"test",routedBy:"explicit",payloadHash:"forged-owner",userId:who.userId})).toThrow(/reserved for authenticated/);
+		});
+	});
+	const delta=(full:ReturnType<typeof journal>,known:ReturnType<typeof journal>,after:number)=>full.rows.filter(([t,r])=>t==="requests"?!known.requests.some(q=>q.request_id===r.request_id):Number(r.revision)>after);
+	const imported=async(label:string,over:Row={})=>{
+		const {token}=await deviceToken(`legacy-${label}`,["import"],["work","personal"],"work"),id=newMemoryId("test-user","test","personal","project",`legacy-${label}`),j=journal(id,1,i=>`${label}-${i}`);
+		const n=classified(id,{revision:2,chars:j.content.length,...over}),cmd=commandsFor("work",n,j.rows);
+		expect((await send(token,[...cmd.stages,cmd.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		return {token,id,j,n,cmd,next:(answer?:string)=>{const two=journal(id,2,i=>`${label}-${i}`);return {two,cmd:commandsFor("work",classified(id,{revision:3,chars:two.content.length,content_hash:sha256(two.content),...over},answer," fresh"),delta(two,j,2),{no:1,base_record_sha256:cmd.finalize.record_sha256,base_revision:2,base_content_hash:String(n.content_hash)})};}};
+	};
+	it("holds a classified refresh after hosted metadata drift, and still refreshes over null dates and derived embedding state",async()=>{
+		const drift=await imported("metadata-drift");
+		await profileSql("work",sql=>sql.exec("UPDATE nodes SET description = 'owner-reviewed metadata; preserve this' WHERE id = ?",drift.id).toArray());
+		const held=drift.next().cmd;expect((await send(drift.token,[...held.stages,held.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"hosted_changed"});
+		expect(await profileSql("work",sql=>sql.exec("SELECT revision, description FROM nodes WHERE id = ?",drift.id).one())).toMatchObject({revision:2,description:"owner-reviewed metadata; preserve this"});
+		const derived=await imported("derived-control",{created_at:null,updated_at:null});
+		await profileSql("work",sql=>sql.exec("UPDATE nodes SET embed_hash = card_hash, seq = seq + 1 WHERE id = ?",derived.id).toArray());
+		const next=derived.next().cmd;expect((await send(derived.token,[...next.stages,next.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		expect((await send(derived.token,[next.finalize])).data.receipts[0]).toMatchObject({status:"replayed"});
+	});
+	it("refuses an import finalize replay after an owner pin, while a legacy request replay keeps its original result",async()=>{
+		const b=await imported("pinned"),c=await contextFor(),who=c.account.profiles.find(p=>p.profile==="work")!,rid=b.j.requests[1]!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:work:${who.generation}`)),(_i,s)=>{
+			runWrite(s.storage,who,{op:"owner",args:{action:"pin",memory_id:b.id,request_id:"legacy-pin"}},{actor:"owner",platform:"test",routedBy:"explicit",payloadHash:"legacy-pin",userId:who.userId});
+		});
+		expect(await profileSql("work",sql=>sql.exec("SELECT revision, pinned FROM nodes WHERE id = ?",b.id).one())).toMatchObject({revision:3,pinned:1});
+		expect((await send(b.token,[b.cmd.finalize])).data.receipts[0]).toMatchObject({status:"refused",reason:"hosted_changed"});
+		expect(await call(c,"append_memory",{profile:"work",memory_id:b.id,content:"pinned-0",separator:"\n",request_id:rid.request_id})).toMatchObject({action:"replayed",revision:2});
+		expect(await profileSql("work",sql=>sql.exec("SELECT result FROM requests WHERE request_id = ?",rid.request_id).one().result)).toBe(rid.result);
+	});
+	it("refuses a stage without classification_version before any account reservation, so the request stays usable",async()=>{
+		const b=await imported("preflight"),{two,cmd}=b.next(),rid=two.requests.at(-1)!.request_id;
+		const stage={...cmd.stages[0]} as Row;delete stage.classification_version;stage.sha256=sha256(canonicalJson(Object.fromEntries(Object.entries(stage).filter(([k])=>k!=="sha256"&&k!=="part_id"))));
+		expect(await accountSql(sql=>sql.exec("SELECT count(*) AS n FROM request_index WHERE request_id = ?",rid).one().n)).toBe(0);
+		expect((await send(b.token,[stage])).data.receipts[0]).toMatchObject({status:"refused",reason:"classification_version"});
+		expect(await accountSql(sql=>sql.exec("SELECT profile, pending, legacy FROM request_index WHERE request_id = ?",rid).toArray())).toEqual([]);
+		expect(await profileSql("work",sql=>sql.exec("SELECT count(*) AS n FROM import_refreshes WHERE record_id = ?",b.id).one().n)).toBe(0);
+		expect(await outcome(await contextFor(),"append_memory",{profile:"work",memory_id:b.id,content:"actual requested write",request_id:rid})).toMatchObject({ok:true});
+	});
+	it("refreshes the same identity with a fresh witness and refuses a changed classification or in-place adoption of an existing copy",async()=>{
+		const {token}=await deviceToken("legacy-work-refresh",["import"],["work","personal"],"work");
+		const id=newMemoryId("test-user","test","personal","project","legacy-refresh"),j=journal(id,1,i=>`old-${i}`),n=classified(id,{revision:2,chars:j.content.length});
+		const base=commandsFor("work",n,j.rows);expect((await send(token,[...base.stages,base.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		const two=journal(id,2,i=>`old-${i}`),fresh=classified(id,{revision:3,chars:two.content.length,content_hash:sha256(two.content)},undefined," fresh");
+		const next=commandsFor("work",fresh,delta(two,j,2),{no:1,base_record_sha256:base.finalize.record_sha256,base_revision:2,base_content_hash:String(n.content_hash)});
+		expect((await send(token,[...next.stages,next.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		const three=journal(id,3,i=>`old-${i}`),changed=classified(id,{revision:4,chars:three.content.length,content_hash:sha256(three.content)},"another answer"," fresh");
+		const drift=commandsFor("work",changed,delta(three,two,3),{no:2,base_record_sha256:next.finalize.record_sha256,base_revision:3,base_content_hash:String(fresh.content_hash)});
+		expect((await send(token,[...drift.stages,drift.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"classification_changed"});
+		const plain=newMemoryId("test-user","test","personal","project","legacy-plain"),pj=journal(plain,0,()=>""),pn=node(plain,{scope:"personal",chars:5});
+		const copy=commandsFor("work",pn,pj.rows);expect((await send(token,[...copy.stages,copy.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		const adopt=commandsFor("work",classified(plain,{chars:5}),[],{no:1,base_record_sha256:copy.finalize.record_sha256,base_revision:1,base_content_hash:String(pn.content_hash)});
+		expect((await send(token,[...adopt.stages,adopt.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"classification_changed"});
+		const mine=newMemoryId("test-user","test","personal","project","legacy-personal-copy"),rows=journal(mine,0,()=>"").rows.filter(([t])=>t!=="requests");
+		const personal=commandsFor("personal",node(mine,{chars:5}),rows);expect((await send(token,[...personal.stages,personal.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		const moved=commandsFor("work",classified(mine,{chars:5}),rows);expect((await send(token,[...moved.stages,moved.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"node_conflict"});
+		expect(await profileSql("work",sql=>sql.exec("SELECT count(*) AS n FROM nodes WHERE id = ?",mine).one().n)).toBe(0);
+	});
+});
+
+
+describe("combined classified policy date controls", () => {
+ const make = (path:string, kind:"source_suffix"|"archival_reference", unknown:boolean, fresh:number) => {
+  const f=reviewedMarkdown(path,"unchanged synthetic policy body",kind);
+  const source=f.node.attrs.source as Row, policy=f.node.attrs.import_review as any;
+  f.node.scope=`synthetic-combined-${kind}-${unknown}`;policy.witness.scope=f.node.scope;
+  if(unknown){source.birthtime=null;source.mtime=null;f.node.created_at=null;f.node.updated_at=null;}
+  const owner={reference:"synthetic owner decision 454",answer:"all old items to Work",roster_sha256:sha256(`synthetic roster ${fresh}`)};
+  const k={version:1,effect:"legacy_work_owner",profile:"work",owner_decision:owner,owner_decision_sha256:sha256(canonicalJson(owner)),
+   witness:{export_manifest_sha256:sha256(`synthetic export ${fresh}`),source_key_sha256:sha256(`${source.system}:${path}`),source_row_sha256:sha256(`synthetic source ${fresh}`),id:f.node.id,scope:f.node.scope,memory_type:f.node.memory_type}};
+  source.owner_classification=k;
+  policy.witness.export_manifest_sha256=k.witness.export_manifest_sha256;policy.witness.source_row_sha256=k.witness.source_row_sha256;
+  if(kind==="archival_reference")policy.profile_review_sha256=sha256(canonicalJson(k));
+  return f;
+ };
+ for(const [kind,unknown] of [["source_suffix",true],["archival_reference",true],["archival_reference",false]] as const) {
+  it(`${kind} ${unknown?"unknown":"known"} source dates refresh and replay`,async()=>{
+   const path=`~/synthetic-combined-${kind}-${unknown}/MEMORY.md`,f=make(path,kind,unknown,0);
+   const {token}=await deviceToken(`combined-${kind}-${unknown}`,["import"],["work"],"work");
+   const rows:[Table,Row][]=[...f.texts.map(t=>["texts",{...t}] as [Table,Row]),...f.revisions.map(r=>["revisions",{...r}] as [Table,Row])];
+   const first=commandsFor("work",f.node as unknown as Row,rows);
+   expect((await send(token,[...first.stages,first.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+   expect((await send(token,[first.finalize])).data.receipts[0]).toMatchObject({status:"replayed"});
+   const original=await profileSql("work",sql=>sql.exec("SELECT n.created_at,n.updated_at,r.published_at FROM nodes n JOIN import_records r ON r.record_id=n.id WHERE n.id = ?",f.node.id).one());
+   const next=make(path,kind,unknown,1);
+   const refresh=commandsFor("work",next.node as unknown as Row,[],{no:1,base_record_sha256:first.finalize.record_sha256,base_revision:1,base_content_hash:f.node.content_hash});
+   const r1=(await send(token,[...refresh.stages,refresh.finalize])).data.receipts;
+   expect(r1.at(-1)).toMatchObject({status:"published"});
+   const after=await profileSql("work",sql=>sql.exec("SELECT n.created_at,n.updated_at,r.published_at FROM nodes n JOIN import_refreshes r ON r.record_id=n.id AND r.refresh_no=1 WHERE n.id = ?",f.node.id).one());
+   expect(after.published_at).not.toBe(original.published_at);
+   const replay=(await send(token,[refresh.finalize])).data.receipts[0];
+   const last=make(path,kind,unknown,2);
+   const refresh2=commandsFor("work",last.node as unknown as Row,[],{no:2,base_record_sha256:refresh.finalize.record_sha256,base_revision:1,base_content_hash:f.node.content_hash});
+   const r2=(await send(token,[...refresh2.stages,refresh2.finalize])).data.receipts;
+   console.log(JSON.stringify({kind,unknown,original,after,r1,replay,r2}));
+   expect.soft(replay).toMatchObject({status:"replayed"});
+   expect.soft(r2.at(-1)).toMatchObject({status:"published"});
+   const held=await profileSql("work",sql=>sql.exec("SELECT revision, created_at, updated_at FROM nodes WHERE id = ?",f.node.id).one());
+   expect(held.created_at).toBe(original.created_at);
+   const latest=await profileSql("work",sql=>sql.exec<{published_at:string}>("SELECT published_at FROM import_refreshes WHERE record_id = ? AND refresh_no = 2",f.node.id).one());
+   expect(latest.published_at).not.toBe(original.published_at);
+   await profileSql("work",sql=>sql.exec("UPDATE nodes SET created_at = ? WHERE id = ?",latest.published_at,f.node.id).toArray());
+   expect((await send(token,[refresh2.finalize])).data.receipts[0]).toMatchObject({status:"refused",reason:"hosted_changed"});
+  });
+ }
 });

@@ -149,8 +149,11 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 				// first: its company-free survivors are then spared everywhere, so they keep their requests and can still move.
 				const others = plan.refs.filter((x) => x.profile !== profile).sort((a, b) => Number(b.profile === "me") - Number(a.profile === "me"));
 				for (const ref of others) {
-					const fenced = value(await ports.profile(ref, { op: "fence", wipe: { profile, at: r.wiped_at, ids, terms: begun.terms!, keep: [...preserved] } })) as PurgeResult;
-					fenced.preserved.forEach((id) => preserved.add(id));
+					let fenced:PurgeResult;
+					do {
+						fenced = value(await ports.profile(ref, { op: "fence", wipe: { profile, at: r.wiped_at, ids, terms: begun.terms!, keep: [...preserved] } })) as PurgeResult;
+						fenced.preserved.forEach((id) => preserved.add(id));
+					} while(!fenced.done);
 				}
 				value(await ports.account({ op: "forget", profile, ids: ids.filter((id) => !preserved.has(id)), requests: [] }));
 				for (const ref of plan.refs.filter((x) => x.profile !== profile)) {

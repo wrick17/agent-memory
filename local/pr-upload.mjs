@@ -1,5 +1,6 @@
 // Bounded local PR metadata (sections 10 and 13). The caller holds the machine lock and supplies the authenticated ingest
-// transport and an account-bound gh executor; this module never runs gh, reads a token or switches a shared gh account.
+// transport and an account-bound gh executor, normally ghReader(repo); nothing here switches a shared gh account.
+import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { redact, writePrivate } from "./agent-memory.mjs";
 
@@ -9,10 +10,12 @@ const FIELDS = `number title state updatedAt headRefName repository { nameWithOw
  commits(first:100) { nodes { commit { oid } } pageInfo { hasNextPage } }
  closingIssuesReferences(first:100) { nodes { number url } pageInfo { hasNextPage } }
  reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } pageInfo { hasNextPage } }`;
+const SEARCH_QUERY = `query($q:String!){search(query:$q,type:ISSUE,first:50){nodes{... on PullRequest {${FIELDS}}}}}`;
+const PR_QUERY = `query($org:String!,$name:String!,$number:Int!){repository(owner:$org,name:$name){pullRequest(number:$number){${FIELDS}}}}`;
 async function graphql(gh, query, variables) {
  let raw;
  try { raw=await gh.run(["api","graphql","--hostname","github.com","-f",`query=${query}`,...Object.entries(variables).flatMap(([k,v])=>[typeof v==="number"?"-F":"-f",`${k}=${v}`])]); }
- catch {throw new Error("pr_collection_unavailable");}
+ catch(e) {throw new Error(e?.message==="gh_account_mismatch"?e.message:"pr_collection_unavailable");}
  if(typeof raw!=="string"||Buffer.byteLength(raw)>8_000_000) throw new Error("pr_collection_too_large");
  let body;try {body=JSON.parse(raw);}catch {throw new Error("invalid_pr_metadata");}
  if(body.errors?.length||!body.data) throw new Error("pr_collection_unavailable");
@@ -50,6 +53,39 @@ export function accountFor(repo) {
 	return ["sequoia-engineering", "sequoia-us", "pratyush-poddar_seq"].includes(repo.split("/")[0]) ? "pratyush-poddar_seq" : "wrick17";
 }
 
+// Fixed error only: a child error carries its command line and output.
+const execGh = (bin, args, env) => new Promise((resolve, reject) => execFile(bin, args, { env, encoding: "utf8", timeout: 60_000, maxBuffer: 16_000_000 },
+	(e, out) => (e ? reject(new Error("gh_failed")) : resolve(out))));
+
+/**
+ * The gh executor uploadPRs takes, bound to accountFor(repo) without switching gh's shared active account. Before its first
+ * query it reads that account's stored token (`gh auth token --user`) and checks that GitHub names the same login for it; every
+ * query then runs with that token in the child's environment alone. Ambient GH_ and GITHUB_ variables other than GH_CONFIG_DIR
+ * are dropped, so no other token, host or debug output applies. A failed check fails every query; the token stays in this closure.
+ * Its login is the account, so the caller passes `ownerLogin: gh.account`. Only explicit GraphQL reads run.
+ */
+export function ghReader(repo, { bin = "gh", env = process.env, exec = execGh } = {}) {
+	const account = accountFor(repo), base = Object.fromEntries(Object.entries(env).filter(([k]) => k === "GH_CONFIG_DIR" || !/^(GH|GITHUB)_/.test(k)));
+	let verified;
+	const token = () => (verified ??= (async () => {
+		const t = String(await exec(bin, ["auth", "token", "--hostname", "github.com", "--user", account], base)).trim();
+		if (!/^\S{1,4096}$/.test(t)) throw new Error("gh_failed");
+		const login = String(await exec(bin, ["api", "user", "--hostname", "github.com", "--jq", ".login"], { ...base, GH_TOKEN: t })).trim();
+		if (login.toLowerCase() !== account.toLowerCase()) throw new Error("gh_account_mismatch");
+		return t;
+	})());
+	return { account, run: async (args) => {
+		if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) throw new Error("gh_read_only");
+		const argv = [...args];
+		const prefix = ["api", "graphql", "--hostname", "github.com", "-f"].every((a, i) => argv[i] === a);
+		const search = argv.length === 8 && argv[5] === `query=${SEARCH_QUERY}` && argv[6] === "-f" && argv[7].startsWith("q=");
+		const retry = argv.length === 12 && argv[5] === `query=${PR_QUERY}` && argv[6] === "-f" && argv[7].startsWith("org=") &&
+			argv[8] === "-f" && argv[9].startsWith("name=") && argv[10] === "-F" && /^number=[1-9]\d*$/.test(argv[11]);
+		if (!prefix || (!search && !retry)) throw new Error("gh_read_only");
+		return exec(bin, argv, { ...base, GH_TOKEN: await token() });
+	} };
+}
+
 /**
  * One PR metadata row from the explicit GraphQL selection, untrusted. Handles are validated GitHub logins and SHAs full; a bot author, a pending review and a team
  * review request name no person. A list gh may have cut (NESTED long) or a malformed entry keeps what is valid and names the
@@ -83,7 +119,7 @@ function normalize(r, owner) {
  * page out of order, or one whose every row shares the lower bound, cannot be paged without loss: refused, nothing advances.
  */
 async function collectPage(gh, repo, from, to, owner) {
- const data=await graphql(gh,`query($q:String!){search(query:$q,type:ISSUE,first:50){nodes{... on PullRequest {${FIELDS}}}}}`,{q:`repo:${repo} is:pr updated:${search(from)}..${search(to)} sort:updated-asc`});
+ const data=await graphql(gh,SEARCH_QUERY,{q:`repo:${repo} is:pr updated:${search(from)}..${search(to)} sort:updated-asc`});
  const rows=data.search?.nodes;
  if(!Array.isArray(rows)||rows.length>PAGE) throw new Error("invalid_pr_metadata");
  const all=rows.map(r=>fromGraphql(r,repo,owner));
@@ -117,7 +153,7 @@ async function fillPage(state, stateFile, gh, owner) {
   for(const h of (state.incomplete??[]).slice(0,BATCH)) {
    const number=Number(h.slice(0,h.indexOf("@")));
    if(page.prs.some(pr=>pr.number===number)) continue;
-   const data=await graphql(gh,`query($org:String!,$name:String!,$number:Int!){repository(owner:$org,name:$name){pullRequest(number:$number){${FIELDS}}}}`,{org,name,number});
+   const data=await graphql(gh,PR_QUERY,{org,name,number});
    if(data.repository?.pullRequest) {const pr=fromGraphql(data.repository.pullRequest,state.repo,owner);if(pr.updated_at<=p.to)retry.push(pr);}
   }
  }

@@ -1399,7 +1399,7 @@ Implementation seam (D2/D3, source-cleared and in the private [integration candi
 
 ## 13. Work graph
 
-**PR/Jira source status, 2026-10-30:** The reviewed PR/Jira snapshot writers and injected local collectors are adopted locally over the current R0/self-host/F1 source. Same-source-revision completion retains field-hash and owner-Undo fences; reciprocal Jira evidence preserves source order and exact replay. More than 100 positive incoming listing rows explicitly refuses the entire item and leaves the local request pending; durable paging is not implemented. Product J5/J6 closure and the PM's bounded-purge fixture correction are source/local evidence only. Current integration glue and Terra's final combined flow remain pending. Live acquisition, Jira-only tool fencing, capture/native wiring, daily refresh, board/review acceptance and full AM-12 completion remain open ([contract and evidence](module-contracts.md#prjira-locally-adopted-source-2026-10-30)).
+**PR/Jira source status, 2026-10-30:** The reviewed PR/Jira snapshot writers and injected local collectors are adopted locally over the current R0/self-host/F1 source. Same-source-revision completion retains field-hash and owner-Undo fences; reciprocal Jira evidence preserves source order and exact replay. More than 100 positive incoming listing rows explicitly refuses the entire item and leaves the local request pending; durable paging is not implemented. Product J5/J6 closure and the PM's bounded-purge fixture correction are source/local evidence only. Current integration glue and the final local combined check passed. Live acquisition, Jira-only tool fencing, capture/native wiring, daily refresh, board/review acceptance and full AM-12 completion remain open ([contract and evidence](module-contracts.md#prjira-locally-adopted-source-2026-10-30)).
 
 Cloudflare never talks to GitHub or Jira and holds none of their credentials. All repos and Jira projects are private, and work data enters memory only from the owner's machines while work happens:
 
@@ -1503,7 +1503,7 @@ GET  /api/admin/restores/:id                POST /api/admin/profiles/:p/wipe {co
 POST /api/devices/:id/enable                GET  /api/admin/recovery
 ```
 
-Map and path endpoints run under the same work budgets as the graph tools (300 nodes for the map, 5,000 edge rows, 3 paths of at most 4 hops), and say when they stopped early. The map accepts either `center` id or `center_key`, never both. Historical map discovery caps raw physical reads before applying its recorded-time cutoff and admitting edges to the frontier; an exhausted raw page is reported as truncated even if it contains no eligible historical edge. Owner archive restore remains atomic and refuses a removal exceeding the existing 1,000-row/1 MB write budget; staged large restore is not implemented.
+Map and path endpoints run under the same work budgets as the graph tools (300 nodes for the map, 5,000 edge rows, 3 paths of at most 4 hops), and say when they stopped early. The map accepts either `center` id or `center_key`, never both. Historical map discovery caps raw physical reads before applying its recorded-time cutoff and admitting edges to the frontier; an exhausted raw page is reported as truncated even if it contains no eligible historical edge. Small owner archive restore remains atomic under the existing 1,000-row/1 MB write budget. The separately addressed [staged owner archive](#staged-owner-archive-source-adoption-2026-10-31) now has adopted source for completed staged-forget removals; old atomic removals keep their existing atomic route. Integration and combined/runtime gates remain pending.
 
 ## 16. Migration and cutover
 
@@ -2241,3 +2241,21 @@ All read on 2026-10-28. "Updated" is the page's own date where it shows one.
 | Hook behavior under T3 Code | `research/04-hook-test.md` | 2026-10-28 |
 | `gh pr view --json closingIssuesReferences` | gh 2.102.0 field list, checked locally | 2026-09-30 |
 | Corpus build provenance (assembled 2026-08-12 from `/tmp` scratch databases) | `corpus_metadata` and `frontend_metadata` in `~/.bothq/corpus/sequoia.sqlite`, read-only | 2026-08-12 |
+
+### Staged owner archive source adoption, 2026-10-31
+
+The source adoption of the reviewed archive R2 candidate adds the explicit owner operation contract described in [module contracts](module-contracts.md#staged-owner-archive-source-adoption-2026-10-31). Section 5 uses profile_meta operation/part/node-index/pin state and pages only through existing profile v6 indexes, so it adds no schema migration and atomic writes keep their measured row cost; section 6 keeps the existing measured transaction limits. Sections 9 and 12 require reciprocal local transfer/edge-writer fences, indexed wipe cancellation and cooperative generation-gated recovery. Section 15 adds owner start/status/resume/abort and staged Undo while preserving small atomic routes. Original157 review plus the F1 closure and fresh D1/R1 SOURCE CLEAR support this controlled ROOT source adoption only. Final db47 overlap glue is accepted; the final local combined check passed; no runtime or full-feature acceptance follows.
+
+Sections 7 and 19 retain the already approved whole-result MCP read origin/data envelope and unchanged stored request replay bytes. This owner REST addition does not switch callers or add an MCP tool. Backup/PIT, permanent daily refresh, native acquisition and full wipe acceptance remain separately gated. Current AM-12 Jira, AM-14 F1 and AM-18 fixture evidence is unchanged.
+
+### Migration policy and PR-reader source adoption, 2026-10-31
+
+The [private merged contract](module-contracts.md#migration-policy-and-pr-reader-source-adoption-2026-10-31) reconciles complete D1/D4 delivery/history/read-only metadata, owner454 export-bound legacy Work classification, semantic publication-date refresh/replay and account-bound fixed-query PR acquisition with ARC158. Existing archive/Undo/wipe/read/envelope and corpus/Jira contracts remain. This adds no schema, privacy exception, future routing default or real roster/plan/upload. Final db47 glue CLEAR and parent-authorized source adoption are recorded; the final local combined check passed. Current hosted/native/fixture, dashboard-last and final-backup gates are unchanged.
+
+### Weekly source adoption, 2026-10-31
+
+The [private composition contract](module-contracts.md#weekly-source-adoption-with-policy-and-pr-2026-10-31) combines parent-accepted weekly source with complete policy/ownerWork/date/PR guards. Weekly top20 subject leases, internal review attrs, stable item receipt and truthful board coverage add no public API or schema. Public/source docs remain unchanged. The parent-accepted graph5559 correction is adopted after final db47 overlap glue CLEAR; the final local combined check passed. New actual OPS/model/whole-lease acceptance remains pending; all six Responses are used and STOPPED, without event identity or readiness.
+
+### Final graph source adoption, 2026-10-31
+
+The [private final union](module-contracts.md#reviewed-graph-policy-pr-and-weekly-source-adoption-2026-10-31) retains SourcePolicy labels with the graph5559 source closure and existing bounded endpoint/payload privacy. Unrelated relations may deliberately consume discovery capacity and cause truthful early truncation. This source has no new API/schema/dependency. Final db47 overlap glue is accepted and source is adopted; the final local combined check passed; meter453 and baseline-reproduced recall/teardown diagnostics are not closed. Native requests are6of6 STOPPED, event/readiness unproved, daily corrected source SOURCE CLEAR but excluded/private composition pending, and fixture held. This is SOURCE ADOPTION only, with no runtime or feature completion.

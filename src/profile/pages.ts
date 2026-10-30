@@ -1,3 +1,4 @@
+import { importDelivery, policyOf, currentImportFields, POLICY_ATTRS_SQL } from "../domain/import-policy";
 // Owner page reads over one profile (section 15): a node's entity page, the map, a node's timeline, journals and activity.
 // Read-only and bounded: nothing is written, bound or stamped. A record that is not shown here (still landing, moving, moved away,
 // a candidate, or a capture, which review_candidates reads) answers not_found before anything about it is read. Text comes through
@@ -100,16 +101,23 @@ export function entity(sql: SqlStorage, q: EntityQuery) {
 	if (Number.isNaN(ms)) throw Fail.of("validation", "as_of must be an ISO date");
 	const asOf = ms < Infinity ? new Date(ms).toISOString() : undefined;
 	const id = shown(sql, q.node);
+	const currentAttrs = sql.exec<{attrs:string}>(`SELECT ${POLICY_ATTRS_SQL} AS attrs FROM nodes WHERE id = ?`,id).one().attrs;
+	const delivery = importDelivery(currentAttrs);
+	const delivered = <T extends object>(value:T) => {
+		const out = {...value,...delivery,...(asOf && policyOf(currentAttrs) ? {current_delivery:currentImportFields(currentAttrs)} : {})};
+		if (Buffer.byteLength(JSON.stringify(out),"utf8") > 1_000_000) throw Fail.of("size_budget","entity response exceeds 1,000,000 bytes");
+		return out;
+	};
 	const raw = sql.exec<Row>(`SELECT ${RAW} FROM nodes WHERE id = ?`, id).one();
 	const past = asOf ? pastOf(sql, { id, revision: Number(raw.revision) }, asOf, true) : undefined;
 	if (asOf && !past?.started) throw Fail.of("not_found", "this node has no stored record dated at or before as_of", { reason: "after_as_of" });
-	if (q.before !== undefined) return { id, as_of: asOf ?? null, history: history(sql, id, q.before, ms) };
+	if (q.before !== undefined) return delivered({ id, as_of: asOf ?? null, history: history(sql, id, q.before, ms) });
 	if (q.content) {
 		// The whole content in 100k-character pages, each cursor bound to the revision shown (and to as_of).
 		const full = past ? past.content : readContent(sql, id);
 		if (full == null) throw Fail.of("not_found", "this node's content at as_of cannot be rebuilt from what is stored", { reason: "content_unknown" });
 		const bind = past ? { id, revision: past.revision, content_hash: `${String(raw.content_hash)}@${String(raw.revision)}` } : { id, revision: Number(raw.revision), content_hash: String(raw.content_hash) };
-		return { id, as_of: asOf ?? null, content: contentPage(bind, full, { complete: true, ...(q.content.cursor ? { cursor: q.content.cursor } : {}) }, asOf) };
+		return delivered({ id, as_of: asOf ?? null, content: contentPage(bind, full, { complete: true, ...(q.content.cursor ? { cursor: q.content.cursor } : {}) }, asOf) });
 	}
 	const node = past ? nodeAt(sql, id, past) : raw;
 	const ex = explore(sql, { kind: "explore", node: { id }, depth: 1, known: q.known, maxEdges: EDGE_ROWS, ...(asOf ? { asOf } : {}) });
@@ -124,7 +132,7 @@ export function entity(sql: SqlStorage, q: EntityQuery) {
 	const text = past ? past.content?.slice(0, TEXT_MAX) ?? null : readPrefix(sql, id, TEXT_MAX);
 	const chars = past ? past.content?.length ?? null : Number(raw.chars);
 	const tl = timeline(sql, { kind: "timeline", node: { id }, from: "0000-01-01T00:00:00.000Z", to: asOf ? new Date(ms + 1).toISOString() : END, limit: EVENTS, known: q.known });
-	return {
+	return delivered({
 		id, as_of: asOf ?? null,
 		...(asOf ? { note: "as_of selects the node's stored state then, links recorded by then and valid then, and the timeline up to then; history marks later revisions. Evidence and current are today's.",
 			current: { status: raw.status, revision: raw.revision, pinned: raw.pinned !== 0, flagged: raw.flagged } } : {}),
@@ -134,7 +142,7 @@ export function entity(sql: SqlStorage, q: EntityQuery) {
 		people: [...people.values()], links, budget: ex.budget,
 		timeline: { events: asOf ? tl.events.filter((e) => Date.parse(e.at) <= ms) : tl.events, truncated: tl.truncated },
 		history: history(sql, id, undefined, ms),
-	};
+	});
 }
 
 function position(after: string): [string, string] {

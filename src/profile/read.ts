@@ -2,7 +2,8 @@
 // time, section 4) each reads the record's stored state then: its revisions and appended entries up to that instant.
 import { contentRows, fenceOf, VISIBLE } from "./compact";
 import { owned, READABLE_NODE, valid } from "./graph";
-import { normalizeName, normalizeScope } from "../domain/ids";
+import { importDelivery, policyOf, currentImportFields, POLICY_ATTRS_SQL } from "../domain/import-policy";
+import { normalizeName, normalizeScope, sha256 } from "../domain/ids";
 import { Fail, type MemoryKind, type MemoryType, type RecallHit, type Step } from "../domain/types";
 import { captureText, findNode, readContent, relationships, type NodeRow, type Who } from "./write";
 import { captureState, parseRange, sessionKey } from "./capture";
@@ -33,7 +34,7 @@ export function get(sql: SqlStorage, who: Who, q: GetQuery) {
 	for (const r of sql.exec<{ owner: string; kind: string; ref: string; note: string | null }>("SELECT owner, kind, ref, note FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) ORDER BY owner, kind, ref",
 		JSON.stringify([`n:${n.id}`, ...edges.map((e) => `e:${e.id}`)])).toArray()) (evidence.get(r.owner) ?? evidence.set(r.owner, []).get(r.owner)!).push({ kind: r.kind, ref: r.ref, note: r.note });
 	return {
-		ok: true, memory_id: n.id, profile: who.profile, kind: n.kind, name: n.name, type: n.memory_type, scope: n.scope, revision: n.revision,
+		...importDelivery(n.attrs), ok: true, memory_id: n.id, profile: who.profile, kind: n.kind, name: n.name, type: n.memory_type, scope: n.scope, revision: n.revision,
 		description: n.description, content: page.content, why: n.why ?? "", how_to_apply: n.how_to_apply ?? "", objective: n.objective ?? "",
 		status: n.status, origin: n.origin, content_hash: n.content_hash, content_chars: full.length, complete: page.complete, cursor: page.cursor,
 		steps: n.steps ? (JSON.parse(n.steps) as Step[]) : [],
@@ -128,8 +129,21 @@ export function pastOf(sql: SqlStorage, n: { id: string; revision: number }, at:
  * summary the rebuild needs, and a compaction over a body replaced since has no stored body; both return null.
  */
 function contentAt(sql: SqlStorage, id: string, E: number): string | null {
-	const base = sql.exec<{ revision: number; content: string }>(`SELECT revision, json_extract(snapshot, '$.content') AS content FROM revisions
+	let base = sql.exec<{ revision: number; content: string }>(`SELECT revision, json_extract(snapshot, '$.content') AS content FROM revisions
 		WHERE node_id = ? AND revision <= ? AND op <> 'compacted' AND json_type(snapshot, '$.content') = 'text' ORDER BY revision DESC LIMIT 1`, id, E).toArray()[0];
+	const attrs = sql.exec<{attrs:string}>(`SELECT ${POLICY_ATTRS_SQL} AS attrs FROM nodes WHERE id = ?`,id).toArray()[0]?.attrs;
+	if (policyOf(attrs)) {
+		const file = sql.exec<{revision:number;snapshot:string}>("SELECT revision, snapshot FROM revisions WHERE node_id = ? AND actor = 'migration' AND op = 'legacy_snapshot' AND revision <= ? ORDER BY revision DESC LIMIT 1",id,E).toArray()[0];
+		if (file && (!base || file.revision > base.revision)) {
+			const snap = JSON.parse(file.snapshot) as {sha256?:unknown;bytes?:unknown};
+			const rows = sql.exec<{chunk:number;body:string}>("SELECT chunk, body FROM texts WHERE node_id = ? AND actor = 'migration' AND part = 'body' AND revision = ? ORDER BY chunk",id,file.revision).toArray();
+			const body = rows.map(r=>r.body).join("");
+			if (typeof snap.bytes !== "number" || typeof snap.sha256 !== "string" || rows.some((r,i)=>r.chunk!==i) || Buffer.byteLength(body,"utf8") !== snap.bytes || sha256(body) !== snap.sha256) return null;
+			// This exact file snapshot is proved independently of later hosted Undo activity.
+			if (file.revision === E) return body;
+			base = {revision:file.revision,content:body};
+		}
+	}
 	const B = base?.revision ?? 0;
 	if (sql.exec("SELECT 1 FROM revisions WHERE node_id = ? AND revision > ? AND op = 'restored' LIMIT 1", id, B).toArray().length) return null;
 	// Fail closed on history this rebuild does not understand: after the base only appends whose entries are still stored, status
@@ -189,7 +203,7 @@ function getAt(sql: SqlStorage, who: Who, q: GetQuery, at: string) {
 	const evidence = evidenceOf(sql, [`n:${n.id}`, ...edges.map((e) => `e:${e.id}`)]);
 	const steps = Array.isArray(s.steps) ? s.steps as Step[] : null;
 	return {
-		ok: true, memory_id: n.id, profile: who.profile, kind: n.kind, name: str(s, "name"), type: n.memory_type, scope: str(s, "scope"), revision: p.revision,
+		...importDelivery(n.attrs), ok: true, memory_id: n.id, profile: who.profile, kind: n.kind, name: str(s, "name"), type: n.memory_type, scope: str(s, "scope"), revision: p.revision,
 		description: str(s, "description"), content: page.content, why: str(s, "why"), how_to_apply: str(s, "how_to_apply"), objective: str(s, "objective"),
 		status: p.status, origin: n.origin, content_hash: p.contentHash, content_chars: p.content?.length ?? null,
 		complete: page.complete, cursor: page.cursor, steps, relationships: s.relationships ?? null,
@@ -197,7 +211,7 @@ function getAt(sql: SqlStorage, who: Who, q: GetQuery, at: string) {
 		evidence: evidence.get(`n:${n.id}`) ?? [],
 		edges: edges.map(({ id, src, ...e }) => ({ id, from_id: src, ...e, evidence: evidence.get(`e:${id}`) ?? [] })),
 		freshness: { created_at: n.created_at, updated_at: p.recorded_at, valid_from: str(s, "_valid_from"), valid_until: str(s, "_valid_until") },
-		as_of: { at, revision: p.revision, recorded_at: p.recorded_at, valid: p.valid, content_known: p.content != null, current: ["evidence"],
+		as_of: { at, revision: p.revision, recorded_at: p.recorded_at, valid: p.valid, content_known: p.content != null, current: ["evidence", ...currentImportFields(n.attrs)],
 			note: "Fields and content are the stored state at as_of; null means its history does not hold them. Links are those valid at as_of. Evidence is current." },
 		...(q.history ? history(sql, n, { limit: q.history.limit, beforeRevision: Math.min(q.history.beforeRevision ?? Infinity, p.revision + 1) }) : {}),
 	};
@@ -410,12 +424,12 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, all: Record<stri
 function hitAt(who: Who, n: NodeRow, p: Past, score: number, matchedBy: string[], keyword: string): RecallHit {
 	const s = p.snap, field = (k: string) => str(s, k) ?? "";
 	return {
-		memory_id: n.id, profile: who.profile, kind: n.kind, type: n.memory_type, name: str(s, "name"), scope: str(s, "scope"), origin: n.origin, status: p.status,
+		...importDelivery(n.attrs), memory_id: n.id, profile: who.profile, kind: n.kind, type: n.memory_type, name: str(s, "name"), scope: str(s, "scope"), origin: n.origin, status: p.status,
 		revision: p.revision, passage: passage([p.content ?? "", field("why"), field("how_to_apply"), field("objective"), field("description"), field("name")], keyword),
 		matched_by: matchedBy, score: Math.round(score * 1e8) / 1e8, objective: str(s, "objective"), step_count: Array.isArray(s.steps) ? s.steps.length : 0,
 		provenance: { source_platform: str(s, "_source_platform"), updated_source_platform: str(s, "_updated_source_platform"), source_hash: p.contentHash },
 		freshness: { created_at: n.created_at, updated_at: p.recorded_at, valid_from: str(s, "_valid_from"), valid_until: str(s, "_valid_until") },
-		as_of: { recorded_at: p.recorded_at, valid: p.valid, content_known: p.content != null }, row: n.rowid,
+		as_of: { recorded_at: p.recorded_at, valid: p.valid, content_known: p.content != null, ...(policyOf(n.attrs) ? {current:currentImportFields(n.attrs)} : {}) }, row: n.rowid,
 	};
 }
 
@@ -426,10 +440,10 @@ export function hit(sql: SqlStorage, who: Who, n: NodeRow, score: number, matche
 	const body = chunkText && chunkText.part !== "head" ? chunkText.body
 		: contentRows(sql, n.id).toArray()[0]?.body ?? "";
 	return {
-		memory_id: n.id, profile: who.profile, kind: n.kind, type: n.memory_type, name: n.name, scope: n.scope, origin: n.origin, status: n.status,
+		...importDelivery(n.attrs), memory_id: n.id, profile: who.profile, kind: n.kind, type: n.memory_type, name: n.name, scope: n.scope, origin: n.origin, status: n.status,
 		revision: n.revision, passage: passage([body, n.why ?? "", n.how_to_apply ?? "", n.objective ?? "", n.description, n.name], keyword),
 		matched_by: matchedBy, score: Math.round(score * 1e8) / 1e8, objective: n.objective, step_count: n.steps ? (JSON.parse(n.steps) as unknown[]).length : 0,
-		provenance: { source_platform: n.source_platform, updated_source_platform: n.updated_source_platform, source_hash: n.content_hash },
+		provenance: { source_platform: n.source_platform, updated_source_platform: n.updated_source_platform, source_hash: policyOf(n.attrs)?.source_head.content_hash ?? n.content_hash, ...(policyOf(n.attrs) ? {hosted_view_hash:n.content_hash} : {}) },
 		freshness: { created_at: n.created_at, updated_at: n.updated_at, valid_from: n.valid_from, valid_until: n.valid_to },
 		row: n.rowid,
 	};

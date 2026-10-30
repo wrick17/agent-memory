@@ -1,5 +1,6 @@
 // Alarm stage `similar` (section 12), after `embed`: each embedded card's nearest neighbours in its own generation's namespace
 // become up to 5 relates_to edges with basis similarity (cosine at least 0.85, score kept); its older similarity edges end.
+import { archiveFenced } from "./archive-fence";
 import { nextSeq } from "../storage";
 import { embeddingsOn, namespaceOf, vectorId } from "./index";
 import { enqueue } from "./maintenance";
@@ -59,6 +60,12 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 				// No vector visible yet (or the node has no card): try again later, without holding the cursor.
 				cur.pending[n.id] = { n: (cur.pending[n.id]?.n ?? 0) + 1, at: now + SETTLE_MS, card: n.card || (cur.pending[n.id]?.card ?? false) };
 				return;
+			}
+			// A landing endpoint is not a missing neighbour. Retain this comparison without changing any touching seq.
+			const source=sql.exec("SELECT 1 FROM nodes WHERE id=? AND status='active' AND embed_hash=card_hash",n.id).toArray().length;
+			const endpoints=sql.exec<{dst:string;dst_profile:string}>("SELECT dst,dst_profile FROM edges WHERE src=? AND basis='similarity' AND ended_at IS NULL",n.id).toArray();
+			if(!source || archiveFenced(sql,n.id) || hits.some(h=>archiveFenced(sql,h.id)) || endpoints.some(e=>e.dst_profile === ""&&archiveFenced(sql,e.dst))) {
+				cur.pending[n.id]={n:0,at:now+SETTLE_MS,card:n.card};return;
 			}
 			delete cur.pending[n.id];
 			// Only neighbours that are still active nodes of this profile.

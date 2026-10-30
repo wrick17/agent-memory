@@ -7,7 +7,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { attrsDigest, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest } from "../src/domain/import-audit.ts";
+import { normalizeName } from "../src/domain/ids.ts";
+import { identityDigest, textDigest, textRowsDigest, attrsDigest, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest } from "../src/domain/import-audit.ts";
 import { dryRun, migrationDir, planRecords, readJsonl, withLock, writePrivate } from "./migrate.mjs";
 
 const RETRIES = 5;
@@ -112,7 +113,7 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 	for (const r of planRecords(dir)) {
 		expected.set(key(r.route.profile, r.id), { id: r.id, profile: r.route.profile, record_sha256: r.record_sha256,
 			node: r.node, node_sha256: nodeDigest(r.node), ...attrsDigest(r.node.attrs), revisions: r.revisions.map(revisionDigest),
-			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })) });
+			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })), ...(r.node.attrs.import_review ? {texts:r.texts.map(textDigest),identity_sha256:identityDigest(r.node.scope,r.node.memory_type,normalizeName(r.node.name))} : {}) });
 	}
 	if (!expected.size) throw new Error("the plan has no records to audit");
 	const get = async (query) => {
@@ -152,7 +153,19 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 			f[rows] = { ...f[rows], count: all.length, sha256: rowsDigest(all) };
 		}
 	}
-	const mismatches = { missing: [], extra: [], state: [], record: [], node: [], attrs: [], source: [], revisions: [], requests: [] }, drift = [];
+	for (const [k,e] of expected) {
+		if (!e.texts) continue;
+		const f=found.get(k);if(!f)continue;
+		const all=[];let after=null;
+		do {
+			const page=await get({profile:e.profile,record:e.id,rows:"texts",after,limit:200});
+			if (page.node_revision !== f.node?.revision || page.record_sha256 !== f.record_sha256 || page.node_sha256 !== f.node?.row_sha256) f.moved_while_read=true;
+			all.push(...page.rows);if(page.next_after!==null && page.next_after===after)throw new Error("text audit did not advance");after=page.next_after;
+		} while(after!==null);
+		f.texts=all;
+	}
+
+	const mismatches = { missing: [], extra: [], state: [], record: [], node: [], attrs: [], source: [], revisions: [], requests: [], ...(readJson(path.join(dir,"manifest.json"))?.version===2 ? {identity:[],texts:[]} : {}) }, drift = [];
 	for (const [k, e] of expected) {
 		const f = found.get(k), id = e.id;
 		if (!f) { mismatches.missing.push(id); continue; }
@@ -168,6 +181,7 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 		check("source", f.node?.source_sha256 === e.source_sha256);
 		check("revisions", f.revisions.count === e.revisions.length && f.revisions.sha256 === rowsDigest(e.revisions));
 		check("requests", f.requests.count === e.requests.length && f.requests.sha256 === rowsDigest(e.requests));
+		if(e.texts){check("identity",f.node?.identity_sha256===e.identity_sha256);check("texts",f.texts && textRowsDigest(f.texts)===textRowsDigest(e.texts));}
 		// Hosted changes since the import are drift: listed, and they fail the audit, while the imported rows are still checked exactly.
 		if (f.revisions.hosted || f.requests.hosted || moved || f.moved_while_read) drift.push(id);
 	}

@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { beforeEach, describe, it } from "node:test";
-import { sha256, uuid5 } from "../src/domain/ids.ts";
-import { attrsDigest, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest } from "../src/domain/import-audit.ts";
+import { canonicalJson, normalizeName, sha256, uuid5 } from "../src/domain/ids.ts";
+import { identityDigest, textDigest, textRowsDigest, attrsDigest, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest } from "../src/domain/import-audit.ts";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-upload-test-"));
 let n = 0;
@@ -166,9 +166,10 @@ describe("upload audit", () => {
 		const recs = new Map();
 		for (const c of m.readJsonl(path.join(dir, sub, "commands.jsonl"))) {
 			if (c.op === "stage") {
-				const r = recs.get(c.record_id) ?? { revisions: [], requests: [] };
+				const r = recs.get(c.record_id) ?? { revisions: [], requests: [], texts: [] };
 				r.revisions.push(...c.rows.revisions);
 				r.requests.push(...c.rows.requests);
+				r.texts.push(...c.rows.texts);
 				recs.set(c.record_id, r);
 			} else if (c.op === "finalize") {
 				const published_at = "2026-02-01T00:00:00.000Z";
@@ -186,10 +187,10 @@ describe("upload audit", () => {
 			const u = new URL(url), after = u.searchParams.get("after"), profile = u.searchParams.get("profile"), record = u.searchParams.get("record");
 			assert.equal([u.pathname, init.redirect, init.method ?? "GET"].join(" "), "/v1/import/audit manual GET");
 			if (record) {
-				const r = recs.get(record), rows = digestsOf(r)[u.searchParams.get("rows")], limit = Number(u.searchParams.get("limit"));
-				const page = rows.filter((x) => after === null || ("revision" in x ? x.revision > Number(after) : x.request_id > after)).slice(0, limit);
+				const r = recs.get(record), table=u.searchParams.get("rows"), rows = table==="texts" ? r.texts.map(textDigest) : digestsOf(r)[table], limit = Number(u.searchParams.get("limit"));
+				const page = rows.filter((x) => after === null || (table==="texts" ? JSON.stringify([x.part,x.revision,x.seq_no,x.chunk]) > after : "revision" in x ? x.revision > Number(after) : x.request_id > after)).slice(0, limit);
 				const last = page.at(-1);
-				return Response.json({ record_id: record, node_revision: r.stored.revision, rows: page, next_after: page.length === limit ? String(last.revision ?? last.request_id) : null });
+				return Response.json({ record_id: record, node_revision: r.stored.revision, ...(r.node.attrs.import_review ? {record_sha256:r.record_sha256,node_sha256:nodeDigest(r.stored)} : {}), rows: page, next_after: page.length === limit ? table==="texts" ? JSON.stringify([last.part,last.revision,last.seq_no,last.chunk]) : String(last.revision ?? last.request_id) : null });
 			}
 			// Small pages, as a server stopping at its row bound returns them.
 			const page = rowsIn(profile).filter((id) => !after || id > after).slice(0, 7);
@@ -197,13 +198,25 @@ describe("upload audit", () => {
 				const r = recs.get(id), d = digestsOf(r), big = paged !== undefined && id === ids[paged];
 				// A record over the server's row bound comes with counts only; its rows are on the detail pages.
 				return { record_id: id, state: "published", published_at: r.published_at, record_sha256: r.record_sha256, node_sha256: nodeDigest(r.node), ...(big ? { paged: true } : {}),
-					node: { revision: r.stored.revision, created_at: r.stored.created_at, updated_at: r.stored.updated_at, row_sha256: nodeDigest(r.stored), ...attrsDigest(r.stored.attrs) },
+					node: { revision: r.stored.revision, created_at: r.stored.created_at, updated_at: r.stored.updated_at, row_sha256: nodeDigest(r.stored), ...attrsDigest(r.stored.attrs), ...(r.node.attrs.import_review ? {identity_sha256:identityDigest(r.stored.scope,r.stored.memory_type,normalizeName(r.stored.name))} : {}) },
 					revisions: { count: d.revisions.length, sha256: big ? null : rowsDigest(d.revisions), hosted: 0 },
 					requests: { count: d.requests.length, sha256: big ? null : rowsDigest(d.requests), hosted: hosted !== undefined && id === ids[hosted] ? 1 : 0 } };
 			});
 			return Response.json({ profile, records, next_after: page.length === 7 ? page.at(-1) : null });
 		};
 	}
+
+	it("audits v2 policy text and identity and refuses changed text or page anchors",async()=>{
+		const dir=fs.mkdtempSync(path.join(tmp,"policy-export-")),content="untrusted synthetic archive",f={system:"codex",rel:"skills/fixture/SKILL.md",category:"codex_reference_candidate",realpath:"~/fixture/SKILL.md",paths:["~/fixture/SKILL.md"],content,sha256:sha256(content),bytes:Buffer.byteLength(content),utf8:true,birthtime:"2026-01-01T00:00:00Z",mtime:"2026-01-01T00:00:00Z"};
+		fs.mkdirSync(path.join(dir,"markdown"));const lines=JSON.stringify(f)+"\n";fs.writeFileSync(path.join(dir,"markdown/files.jsonl"),lines);const manifest={version:1,markdown:{distinct:1,files_jsonl_sha256:sha256(lines),files_sha256:sha256(`${f.realpath}\t${f.sha256}`)}};fs.writeFileSync(path.join(dir,"manifest.json"),JSON.stringify(manifest));
+		const it=m.markdownItem(f,[]),entry={source:it.key,id:it.id,scope:it.node.scope,profile:"work",source_sha256:sha256(canonicalJson(f))},exportHash=sha256(JSON.stringify(manifest)),decision={reference:"synthetic intent",answer:"archive in work",kind:"archival_reference",permitted_ids:[it.id]};
+		const routes=path.join(dir,"routes.json"),policy=path.join(dir,"policy.json");fs.writeFileSync(routes,JSON.stringify({version:1,export_manifest_sha256:exportHash,routes:[entry]}),{mode:0o600});fs.writeFileSync(policy,JSON.stringify({version:1,export_manifest_sha256:exportHash,entries:[{...entry,kind:"archival_reference",owner_decision:decision,owner_decision_sha256:sha256(canonicalJson(decision)),profile_review_sha256:sha256("synthetic evidence")}]}),{mode:0o600});
+		await m.plan({exportDir:dir,routes,sourcePolicy:policy});const cfg=u.loadConfig(config({rehearsal:false})),fetchImpl=fakeAudit(dir,{sub:"plan"});
+		const clean=await u.audit({exportDir:dir,config:cfg,fetchImpl});assert.equal(clean.status,"ok");assert.equal(clean.mismatches.texts,0);assert.equal(clean.mismatches.identity,0);
+		const changed=await u.audit({exportDir:dir,config:cfg,fetchImpl:async(url,init)=>{const r=await fetchImpl(url,init),d=await r.json();if(new URL(url).searchParams.get("rows")==="texts")d.rows[0].body_raw_utf8_sha256=sha256("changed");return Response.json(d);}});assert.equal(changed.mismatches.texts,1);
+		const raced=await u.audit({exportDir:dir,config:cfg,fetchImpl:async(url,init)=>{const r=await fetchImpl(url,init),d=await r.json();if(new URL(url).searchParams.get("rows")==="texts")d.record_sha256="0".repeat(64);return Response.json(d);}});assert.equal(raced.status,"drift");
+		assert.equal(textRowsDigest(m.planRecords(path.join(dir,"plan"))[0].texts.map(textDigest)).length,64);
+	});
 
 	it("passes a faithful server over several pages, and names the one record whose stored bytes changed", async () => {
 		const dir = await plannedExport();

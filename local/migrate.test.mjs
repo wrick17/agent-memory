@@ -590,3 +590,171 @@ describe("reviewed routes", () => {
 		assert.deepEqual([fin.profile, fin.refresh.no, fin.node.revision, reviewOf(dir)], ["personal", 1, base.props._version + 2, []]);
 	});
 });
+
+
+describe("source policy", () => {
+	const md = (realpath, content = "retained source") => ({system:"claude",project:"same-project",rel:"MEMORY.md",category:"claude_index",realpath,paths:[realpath],content,sha256:sha256(content),bytes:Buffer.byteLength(content),utf8:true,birthtime:"2026-01-01T00:00:00Z",mtime:"2026-02-01T00:00:00Z"});
+	function approvals(dir, files, kind = "source_suffix", profile = "work") {
+		const items=files.map(f=>m.markdownItem(f,[])), decision={reference:"synthetic owner intent",answer:"retain distinct sources",kind,permitted_ids:items.map(it=>it.id)};
+		const exportHash=sha256(fs.readFileSync(path.join(dir,"manifest.json"),"utf8"));
+		const routes=items.map((it,i)=>({source:it.key,id:it.id,scope:it.node.scope,profile,source_sha256:sha256(canonicalJson(files[i]))}));
+		const entries=routes.map(r=>({...r,kind,owner_decision:decision,owner_decision_sha256:sha256(canonicalJson(decision)),...(kind==="archival_reference"?{profile_review_sha256:sha256("synthetic individual profile evidence")}: {})}));
+		const rp=path.join(dir,"routes.json"),sp=path.join(dir,"policy.json");
+		fs.writeFileSync(rp,JSON.stringify({version:1,export_manifest_sha256:exportHash,routes}),{mode:0o600});
+		fs.writeFileSync(sp,JSON.stringify({version:1,export_manifest_sha256:exportHash,entries}),{mode:0o600});
+		return {routes:rp,sourcePolicy:sp};
+	}
+	it("keeps two colliding source IDs and exact history, and applies source-first changed and empty refreshes",async()=>{
+		const files=[md("~/synthetic-one/MEMORY.md"),md("~/synthetic-two/MEMORY.md","second source")],dir=makeExport([],files),opts=approvals(dir,files);
+		await m.plan({exportDir:dir,routes:opts.routes});assert.equal(reviewOf(dir).filter(r=>r.reasons.includes("identity_conflict")).length,2);
+		const initial=await uploaded(dir,opts),records=m.planRecords(initial.dir);assert.equal(records.length,2);assert.equal(initial.manifest.version,2);
+		for(const r of records){const original=m.markdownItem(files.find(f=>r.key.endsWith(f.realpath)),[]);assert.equal(r.node.name,original.node.name+` [source ${r.id.slice(0,8)}]`);assert.equal(r.id,original.id);assert.deepEqual(r.revisions,original.revisions);assert.deepEqual(r.texts,original.texts);assert.deepEqual(r.requests,[]);assert.equal(r.node.attrs.import_review.source_head.content_hash,original.node.content_hash);assert.equal(r.node.content_hash,m.bothqContentHash({...r.node,content:r.content}));}
+		const identical=makeExport([],files);fs.copyFileSync(path.join(dir,"manifest.json"),path.join(identical,"manifest.json"));await m.plan({exportDir:identical,...approvals(identical,files),refreshFrom:dir});assert.equal(planned(identical).length,0);
+		const changed=[md(files[0].realpath,"changed source"),files[1]],fresh=makeExport([],changed);await uploaded(fresh,{...approvals(fresh,changed),refreshFrom:dir});
+		const after=m.planRecords(path.join(fresh,"plan")).find(r=>r.id===records[0].id);assert.equal(after.node.revision,2);assert.equal(after.revisions.length,2);assert.equal(after.texts.filter(t=>!t.live)[0].body,"retained source");assert.equal(after.node.attrs.import_review.source_head.revision,2);
+		const empty=[md(files[0].realpath,""),files[1]],last=makeExport([],empty);await m.plan({exportDir:last,...approvals(last,empty),refreshFrom:fresh});const fin=planned(last).find(c=>c.op==="finalize");assert.equal(fin.refresh.base_content_hash,after.node.content_hash);assert.equal(fin.refresh.body_revision,3);assert.equal(fin.node.chars,0);assert.equal(fin.node.name,after.node.name);assert.equal(fin.policy_version,1);
+		const missing=makeExport([],empty);await m.plan({exportDir:missing,routes:approvals(missing,empty).routes,refreshFrom:fresh});assert.ok(reviewOf(missing).some(r=>r.reasons.includes("policy_changed")));
+	});
+	it("requires exact archive/profile witnesses and never waives redaction or creates a profile",async()=>{
+		const file={...md("~/synthetic/skills/archive/SKILL.md"),system:"codex",category:"codex_reference_candidate",rel:"skills/archive/SKILL.md"},dir=makeExport([],[file]),opts=approvals(dir,[file],"archival_reference","work");
+		await assert.rejects(m.plan({exportDir:dir,sourcePolicy:opts.sourcePolicy}),/cannot route/);
+		const p=await m.plan({exportDir:dir,...opts});assert.equal(p.manifest.planned,1);assert.equal(planned(dir).find(c=>c.op==="finalize").node.attrs.import_review.kind,"archival_reference");
+		const mismatch=JSON.parse(fs.readFileSync(opts.sourcePolicy));mismatch.entries[0].profile="personal";fs.writeFileSync(opts.sourcePolicy,JSON.stringify(mismatch));await assert.rejects(m.plan({exportDir:dir,...opts}),/cannot route/);
+		approvals(dir,[file],"archival_reference","work");
+		const policy=JSON.parse(fs.readFileSync(opts.sourcePolicy));policy.entries[0].source_sha256="0".repeat(64);fs.writeFileSync(opts.sourcePolicy,JSON.stringify(policy));await assert.rejects(m.plan({exportDir:dir,...opts}),/exact exported source/);
+		const secret={...file,content:"token=abc123secret",sha256:sha256("token=abc123secret"),bytes:18},held=makeExport([],[secret]);await m.plan({exportDir:held,...approvals(held,[secret],"archival_reference","work")});assert.equal(planned(held).length,0);assert.ok(reviewOf(held)[0].reasons.includes("reference_candidate"));assert.ok(reviewOf(held)[0].reasons.includes("needs_redaction"));
+	});
+});
+
+// Owner decision: every legacy identity of one export goes to Work under an exact closed v2 route document (docs/import-implementation.md).
+describe("legacy Work owner classification", () => {
+	const legacy = (name, scope, props = {}) => record({ eid: `lw-${name}`, legacyId: uuid5(`${scope}:project:${name}`), scope, name, props: { content: "safe", ...props } });
+	const keyOf = (r) => (r.eid ? `bothq:${r.eid}` : `${r.system}:${r.realpath}`);
+	const exportSha = (dir) => sha256(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+	const sign = (d) => { d.owner_decision.roster_sha256 = sha256(canonicalJson(d.roster)); d.owner_decision_sha256 = sha256(canonicalJson(d.owner_decision)); return d; };
+	/** The v2 owner document: the export's roster (or the named sources), sorted by source key and bound into the owner decision. */
+	function ownerFile(dir, keys = null, edit = (d) => d) {
+		const rows = [...readJsonl(path.join(dir, "bothq", "records.jsonl")), ...readJsonl(path.join(dir, "markdown", "files.jsonl"))];
+		const roster = rows.filter((r) => !keys || keys.includes(keyOf(r))).map((row) => {
+			const it = row.eid ? m.bothqItem(row) : m.markdownItem(row, []);
+			return { source: keyOf(row), id: it.id ?? null, scope: it.node.scope ?? null, source_sha256: sha256(canonicalJson(row)) };
+		}).sort((a, b) => (a.source < b.source ? -1 : 1));
+		const doc = sign({ version: 2, effect: "legacy_work_owner", export_manifest_sha256: exportSha(dir), owner_decision: { reference: "synthetic owner decision", answer: "synthetic: all old items go to work" }, roster });
+		const file = path.join(fs.mkdtempSync(path.join(tmp, "owner-")), "routes.json");
+		fs.writeFileSync(file, JSON.stringify(edit(doc)));
+		return file;
+	}
+	function v1File(dir, row, profile) {
+		const it = m.bothqItem(row), file = path.join(fs.mkdtempSync(path.join(tmp, "routes-")), "routes.json");
+		fs.writeFileSync(file, JSON.stringify({ version: 1, export_manifest_sha256: exportSha(dir), routes: [{ source: keyOf(row), id: it.id, scope: it.node.scope, profile, source_sha256: sha256(canonicalJson(row)) }] }));
+		return file;
+	}
+	const finalizes = (dir) => Object.fromEntries(planned(dir).filter((c) => c.op === "finalize").map((c) => [c.record_id, c]));
+
+	it("sends an automatically Personal legacy member to Work only under exact v2 authority, while v1 still refuses it", async () => {
+		const mine = legacy("mine", "personal"), mixed = legacy("mixed", "bot_hq"), outside = legacy("outside", "personal"), secret = legacy("secret", "personal", { content: "Use token=abc123secret." });
+		const scopeless = record({ eid: "lw-scopeless", name: "no scope", props: { content: "safe" } });
+		const dir = makeExport([mine, mixed, outside, scopeless, secret]), id = (r) => m.bothqItem(r).id;
+		await m.plan({ exportDir: dir });
+		assert.deepEqual(Object.values(finalizes(dir)).map((c) => c.profile), ["personal", "personal"]);
+		await assert.rejects(m.plan({ exportDir: dir, routes: v1File(dir, mine, "work") }), /route 1 conflicts with an existing routing rule/);
+		const p = await m.plan({ exportDir: dir, routes: ownerFile(dir, [mine, mixed, scopeless, secret].map(keyOf)) });
+		const fins = finalizes(dir), w = fins[id(mine)].node.attrs.source.owner_classification;
+		assert.deepEqual([p.manifest.version, fins[id(mine)].profile, fins[id(mixed)].profile, fins[id(outside)].profile], [2, "work", "work", "personal"]);
+		assert.ok(planned(dir).filter((c) => c.record_id !== id(outside)).every((c) => c.classification_version === 1));
+		assert.ok(planned(dir).filter((c) => c.record_id === id(outside)).every((c) => c.classification_version === undefined && !c.node?.attrs.source.owner_classification));
+		assert.deepEqual([w.effect, w.profile, w.witness.id, w.witness.scope, fins[id(mine)].node.scope, fins[id(mine)].node.name], ["legacy_work_owner", "work", id(mine), "personal", "personal", "mine"]);
+		assert.deepEqual(m.planRecords(p.dir).find((r) => r.id === id(mine)).route, { profile: "work", rule: "legacy_work_owner", automatic: { profile: "personal", rule: "scope:personal" } });
+		assert.deepEqual([p.manifest.reviewed_routes.classified, reviewOf(dir).map((r) => [r.key, r.reasons, r.proposed?.profile])], [3, [[keyOf(scopeless), ["missing_scope"], undefined], [keyOf(secret), ["needs_redaction"], "work"]]]);
+		m.dryRun({ exportDir: dir });
+		const text = fs.readFileSync(path.join(dir, "plan", "commands.jsonl"), "utf8");
+		fs.writeFileSync(path.join(dir, "plan", "commands.jsonl"), text.replace('"classification_version":1,', ""));
+		assert.throws(() => m.dryRun({ exportDir: dir }), /classification command version differs/);
+	});
+
+	it("refuses an unknown, stale, retargeted or unsigned owner document before any output", async () => {
+		const mine = legacy("strict", "personal"), dir = makeExport([mine]), key = keyOf(mine);
+		const entry = (over) => (d) => sign({ ...d, roster: [{ ...d.roster[0], ...over }] });
+		const cases = [
+			[entry({ source: "bothq:not-exported" }), /names a source this export does not have/],
+			[entry({ source_sha256: "0".repeat(64) }), /no longer matches its exported source/],
+			[entry({ id: null }), /no longer matches its exported source/],
+			[entry({ scope: "sequoia" }), /no longer matches its exported source/],
+			[entry({ profile: "personal" }), /roster 1 schema/],
+			[(d) => sign({ ...d, roster: [d.roster[0], d.roster[0]] }), /sorted/],
+			[(d) => ({ ...d, roster: [{ ...d.roster[0], scope: "sequoia" }] }), /owner decision/],
+			[(d) => ({ ...d, owner_decision_sha256: "0".repeat(64) }), /owner decision/],
+			[(d) => ({ ...d, export_manifest_sha256: "0".repeat(64) }), /made for another export/],
+			[(d) => ({ ...d, version: 3 }), /schema/],
+			[(d) => ({ ...d, effect: "legacy_personal_owner" }), /schema/],
+			[(d) => ({ ...d, profile: "personal" }), /schema/],
+		];
+		for (const [edit, error] of cases) await assert.rejects(m.plan({ exportDir: dir, routes: ownerFile(dir, [key], edit) }), error);
+		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: ownerFile(dir) }), /rehearsal ignores routing/);
+		assert.ok(!fs.existsSync(path.join(dir, "plan")) && !fs.existsSync(path.join(m.migrationDir(), "state.json")), "no plan, review or state written");
+	});
+
+	it("recomputes all-Work collisions: a newly exposed collision stays held and only the approved D1 sources take suffixes", async () => {
+		const md = (realpath, content, extra = {}) => ({ system: "claude", project: "same-project", rel: "MEMORY.md", category: "claude_index", realpath, paths: [realpath], content,
+			sha256: sha256(content), bytes: Buffer.byteLength(content), utf8: true, birthtime: "2026-01-01T00:00:00Z", mtime: "2026-02-01T00:00:00Z", ...extra });
+		const files = [md("~/lw-one/MEMORY.md", "first source"), md("~/lw-two/MEMORY.md", "second source"),
+			md("~/lw/skills/archive/SKILL.md", "archived reference", { system: "codex", category: "codex_reference_candidate", rel: "skills/archive/SKILL.md" })];
+		const twins = [legacy("twin", "bot_hq"), record({ eid: "lw-twin-b", legacyId: uuid5("bot_hq:project:twin-b"), scope: "bot_hq", name: "twin", props: { content: "safe" } })];
+		const dir = makeExport(twins, files), routes = ownerFile(dir), reviewed = m.readReviewedRoutes(routes, dir);
+		await m.plan({ exportDir: dir });
+		assert.deepEqual(reviewOf(dir).filter((r) => r.key.startsWith("bothq:")).map((r) => r.reasons), [["unrouted_scope"], ["unrouted_scope"]]);
+		const items = files.map((f) => m.markdownItem(f, [])), kinds = ["source_suffix", "source_suffix", "archival_reference"];
+		const entries = items.map((it, i) => {
+			const decision = { reference: "synthetic owner intent", answer: "retain distinct sources", kind: kinds[i], permitted_ids: items.filter((_, j) => kinds[j] === kinds[i]).map((x) => x.id) };
+			return { source: it.key, id: it.id, scope: it.node.scope, profile: "work", source_sha256: sha256(canonicalJson(files[i])), kind: kinds[i], owner_decision: decision, owner_decision_sha256: sha256(canonicalJson(decision)),
+				...(kinds[i] === "archival_reference" ? { profile_review_sha256: sha256(canonicalJson(m.ownerWitness(reviewed, reviewed.routes.get(it.key), it))) } : {}) };
+		});
+		const sourcePolicy = path.join(dir, "policy.json"), writePolicy = () => fs.writeFileSync(sourcePolicy, JSON.stringify({ version: 1, export_manifest_sha256: exportSha(dir), entries }), { mode: 0o600 });
+		writePolicy();
+		await m.plan({ exportDir: dir, routes, sourcePolicy });
+		const fins = Object.values(finalizes(dir));
+		assert.deepEqual([fins.length, fins.every((c) => c.profile === "work" && c.classification_version === 1), fins.filter((c) => / \[source [0-9a-f]{8}\]$/.test(c.node.name)).length], [3, true, 2]);
+		assert.equal(fins.find((c) => c.node.attrs.import_review?.kind === "archival_reference").policy_version, 1);
+		assert.deepEqual(reviewOf(dir).map((r) => [r.reasons, r.proposed.profile, r.planned]), [[["identity_conflict"], "work", false], [["identity_conflict"], "work", false]]);
+		entries[2].profile_review_sha256 = sha256("superseded individual profile review");
+		writePolicy();
+		await assert.rejects(m.plan({ exportDir: dir, routes, sourcePolicy }), /profile receipt differs from the owner classification/);
+	});
+
+	it("refreshes the same classified identity with a fresh witness, provenance-only when unchanged, and holds a missing or changed classification", async () => {
+		const base = journal("lw-refresh", { appends: 0, size: 1, scope: "personal" }), baseDir = makeExport([base]);
+		await uploaded(baseDir, { routes: ownerFile(baseDir) });
+		const old = planned(baseDir).find((c) => c.op === "finalize");
+		assert.equal(old.profile, "work");
+		const dir = makeExport([advanceRecord(base, 1)]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir });
+		assert.deepEqual([planned(dir).length, reviewOf(dir)[0].reasons.includes("classification_changed")], [0, true]);
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: baseDir, routes: ownerFile(baseDir) }), /made for another export/);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir, routes: ownerFile(dir) });
+		const fin = planned(dir).find((c) => c.op === "finalize"), w = fin.node.attrs.source.owner_classification.witness, was = old.node.attrs.source.owner_classification.witness;
+		assert.deepEqual([fin.profile, fin.refresh.no, fin.classification_version, fin.node.revision, reviewOf(dir)], ["work", 1, 1, base.props._version + 1, []]);
+		assert.deepEqual([w.export_manifest_sha256 !== was.export_manifest_sha256, w.source_row_sha256 !== was.source_row_sha256, w.source_key_sha256 === was.source_key_sha256, w.id === was.id], [true, true, true, true]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir, routes: ownerFile(dir, null, (d) => { d.owner_decision.answer = "another answer"; d.owner_decision_sha256 = sha256(canonicalJson(d.owner_decision)); return d; }) });
+		assert.deepEqual([planned(dir).length, reviewOf(dir)[0].reasons.includes("classification_changed")], [0, true]);
+		const same = makeExport([base]);
+		await m.plan({ exportDir: same, refreshFrom: baseDir, routes: ownerFile(same) });
+		const meta = planned(same).find((c) => c.op === "finalize"), stage = planned(same).find((c) => c.op === "stage");
+		assert.deepEqual([meta.node.revision, meta.refresh.base_revision, meta.refresh.body_revision, stage.rows.revisions.length + stage.rows.texts.length], [base.props._version, base.props._version, undefined, 0]);
+		assert.notEqual(meta.node.attrs.source.owner_classification.witness.export_manifest_sha256, was.export_manifest_sha256);
+	});
+
+	it("never adopts an existing Personal or unclassified copy into Work in place", async () => {
+		const base = journal("lw-personal", { appends: 0, size: 1, scope: "personal" }), baseDir = makeExport([base]);
+		await uploaded(baseDir);
+		assert.equal(planned(baseDir).find((c) => c.op === "finalize").profile, "personal");
+		const dir = makeExport([advanceRecord(base, 1)]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir, routes: ownerFile(dir) });
+		assert.equal(planned(dir).length, 0);
+		assert.ok(["route_changed", "classification_changed"].every((r) => reviewOf(dir)[0].reasons.includes(r)));
+		const work = journal("lw-work", { appends: 0, size: 1, scope: "sequoia" }), workDir = makeExport([work]);
+		await uploaded(workDir);
+		const same = makeExport([work]);
+		await m.plan({ exportDir: same, refreshFrom: workDir, routes: ownerFile(same) });
+		assert.deepEqual([planned(same).length, reviewOf(same)[0].reasons.includes("classification_changed")], [0, true]);
+	});
+});

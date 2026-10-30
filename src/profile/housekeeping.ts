@@ -1,12 +1,14 @@
 // Housekeeping (section 12): deterministic alarm stages, one bounded step per call, with cursors. Exact dedupe, the 90-day
 // capture TTL into the archive, and the 300-day purge. Every change except purge keeps its undo; protected nodes are only
 // flagged. The size level (section 6) is measured on every call.
+import { retireArchivePage } from "./archive-operations";
 import { fenceOf, queueFold } from "./compact";
 import { requestHash } from "../domain/ids";
 import { Fail, type WriteContext } from "../domain/types";
 import { nextSeq } from "../storage";
 import { archiveNode, archiveRows, BudgetTx, purgeAfter, type Row } from "./archive";
 import { flagProtected, mayChange } from "./protect";
+import { board, REVIEW_ITEMS } from "./board";
 import { enqueue } from "./maintenance";
 import { runWrite, type Who } from "./write";
 
@@ -47,7 +49,7 @@ export function housekeep(storage: DurableObjectStorage, who: Who, now = Date.no
 	const first = stages[0]!;
 	if (first.dueAt > now) return { stage: null, more: false, purged: [], size, nextDue: first.dueAt };
 	const r: StepResult = first.stage === "dedupe" ? dedupe(storage, who, Number(first.cursor ?? 0)) : first.stage === "ttl" ? ttl(storage, who, now, first.cursor)
-		: first.stage === "queue" ? queueStep(storage, Number(first.cursor ?? 0), now) : purge(storage, now);
+		: first.stage === "queue" ? queueStep(storage, who, Number(first.cursor ?? 0), now) : purge(storage, now);
 	const dueAt = r.more ? now : now + DAY;
 	sql.exec(`INSERT INTO cursors (stage, cursor, due_at, last_run_at, last_error, stats) VALUES (?, ?, ?, ?, NULL, ?)
 		ON CONFLICT (stage) DO UPDATE SET cursor = excluded.cursor, due_at = excluded.due_at, last_run_at = excluded.last_run_at, last_error = NULL, stats = excluded.stats`,
@@ -149,7 +151,7 @@ function purge(storage: DurableObjectStorage, now: number): StepResult {
 		const sql = storage.sql;
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date(now).toISOString());
 		const rows = sql.exec<{ id: number; node: string | null }>(`SELECT id, CASE WHEN source = 'nodes' THEN json_extract(payload, '$.id') END AS node
-			FROM archive WHERE purge_after < ? ORDER BY purge_after, id LIMIT ?`, tx.now, STEP.purge).toArray();
+			FROM archive WHERE NOT EXISTS (SELECT 1 FROM profile_meta WHERE key='archive-pin:'||archive.activity_id) AND purge_after < ? ORDER BY purge_after, id LIMIT ?`, tx.now, STEP.purge).toArray();
 		const purged: string[] = [];
 		const requests: string[] = [];
 		let more = rows.length === STEP.purge, done = 0;
@@ -168,8 +170,10 @@ function purge(storage: DurableObjectStorage, now: number): StepResult {
 			if (requests.length + purged.length >= 100) { more = true; break; }
 		}
 		const old = new Date(now - ACTIVITY_DAYS * DAY).toISOString();
-		const stale = tx.spent(SOFT) ? [] : sql.exec<{ id: number }>("SELECT id FROM activity WHERE at < ? ORDER BY id LIMIT 100", old).toArray().map((a) => a.id);
-		if (stale.length) tx.run("DELETE FROM activity WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(stale));
+		const stale = tx.spent(SOFT) ? [] : sql.exec<{ id: number }>("SELECT id FROM activity WHERE NOT EXISTS (SELECT 1 FROM profile_meta WHERE key='archive-pin:'||activity.id) AND at < ? ORDER BY id LIMIT 100", old).toArray().map((a) => a.id);
+		const removable:number[]=[];
+		for(const id of stale){if(tx.spent(SOFT)){more=true;break;}if(retireArchivePage(tx,id))removable.push(id);else more=true;}
+		if (removable.length) tx.run("DELETE FROM activity WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(removable));
 		more ||= stale.length === 100;
 		if (done || stale.length) {
 			tx.run("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'keep', 'purge', ?, ?, ?)", tx.now,
@@ -181,7 +185,7 @@ function purge(storage: DurableObjectStorage, now: number): StepResult {
 }
 
 /** Nightly node scan, bounded to 200 nodes. Fingerprints make repeats harmless and changed cards eligible again. */
-function queueStep(storage: DurableObjectStorage, after: number, now: number): StepResult {
+function queueStep(storage: DurableObjectStorage, who: Who, after: number, now: number): StepResult {
 	const sql = storage.sql;
 	const rows = sql.exec<{ r: number; id: string; kind: string; attrs: string; memory_type: string | null; chars: number; updated_at: string; created_at: string }>(
 		"SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at FROM nodes WHERE rowid > ? AND status IN ('active','candidate') ORDER BY rowid LIMIT ?", after, STEP.queue).toArray();
@@ -203,8 +207,16 @@ function queueStep(storage: DurableObjectStorage, after: number, now: number): S
 		if (digests.some((d) => { try { return ((JSON.parse(d.body) as { corrections?: unknown[] }).corrections?.length ?? 0) > 0; } catch { return false; } })) kinds.push("preference_signal");
 		if (kinds.length) { enqueue(storage, kinds.map((kind) => ({ kind, subjects: [n.id], ...(kind === "stale_journal" ? { slot: String(F) } : {}) }))); items += kinds.length; }
 	}
-	// One weekly slot per profile, including an empty profile; a completed or dismissed slot is never queued again.
-	const lastReview = sql.exec<{ at: string }>("SELECT at FROM activity WHERE op = 'strategic_review' ORDER BY id DESC LIMIT 1").toArray()[0]?.at;
-	if (!lastReview || Date.parse(lastReview) <= now - 7 * DAY) enqueue(storage, [{ kind: "weekly_review", subjects: [], slot: String(Math.floor(now / (7 * DAY))) }]);
+	// One weekly slot per profile, an empty board included, never in me (no background writes there); a completed or dismissed
+	// slot is never queued again, and a review written in the last seven days skips it. Its subjects are the board's top items
+	// as of now, the only nodes the review may link to; the lease shows their board rows as of the item's creation.
+	const slot = Math.floor(now / (7 * DAY));
+	const queued = sql.exec("SELECT 1 FROM maintenance WHERE kind = 'weekly_review' AND created_at >= ? LIMIT 1", new Date(slot * 7 * DAY).toISOString()).toArray().length;
+	const recent = sql.exec("SELECT 1 FROM nodes WHERE kind = 'document' AND status = 'active' AND json_extract(attrs, '$.kind') = 'strategic_review' AND recorded_at > ? LIMIT 1",
+		new Date(now - 7 * DAY).toISOString()).toArray().length;
+	if (who.profile !== "me" && !queued && !recent) {
+		const top = board(sql, { kind: "board", asOf: new Date(now).toISOString(), limit: REVIEW_ITEMS, known: [] }).items.map((i) => i.id);
+		enqueue(storage, [{ kind: "weekly_review", subjects: top, slot: String(slot) }]);
+	}
 	return { more: rows.length === STEP.queue, cursor: String(rows.at(-1)?.r ?? after), stats: { scanned: rows.length, items } };
 }

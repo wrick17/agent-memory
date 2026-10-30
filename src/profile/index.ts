@@ -54,7 +54,7 @@ export async function embedStep(storage: DurableObjectStorage, env: Env, who: Wh
 	storage.transactionSync(() => {
 		const seq = nextSeq(sql, "profile_meta");
 		// The BothQ rule: record embed_hash only if the card did not change while it was embedding.
-		keep.forEach((n) => sql.exec("UPDATE nodes SET embed_hash = card_hash, seq = ? WHERE id = ? AND card_hash = ?", seq, n.id, n.card_hash));
+		keep.forEach((n) => sql.exec("UPDATE nodes SET embed_hash = card_hash, seq = ? WHERE id = ? AND card_hash = ? AND status = 'active'", seq, n.id, n.card_hash));
 	});
 	return due.length === BATCH;
 }

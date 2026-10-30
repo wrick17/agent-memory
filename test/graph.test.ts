@@ -10,6 +10,7 @@ import { EDGE_ROWS, EXPAND_ROWS, expandLinks, explore, trace, timeline, LEVEL_NO
 import { SETTLE_MS, similarStep } from "../src/profile/similar";
 import { sha256 } from "../src/domain/ids";
 import { nextSeq } from "../src/storage";
+import { RELATIONS } from "../src/domain/types";
 
 type Ctx = Awaited<ReturnType<typeof contextFor>>;
 const stub = (c: Ctx, name: string) => {
@@ -332,7 +333,7 @@ describe("review regressions", () => {
 			for (let i = 0; i < 5_100; i++) sql.exec("INSERT INTO edges (src, rel, dst, dst_profile, basis, recorded_at, ended_at, actor, seq) VALUES (?, 'relates_to', ?, '', 'identifier', '2026-01-01', '2026-02-01', 'index', ?)", a, `${a}-${i}`, seq);
 			// SQLite's own count of the rows each edge query read, taken once the query has been consumed.
 			const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
-			const tracked = { exec: (q: string, ...p: SqlStorageValue[]) => { const cur = sql.exec(q, ...p); if (q.startsWith("SELECT id, src") || q.startsWith("SELECT id FROM nodes WHERE id IN")) cursors.push(cur); return cur; } } as SqlStorage;
+			const tracked = { exec: (q: string, ...p: SqlStorageValue[]) => { const cur = sql.exec(q, ...p); if (q.startsWith("SELECT id, src") || q.startsWith("SELECT id FROM nodes WHERE id IN") || q.startsWith("SELECT n.id,n.status")) cursors.push(cur); return cur; } } as SqlStorage;
 			const result = explore(tracked, { kind: "explore", node: { id: a }, depth: 1, known: [], maxEdges: EDGE_ROWS });
 			return { scanned: cursors.reduce((n, cur) => n + cur.rowsRead, 0), result };
 		});
@@ -340,6 +341,42 @@ describe("review regressions", () => {
 		expect(got.result.budget).toMatchObject({ exhausted: true, stopped: "level 1 edges" });
 		expect(got.scanned).toBeLessThanOrEqual(EDGE_ROWS);
 		expect(got.result.budget.edges_read).toBe(got.scanned);
+	});
+
+
+	it("bounds actual discovery reads across frontier, relation and profile fanout", async () => {
+		for (const count of [120, 140]) {
+			const p = await registered("test");
+			const got = await runInDurableObject(p.stub, (_i, s) => {
+				const sql = s.storage.sql, seq = nextSeq(sql, "profile_meta");
+				s.storage.transactionSync(() => {
+					seedNode(sql, seq, "center", "project");
+					for (let i = 0; i < count; i++) {
+						const root = `root-${i}`;
+						seedNode(sql, seq, root, "project"); seedEdge(sql, seq, "center", "depends_on", root);
+						if (i % 4 === 0) { seedNode(sql, seq, `out-${i}`, "project"); seedEdge(sql, seq, root, "depends_on", `out-${i}`); }
+						for (let j = 0; j < 24; j++) {
+							const leaf = `leaf-${i}-${j}`, rel = ["works_on", "depends_on", "part_of", "relates_to", "decided_because", "supersedes"][j % 6]!;
+							seedNode(sql, seq, leaf, rel === "works_on" ? "person" : "project");
+							if (rel === "decided_because") sql.exec("UPDATE nodes SET kind = 'decision', why = 'fanout fixture' WHERE id = ?", leaf);
+							seedEdge(sql, seq, leaf, rel, root);
+						}
+					}
+				});
+				const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+				const measured = { exec(q: string, ...v: SqlStorageValue[]) {
+					const cur = sql.exec(q, ...v);
+					if (q.startsWith("SELECT id, src") || q.startsWith("SELECT n.id,n.status")) cursors.push(cur);
+					return cur;
+				} } as SqlStorage;
+				const result = explore(measured, { kind: "explore", node: { id: "center" }, depth: 2, rels: [...RELATIONS], known: ["me", "work", "personal", "test"], maxEdges: EDGE_ROWS });
+				return { budget: result.budget, scanned: cursors.reduce((n, cur) => n + cur.rowsRead, 0), links: result.links.length };
+			});
+			expect(got.links).toBeGreaterThanOrEqual(count);
+			expect(got.budget.exhausted).toBe(true);
+			expect(got.scanned).toBeLessThanOrEqual(EDGE_ROWS);
+			expect(got.budget.edges_read).toBe(got.scanned);
+		}
 	});
 
 	it("G2: trace path joins links stored in two explicitly followed profiles", async () => {
@@ -641,7 +678,7 @@ it("historical map bounds future-edge discovery reads", async () => {
   sql.exec(`INSERT INTO nodes (id,kind,name,norm_name,status,origin,content_hash,card_hash,recorded_at,created_at,updated_at,seq) VALUES ('hub','project','hub','hub','active','agent','h','h',?,?,?,1)`,early,early,early);
   sql.exec(`WITH RECURSIVE nums(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM nums WHERE i<6000) INSERT INTO edges (src,rel,dst,dst_profile,basis,recorded_at,actor,seq) SELECT 'hub','relates_to','leaf-'||i,'','identifier',?,'test',1 FROM nums`,late);
   const cursors: SqlStorageCursor<Record<string,SqlStorageValue>>[]=[];
-  const measured = {exec(q:string,...v:SqlStorageValue[]){const r=sql.exec(q,...v); if(q.startsWith("SELECT id, src") || q.startsWith("SELECT id FROM nodes WHERE id IN")) cursors.push(r);return r;}} as SqlStorage;
+  const measured = {exec(q:string,...v:SqlStorageValue[]){const r=sql.exec(q,...v); if(q.startsWith("SELECT id, src") || q.startsWith("SELECT id FROM nodes WHERE id IN") || q.startsWith("SELECT n.id,n.status")) cursors.push(r);return r;}} as SqlStorage;
   const control=map(sql,{kind:"map",center:{id:"hub"},depth:2,known:["test"]});
   const result=map(measured,{kind:"map",center:{id:"hub"},depth:2,asOf:"2026-02-01T00:00:00.000Z",known:["test"]});
   return {scanned:cursors.reduce((n,c)=>n+c.rowsRead,0),result,control:{budget:control.budget,truncated:control.truncated}};

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { accountFor, uploadPRs } from "./pr-upload.mjs";
+import { accountFor, ghReader, uploadPRs } from "./pr-upload.mjs";
 
 const REPO = "syntheticorg/web";
 const T0 = Date.parse("2026-10-30T00:00:00.000Z");
@@ -151,4 +151,110 @@ test("retries incomplete PRs at the same revision beyond the lookback and keeps 
  clock=at(130);const done=await uploadPRs(options);
  assert.deepEqual(done.incomplete,[]);
  assert.ok(sent.some(b=>b.prs.some(p=>p.reviewers.includes("recovered"))),"same-T completion outside the window must be sent");
+});
+
+/** A gh executable on disk: a stored token per account, the login GitHub names for each token, one GraphQL page. It logs every call. */
+function fakeGh(t, config) {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "am-synthetic-gh-")), bin = path.join(dir, "gh"), log = path.join(dir, "log.jsonl");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const set = (c) => fs.writeFileSync(path.join(dir, "gh.json"), JSON.stringify(c));
+	set(config);
+	// A failure echoes the token on stderr, as a verbose gh might.
+	fs.writeFileSync(bin, `#!${process.execPath}
+const fs = require("node:fs"), c = JSON.parse(fs.readFileSync(__dirname + "/gh.json", "utf8")), a = process.argv.slice(2), t = process.env.GH_TOKEN;
+fs.appendFileSync(__dirname + "/log.jsonl", JSON.stringify({ args: a, token: t ?? null, ambient: Object.keys(process.env).filter((k) => /^(GH|GITHUB)_/.test(k) && k !== "GH_TOKEN") }) + "\\n");
+const out = a[0] === "auth" ? c.tokens[a[a.indexOf("--user") + 1]] : a[1] === "user" ? c.logins[t] : c.logins[t] && JSON.stringify(c.page);
+if (out === undefined) { process.stderr.write("HTTP 401 for " + t); process.exit(1); }
+process.stdout.write(out + "\\n");
+`, { mode: 0o700 });
+	return { bin, set, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []) };
+}
+const TOKEN = "gho_syntheticPersonalToken";
+const page = (...rows) => ({ data: { search: { nodes: rows.map(graphqlRow) } } });
+
+test("ghReader proves the repo owner's account before one explicit metadata page and keeps its token out of every result", async (t) => {
+	const stateFile = fixture(t), fake = fakeGh(t, { tokens: { wrick17: TOKEN, "pratyush-poddar_seq": "gho_syntheticWork" }, logins: { [TOKEN]: "Wrick17", gho_syntheticWork: "pratyush-poddar_seq" },
+		page: page(row(1, 5, { reviewRequests: [{ __typename: "User", login: "WRICK17" }] })) });
+	// Ambient tokens, host and debug settings never reach gh; its config location does.
+	const env = { ...process.env, GH_TOKEN: "gho_ambient", GITHUB_TOKEN: "gho_ambient", GH_HOST: "elsewhere.invalid", GH_DEBUG: "api", GH_CONFIG_DIR: "/synthetic/gh" };
+	assert.equal(ghReader("sequoia-us/app", { bin: fake.bin }).account, "pratyush-poddar_seq");
+	const gh = ghReader(REPO, { bin: fake.bin, env });
+	assert.equal(JSON.stringify(gh), '{"account":"wrick17"}');
+	let body;
+	const out = await uploadPRs({ repo: REPO, profile: "test", since: at(0), stateFile, gh, ownerLogin: gh.account, now: () => at(10), send: async (b) => { body = b; return receipt(b); } });
+	assert.deepEqual(out, { status: "acknowledged", prs: 1, incomplete: [] });
+	const calls = fake.calls();
+	assert.deepEqual(calls.map((c) => c.args.slice(0, 2)), [["auth", "token"], ["api", "user"], ["api", "graphql"]]);
+	assert.deepEqual(calls[0].args, ["auth", "token", "--hostname", "github.com", "--user", "wrick17"]);
+	assert.deepEqual(calls.map((c) => c.token), [null, TOKEN, TOKEN]);
+	assert.ok(calls.every((c) => c.ambient.join() === "GH_CONFIG_DIR"));
+	assert.match(calls[2].args.find((a) => a.startsWith("query=")), /search\(query:\$q,type:ISSUE,first:50\)/);
+	assert.equal(body.prs[0].review_requested_from_owner, true);
+	assert.doesNotMatch(JSON.stringify([out, body]) + fs.readFileSync(stateFile, "utf8"), /gho_/);
+});
+
+test("a wrong gh login reads no metadata and uploads nothing, and held bytes resend before any new gh call", async (t) => {
+	const stateFile = fixture(t), sent = [], as = (login) => ({ tokens: { wrick17: TOKEN }, logins: login ? { [TOKEN]: login } : {}, page: page(row(1, 5)) });
+	const fake = fakeGh(t, as("someone-else"));
+	const send = async (b) => { sent.push(JSON.stringify(b)); if (sent.length === 1) throw new Error("response lost"); return receipt(b); };
+	const run = () => uploadPRs({ repo: REPO, profile: "test", since: at(0), stateFile, gh: ghReader(REPO, { bin: fake.bin }), ownerLogin: "wrick17", now: () => at(10), send });
+	await assert.rejects(run(), (e) => e.message === "gh_account_mismatch");
+	assert.deepEqual(fake.calls().map((c) => c.args[1]), ["token", "user"]);
+	assert.equal(fs.existsSync(stateFile), false);
+	fake.set(as("wrick17"));
+	assert.equal((await run()).reason, "upload_failed");
+	const kept = JSON.parse(fs.readFileSync(stateFile, "utf8")), calls = fake.calls().length;
+	// The next run's account now answers as someone else, so any gh call would fail; the held bytes still go first, alone.
+	fake.set(as("someone-else"));
+	assert.deepEqual(await run(), { status: "acknowledged", prs: 1, incomplete: [] });
+	assert.equal(fake.calls().length, calls);
+	assert.deepEqual(sent, [kept.pending.requests[0], kept.pending.requests[0]]);
+	// gh's stderr, which echoes the token here, never becomes the error, and the reader runs nothing but GraphQL reads.
+	fake.set(as(undefined));
+	const gh = ghReader(REPO, { bin: fake.bin });
+	await assert.rejects(gh.run(fake.calls().find((c) => c.args[1] === "graphql").args), (e) => e.message === "gh_failed");
+	await assert.rejects(gh.run(["auth", "token"]), (e) => e.message === "gh_read_only");
+	assert.equal(fake.calls().at(-1).args[1], "user");
+	assert.equal(sent.length, 2);
+});
+
+test("ghReader accepts only the uploader's two argument shapes before reading credentials", async (t) => {
+	const stateFile = fixture(t), queries = [];
+	let retry = false;
+	const exec = async (_bin, args) => {
+		if (args[0] === "auth") return TOKEN;
+		if (args[1] === "user") return "wrick17";
+		queries.push([...args]);
+		return args.some((a) => a.startsWith("q=")) ? JSON.stringify(page(...(retry ? [] : [row(1, 5, { reviews: null })]))) :
+			JSON.stringify({ data: { repository: { pullRequest: graphqlRow(row(1, 5)) } } });
+	};
+	const options = { repo: REPO, profile: "test", since: at(0), stateFile, ownerLogin: "wrick17", gh: ghReader(REPO, { exec }),
+		send: async (body) => receipt(body), now: () => at(retry ? 50 : 10) };
+	assert.deepEqual((await uploadPRs(options)).incomplete, [`github:${REPO}#1`]);
+	retry = true;
+	assert.deepEqual((await uploadPRs(options)).incomplete, []);
+	const searchArgs = queries[0], retryArgs = queries.at(-1);
+	assert.ok(retryArgs.includes("number=1"));
+	let calls = 0;
+	const guarded = ghReader(REPO, { exec: async (_bin, args) => { calls++; return args[1] === "user" ? "wrick17" : TOKEN; } });
+	for (const args of [
+		[...searchArgs, "-f", 'query=mutation{addStar(input:{starrableId:"SYNTHETIC"}){starrable{id}}}'],
+		searchArgs.map((a) => a === "github.com" ? "different.ghe.com" : a),
+		[...searchArgs, "-H", "Authorization: synthetic-foreign"],
+		[...retryArgs, "-F", "number=2"],
+		searchArgs.map((a) => a.startsWith("query=") ? "query=query($n:Int!){viewer{login}}" : a),
+	]) await assert.rejects(guarded.run(args), (e) => e.message === "gh_read_only");
+	assert.equal(calls, 0);
+	let release;
+	const actual = [], mutable = [...searchArgs], pinned = ghReader(REPO, { exec: async (_bin, args) => {
+		if (args[0] === "auth") return new Promise((resolve) => { release = resolve; });
+		if (args[1] === "user") return "wrick17";
+		actual.push(args);
+		return "{}";
+	} });
+	const pending = pinned.run(mutable);
+	mutable.push("-H", "Authorization: synthetic-foreign");
+	release(TOKEN);
+	await pending;
+	assert.deepEqual(actual, [searchArgs]);
 });

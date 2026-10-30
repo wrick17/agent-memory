@@ -14,7 +14,10 @@ import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
 import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
 import { activity, entity, journal, journals, map, pageTimeline, shownIds } from "./pages";
+import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
+import { archiveCursor, archiveOperation, archiveStatus, deferArchive, nextArchiveAlarm, nextArchiveOperation, runArchive, stagedArchiveActivity, stagedUndo, type ArchiveCommand } from "./archive-operations";
+export type { ArchiveCommand } from "./archive-operations";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
@@ -105,6 +108,12 @@ export class ProfileStore extends DurableObject<Env> {
 			// A restore's ids are the archived records, checked against the account's wipe ledger like any other write's.
 			await this.access(who, cmd.op === "restore" ? archivedNodeIds(this.ctx.storage.sql, cmd.args.activity_id) : writeIds(who, cmd));
 			this.bind(who);
+			if (cmd.op === "undo" && stagedArchiveActivity(this.ctx.storage.sql,cmd.args.activity_id)) {
+				const a=this.ctx.storage.sql.exec<{result:string}>("SELECT result FROM requests WHERE request_id=?",cmd.args.request_id).toArray()[0];
+				const next=a ? {action:"restore" as const,activity_id:cmd.args.activity_id,request_id:cmd.args.request_id} : stagedUndo(this.ctx.storage.sql,cmd.args.activity_id)!.command;
+				const result=await this.archiveOperation(who,next,ctx,cmd.args.activity_id);
+				return result.ok ? ok({...result.value,created:[]}) : result;
+			}
 			const out = this.metered(runWrite(this.ctx.storage, who, cmd, ctx));
 			if (((out.embedDue && embeddingsOn(this.env)) || foldDue(this.ctx.storage.sql)) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
 			else if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 60_000); // starts housekeeping
@@ -114,6 +123,40 @@ export class ProfileStore extends DurableObject<Env> {
 			if (e instanceof Error && e.message.includes("import_pending")) return { ok: false, error: { code: "busy", message: "a record with this id is still being imported; retry later" } };
 			throw e;
 		}
+	}
+
+	/** Owner-only archive RPC; the account binding is established before any page can commit. */
+	async archiveOperation(who:Who,cmd:ArchiveCommand,ctx:WriteContext,undoOf?:number):Promise<Outcome<Record<string,unknown>>> {
+		if(ctx.actor!=="owner")return {ok:false,error:{code:"forbidden",message:"only the owner may run archive operations"}};
+		const account=this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore,"bindRequest"|"releaseRequest"|"resolveNode">;
+		const hash=undoOf?ctx.payloadHash:requestHash("archive",cmd), op=undoOf?"undo":"archive";
+		let newBinding=false,committed=false;
+		try {
+			const sql=this.ctx.storage.sql;
+			const ids=cmd.action === "forget"?[cmd.memory_id]:cmd.action === "restore"?archivedNodeIds(sql,cmd.activity_id):[archiveOperation(sql,cmd.operation_id)?.node??""];
+			await this.access(who,ids);
+			const bound=await account.bindRequest({requestId:cmd.request_id,profile:who.profile,op,payloadHash:hash,generation:who.generation});
+			if(!bound.ok)throw new Fail(bound.error);
+			newBinding=!bound.value.existing;
+			if(bound.value.profile!==who.profile)throw Fail.of("idempotency_mismatch","request belongs to another profile");
+			const alarm=await this.ctx.storage.getAlarm();
+			if(alarm===null||alarm>Date.now()+1000)await this.ctx.storage.setAlarm(Date.now()+1000);
+			for(const id of ids.filter(Boolean)){
+				const owner=await account.resolveNode(id);
+				await this.access(who,[id]);
+				if(owner!==null&&owner!==who.profile)throw Fail.of("not_found","the record is owned by another profile");
+			}
+			await this.access(who,ids);this.bind(who);
+			const value=this.metered(runArchive(this.ctx.storage,who,cmd,ctx,undoOf));committed=true;
+			const o=archiveOperation(sql,String(value.operation_id));
+			if(o?.action === "restore"&&o.state === "complete")await this.register(who,[o.node]);
+			return ok(value);
+		}catch(e){if(e instanceof Fail)return {ok:false,error:e.failure};throw e;}
+		finally {if(newBinding&&!committed)await account.releaseRequest(cmd.request_id,hash);}
+	}
+	async archiveOperationStatus(who:Who,id:string):Promise<Outcome<Record<string,unknown>>> {
+		try{await this.access(who,[archiveOperation(this.ctx.storage.sql,id)?.node??""]);this.bind(who,true);return ok(archiveStatus(this.ctx.storage.sql,who,id));}
+		catch(e){if(e instanceof Fail)return {ok:false,error:e.failure};throw e;}
 	}
 
 	/** The me guard's term table, written only by AccountStore before it confirms a term registration (section 5). */
@@ -134,12 +177,12 @@ export class ProfileStore extends DurableObject<Env> {
 
 	/** Capture digests and manifests (section 10). Never through the memory write path: digests are not memories. */
 	/** One step of the staged import (stage, prepare, publish, link), in one transaction. Publishing an active record schedules its embedding. */
-	async importStep(who: Who, step: ImportStep): Promise<Outcome<ImportResult>> {
+	async importStep(who: Who, step: ImportStep, check = false): Promise<Outcome<ImportResult>> {
 		try {
 			await this.access(who, step.op === "link" ? [step.src, step.dst] : [step.record_id]);
 			this.bind(who);
 			if (sizeLevel(this.ctx.storage.sql.databaseSize) === "shrink_only") throw Fail.of("size_budget", "this profile is over 90% of its size limit; imports are paused");
-			const out = this.metered(runImport(this.ctx.storage, step));
+			const out = this.metered(runImport(this.ctx.storage, step, who.profile, check));
 			if (out.embed && embeddingsOn(this.env) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
 			return ok(out);
 		} catch (e) {
@@ -156,14 +199,14 @@ export class ProfileStore extends DurableObject<Env> {
 			if (cmd.op === "next") return ok(this.metered(next(this.ctx.storage, cmd)));
 			if ("status" in cmd) return ok(this.metered(finishBatch(this.ctx.storage, cmd, job)));
 			// The wakeup is armed before an item can commit its outbox row, so a crash right after the commit is still settled.
-			if (cmd.results.some((r) => r.ops.some((o) => o.op === "infer_preference" || o.op === "promote_to_me"))) {
+			if (cmd.results.some((r) => r.ops.some((o) => o.op === "infer_preference" || o.op === "promote_to_me" || o.op === "strategic_review"))) {
 				const due = Date.now() + RESUME_MS, at = await this.ctx.storage.getAlarm();
 				if (at === null || at > due) await this.ctx.storage.setAlarm(due);
 				await this.access(who);
 			}
 			const out = this.metered(complete(this.ctx.storage, who, cmd, job));
 			if (((out.embedDue && embeddingsOn(this.env)) || foldDue(this.ctx.storage.sql)) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
-			// Inferred preferences, fresh or replayed, are registered for this generation before any result is acknowledged.
+			// Created records (inferred preferences, reviews), fresh or replayed, are registered for this generation before any result is acknowledged.
 			const created = out.results.flatMap((r) => ("ops" in r && Array.isArray(r.ops) ? (r.ops as OpOutcome[]) : []).flatMap((o) => o.created ?? []));
 			if (created.length) try { await this.register(who, created); } catch (e) {
 				if (e instanceof Fail) throw e;
@@ -438,6 +481,20 @@ export class ProfileStore extends DurableObject<Env> {
 			let background = true, meterError: string | null = null;
 			try { reported = pendingRows(sql); background = (await account.meter({ day, rowsWritten: reported })).background; } catch (e) { meterError = (e as Error).message.slice(0, 500); }
 			await gate();
+			let archiveMore=false;
+			const archive=nextArchiveOperation(sql);
+			if(archive){
+				await this.access(who,[archive.node]);
+				const c={action:"resume" as const,operation_id:archive.id,cursor:archiveCursor(archive),request_id:`archive-auto:${archive.id}:${archive.version}`};
+				const r=await this.archiveOperation(who,c,{actor:"owner",platform:"archive-alarm",routedBy:"explicit",userId:who.userId,payloadHash:requestHash("archive",c),meGuard:archive.me});
+				if(!r.ok){
+					await this.access(who,[archive.node]);
+					this.ctx.storage.transactionSync(()=>deferArchive(new BudgetTx(sql,nextSeq(sql,"profile_meta"),new Date().toISOString()),archive.id,r.error.code));
+					await failed("archive",new Error(r.error.code));
+				}
+				archiveMore=Boolean(nextArchiveOperation(sql));
+			}
+			await gate();
 			let more = false, embedError: string | null = null;
 			// An embedding outage must not stop retention, cleanup or queue work; the gate below still stops a closed generation.
 			try {
@@ -508,7 +565,7 @@ export class ProfileStore extends DurableObject<Env> {
 			await gate();
 			flushRows(this.ctx.storage);
 			// The alarm always comes back for the earliest stage due, so housekeeping runs with or without embeddings.
-			await this.ctx.storage.setAlarm(Math.max(Math.min(more ? Date.now() : embedError === null && meterError === null ? Infinity : Date.now() + RETRY_MS, next ?? Infinity, moves ?? Infinity, nextOutbox(this.ctx.storage.sql) ?? Infinity, (folding || foldDue(this.ctx.storage.sql)) ? Date.now() : Infinity, due, dangling), Date.now() + 1_000));
+			await this.ctx.storage.setAlarm(Math.max(Math.min(more ? Date.now() : embedError === null && meterError === null ? Infinity : Date.now() + RETRY_MS, next ?? Infinity, moves ?? Infinity, nextArchiveAlarm(sql) ?? Infinity, nextOutbox(this.ctx.storage.sql) ?? Infinity, (archiveMore || folding || foldDue(this.ctx.storage.sql)) ? Date.now() : Infinity, due, dangling), Date.now() + 1_000));
 		} catch (e) {
 			const stop = e instanceof Stopped ? e : await gate().then(() => null, (s: unknown) => (s instanceof Stopped ? s : null));
 			if (stop && !stop.retry) return;

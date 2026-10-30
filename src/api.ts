@@ -209,9 +209,9 @@ const refreshFinalize = refreshStage.extend({ base_revision: z.number().int().mi
 const importCommand = z.discriminatedUnion("op", [
 	z.object({ op: z.literal("stage"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), part: z.number().int().min(1), parts: z.number().int().min(1).max(1000),
 		rows: z.object({ texts: z.array(importText).max(1000), revisions: z.array(importRevision).max(1000), requests: z.array(importRequest).max(1000) }).strict(),
-		cost: z.object({ rows: z.number().int(), bytes: z.number().int() }).strict(), part_id: z.string().max(300), sha256: hex64, refresh: refreshStage.optional() }).strict(),
+		cost: z.object({ rows: z.number().int(), bytes: z.number().int() }).strict(), part_id: z.string().max(300), sha256: hex64, refresh: refreshStage.optional(), policy_version: z.literal(1).optional(), classification_version: z.literal(1).optional() }).strict(),
 	z.object({ op: z.literal("finalize"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), node: importNode,
-		parts: z.array(z.object({ part_id: z.string().max(300), sha256: hex64 }).strict()).min(1).max(1000), request_ids: z.array(z.string().min(1).max(256)).max(5000), sha256: hex64, refresh: refreshFinalize.optional() }).strict(),
+		parts: z.array(z.object({ part_id: z.string().max(300), sha256: hex64 }).strict()).min(1).max(1000), request_ids: z.array(z.string().min(1).max(256)).max(5000), sha256: hex64, refresh: refreshFinalize.optional(), policy_version: z.literal(1).optional(), classification_version: z.literal(1).optional() }).strict(),
 	z.object({ op: z.literal("link"), src: id, rel: z.literal("supersedes"), dst: id, basis: z.literal("identifier"), profile: z.string().regex(PROFILE_NAME), sha256: hex64 }).strict(),
 ]);
 const importSchema = z.object({ import_id: z.string().max(128).optional(), batch: z.number().int().min(1).optional(), commands: z.array(importCommand).min(1).max(50) }).strict();
@@ -272,7 +272,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 		// The personal-field rule for every node (section 4): an import that would lose an attribute to it is refused, never rewritten.
 		if (c.op === "finalize" && stripPersonal(c.node.kind, c.node.attrs).stripped.length) { refused("personal_fields", "the node carries attributes the personal-field rule removes; it is refused, never rewritten"); continue; }
 		const stub = profileStub(env, ref);
-		const step = async (s: ImportStep) => stub.importStep(ref, s);
+		const step = async (s: ImportStep, check = false) => stub.importStep(ref, s, check);
 		const take = (r: Awaited<ReturnType<typeof step>>) => {
 			if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); return null; }
 			return r.value;
@@ -280,13 +280,16 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 		if (c.op === "stage") {
 			// Reserve the part's request ids account-wide first, so no ordinary call in any profile can take one before publication.
 			const wanted = c.rows.requests.map((q) => ({ request_id: q.request_id, op: q.legacy_op, hash: q.legacy_hash }));
+			const staged: ImportStep = { op: "stage", record_id: c.record_id, record_sha256: c.record_sha256, part: c.part, parts: c.parts, part_id: c.part_id, sha256: c.sha256, rows: c.rows, ...(c.policy_version ? {policy_version:c.policy_version} : {}), ...(c.classification_version ? {classification_version:c.classification_version} : {}), ...(c.refresh ? { refresh: c.refresh } : {}) };
+			// The profile's own import guards run first, so a stage they refuse leaves no account-wide reservation behind.
+			if (wanted.length && !take(await step(staged, true))) continue;
 			let reserved = true;
 			for (let i = 0; i < wanted.length; i += 400) {
 				const r = await account.reserveImport({ profile: c.profile, requests: wanted.slice(i, i + 400) });
 				if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); reserved = false; break; }
 			}
 			if (!reserved) continue;
-			const r = take(await step({ op: "stage", record_id: c.record_id, record_sha256: c.record_sha256, part: c.part, parts: c.parts, part_id: c.part_id, sha256: c.sha256, rows: c.rows, ...(c.refresh ? { refresh: c.refresh } : {}) }));
+			const r = take(await step(staged));
 			if (r) receipts.push({ ...base, status: r.status, rows_written: r.rows_written ?? 0, bytes: r.bytes ?? 0 });
 			continue;
 		}
@@ -295,7 +298,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 			if (r) receipts.push({ ...base, status: r.status });
 			continue;
 		}
-		const fin = { record_id: c.record_id, record_sha256: c.record_sha256, node: c.node, parts: c.parts, request_ids: c.request_ids, ...(c.refresh ? { refresh: c.refresh } : {}) };
+		const fin = { record_id: c.record_id, record_sha256: c.record_sha256, node: c.node, parts: c.parts, request_ids: c.request_ids, ...(c.policy_version ? {policy_version:c.policy_version} : {}), ...(c.classification_version ? {classification_version:c.classification_version} : {}), ...(c.refresh ? { refresh: c.refresh } : {}) };
 		const prep = take(await step({ op: "prepare", ...fin }));
 		if (!prep) continue;
 		if (prep.status === "published") { receipts.push({ ...base, status: "replayed" }); continue; }
@@ -337,7 +340,7 @@ const isoOf = (s: string | undefined) => (s ? new Date(s).toISOString() : undefi
 const TIMELINE_DAYS = 90;
 
 const auditQuery = z.object({ profile: z.string().regex(PROFILE_NAME), after: z.string().min(1).max(300).optional(), limit: z.coerce.number().int().min(1).max(200).optional(),
-	record: id.optional(), rows: z.enum(["revisions", "requests"]).optional() }).strict();
+	record: id.optional(), rows: z.enum(["revisions", "requests", "texts"]).optional() }).strict();
 
 /**
  * GET /v1/import/audit: read-only digests of what the import stored, for the owner or an import device that may use the
@@ -514,6 +517,28 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			...(typeof b.default_profile === "string" ? { defaultProfile: b.default_profile } : {}),
 			...(typeof b.expires_at === "string" ? { expiresAt: b.expires_at } : {}) });
 	}
+	const archiveOp = /^\/api\/profiles\/([^/]+)\/archive\/operations(?:\/([a-f0-9-]{36})(?:\/(resume|abort))?)?$/.exec(url.pathname);
+	if(archiveOp && (request.method === "POST" || request.method === "GET")) {
+		const ref=ctx.value.profiles.find(p=>p.profile===archiveOp[1]);
+		if(!ref)return json({error:{code:"not_found",message:"profile is not active"}},404);
+		if(request.method === "GET") {
+			if(!archiveOp[2]||archiveOp[3])return json({error:{code:"not_found"}},404);
+			const r=await profileStub(env,ref).archiveOperationStatus(ref,archiveOp[2]);
+			return r.ok?json(r.value):json({error:r.error},r.error.code === "not_found"?404:400);
+		}
+		const requestId=z.string().min(1).max(256), shortId=z.string().min(1).max(128);
+		const schema=archiveOp[3]?z.object({cursor:z.string().min(1).max(1024),request_id:requestId}).strict():z.discriminatedUnion("action",[
+			z.object({action:z.literal("forget"),memory_id:shortId,expected_revision:z.number().int().min(1),request_id:requestId}).strict(),
+			z.object({action:z.literal("restore"),activity_id:z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),request_id:requestId}).strict()]);
+		if(archiveOp[2]&&!archiveOp[3])return json({error:{code:"not_found"}},404);
+		const parsed=schema.safeParse(await body(request));
+		if(!parsed.success)return json({error:{code:"validation",message:"invalid archive operation"}},400);
+		const cmd=(archiveOp[3]?{...parsed.data,action:archiveOp[3],operation_id:archiveOp[2]}:parsed.data) as import("./profile/store").ArchiveCommand;
+		const r=await profileStub(env,ref).archiveOperation(ref,cmd,{actor:"owner",platform:"dashboard",routedBy:"explicit",userId:auth.principal.userId,payloadHash:requestHash("archive",cmd),
+			...(ref.profile === "me"?{meGuard:{explicit:true,context:null,companyFree:false,sensitiveTerms:ctx.value.sensitiveTerms}}:{})});
+		return r.ok?json(r.value):json({error:r.error},r.error.code === "not_found"?404:r.error.code === "revision_conflict"||r.error.code === "moving"?409:r.error.code === "size_budget"?413:400);
+	}
+
 	// The owner's node actions and undo (section 15): ordinary writes as actor owner, each with its activity row and undo.
 	const node = /^\/api\/profiles\/([^/]+)\/nodes\/([^/]{1,128})\/(pin|unpin|forget|unflag)$/.exec(url.pathname);
 	const undo = /^\/api\/profiles\/([^/]+)\/activity\/(\d{1,15})\/undo$/.exec(url.pathname);

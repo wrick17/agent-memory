@@ -152,7 +152,8 @@ export function board(sql: SqlStorage, q: BoardQuery) {
 	}).sort((x, y) => y.score - x.score || x.id.localeCompare(y.id));
 
 	// shortcut: reads every active document through nodes_kind to find the newest review; index attrs.kind if documents grow large.
-	const review = sql.exec<{ id: string; name: string; description: string; recorded_at: string }>(`SELECT id, name, substr(description, 1, 280) AS description, recorded_at
+	const review = sql.exec<{ id: string; name: string; description: string; recorded_at: string; data_as_of: string | null; coverage: string | null }>(`SELECT id, name,
+		substr(description, 1, 280) AS description, recorded_at, json_extract(attrs, '$.as_of') AS data_as_of, json_extract(attrs, '$.coverage') AS coverage
 		FROM nodes WHERE kind = 'document' AND status = 'active' AND recorded_at <= ? AND json_extract(attrs, '$.kind') = 'strategic_review'
 		ORDER BY recorded_at DESC, id DESC LIMIT 1`, asOf).toArray()[0];
 
@@ -160,6 +161,24 @@ export function board(sql: SqlStorage, q: BoardQuery) {
 		as_of: asOf, covers_only_uploaded_data: true as const,
 		note: "Covers only what the owner's machines have uploaded. Item fields are their latest upload; as_of dates links, due dates and activity.",
 		items: items.slice(0, q.limit), total: items.length, truncated: items.length > q.limit, without_state: counts.without_state,
-		review: review ? { ...review, age_days: Math.floor((ms - Date.parse(review.recorded_at)) / DAY) } : null, budget: b,
+		review: review ? { id: review.id, name: review.name, description: review.description, recorded_at: review.recorded_at, age_days: Math.floor((ms - Date.parse(review.recorded_at)) / DAY),
+			// A batch-written review also says which board it read: its data as_of and that board's coverage.
+			...(review.data_as_of ? { data_as_of: review.data_as_of, coverage: JSON.parse(review.coverage ?? "null") as ReviewCoverage | null } : {}) } : null,
+		budget: b,
 	};
+}
+
+/** At most this many board items are a weekly review's subjects: the only nodes it may link to or cite. */
+export const REVIEW_ITEMS = 20;
+export interface ReviewCoverage { open: number; scored: number; without_state: number; partial: boolean; reviewed: number; profile_local: true }
+
+/**
+ * The board a weekly review reads (section 13): this profile only (links into other profiles are not read), as of the item's
+ * creation, so every lease and the write see the same as_of. `items` are the subjects' rows; coverage says how much of the
+ * uploaded board they are.
+ */
+export function reviewBoard(sql: SqlStorage, asOf: string, subjects: string[]) {
+	const b = board(sql, { kind: "board", asOf, limit: LEVEL_NODES, known: [] }), want = new Set(subjects);
+	const coverage: ReviewCoverage = { open: b.total + b.budget.skipped, scored: b.total, without_state: b.without_state, partial: b.budget.exhausted, reviewed: subjects.length, profile_local: true };
+	return { as_of: b.as_of, covers_only_uploaded_data: true as const, coverage, items: b.items.filter((i) => want.has(i.id)) };
 }

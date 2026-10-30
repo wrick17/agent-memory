@@ -1,3 +1,4 @@
+import { archiveNodeIds } from "./write";
 // The maintenance queue (sections 7 and 12): deterministic items leased to the confined daily batch, and their results applied
 // through the normal write path with actor maintenance. Each op stays inside its item's subjects, and any op that touches a
 // protected node (stated, pinned, or anything in me) becomes a flag on it instead.
@@ -8,9 +9,10 @@ import { nextSeq } from "../storage";
 import { BudgetTx } from "./archive";
 import { flagProtected, mayChange } from "./protect";
 import { assertWritable, RESUME_MS } from "./transfer";
-import { assertOpen } from "./wipe";
+import { assertNotWiped, assertOpen } from "./wipe";
 import { fenceOf } from "./compact";
 import { captureText, readPrefix, runWrite, type Who } from "./write";
+import { reviewBoard } from "./board";
 import { readableNodeIds } from "./graph";
 
 export const MAX_ITEMS = 40;
@@ -23,6 +25,8 @@ export const ALLOWED_OPS = ["save", "compact", "link", "end_link", "supersede", 
 export function opsFor(kind: string): string[] {
 	// A dangling link's target is opaque here: the batch may only end the link, flag its source or dismiss the item.
 	if (kind === "dangling_link") return ["end_link", "flag", "dismiss"];
+	// The weekly item only writes the review document; its subjects are board items it may link to, never change.
+	if (kind === "weekly_review") return ["strategic_review", "dismiss"];
 	const infer = kind === "preference_signal" || kind === "unprocessed_capture";
 	return [...ALLOWED_OPS, ...(infer ? ["infer_preference"] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
 }
@@ -37,7 +41,11 @@ export type MaintenanceOp =
 	| { op: "flag"; node: string; reason: string }
 	| { op: "dismiss" }
 	| { op: "infer_preference"; name: string; description: string; why?: string; how_to_apply?: string; scope?: string; evidence: Evidence[] }
-	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true };
+	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true }
+	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] };
+/** A review's link to one board item it discusses (relates_to), cited by node pointers to the item's subjects. */
+export type ReviewLink = { to: string; reason: string; evidence: { kind: "node"; ref: string; note?: string }[] };
+export const REVIEW_LINKS = 20;
 export type MaintenanceCmd =
 	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number }
 	| { op: "complete"; lease_id: string; results: { item_id: number; ops: MaintenanceOp[] }[] }
@@ -101,7 +109,7 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), iso);
 		release(tx);
 		const kinds = q.kinds?.length ? JSON.stringify(q.kinds) : null;
-		const items = sql.exec<{ id: number; kind: string; subjects: string }>(`SELECT id, kind, subjects FROM maintenance WHERE state = 'open'
+		const items = sql.exec<{ id: number; kind: string; subjects: string; created_at: string }>(`SELECT id, kind, subjects, created_at FROM maintenance WHERE state = 'open'
 			AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, kinds, kinds, limit).toArray();
 		if (!items.length) return { lease_id: null, items: [], next_allowed_at: null };
 		const leaseId = crypto.randomUUID(), until = new Date(now + lease * 1000).toISOString();
@@ -111,7 +119,8 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at`, iso);
 		return {
 			lease_id: leaseId, lease_until: until,
-			items: items.map((i) => ({ item_id: i.id, kind: i.kind, subjects: JSON.parse(i.subjects) as string[], context: context(sql, JSON.parse(i.subjects) as string[], i.kind), allowed_ops: opsFor(i.kind) })),
+			items: items.map((i) => ({ item_id: i.id, kind: i.kind, subjects: JSON.parse(i.subjects) as string[], context: context(sql, JSON.parse(i.subjects) as string[], i.kind), allowed_ops: opsFor(i.kind),
+				...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, JSON.parse(i.subjects) as string[]) } : {}) })),
 		};
 	});
 }
@@ -128,12 +137,14 @@ function context(sql: SqlStorage, subjects: string[], kind: string) {
 	if (kind === "unprocessed_capture" || kind === "preference_signal") {
 		for (const n of sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'candidate'", JSON.stringify(subjects)).toArray()) readable.add(n.id);
 	}
+	for (const id of archiveNodeIds(sql,[...readable])) readable.delete(id);
 	const ids = JSON.stringify([...readable]);
 	const nodes = sql.exec<{ id: string; kind: string; other_label: string | null; memory_type: string | null; scope: string; name: string; description: string; status: string; origin: string; pinned: number; revision: number }>(
 		"SELECT id, kind, other_label, memory_type, scope, name, description, status, origin, pinned, revision FROM nodes WHERE id IN (SELECT value FROM json_each(?))", ids).toArray()
 		.map((n) => ({ ...n, ...(n.kind === "journal" ? journalPrefix(sql, n.id) : {}), passage: n.other_label === "capture" ? captureText(sql, n.id).slice(0, 1200) : readPrefix(sql, n.id) }));
 	const refs = sql.exec<{ id: number; src: string }>("SELECT id, src FROM edges WHERE ended_at IS NULL AND (src IN (SELECT value FROM json_each(?)) OR dst IN (SELECT value FROM json_each(?))) LIMIT 50", ids, ids).toArray();
 	const sources = readableNodeIds(sql, [...new Set(refs.map((e) => e.src))]);
+	for (const id of archiveNodeIds(sql,[...sources])) sources.delete(id);
 	// A capture item may read its own candidate subjects, never an unrelated incoming candidate's reason.
 	if (kind === "unprocessed_capture" || kind === "preference_signal") for (const id of readable) sources.add(id);
 	const edges = sql.exec("SELECT id, src, rel, dst, dst_profile, basis, reason FROM edges WHERE id IN (SELECT value FROM json_each(?))",
@@ -161,8 +172,8 @@ export function complete(storage: DurableObjectStorage, who: Who, raw: { lease_i
 	// Model text is redacted before anything is applied, hashed or flagged, as on every other write path.
 	const c = redactPayload(raw);
 	const sql = storage.sql, now = Date.now();
-	const items = new Map(sql.exec<{ id: number; kind: string; subjects: string; state: string; lease_until: string | null; outcome: string | null }>(
-		"SELECT id, kind, subjects, state, lease_until, outcome FROM maintenance WHERE lease_id = ?", c.lease_id).toArray().map((r) => [r.id, r]));
+	const items = new Map(sql.exec<{ id: number; kind: string; subjects: string; state: string; lease_until: string | null; outcome: string | null; created_at: string }>(
+		"SELECT id, kind, subjects, state, lease_until, outcome, created_at FROM maintenance WHERE lease_id = ?", c.lease_id).toArray().map((r) => [r.id, r]));
 	// wiring: ErrorCode gains "lease_expired".
 	const expired = () => Fail.of("lease_expired" as ErrorCode, "this lease expired; its items went back to the queue", { reason: "lease_expired" });
 	if (!items.size) throw expired();
@@ -180,7 +191,7 @@ export function complete(storage: DurableObjectStorage, who: Who, raw: { lease_i
 		const ops: OpOutcome[] = [];
 		for (const [n, op] of r.ops.entries()) {
 			if (!allowed.includes(op.op)) { ops.push({ op: op.op, status: "rejected", code: "validation", reason: "op_not_allowed" }); continue; }
-			const o = apply(storage, who, op, subjects, job, `maint:${c.lease_id}:${item.id}:${n}`, ops);
+			const o = apply(storage, who, op, subjects, job, `maint:${c.lease_id}:${item.id}:${n}`, ops, item);
 			embedDue ||= o.embedDue;
 			ops.push(o.outcome);
 		}
@@ -270,8 +281,9 @@ export function batchStatus(sql: SqlStorage) {
 		last_status: s && stats ? { status: stats.status, reason: s.last_error, items: stats.items, at: s.last_run_at } : null };
 }
 
-/** `earlier`: this item's outcomes so far, so a from_op can name only an op before it. */
-function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subjects: Set<string>, job: JobContext, requestId: string, earlier: OpOutcome[]): { outcome: OpOutcome; embedDue: boolean } {
+/** `earlier`: this item's outcomes so far, so a from_op can name only an op before it. `item`: the leased item, which dates a review. */
+function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subjects: Set<string>, job: JobContext, requestId: string, earlier: OpOutcome[],
+	item: { id: number; created_at: string }): { outcome: OpOutcome; embedDue: boolean } {
 	const sql = storage.sql;
 	const done = (outcome: Omit<OpOutcome, "op">, embedDue = false) => ({ outcome: { op: op.op, ...outcome }, embedDue });
 	const refuse = (reason: string) => done({ status: "rejected", code: "validation", reason });
@@ -298,9 +310,19 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		if ((op.from_op === undefined) === (op.memory_id === undefined) || (op.from_op !== undefined && (made?.op !== "infer_preference" || !made.created?.length))) return refuse("bad_target");
 		touched = [made ? made.created![0]! : op.memory_id!];
 		local = !made;
+	} else if (op.op === "strategic_review") {
+		// A new document that only points at the item's subjects: it changes none of them, and nothing in me.
+		if (who.profile === "me") return done({ status: "rejected", code: "forbidden" });
+		if (!Array.isArray(op.links) || op.links.length > REVIEW_LINKS) return refuse("bad_links");
+		if (op.links.some((l) => !subjects.has(l.to) || !Array.isArray(l.evidence) || !l.evidence.length || l.evidence.some((e) => e.kind !== "node" || !subjects.has(e.ref)))) {
+			return done({ status: "rejected", code: "outside_subjects" });
+		}
+		touched = [];
 	} else {
 		touched = (op.op === "save" || op.op === "compact") ? [op.memory_id] : op.op === "link" ? [op.from, op.to] : op.op === "supersede" ? [op.keep, ...op.retire] : [op.node];
 	}
+	const evidenceIds = "evidence" in op ? (op.evidence ?? []).filter(e=>e.kind === "node").map(e=>e.ref) : [];
+	if (op.op !== "flag" && archiveNodeIds(sql,[...subjects,...touched,...evidenceIds]).length) return refuse("archival_reference");
 	if (local && !touched.every((id) => subjects.has(id))) return done({ status: "rejected", code: "outside_subjects" });
 	const nodes = sql.exec<{ id: string; origin: string; pinned: number; kind: string; status: string }>("SELECT id, origin, pinned, kind, status FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(touched)).toArray();
 	if (nodes.length !== new Set(touched).size) return done({ status: "rejected", code: "not_found" });
@@ -327,7 +349,27 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 	}
 	// Nothing crosses profiles here: the Worker moves the record through the C3 transfer under this deterministic id.
 	if (op.op === "promote_to_me") return done({ status: "transfer_started", memory_id: touched[0]!, transfer_id: uuid5(requestId.replace(/^maint:/, `${who.userId}:promote:`)), company_free: true, me: job.me! });
-	const cmd: WriteCommand = op.op === "infer_preference" ? { op: "save", args: { name: op.name, type: "user", kind: "preference", description: op.description,
+	// The request row commits with the save and survives archival/undo. A later lease replays that outcome, never a new draft.
+	const review = op.op === "strategic_review" ? { name: `Strategic review ${item.created_at.slice(0, 10)}`, as_of: item.created_at } : undefined;
+	if (review) {
+		requestId = `maint:review:${who.generation}:${item.id}`;
+		const prior = sql.exec<{ node_id: string; result: string }>("SELECT node_id, result FROM requests WHERE request_id = ? AND op = 'save'", requestId).toArray()[0];
+		if (prior) {
+			try { assertOpen(sql); assertNotWiped(sql, prior.node_id); } catch (e) {
+				if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+				throw e;
+			}
+			const result = JSON.parse(prior.result) as { action: string; activity_id?: number };
+			return done({ status: result.action === "flagged" ? "flagged" : "applied", reason: "already_written",
+				...(typeof result.activity_id === "number" ? { activity_id: result.activity_id } : {}),
+				...(result.action === "created" ? { created: [prior.node_id] } : {}) });
+		}
+	}
+	const cmd: WriteCommand = op.op === "strategic_review" ? { op: "save", args: { name: review!.name, type: "reference", kind: "document", description: op.summary, content: op.content,
+			scope: "default", origin: "agent", review: { as_of: review!.as_of, item: item.id, coverage: reviewBoard(sql, review!.as_of, [...subjects]).coverage },
+			// An empty board's review has nothing to link: the shared writer takes links only as a non-empty list.
+			...(op.links.length ? { links: op.links.map((l) => ({ rel: "relates_to" as const, to: { id: l.to }, reason: l.reason, evidence: l.evidence })) } : {}), request_id: requestId } }
+		: op.op === "infer_preference" ? { op: "save", args: { name: op.name, type: "user", kind: "preference", description: op.description,
 			...(op.why !== undefined ? { why: op.why } : {}), ...(op.how_to_apply !== undefined ? { how_to_apply: op.how_to_apply } : {}), scope: op.scope ?? "default",
 			origin: "inferred", evidence: op.evidence, request_id: requestId } }
 		: op.op === "save" ? { op: "save", args: { ...withoutOp(op), request_id: requestId } }
@@ -344,7 +386,7 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		// A replay reports what the first run did; only a created preference is registered and may be promoted.
 		const action = out.result.action === "replayed" ? (JSON.parse(sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ?", requestId).one().result) as { action: string }).action : out.result.action;
 		return done({ status: action === "flagged" ? "flagged" : "applied", ...(typeof out.result.activity_id === "number" ? { activity_id: out.result.activity_id } : {}),
-			...(op.op === "infer_preference" && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
+			...((op.op === "infer_preference" || op.op === "strategic_review") && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
 	} catch (e) {
 		if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
 		throw e;

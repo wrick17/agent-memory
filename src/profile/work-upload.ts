@@ -1,3 +1,4 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // Work uploads (sections 4, 10 and 13): bounded metadata the owner's machines read locally, published through the shared write
 // path as actor `index`. The server never calls GitHub or Jira. Commits, PR snapshots and Jira ticket snapshots (work only).
 import { knowledgeTerms } from "../domain/guard";
@@ -133,6 +134,7 @@ function endUnlisted(tx: Tx, item: "pr" | "ticket", id: string, want: Set<string
 		const field = e.dst === id ? SNAPSHOT_RELS[item].in[e.rel] : SNAPSHOT_RELS[item].out[e.rel];
 		if (want.has(`${e.src} ${e.rel} ${e.dst}`) || !field || unknown.includes(field)) continue;
 		assertWritable(tx.sql, e.src);
+		assertArchiveEndpoints(tx.sql,e.src,e.dst,"");
 		ended += tx.run("UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE id = ?", tx.now, validTo, tx.seq, e.id).rowsWritten ? 1 : 0;
 	}
 	return ended;
@@ -170,6 +172,7 @@ function ensure(tx: Tx, who: Who, created: string[], kind: "project" | "person" 
 /** One current identifier edge; 1 when it is new. A link belongs to its source, so a source being transferred refuses the item (section 9). */
 function identifierEdge(tx: Tx, src: string, rel: string, dst: string, validFrom: string): number {
 	assertWritable(tx.sql, src);
+	assertArchiveEndpoints(tx.sql,src,dst,"");
 	return tx.run(`INSERT OR IGNORE INTO edges (src, rel, dst, dst_profile, basis, valid_from, recorded_at, actor, request_id, seq)
 		VALUES (?, ?, ?, '', 'identifier', ?, ?, ?, ?, ?)`, src, rel, dst, validFrom, tx.now, tx.ctx.actor, tx.requestId, tx.seq).rowsWritten ? 1 : 0;
 }
@@ -361,6 +364,7 @@ function uploadTicket(tx: Tx, who: Who, a: TicketUploadArgs): WriteOutput {
 		// Only this snapshot's removal ends the edge, never before it began; an older word leaves it as the newer one set it.
 		else if (word && "now" in word && p.edge !== undefined) {
 			assertWritable(tx.sql, p.src);
+			assertArchiveEndpoints(tx.sql,p.src,p.dst,"");
 			ended += tx.run("UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE id = ? AND (valid_from IS NULL OR valid_from <= ?)", tx.now, a.updated_at, tx.seq, p.edge, a.updated_at).rowsWritten ? 1 : 0;
 		}
 	}

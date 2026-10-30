@@ -1,3 +1,4 @@
+import { importDelivery, POLICY_ATTRS_SQL, type ImportDelivery } from "../domain/import-policy";
 // Graph reads over one profile (sections 4, 7 and 11): explore, trace, timeline and recall's link expansion. Each read has a
 // work budget and says where it stopped. An endpoint that is not a node of this profile comes back as a foreign id: only the
 // Worker may follow it, and only into profiles the caller named and may read.
@@ -51,7 +52,7 @@ type EdgeRow = {
 	score: number | null; weight: number; valid_from: string | null; valid_to: string | null; recorded_at: string; ended_at: string | null;
 };
 export type GraphLink = EdgeRow & { class: string; depth: number; evidence: { kind: string; ref: string; note: string | null }[] };
-export type NodeSummary = {
+export type NodeSummary = ImportDelivery & {
 	id: string; kind: string; other_label: string | null; key: string | null; name: string; type: string | null; scope: string; status: string;
 	description: string; valid_from: string | null; valid_to: string | null; recorded_at: string; ended_at: string | null;
 };
@@ -72,29 +73,34 @@ export function valid(e: { valid_from: string | null; valid_to: string | null; e
  */
 function edgesOf(sql: SqlStorage, ids: string[], f: EdgeFilter, b: Budget, where: string): EdgeRow[] {
 	if (!ids.length) return [];
-	const list = JSON.stringify(ids), rels = f.rels ? JSON.stringify(f.rels) : null, relCond = rels ? " AND rel IN (SELECT value FROM json_each(?))" : "";
-	// Time eligibility follows bounded discovery: a predicate before LIMIT can scan unbounded newer edges.
-	let query = `SELECT id, src FROM edges WHERE src IN (SELECT value FROM json_each(?))${relCond}`;
-	const params: SqlStorageValue[] = [list, ...(rels ? [rels] : [])];
-	let listed = ids.length + (f.rels?.length ?? 0);
+	const list = JSON.stringify(ids), profiles = f.out ? 0 : f.known.length + 1;
+	// Time and relation eligibility follow bounded discovery: predicates before LIMIT can scan unbounded ineligible edges.
+	let query = "SELECT id, src, dst, dst_profile, rel FROM edges INDEXED BY edges_src_all WHERE src IN (SELECT value FROM json_each(?))";
+	const params: SqlStorageValue[] = [list];
+	let listed = ids.length;
 	if (!f.out) {
-		query += ` UNION ALL SELECT id, src FROM edges WHERE dst_profile IN (SELECT value FROM json_each(?)) AND dst IN (SELECT value FROM json_each(?))${relCond}`;
-		params.push(JSON.stringify(["", ...f.known]), list, ...(rels ? [rels] : []));
-		listed += f.known.length + 1 + ids.length + (f.rels?.length ?? 0);
+		query += " UNION ALL SELECT id, src, dst, dst_profile, rel FROM edges INDEXED BY edges_dst WHERE dst_profile IN (SELECT value FROM json_each(?)) AND dst IN (SELECT value FROM json_each(?))";
+		params.push(JSON.stringify(["", ...f.known]), list);
+		listed += profiles + ids.length;
 	}
-	// Reserve indexed edge/source/payload lookups and JSON-list overhead for every discovered row, including hidden ones.
-	const room = Math.floor((b.limit - b.edges_read - 3 * listed - 8) / 12);
+	// Each JSON list is read and materialized; incoming discovery also traverses the id list per profile. No relation-list
+	// product remains. Each discovered row reserves one edge read, two endpoints at four reads each, and three payload reads.
+	const room = Math.floor((b.limit - b.edges_read - 2 * listed - profiles * ids.length) / 12);
 	if (room <= 0) { stop(b, where); return []; }
-	const cursor = sql.exec<{ id: number; src: string }>(`${query} LIMIT ?`, ...params, room);
-	const rows = cursor.toArray();
+	const cursor = sql.exec<{ id: number; src: string; dst: string; dst_profile: string; rel: Rel }>(`${query} LIMIT ?`, ...params, room);
+	const discovered = cursor.toArray();
 	b.edges_read += cursor.rowsRead;
-	if (rows.length >= room) stop(b, where);
+	if (discovered.length >= room) stop(b, where);
+	const rows = discovered.filter(r => !f.rels || f.rels.includes(r.rel));
 	if (!rows.length) return [];
-	const sourceRows = readableNodeRows(sql, rows.map(r => r.src));
-	const readable = new Set(sourceRows.toArray().map(r => r.id));
+	const sourceRows = sql.exec<{id:string;status:string;archive:string|null}>("SELECT n.id,n.status,CASE WHEN n.status IN ('incoming','moving') AND EXISTS(SELECT 1 FROM profile_meta o WHERE o.key='archive-op:'||json_extract(n.attrs,'$.archive_operation') AND json_extract(o.value,'$.node')=n.id) THEN json_extract(n.attrs,'$.archive_operation') END AS archive FROM nodes n WHERE n.id IN (SELECT value FROM json_each(?))",
+		JSON.stringify([...new Set(rows.flatMap(r=>r.dst_profile === ""?[r.src,r.dst]:[r.src]))]));
+	const endpoints=sourceRows.toArray();
+	const readable = new Set(endpoints.filter(r=>["active","retired","superseded"].includes(r.status)).map(r=>r.id));
+	const fenced = new Set(endpoints.filter(r=>r.archive!==null&&["incoming","moving"].includes(r.status)).map(r=>r.id));
 	b.edges_read += sourceRows.rowsRead;
 	const seen = new Set<number>();
-	const kept = rows.filter(r => readable.has(r.src) && !seen.has(r.id) && (seen.add(r.id), true)).map(r => r.id);
+	const kept = rows.filter(r => readable.has(r.src) && !fenced.has(r.src) && !(r.dst_profile === ""&&fenced.has(r.dst)) && !seen.has(r.id) && (seen.add(r.id), true)).map(r => r.id);
 	if (!kept.length) return [];
 	const payload = sql.exec<EdgeRow>(`SELECT ${EDGE_COLS} FROM edges WHERE id IN (SELECT value FROM json_each(?))`, JSON.stringify(kept));
 	const byId = new Map(payload.toArray().map(r => [r.id, r]));
@@ -111,8 +117,8 @@ export function owned<T extends { src: string }>(sql: SqlStorage, rows: T[]): T[
 /** Summaries of published local records only; all other endpoints remain opaque. */
 export function summaries(sql: SqlStorage, ids: string[]): Map<string, NodeSummary> {
 	if (!ids.length) return new Map();
-	return new Map(sql.exec<NodeSummary>(`SELECT id, kind, other_label, key, name, memory_type AS type, scope, status, substr(description, 1, 280) AS description,
-		valid_from, valid_to, recorded_at, ended_at FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND ${READABLE_NODE}`, JSON.stringify(ids)).toArray().map((n) => [n.id, n]));
+	return new Map(sql.exec<Omit<NodeSummary,keyof ImportDelivery> & {attrs:string}>(`SELECT ${POLICY_ATTRS_SQL} AS attrs, id, kind, other_label, key, name, memory_type AS type, scope, status, substr(description, 1, 280) AS description,
+		valid_from, valid_to, recorded_at, ended_at FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND ${READABLE_NODE}`, JSON.stringify(ids)).toArray().map(({attrs,...n}) => [n.id, {...n,...importDelivery(attrs)}]));
 }
 
 function withEvidence(sql: SqlStorage, edges: (EdgeRow & { depth: number })[]): GraphLink[] {
@@ -188,7 +194,8 @@ export function trace(sql: SqlStorage, q: TraceQuery) {
 	if (q.mode === "step") return { edges: edgesOf(sql, q.ids, { ...(q.asOf ? { asOf: q.asOf } : {}), similarity: q.similarity, known: q.known }, b, "path edges"), budget: b };
 	if (q.mode === "detail") {
 		const edges = q.edges.length ? sql.exec<EdgeRow>(`SELECT ${EDGE_COLS} FROM edges WHERE id IN (SELECT value FROM json_each(?))
-			AND EXISTS (SELECT 1 FROM nodes n WHERE n.id = edges.src AND n.${READABLE_NODE})`, JSON.stringify(q.edges)).toArray() : [];
+			AND EXISTS (SELECT 1 FROM nodes n WHERE n.id = edges.src AND n.${READABLE_NODE})
+			AND NOT EXISTS (SELECT 1 FROM nodes f WHERE (f.id=edges.src OR (edges.dst_profile='' AND f.id=edges.dst)) AND f.status IN ('incoming','moving') AND EXISTS(SELECT 1 FROM profile_meta o WHERE o.key='archive-op:'||json_extract(f.attrs,'$.archive_operation') AND json_extract(o.value,'$.node')=f.id))`, JSON.stringify(q.edges)).toArray() : [];
 		return { links: withEvidence(sql, edges.map((e) => ({ ...e, depth: 0 }))), nodes: Object.fromEntries(summaries(sql, q.nodes)), budget: b };
 	}
 	const from = resolve(sql, q.from), nodes = summaries(sql, [from]);
@@ -222,7 +229,8 @@ function nodeEvents(sql: SqlStorage, id: string, limit: number, w?: { from: stri
 		CASE WHEN ${ended} >= julianday(?1) AND ${ended} < julianday(?2) THEN min(${recorded}, ${ended}) ELSE ${recorded} END ELSE ${ended} END`;
 	const edges = w ? sql.exec<EdgeRow>(`SELECT ${EDGE_COLS}, ${first} AS event_at FROM edges
 		WHERE (src = ?3 OR (dst_profile IN (SELECT value FROM json_each(?4)) AND dst = ?3)) AND ${time}
-		AND src IN (SELECT id FROM nodes WHERE ${READABLE_NODE}) ORDER BY event_at, id LIMIT ?5`,
+		AND src IN (SELECT id FROM nodes WHERE ${READABLE_NODE})
+		AND NOT EXISTS (SELECT 1 FROM nodes f WHERE (f.id=edges.src OR (edges.dst_profile='' AND f.id=edges.dst)) AND f.status IN ('incoming','moving') AND EXISTS(SELECT 1 FROM profile_meta o WHERE o.key='archive-op:'||json_extract(f.attrs,'$.archive_operation') AND json_extract(o.value,'$.node')=f.id)) ORDER BY event_at, id LIMIT ?5`,
 		w.from, w.to, id, JSON.stringify(["", ...w.known]), limit + 1).toArray() : [];
 	const events: Event[] = [
 		...revs.slice(0, limit).map((r) => ({ at: r.at, event: `revision:${r.op}`, node_id: id, revision: r.revision, actor: r.actor })),
@@ -248,11 +256,13 @@ export function timeline(sql: SqlStorage, q: TimelineQuery) {
 	const kinds = q.kinds?.length ? JSON.stringify(q.kinds) : null;
 	const activity = sql.exec<{ id: number; at: string; actor: string; op: string; summary: string; targets: string; redacted: string | null }>(
 		`SELECT a.id, a.at, a.actor, a.op, a.summary, a.targets, a.redacted FROM activity a WHERE julianday(a.at) >= julianday(?) AND julianday(a.at) < julianday(?) AND a.op <> 'import'
+		 AND NOT EXISTS (SELECT 1 FROM json_each(a.targets) t JOIN nodes f ON f.id=t.value WHERE json_extract(f.attrs,'$.archive_operation') IS NOT NULL)
+		 AND NOT EXISTS (SELECT 1 FROM json_each(a.targets) t JOIN edges e ON t.value='e:'||e.id JOIN nodes f ON (f.id=e.src OR (e.dst_profile='' AND f.id=e.dst)) WHERE json_extract(f.attrs,'$.archive_operation') IS NOT NULL)
 		 ${kinds ? "AND EXISTS (SELECT 1 FROM json_each(a.targets) t JOIN nodes n ON n.id = t.value WHERE n.kind IN (SELECT value FROM json_each(?)))" : ""}
 		 ORDER BY julianday(a.at), a.id LIMIT ?`, q.from, q.to, ...(kinds ? [kinds] : []), q.limit + 1).toArray();
 	// shortcut: revisions has no index on `at`, so this scans the profile's revisions; add revisions (at) in profile v4 to bound it.
 	const imported = sql.exec<{ node_id: string; revision: number; op: string; at: string; kind: string; name: string }>(
-		`SELECT r.node_id, r.revision, r.op, r.at, n.kind, n.name FROM revisions r JOIN nodes n ON n.id = r.node_id
+		`SELECT r.node_id, r.revision, r.op, r.at, n.kind, CASE WHEN json_type(n.attrs,'$.import_review') = 'object' THEN json_extract(r.snapshot,'$.name') ELSE n.name END AS name FROM revisions r JOIN nodes n ON n.id = r.node_id
 		 WHERE r.actor = 'migration' AND n.${READABLE_NODE} AND julianday(r.at) >= julianday(?) AND julianday(r.at) < julianday(?)${kinds ? " AND n.kind IN (SELECT value FROM json_each(?))" : ""} ORDER BY julianday(r.at), r.node_id, r.revision LIMIT ?`,
 		q.from, q.to, ...(kinds ? [kinds] : []), q.limit + 1).toArray();
 	const events: Event[] = [

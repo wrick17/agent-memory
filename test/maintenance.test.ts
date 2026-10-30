@@ -2,7 +2,7 @@
 // the proposed wiring: write.ts takes beforeImages before the op, dispatches "undo" to revert and calls recordUndo after it,
 // and types.ts gains the "undo" command, the background actors and the two error codes. Without that wiring the undo cases fail.
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { requestHash, sha256 } from "../src/domain/ids";
 import { foldDue, foldStep, queueFold } from "../src/profile/compact";
@@ -18,7 +18,7 @@ import { mayChange } from "../src/profile/protect";
 import { undo } from "../src/profile/undo";
 import { runWrite, type Who } from "../src/profile/write";
 import { nextSeq } from "../src/storage";
-import { call, contextFor, devicePrincipal, deviceToken, outcome, registered } from "./helpers";
+import { call, contextFor, devicePrincipal, deviceToken, outcome, OWNER, registered } from "./helpers";
 import { accountTransfer } from "../src/account/transfers";
 import { uuid5 } from "../src/domain/ids";
 import { statedFirst } from "../src/domain/rank";
@@ -1937,4 +1937,265 @@ it("undo of a TTL digest restore archives the restored text again", async () => 
  });
  expect(await write(inverse)).toMatchObject({ok: false, error: {code: "profile_wiped"}});
  await runInDurableObject(p.stub, (_i, state) => expect(state.storage.sql.exec("SELECT 1 FROM texts WHERE range_id = ?", range_id).toArray()).toHaveLength(1));
+});
+
+describe("Weekly strategic review", () => {
+	const origin = new URL(env.RESOURCE_URL).origin, PROTOCOL = "2026-07-28";
+	type Board = { as_of: string; coverage: Record<string, unknown>; items: { id: string; score: number }[] };
+	type Lease = { lease_id: string; items: { item_id: number; kind: string; subjects: string[]; allowed_ops: string[]; board?: Board; context: { nodes: { id: string }[]; edges: { src: string; dst: string; reason: string }[] } }[] };
+	type Done = { results: { status: string; ops: { op: string; status: string; code?: string; reason?: string; created?: string[]; activity_id?: number }[] }[] };
+	/** The local batch's job client (local/batch.mjs mcpJob): tools/call on the Worker's /mcp with the job token, no other route. */
+	async function job<T>(token: string, name: string, args: Record<string, unknown>): Promise<T> {
+		const res = await exports.default.fetch(new Request(`${origin}/mcp`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json",
+			accept: "application/json, text/event-stream", "mcp-protocol-version": PROTOCOL, "mcp-method": "tools/call", "mcp-name": name },
+		body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args, _meta: { "io.modelcontextprotocol/protocolVersion": PROTOCOL,
+			"io.modelcontextprotocol/clientInfo": { name: "agent-memory-batch", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } }) }));
+		expect(res.status).toBe(200);
+		const text = await res.text(), sse = text.split("\n").find((l) => l.startsWith("data: "));
+		const msg = JSON.parse(text.startsWith("{") ? text : sse!.slice(6)) as { result: { content: { text: string }[]; isError?: boolean }; error?: { code: number } };
+		if (msg.error) throw Object.assign(new Error(`rpc ${msg.error.code}`), { code: `rpc_${msg.error.code}` });
+		const text0 = msg.result.content[0]!.text;
+		// The transport's own input validation answers in plain text, before any tool runs.
+		if (msg.result.isError && !text0.startsWith("{")) throw Object.assign(new Error(text0.slice(0, 200)), { code: "input_invalid" });
+		const value = JSON.parse(text0) as T & { error?: { code: string } };
+		if (msg.result.isError) throw Object.assign(new Error(value.error?.code), { code: value.error?.code });
+		return value;
+	}
+	/** The profile's real alarm with only the queue stage due and embeddings off: the nightly producer. */
+	const produce = (stub: DurableObjectStub<ProfileStore>) => runInDurableObject(stub, async (instance, state) => {
+		const original = Reflect.get(instance, "env");
+		Reflect.set(instance, "env", { ...env, EMBEDDINGS: "off" });
+		try {
+			for (const s of ["dedupe", "ttl", "purge", "queue", "dangling"]) state.storage.sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?) ON CONFLICT (stage) DO UPDATE SET due_at = excluded.due_at", s, s === "queue" ? 0 : Date.now() + 86_400_000);
+			await state.storage.deleteAlarm();
+			await instance.alarm();
+		} finally { Reflect.set(instance, "env", original); await state.storage.deleteAlarm(); }
+	});
+	/**
+	 * A fresh profile of the owner's account (tests share that account) with one open High ticket assigned to the owner, one open
+	 * PR awaiting the owner's review and one closed ticket, written through record_knowledge, and a job token for it.
+	 */
+	async function workBoardRig() {
+		await contextFor();
+		const name = `wr${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`, generation = crypto.randomUUID().slice(0, 8);
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => {
+			const now = new Date().toISOString();
+			s.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${generation}`, generation, now);
+			s.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", generation, name, now);
+		});
+		const owner = await contextFor(), who: Who = { userId: OWNER, profile: name, generation };
+		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${name}:${generation}`));
+		const out = await call<{ nodes: { id: string }[] }>(owner, "record_knowledge", { profile: name, nodes: [
+			{ kind: "ticket", key: "jira:REV-1", name: "Ship the weekly review", attrs: { state: "open", priority: "High", assignee_is_owner: true } },
+			{ kind: "pr", key: "github:acme/web#7", name: "Board as-of fix", attrs: { state: "open", review_requested_from_owner: true } },
+			{ kind: "ticket", key: "jira:REV-2", name: "Already done", attrs: { state: "closed" } }] });
+		const [ticket, pr, closed] = out.nodes.map((n) => n.id) as [string, string, string];
+		const { token } = await deviceToken(`review-${name}`, ["ingest", "maintenance"], [name], name);
+		return { owner, name, who, stub, ticket, pr, closed, token };
+	}
+	const summary = "Two open uploaded items; the High ticket assigned to the owner leads.";
+	const reviewOp = (ticket: string, pr: string) => ({ op: "strategic_review", summary, content: "As of the board's date, two uploaded items are open. The ticket leads; the PR waits on the owner's review.",
+		links: [{ to: ticket, reason: "Highest-scoring open item this week", evidence: [{ kind: "node", ref: ticket }] },
+			{ to: pr, reason: "Review requested from the owner", evidence: [{ kind: "node", ref: pr }, { kind: "node", ref: ticket }] }] });
+
+	it("over the job HTTP route the weekly item names the board's open items, the review becomes one document with reasoned links, and work_board returns it", async () => {
+		const { owner, name, stub, ticket, pr, token } = await workBoardRig();
+		await produce(stub);
+		const lease = await job<Lease>(token, "maintenance_next", { profile: name, limit: 40, lease_seconds: 900 });
+		const item = lease.items.find((i) => i.kind === "weekly_review")!;
+		expect([...item.subjects].sort()).toEqual([ticket, pr].sort());
+		expect(item.allowed_ops).toEqual(["strategic_review", "dismiss"]);
+		expect(item.board).toMatchObject({ covers_only_uploaded_data: true, coverage: { open: 2, scored: 2, without_state: 0, partial: false, reviewed: 2, profile_local: true } });
+		expect(item.board!.items.map((i) => i.id)).toEqual([ticket, pr]);
+		const done = await job<Done>(token, "maintenance_complete", { profile: name, lease_id: lease.lease_id, results: [{ item_id: item.item_id, ops: [reviewOp(ticket, pr)] }] });
+		expect(done.results[0]).toMatchObject({ status: "done", ops: [{ op: "strategic_review", status: "applied" }] });
+		// The new document's embedding wakeup is not under test; it must not fire after the test ends.
+		await runInDurableObject(stub, (_i, s) => s.storage.deleteAlarm());
+		const id = done.results[0]!.ops[0]!.created![0]!;
+		await runInDurableObject(stub, (_i, s) => {
+			const sql = s.storage.sql;
+			const n = sql.exec<{ kind: string; memory_type: string; origin: string; attrs: string; description: string }>("SELECT kind, memory_type, origin, attrs, description FROM nodes WHERE id = ?", id).one();
+			expect({ ...n, attrs: JSON.parse(n.attrs) }).toEqual({ kind: "document", memory_type: "reference", origin: "agent", description: summary,
+				attrs: { kind: "strategic_review", item: item.item_id, as_of: item.board!.as_of, coverage: item.board!.coverage } });
+			const links = sql.exec<{ id: number; dst: string; rel: string; basis: string; reason: string; actor: string }>("SELECT id, dst, rel, basis, reason, actor FROM edges WHERE src = ? ORDER BY reason", id).toArray();
+			expect(links.map((l) => ({ dst: l.dst, rel: l.rel, basis: l.basis, reason: l.reason, actor: l.actor }))).toEqual([
+				{ dst: ticket, rel: "relates_to", basis: "judgment", reason: "Highest-scoring open item this week", actor: "maintenance" },
+				{ dst: pr, rel: "relates_to", basis: "judgment", reason: "Review requested from the owner", actor: "maintenance" }]);
+			expect(sql.exec("SELECT owner, ref FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) ORDER BY owner, ref", JSON.stringify(links.map((l) => `e:${l.id}`))).toArray())
+				.toEqual([{ owner: `e:${links[0]!.id}`, ref: ticket }, ...[pr, ticket].sort().map((ref) => ({ owner: `e:${links[1]!.id}`, ref }))]);
+			// The items it discusses are untouched.
+			expect(sql.exec("SELECT revision FROM nodes WHERE id IN (?, ?)", ticket, pr).toArray()).toEqual([{ revision: 1 }, { revision: 1 }]);
+		});
+		// Registered for this generation before the result came back.
+		expect(await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => s.storage.sql.exec("SELECT profile FROM node_index WHERE node_id = ?", id).toArray())).toEqual([{ profile: name }]);
+		const b = await call<{ review: Record<string, unknown> }>(owner, "work_board", { profile: name });
+		expect(b.review).toMatchObject({ id, profile: name, description: summary, age_days: 0, data_as_of: item.board!.as_of, coverage: item.board!.coverage });
+	});
+
+	it("refuses links and pointers outside the subjects, other ops, a moving subject and payloads over the schema caps, writing nothing", async () => {
+		const { name, stub, ticket, pr, closed, token } = await workBoardRig();
+		await produce(stub);
+		const lease = await job<Lease>(token, "maintenance_next", { profile: name });
+		const item = lease.items.find((i) => i.kind === "weekly_review")!, base = reviewOp(ticket, pr), link = base.links[0]!;
+		const send = (ops: unknown[]) => job<Done>(token, "maintenance_complete", { profile: name, lease_id: lease.lease_id, results: [{ item_id: item.item_id, ops }] });
+		for (const op of [{ ...base, links: Array.from({ length: 21 }, () => link) }, { ...base, summary: "s".repeat(601) }, { ...base, content: "c".repeat(20_001) },
+			{ ...base, links: [{ ...link, evidence: [{ kind: "ticket", ref: "REV-1" }] }] }]) await expect(send([op])).rejects.toMatchObject({ code: "input_invalid" });
+		await runInDurableObject(stub, (_i, s) => s.storage.sql.exec("UPDATE nodes SET status = 'moving' WHERE id = ?", pr));
+		const out = await send([{ op: "save", memory_id: ticket, description: "not for this kind" }, { ...base, links: [{ ...link, to: closed }] },
+			{ ...base, links: [{ ...link, evidence: [{ kind: "node", ref: closed }] }] }, base]);
+		expect(out.results[0]!.ops).toMatchObject([{ status: "rejected", reason: "op_not_allowed" }, { status: "rejected", code: "outside_subjects" },
+			{ status: "rejected", code: "outside_subjects" }, { status: "rejected", code: "not_found" }]);
+		await runInDurableObject(stub, async (_i, s) => {
+			const sql = s.storage.sql;
+			expect(sql.exec("SELECT count(*) AS n FROM nodes WHERE kind = 'document'").one().n).toBe(0);
+			expect(sql.exec("SELECT count(*) AS n FROM requests WHERE request_id LIKE 'maint:%'").one().n).toBe(0);
+			expect(sql.exec("SELECT count(*) AS n FROM activity WHERE actor = 'maintenance'").one().n).toBe(0);
+			expect(sql.exec("SELECT revision FROM nodes WHERE id = ?", ticket).one().revision).toBe(1);
+			await s.storage.deleteAlarm();
+		});
+	});
+
+	it("a repeated completion replays; one interrupted before its outcome reports and re-registers the same document on a new lease; the owner's undo removes it with its links", async () => {
+		const { owner, name, who, stub, ticket, pr, token } = await workBoardRig();
+		await produce(stub);
+		const lease = await job<Lease>(token, "maintenance_next", { profile: name });
+		const item = lease.items.find((i) => i.kind === "weekly_review")!;
+		const args = { profile: name, lease_id: lease.lease_id, results: [{ item_id: item.item_id, ops: [reviewOp(ticket, pr)] }] };
+		const id = (await job<Done>(token, "maintenance_complete", args)).results[0]!.ops[0]!.created![0]!;
+		expect(await job<Done>(token, "maintenance_complete", args)).toMatchObject({ results: [{ status: "done", replayed: true }] });
+		// As if the process died after the document committed and before the item's outcome: still leased, no outbox, unregistered.
+		const index = () => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => s.storage.sql.exec("SELECT profile FROM node_index WHERE node_id = ?", id).toArray());
+		await runInDurableObject(stub, async (_i, s) => {
+			const sql = s.storage.sql, past = (ms: number) => new Date(Date.now() - ms).toISOString();
+			sql.exec("UPDATE maintenance SET state = 'leased', done_at = NULL, outcome = NULL, lease_until = ? WHERE id = ?", past(1_000), item.item_id);
+			sql.exec("DELETE FROM cursors WHERE stage LIKE 'outbox:%'");
+			sql.exec("UPDATE cursors SET last_run_at = ? WHERE stage = 'maintenance_batch'", past(21 * 3_600_000));
+			await s.storage.deleteAlarm();
+		});
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => s.storage.sql.exec("DELETE FROM node_index WHERE node_id = ?", id));
+		expect(await index()).toEqual([]);
+		const again = await job<Lease>(token, "maintenance_next", { profile: name });
+		expect(again.items.find((i) => i.kind === "weekly_review")?.item_id).toBe(item.item_id);
+		const retry = await job<Done>(token, "maintenance_complete", { profile: name, lease_id: again.lease_id, results: [{ item_id: item.item_id, ops: [{ ...reviewOp(ticket, pr), summary: "A different second draft." }] }] });
+		expect(retry.results[0]).toMatchObject({ status: "done", ops: [{ status: "applied", reason: "already_written", created: [id] }] });
+		expect(await index()).toEqual([{ profile: name }]);
+		const activityId = await runInDurableObject(stub, async (_i, s) => {
+			const sql = s.storage.sql;
+			expect(sql.exec("SELECT id, description FROM nodes WHERE kind = 'document'").toArray()).toEqual([{ id, description: summary }]);
+			await s.storage.deleteAlarm();
+			return sql.exec<{ id: number }>("SELECT id FROM activity WHERE op = 'save' AND actor = 'maintenance' AND targets LIKE ?", `%${id}%`).one().id;
+		});
+		await runInDurableObject(stub, (_i, s) => {
+			const out = undo(s.storage, who, activityId, { actor: "owner", platform: "test", routedBy: "explicit", userId: OWNER });
+			expect(out.result).toMatchObject({ action: "undone" });
+			expect(s.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id = ?", id).one().n).toBe(0);
+			expect(s.storage.sql.exec("SELECT count(*) AS n FROM edges WHERE src = ?", id).one().n).toBe(0);
+			expect(s.storage.sql.exec("SELECT revision, status FROM nodes WHERE id IN (?, ?)", ticket, pr).toArray()).toEqual([{ revision: 1, status: "active" }, { revision: 1, status: "active" }]);
+		});
+		expect((await call<{ review: unknown }>(owner, "work_board", { profile: name })).review).toBeNull();
+	});
+
+	it("an empty board gets one truthful weekly item per slot; a review in the last seven days skips the next slot; me gets none and refuses one; a closing generation writes nothing", async () => {
+		const r = await registered("work", "me"), { who, stub } = r.of("work"), meStub = r.of("me").stub;
+		const caller: Caller = { userId: r.userId, kind: "device", deviceId: "job-review", scopes: ["ingest", "maintenance"], profiles: ["work", "me"] };
+		const c: ToolContext = { env, caller, account: { caller, rules: [], profiles: [who, r.of("me").who], known: ["work", "me"], sensitiveTerms: [] }, platform: "test" };
+		const weekly = (st = stub) => runInDurableObject(st, (_i, s) => s.storage.sql.exec<{ subjects: string }>("SELECT subjects FROM maintenance WHERE kind = 'weekly_review'").toArray());
+		// A first job call binds each fresh store (its alarm runs nothing before that) and finds nothing queued yet.
+		for (const p of ["work", "me"]) expect(await call<Lease>(c, "maintenance_next", { profile: p })).toMatchObject({ lease_id: null, items: [] });
+		await produce(stub);
+		await produce(stub);
+		await produce(meStub);
+		expect(await weekly()).toEqual([{ subjects: "[]" }]);
+		expect(await weekly(meStub)).toEqual([]);
+		const lease = await call<Lease>(c, "maintenance_next", { profile: "work" }), item = lease.items[0]!;
+		expect(item.board).toMatchObject({ coverage: { open: 0, scored: 0, without_state: 0, reviewed: 0, partial: false }, items: [] });
+		const empty = { op: "strategic_review", summary: "No open uploaded items as of this board.", content: "The uploaded board had no open items.", links: [] };
+		const complete = (ops: unknown[], profile = "work", l = lease, i = item) => outcome(c, "maintenance_complete", { profile, lease_id: l.lease_id, results: [{ item_id: i.item_id, ops }] });
+		await r.account((a) => a.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'work'"));
+		expect(await complete([empty])).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
+		await r.account((a) => a.exec("UPDATE profiles SET status = 'active' WHERE name = 'work'"));
+		expect(await runInDurableObject(stub, (_i, s) => s.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE kind = 'document'").one().n)).toBe(0);
+		const out = await complete([{ ...empty, links: [{ to: "not-a-subject", reason: "nothing here to link", evidence: [{ kind: "node", ref: "not-a-subject" }] }] }, empty]);
+		expect(out).toMatchObject({ ok: true, value: { results: [{ status: "done", ops: [{ status: "rejected", code: "outside_subjects" }, { status: "applied" }] }] } });
+		await runInDurableObject(stub, (_i, s) => s.storage.deleteAlarm());
+		// The next slot: a review written in the last seven days skips it; without one it is queued.
+		const DAY = 86_400_000, nextSlot = (Math.floor(Date.now() / (7 * DAY)) + 1) * 7 * DAY + 1;
+		const queueAt = (now: number) => runInDurableObject(stub, async (_i, s) => {
+			s.storage.sql.exec("UPDATE cursors SET due_at = 0 WHERE stage = 'queue'");
+			housekeep(s.storage, who, now);
+			await s.storage.deleteAlarm();
+		});
+		await queueAt(nextSlot);
+		expect(await weekly()).toHaveLength(1);
+		await runInDurableObject(stub, (_i, s) => s.storage.sql.exec("UPDATE nodes SET status = 'retired' WHERE kind = 'document'"));
+		await queueAt(nextSlot);
+		expect(await weekly()).toHaveLength(2);
+		// No background write lands in me, even from an item put there by hand.
+		await runInDurableObject(meStub, (_i, s) => enqueue(s.storage, [{ kind: "weekly_review", subjects: [] }]));
+		const meLease = await call<Lease>(c, "maintenance_next", { profile: "me" });
+		expect(await complete([empty], "me", meLease, meLease.items[0]!)).toMatchObject({ ok: true, value: { results: [{ ops: [{ status: "rejected", code: "forbidden" }] }] } });
+		expect(await runInDurableObject(meStub, (_i, s) => s.storage.sql.exec("SELECT count(*) AS n FROM nodes").one().n)).toBe(0);
+	});
+ it("regression privacy: a weekly lease keeps a now-moving subject and its edges opaque",async()=>{
+  const r=await workBoardRig();await produce(r.stub);
+  await runInDurableObject(r.stub,(_i,s)=>{
+   s.storage.sql.exec("UPDATE nodes SET description='L3_MOVING_PRIVATE_PAYLOAD' WHERE id=?",r.ticket);
+   s.storage.sql.exec("INSERT INTO edges(src,rel,dst,dst_profile,basis,reason,recorded_at,actor,seq) VALUES (?,'relates_to',?,'','judgment','L3_MOVING_PRIVATE_REASON',?,'test',1)",r.ticket,r.pr,new Date().toISOString());
+  });
+  const fence=await r.stub.transfer(r.who,{op:"fence",id:crypto.randomUUID(),nodeId:r.ticket,peer:"personal"});
+  expect(fence).toMatchObject({ok:true,value:{state:"fenced"}});
+  const lease=await job<Lease>(r.token,"maintenance_next",{profile:r.name});const item=lease.items.find(i=>i.kind==="weekly_review")!;
+  expect(item.board!.items.some(i=>i.id===r.ticket)).toBe(false);
+  expect(JSON.stringify(item)).not.toContain("L3_MOVING_PRIVATE");
+ });
+ it.each(["undo", "forget"] as const)("regression receipt: owner %s between write commit and item outcome survives a new lease",async(action)=>{
+  const r=await workBoardRig();await produce(r.stub);
+  const lease=await job<Lease>(r.token,"maintenance_next",{profile:r.name});const item=lease.items.find(i=>i.kind==="weekly_review")!;
+  let created="", receipt="";
+  await runInDurableObject(r.stub,async (_i,s)=>{
+   let calls=0;const storage={sql:s.storage.sql,transactionSync:(fn:()=>unknown)=>{if(++calls===2)throw new Error("injected outcome crash");return s.storage.transactionSync(fn);}} as DurableObjectStorage;
+   expect(()=>complete(storage,r.who,{lease_id:lease.lease_id,results:[{item_id:item.item_id,ops:[reviewOp(r.ticket,r.pr) as never]}]},{platform:"review",userId:OWNER})).toThrow("injected outcome crash");
+   const row=s.storage.sql.exec<{id:string}>("SELECT id FROM nodes WHERE json_extract(attrs,'$.kind')='strategic_review'").one();created=row.id;
+   receipt=JSON.stringify(s.storage.sql.exec("SELECT * FROM requests WHERE node_id=? AND op='save'",created).toArray());
+   expect(s.storage.sql.exec("SELECT state FROM maintenance WHERE id=?",item.item_id).one().state).toBe("leased");
+   const aid=s.storage.sql.exec<{id:number}>("SELECT id FROM activity WHERE actor='maintenance' AND op='save'").one().id;
+   const owner = {actor:"owner" as const,platform:"review",routedBy:"explicit",userId:OWNER};
+   if (action === "undo") undo(s.storage,r.who,aid,owner);
+   else runWrite(s.storage,r.who,{op:"owner",args:{memory_id:created,action:"forget"}},{...owner,payloadHash:"forget"});
+   expect(s.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id=?",created).one().n).toBe(0);
+   s.storage.sql.exec("UPDATE maintenance SET lease_until=? WHERE id=?",new Date(Date.now()-1000).toISOString(),item.item_id);
+   s.storage.sql.exec("UPDATE cursors SET last_run_at=? WHERE stage='maintenance_batch'",new Date(Date.now()-21*3600000).toISOString());
+   await s.storage.deleteAlarm();
+  });
+  const again=await job<Lease>(r.token,"maintenance_next",{profile:r.name});
+  const done=await job<Done>(r.token,"maintenance_complete",{profile:r.name,lease_id:again.lease_id,results:[{item_id:item.item_id,ops:[{...reviewOp(r.ticket,r.pr),summary:"A changed retry draft",content:"Never recreate this owner-undone review."}]}]});
+  await runInDurableObject(r.stub,async (_i,s)=>{await s.storage.deleteAlarm();
+   expect(done.results[0]!.ops[0]).toMatchObject({status:"applied",reason:"already_written"});
+   expect(s.storage.sql.exec("SELECT count(*) AS n FROM activity WHERE actor='maintenance' AND op='save'").one().n).toBe(1);
+   expect(s.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id=?",created).one().n).toBe(0);
+   expect(JSON.stringify(s.storage.sql.exec("SELECT * FROM requests WHERE node_id=? AND op='save'",created).toArray())).toBe(receipt);
+  });
+  await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)),(_i,s)=>expect(s.storage.sql.exec("SELECT count(*) AS n FROM node_index WHERE node_id=?",created).one().n).toBe(0));
+ });
+
+	it("regression privacy: candidate payload stays in its capture item and readable backlinks keep opaque targets", async () => {
+		const r = await workBoardRig();
+		const cap = await call<{ capture_id: string }>(r.owner, "capture_memory", { profile: r.name,
+			content: "L3_CANDIDATE_BODY pending owner review", name: "L3_CANDIDATE_NAME" });
+		await call(r.owner, "record_knowledge", { profile: r.name, edges: [{ from: { id: cap.capture_id }, rel: "relates_to", to: { id: r.ticket },
+			reason: "L3_CANDIDATE_REASON", evidence: [{ kind: "file", ref: "L3_CANDIDATE_EVIDENCE" }] }] });
+		await runInDurableObject(r.stub, (_i, s) => {
+			enqueue(s.storage, [{ kind: "unprocessed_capture", subjects: [cap.capture_id] }]);
+			s.storage.sql.exec("INSERT INTO edges (src, rel, dst, dst_profile, basis, reason, recorded_at, actor, seq) VALUES (?, 'relates_to', 'opaque-absent', '', 'judgment', 'Readable source reason', ?, 'test', 1)", r.ticket, new Date().toISOString());
+		});
+		await produce(r.stub);
+		const lease = await job<Lease>(r.token, "maintenance_next", { profile: r.name });
+		const weekly = lease.items.find((i) => i.kind === "weekly_review")!, capture = lease.items.find((i) => i.kind === "unprocessed_capture")!;
+		expect(JSON.stringify(weekly)).not.toContain("L3_CANDIDATE_");
+		expect(weekly.context.edges).toContainEqual(expect.objectContaining({ src: r.ticket, dst: "opaque-absent", reason: "Readable source reason" }));
+		expect(JSON.stringify(capture.context)).toContain("L3_CANDIDATE_BODY");
+		expect(JSON.stringify(capture.context)).toContain("L3_CANDIDATE_REASON");
+		await runInDurableObject(r.stub, (_i, s) => s.storage.deleteAlarm());
+	});
+
 });

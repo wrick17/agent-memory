@@ -1,3 +1,4 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // Identifier extraction (sections 4 and 12). Ids mentioned in text become relates_to edges with basis identifier to the nodes of
 // this profile that carry the key, never a stronger relation; a key no node carries yet is kept as a `mention` evidence row and
 // becomes the edge when a node with that key is written, of whatever kind it really is. File references become evidence rows.
@@ -69,8 +70,8 @@ export interface TxLike {
 }
 export type Consumed = { row: Record<string, SqlStorageValue>; expect: number | null };
 
-const link = (tx: TxLike, src: string, dst: string) => tx.run(`INSERT OR IGNORE INTO edges (src, rel, dst, dst_profile, basis, recorded_at, actor, request_id, seq)
-	VALUES (?, 'relates_to', ?, '', 'identifier', ?, ?, ?, ?)`, src, dst, tx.now, tx.ctx.actor, tx.requestId, tx.seq);
+const link = (tx: TxLike, src: string, dst: string) => {assertArchiveEndpoints(tx.sql,src,dst,"");return tx.run(`INSERT OR IGNORE INTO edges (src, rel, dst, dst_profile, basis, recorded_at, actor, request_id, seq)
+	VALUES (?, 'relates_to', ?, '', 'identifier', ?, ?, ?, ?)`, src, dst, tx.now, tx.ctx.actor, tx.requestId, tx.seq);};
 
 /**
  * Inside the write transaction: a relates_to edge with basis identifier from `src` to every node of this profile whose key the

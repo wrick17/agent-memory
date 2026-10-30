@@ -1,10 +1,13 @@
+import { policyOf, POLICY_ATTRS_SQL } from "../domain/import-policy";
 // The one write path for phase 1: save (create, update, rename, scope move, retire, supersede) and append.
 // Ports BothQ memory_store.py semantics. Runs inside one transactionSync per call; never awaits.
+import { assertArchiveEndpoints } from "./archive-fence";
 import { guardTexts, meGuard, stripPersonal } from "../domain/guard";
 import { canonicalJson, collapse, isScope, newMemoryId, normalizeName, normalizeScope, sha256, uuid5 } from "../domain/ids";
 import { Fail, KINDS_FOR_TYPE, RELATION_ENDPOINTS, type AppendArgs, type CandidateArgs, type CaptureArgs, type KnowledgeArgs, type OwnerArgs, type KnowledgeRef, type MemoryKind, type MemoryType, type SaveArgs, type Step, type WriteCommand, type WriteContext } from "../domain/types";
 import { takeSeq } from "../storage";
 import { compact, contentRows, Unfold, unfoldStep } from "./compact";
+import { runArchive, stagedArchiveActivity, stagedUndo } from "./archive-operations";
 import { archiveNode, purgeAfter } from "./archive";
 import { linkIdentifiers, resolveMentions, type Consumed } from "./extract";
 import { sizeLevel } from "./housekeeping";
@@ -181,7 +184,10 @@ export function writeHead(tx: Tx, n: NodeRow, steps: Step[], revision: number): 
  * current content and both search indexes, and stamped with this write's seq.
  */
 function writeBody(tx: Tx, id: string, content: string, revision: number, requestId: string | null): void {
-	tx.run("DELETE FROM texts WHERE node_id = ? AND part = 'body'", id);
+	if (policyOf(tx.sql.exec<{attrs:string}>("SELECT attrs FROM nodes WHERE id = ?",id).toArray()[0]?.attrs)) {
+		tx.run("DELETE FROM texts WHERE node_id = ? AND part = 'body' AND actor <> 'migration'",id);
+		tx.run("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'body' AND actor = 'migration' AND live = 1",tx.seq,id);
+	} else tx.run("DELETE FROM texts WHERE node_id = ? AND part = 'body'", id);
 	tx.run("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'summary' AND live = 1", tx.seq, id);
 	tx.touch(Number(tx.sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > COALESCE((SELECT json_extract(attrs, '$.compacted_through') FROM nodes WHERE id = ?), 0)", id, id).one().n));
 	tx.run("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > COALESCE((SELECT json_extract(attrs, '$.compacted_through') FROM nodes WHERE id = ?), 0)", tx.seq, id, id);
@@ -298,17 +304,18 @@ function create(tx: Tx, who: Who, a: SaveArgs, scope: string): WriteOutput {
 	if (a.origin === "stated" && BACKGROUND.includes(tx.ctx.actor)) throw Fail.of("forbidden", "a background actor cannot record a stated memory", { reason: "background_stated" });
 	if (a.origin === "inferred" && !a.evidence?.length) throw Fail.of("validation", "an inferred memory needs at least one evidence pointer", { reason: "missing_evidence" });
 	if (kind === "decision" && !a.evidence?.length) throw Fail.of("validation", "a decision needs at least one evidence pointer", { reason: "missing_evidence" });
+	if (a.review && (tx.ctx.actor !== "maintenance" || kind !== "document")) throw Fail.of("forbidden", "only the maintenance batch writes a strategic review", { reason: "review_not_allowed" });
 	const id = newMemoryId(who.userId, who.profile, scope, a.type, name);
 	assertNotWiped(tx.sql, id);
 	if (readNode(tx.sql, id)) throw Fail.of("already_exists", `memory identity '${id}' already exists`, { memory_id: id });
 	const fields = { name, type: a.type, description: a.description, content, why: a.why, how_to_apply: a.how_to_apply, objective, steps };
 	const hash = contentHash(fields);
 	const card = sha256(cardText({ kind, name, description: a.description, why: a.why ?? null }, content));
-	tx.run(`INSERT INTO nodes (id, kind, memory_type, scope, name, norm_name, description, why, how_to_apply, objective, steps, status, origin,
+	tx.run(`INSERT INTO nodes (id, kind, memory_type, scope, name, norm_name, description, why, how_to_apply, objective, steps, attrs, status, origin,
 		revision, chars, content_hash, card_hash, valid_from, recorded_at, created_at, updated_at, source_platform, updated_source_platform, seq)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, kind, a.type, scope, name, normalizeName(name), a.description, a.why ?? null, a.how_to_apply ?? null, objective,
-		a.type === "procedural" ? JSON.stringify(steps) : null, a.origin ?? "agent", content.length, hash, card,
+		a.type === "procedural" ? JSON.stringify(steps) : null, JSON.stringify(a.review ? { kind: "strategic_review", ...a.review } : {}), a.origin ?? "agent", content.length, hash, card,
 		tx.now, tx.now, tx.now, tx.now, tx.ctx.platform, tx.ctx.platform, tx.seq);
 	const node = readNode(tx.sql, id)!;
 	writeHead(tx, node, steps, 1);
@@ -334,6 +341,7 @@ function kindFor(type: MemoryType, kind: MemoryKind | undefined, why: string | u
 
 function update(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string; scope?: string; type?: MemoryType }): WriteOutput {
 	const node = findNode(tx.sql, lookup, true);
+	assertArchiveUnchanged(tx.sql,[node.id]);
 	const changed = [...TEXT_FIELDS, "steps", "scope", "new_name"].filter((f) => (a as Record<string, unknown>)[f] !== undefined);
 	if (!changed.length && a.supersedes === undefined && !a.evidence && !a.links) throw Fail.of("validation", "update needs at least one changed field", { reason: "no_changes" });
 	if (a.kind && a.kind !== node.kind) throw Fail.of("validation", "kind cannot change on an existing memory", { reason: "invalid_kind" });
@@ -416,6 +424,9 @@ export function save(tx: Tx, who: Who, a: SaveArgs): WriteOutput {
 	if (a.scope !== undefined && !isScope(a.scope)) scopeOf(a.scope);
 	const lookupScope = a.from_scope ?? (a.retire ? a.scope : undefined);
 	const lookup = { ...(a.memory_id ? { memory_id: a.memory_id } : { name: a.name }), ...(lookupScope !== undefined ? { scope: lookupScope } : {}), ...(a.type ? { type: a.type } : {}) };
+	if (a.compact !== undefined) { assertArchiveUnchanged(tx.sql,[findNode(tx.sql,lookup,true).id]); }
+	if (a.retire) assertArchiveUnchanged(tx.sql,[findNode(tx.sql,lookup,true).id]);
+	if (a.supersedes) assertArchiveUnchanged(tx.sql,[a.supersedes].flat());
 	if (a.compact !== undefined) return compact(tx, a, findNode(tx.sql, lookup, true));
 	if (a.retire) return retire(tx, a, lookup);
 	if (a.memory_id || a.from_scope !== undefined || a.new_name !== undefined) return update(tx, a, lookup);
@@ -438,6 +449,7 @@ export function append(tx: Tx, a: AppendArgs): WriteOutput {
 	const separator = a.separator ?? "\n";
 	if (typeof separator !== "string") throw Fail.of("validation", "separator must be a string", { reason: "invalid_separator" });
 	const node = findNode(tx.sql, { ...(a.memory_id ? { memory_id: a.memory_id } : { name: a.name }), ...(a.scope !== undefined ? { scope: a.scope } : {}), ...(a.type ? { type: a.type } : {}) }, true);
+	assertArchiveUnchanged(tx.sql,[node.id]);
 	if (node.memory_type === "procedural") throw Fail.of("validation", "append is not supported for procedural memories", { reason: "append_not_supported" });
 	expectRevision(a.expected_revision, node.revision);
 	const used = node.chars > 0 ? separator : "";
@@ -462,12 +474,26 @@ const CONTENT_ARGS = ["content", "description", "why", "how_to_apply", "objectiv
 const shrinks = (cmd: WriteCommand) => cmd.op === "save" && (typeof cmd.args.memory_id === "string" || typeof cmd.args.name === "string")
 	&& (cmd.args.retire === true || cmd.args.compact !== undefined) && !cmd.args.supersedes && !CONTENT_ARGS.some((k) => k in cmd.args);
 
+/** Read current persistent classification; stale jobs and alternate writers share this refusal. */
+export function archiveNodeIds(sql: SqlStorage, ids: string[]): string[] {
+	return sql.exec<{id:string;attrs:string}>(`SELECT id, ${POLICY_ATTRS_SQL} AS attrs FROM nodes WHERE id IN (SELECT value FROM json_each(?))`,JSON.stringify(ids)).toArray()
+		.filter(n=>policyOf(n.attrs)?.kind === "archival_reference").map(n=>n.id);
+}
+function assertArchiveUnchanged(sql: SqlStorage, ids: string[]): void {
+	if (archiveNodeIds(sql,ids).length) throw Fail.of("validation","archival references are content-read-only",{reason:"archival_reference"});
+}
+
 /**
  * The shared gates every write passes inside its transaction. At 90% of the object limit (section 6) only retire,
  * forget and undo are accepted. A background actor never retires or
  * supersedes a stated, pinned or me node (section 12); its callers flag those first, so reaching here is refused.
  */
 function gate(sql: SqlStorage, _who: Who, cmd: WriteCommand, ctx: WriteContext): void {
+	if (cmd.op === "knowledge") for (const n of cmd.args.nodes ?? []) {
+		if (n.attrs && (Object.hasOwn(n.attrs,"import_review") || Object.hasOwn(Object(n.attrs.source),"owner_classification"))) throw Fail.of("validation","import_review and source.owner_classification are reserved for authenticated import",{reason:"reserved_import_policy"});
+		const ids = sql.exec<{id:string}>("SELECT id FROM nodes WHERE key = ? OR (key IS NULL AND kind = ? AND scope = ? AND norm_name = ?)",n.key ?? null,n.kind,n.scope ?? "default",normalizeName(n.name)).toArray().map(r=>r.id);
+		assertArchiveUnchanged(sql,ids);
+	}
 	if (sizeLevel(sql.databaseSize) !== "ok" && ctx.actor === "index" && (cmd.op === "upload" || (cmd.op === "knowledge" && cmd.args.nodes?.some((n) => n.kind === "commit")))) {
 		throw Fail.of("size_budget", "aggregated commit uploads pause at 70% of the profile size limit", { reason: "uploads_refused" });
 	}
@@ -608,6 +634,7 @@ function judgmentEdge(tx: Tx, e: EdgeInput, ends: () => [string, string]): { id:
 	if (!e.evidence?.length) throw Fail.of("validation", "a judgment edge needs at least one evidence pointer", { reason: "missing_evidence" });
 	const [src, dst] = ends();
 	assertWritable(tx.sql, src);
+	assertArchiveEndpoints(tx.sql,src,dst,"");
 	if (src === dst) throw Fail.of("validation", "an edge needs two different nodes", { reason: "self_edge" });
 	checkEndpoints(e.rel, readNode(tx.sql, src)!.kind, readNode(tx.sql, dst)!.kind);
 	const prior = tx.sql.exec<{ id: number }>("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst_profile = '' AND dst = ? AND ended_at IS NULL", src, e.rel, dst).toArray()[0];
@@ -718,8 +745,8 @@ function knowledge(tx: Tx, who: Who, a: KnowledgeArgs): WriteOutput {
 	const ended: number[] = [];
 	for (const x of ends) {
 		if (!x.reason?.trim()) throw Fail.of("validation", "ending an edge needs a reason", { reason: "missing_reason" });
-		const edge = tx.sql.exec<{ src: string }>("SELECT src FROM edges WHERE id = ?", x.edge).toArray()[0];
-		if (edge) assertWritable(tx.sql, edge.src);
+		const edge = tx.sql.exec<{ src: string; dst:string;dst_profile:string }>("SELECT src,dst,dst_profile FROM edges WHERE id = ?", x.edge).toArray()[0];
+		if (edge) {assertWritable(tx.sql, edge.src);assertArchiveEndpoints(tx.sql,edge.src,edge.dst,edge.dst_profile);}
 		const changed = tx.run("UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE id = ? AND ended_at IS NULL", tx.now, x.valid_to, tx.seq, x.edge).rowsWritten;
 		if (!changed) throw Fail.of("not_found", `no current edge ${x.edge}`);
 		ended.push(x.edge);
@@ -799,6 +826,11 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 
 /** Undo reindexes behind the still-current fence, in bounded transactions, before publishing the restored fence. */
 export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, ctx: WriteContext): WriteOutput {
+	if(cmd.op === "undo"&&stagedArchiveActivity(storage.sql,cmd.args.activity_id)) {
+		const prior=storage.sql.exec("SELECT 1 FROM requests WHERE request_id=?",cmd.args.request_id).toArray().length;
+		const c=prior?{action:"restore" as const,activity_id:cmd.args.activity_id,request_id:cmd.args.request_id}:stagedUndo(storage.sql,cmd.args.activity_id)!.command;
+		return {result:runArchive(storage,who,c,ctx,cmd.args.activity_id),created:[],embedDue:false};
+	}
 	for (;;) {
 		try { return writeOnce(storage, who, cmd, ctx); } catch (e) {
 			if (!(e instanceof Unfold)) throw e;

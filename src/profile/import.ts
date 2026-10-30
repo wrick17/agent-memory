@@ -1,9 +1,11 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // The staged import of BothQ and Markdown records (architecture section 16, docs/import-implementation.md). Four steps,
 // each one transaction in this profile: stage parts, prepare, publish, link. AccountStore binds the record's request ids
 // between prepare and publish (api.ts). Until publish a record has no node row, so no read path can see its rows, and
 // replay refuses its requests (write.ts).
-import { canonicalJson, normalizeName, sha256 } from "../domain/ids";
-import { attrsDigest, NODE_COLUMNS, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest, storedNode, type RequestRow, type RevisionRow } from "../domain/import-audit";
+import { canonicalJson, normalizeName, sha256, uuid5 } from "../domain/ids";
+import { identityDigest, textDigest, textKey, type TextRow, attrsDigest, NODE_COLUMNS, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest, storedNode, type RequestRow, type RevisionRow } from "../domain/import-audit";
+import { classificationOf, ownerSemantic, policyOf } from "../domain/import-policy";
 import { IMPORT_BUDGET } from "../domain/import-cost";
 import { Fail, MEMORY_KINDS, MEMORY_TYPES, type ReadQuery } from "../domain/types";
 import { assertNotWiped, assertOpen } from "./wipe";
@@ -23,11 +25,11 @@ export interface ImportNode {
 export interface Refresh { no: number; base_record_sha256: string }
 export interface RefreshBase extends Refresh { base_revision: number; base_content_hash: string; body_revision?: number }
 export type ImportStep =
-	| { op: "stage"; record_id: string; record_sha256: string; part: number; parts: number; part_id: string; sha256: string; rows: { texts: ImportText[]; revisions: ImportRevision[]; requests: ImportRequest[] }; refresh?: Refresh }
+	| { op: "stage"; record_id: string; record_sha256: string; part: number; parts: number; part_id: string; sha256: string; rows: { texts: ImportText[]; revisions: ImportRevision[]; requests: ImportRequest[] }; refresh?: Refresh; policy_version?: 1; classification_version?: 1 }
 	| FinalizeStep
 	| { op: "link"; src: string; dst: string };
-type FinalizeStep = { op: "prepare" | "publish"; record_id: string; record_sha256: string; node: ImportNode; parts: { part_id: string; sha256: string }[]; request_ids: string[]; refresh?: RefreshBase };
-export type ImportResult = { status: "stored" | "replayed" | "prepared" | "published" | "linked"; rows_written?: number; bytes?: number; requests?: { request_id: string; op: string; hash: string }[]; embed?: boolean };
+type FinalizeStep = { op: "prepare" | "publish"; record_id: string; record_sha256: string; node: ImportNode; parts: { part_id: string; sha256: string }[]; request_ids: string[]; refresh?: RefreshBase; policy_version?: 1; classification_version?: 1 };
+export type ImportResult = { status: "stored" | "replayed" | "prepared" | "published" | "linked" | "checked"; rows_written?: number; bytes?: number; requests?: { request_id: string; op: string; hash: string }[]; embed?: boolean };
 
 const utf8 = (s: string) => Buffer.byteLength(s, "utf8");
 const refuse = (reason: string, message: string, details: Record<string, unknown> = {}) => Fail.of("validation", message, { reason, ...details });
@@ -63,7 +65,7 @@ class Budget {
 	}
 }
 
-type RecordRow = { record_sha256: string; parts: number; state: "staging" | "prepared" | "published"; node_sha256: string | null; published_revision: number | null; published_content_hash: string | null; finalize_sha256?: string | null };
+type RecordRow = { record_sha256: string; parts: number; state: "staging" | "prepared" | "published"; node_sha256: string | null; published_revision: number | null; published_content_hash: string | null; published_at?: string | null; finalize_sha256?: string | null };
 const recordOf = (sql: SqlStorage, id: string) => sql.exec<RecordRow>("SELECT * FROM import_records WHERE record_id = ?", id).toArray()[0];
 const hasNode = (sql: SqlStorage, id: string) => sql.exec("SELECT 1 FROM nodes WHERE id = ?", id).toArray().length > 0;
 type RecordStep = Exclude<ImportStep, { op: "link" }>;
@@ -72,6 +74,73 @@ const ledger = (c: RecordStep) => c.refresh ? "import_refreshes" : "import_recor
 const ledgerKey = (c: RecordStep) => c.refresh ? "shadow_id" : "record_id";
 const stagedRecord = (sql: SqlStorage, c: RecordStep) => sql.exec<RecordRow>(`SELECT * FROM ${ledger(c)} WHERE ${ledgerKey(c)} = ?`, stagedId(c)).toArray()[0];
 const finalizeHash = (c: FinalizeStep) => sha256(canonicalJson(c.refresh ? { node: c.node, refresh: c.refresh, parts: c.parts, request_ids: c.request_ids } : c.node));
+
+/** Required before replay shortcuts too: reserved metadata never silently downgrades into an ordinary import. */
+function policyCheck(sql: SqlStorage, c: RecordStep, profile: string): void {
+	const current = sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", c.record_id).toArray()[0];
+	const stored = current && policyOf(current.attrs);
+	const p = c.op === "stage" ? null : policyOf(c.node.attrs);
+	if ((stored || p || c.policy_version !== undefined) && c.policy_version !== 1) throw refuse("policy_version", "source-policy imports require policy_version 1");
+	if (c.op === "stage") return;
+	if (c.policy_version === 1 && !p) throw refuse("policy_missing", "a policy command requires its reserved source witness");
+	if (!p) return;
+	const n = c.node, source = n.attrs.source as Record<string, unknown> | undefined;
+	if (!source || typeof source.realpath !== "string" || uuid5(`markdown:${source.realpath}`) !== n.id
+		|| sha256(`${source.system}:${source.realpath}`) !== p.witness.source_key_sha256
+		|| p.witness.profile !== profile || p.witness.scope !== n.scope || !p.owner_decision.permitted_ids.includes(n.id)
+		|| sha256(canonicalJson(p.owner_decision)) !== p.owner_decision_sha256 || n.origin !== "import") throw refuse("policy_witness", "source-policy identity/profile/scope/decision differs");
+	if(n.kind !== "document" || n.memory_type !== "reference" || n.steps !== null) throw refuse("policy_effect","source-policy Markdown remains a reference document");
+	if (p.kind === "source_suffix") {
+		if (source.system !== "claude" || source.category !== "claude_index" || n.name !== p.source_head.name + ` [source ${n.id.slice(0,8)}]`) throw refuse("policy_effect", "source suffix differs from the approved source head");
+	} else if (source.system !== "codex" || source.category !== "codex_reference_candidate" || n.kind !== "document" || n.memory_type !== "reference" || n.steps !== null
+		|| n.name !== p.source_head.name || n.content_hash !== p.source_head.content_hash) throw refuse("policy_effect", "archive must remain an untrusted reference document");
+	const snapshot = sql.exec<{snapshot:string}>("SELECT snapshot FROM revisions WHERE node_id IN (?, ?) AND actor = 'migration' AND op = 'legacy_snapshot' AND revision = ? ORDER BY node_id = ? DESC LIMIT 1", stagedId(c), c.record_id, p.source_head.revision, stagedId(c)).toArray()[0];
+	const head = snapshot && JSON.parse(snapshot.snapshot) as Record<string, unknown> | undefined;
+	if (!head || head.name !== p.source_head.name || head.content_hash !== p.source_head.content_hash || head.path !== source.realpath || head.type !== n.memory_type
+		|| head.sha256 !== source.sha256 || head.bytes !== source.bytes || n.revision !== p.source_head.revision) throw refuse("policy_source_head", "source head differs from the original legacy snapshot");
+}
+
+/** Like policyCheck, before replay shortcuts: the owner's Work classification is exact, present on both sides, and never downgraded. */
+function classificationCheck(sql: SqlStorage, c: RecordStep, profile: string): void {
+	const current = sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", c.record_id).toArray()[0];
+	const stored = current && classificationOf(current.attrs), k = c.op === "stage" ? null : classificationOf(c.node.attrs);
+	if ((stored || k || c.classification_version !== undefined) && c.classification_version !== 1) throw refuse("classification_version", "legacy Work classification imports require classification_version 1");
+	if (c.op === "stage") return;
+	if (!k) { if (c.classification_version) throw refuse("classification_missing", "a classification command requires its reserved owner witness"); return; }
+	const n = c.node, source = n.attrs.source as Record<string, unknown>, policy = policyOf(n.attrs);
+	if (profile !== "work" || k.witness.id !== n.id || k.witness.scope !== n.scope || k.witness.memory_type !== n.memory_type || n.origin !== "import"
+		|| (source.system !== "bothq" && uuid5(`markdown:${String(source.realpath)}`) !== n.id)
+		|| (policy?.kind === "archival_reference" && policy.profile_review_sha256 !== sha256(canonicalJson(k)))) throw refuse("classification_witness", "owner classification destination/identity/scope/type differs");
+}
+
+/**
+ * Whether the hosted node is still the node digest a published import step wrote. Derived index, embedding and sequence
+ * columns are outside it. Publish stores a null created_at/updated_at as its own time, and a refresh keeps the first copy's
+ * created_at. Normalize creation only at the first publication and update only at the current publication.
+ */
+function stillPublished(sql: SqlStorage, id: string, digest: string | null | undefined, published: (string | null | undefined)[]): boolean {
+	const row = sql.exec(`SELECT ${NODE_COLUMNS} FROM nodes WHERE id = ?`, id).toArray()[0];
+	if (!row || !digest) return false;
+	const n = storedNode(row), dates = (v: unknown, at: string | null | undefined) => (v === at ? [v, null] : [v]);
+	return dates(n.created_at, published[0]).some((created_at) => dates(n.updated_at, published[1]).some((updated_at) => nodeDigest({ ...n, created_at, updated_at }) === digest));
+}
+
+function policyReplay(sql: SqlStorage, c: FinalizeStep, rec: RecordRow): void {
+	const owner = classificationOf(c.node.attrs);
+	if ((!policyOf(c.node.attrs) && !owner) || rec.state === "staging") return;
+	if ((c.refresh ? rec.finalize_sha256 : rec.node_sha256) !== finalizeHash(c)) throw refuse("node_changed", "the finalized policy node changed");
+	if (!c.refresh) {
+		const parts = sql.exec<{part_id:string;sha256:string}>("SELECT part_id, sha256 FROM import_parts WHERE record_id = ? ORDER BY part LIMIT 1001", c.record_id).toArray();
+		const requests = sql.exec<{request_id:string}>("SELECT request_id FROM requests WHERE node_id = ? AND legacy_op IS NOT NULL ORDER BY request_id LIMIT 5001",c.record_id).toArray();
+		if (canonicalJson(parts) !== canonicalJson(c.parts) || canonicalJson(requests.map(r=>r.request_id)) !== canonicalJson([...c.request_ids].sort())) throw refuse("policy_ledger_changed", "published policy parts or requests differ");
+	}
+	if (owner && rec.state === "published" && !stillPublished(sql, c.record_id, sha256(canonicalJson(c.node)), [recordOf(sql, c.record_id)?.published_at, rec.published_at])) {
+		throw refuse("hosted_changed", "the hosted classified record changed since this finalize published it");
+	}
+	if (policyOf(c.node.attrs) && rec.state === "published" && !stillPublished(sql, c.record_id, nodeDigest(c.node), [recordOf(sql, c.record_id)?.published_at, rec.published_at])) {
+		throw refuse("hosted_changed", "published source-policy metadata changed");
+	}
+}
 
 function refreshAnchor(sql: SqlStorage, c: RecordStep): void {
 	if (!c.refresh) return;
@@ -84,6 +153,18 @@ function hostedBase(sql: SqlStorage, c: FinalizeStep): void {
 	if (!c.refresh) return;
 	const n = sql.exec<{ revision: number; content_hash: string; status: string }>("SELECT revision, content_hash, status FROM nodes WHERE id = ?", c.record_id).toArray()[0];
 	const prev = c.refresh.no === 1 ? recordOf(sql, c.record_id) : sql.exec<RecordRow>("SELECT * FROM import_refreshes WHERE record_id = ? AND refresh_no = ?", c.record_id, c.refresh.no - 1).toArray()[0];
+	const owner = classificationOf(c.node.attrs), hosted = owner && sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", c.record_id).toArray()[0];
+	if (owner && (!hosted || ownerSemantic(classificationOf(hosted.attrs)) !== ownerSemantic(owner))) throw refuse("classification_changed", "refresh owner classification changed, or an unclassified hosted copy would be adopted in place");
+	if (owner && !stillPublished(sql, c.record_id, prev?.node_sha256, [recordOf(sql, c.record_id)?.published_at, prev?.published_at])) throw refuse("hosted_changed", "the hosted classified record changed since this import base; hold the refresh for review");
+	if (policyOf(c.node.attrs)) {
+		const row = sql.exec(`SELECT ${NODE_COLUMNS} FROM nodes WHERE id = ?`, c.record_id).toArray()[0];
+		const old = row && storedNode(row), oldPolicy = old && policyOf(old.attrs as Record<string,unknown>), fresh = policyOf(c.node.attrs)!;
+		if (old && oldPolicy) {
+			const semantic = (p:NonNullable<typeof oldPolicy>) => canonicalJson({kind:p.kind,owner:p.owner_decision_sha256,key:p.witness.source_key_sha256,profile:p.witness.profile,scope:p.witness.scope,name:p.source_head.name});
+			if (semantic(oldPolicy) !== semantic(fresh)) throw refuse("policy_changed","refresh source-policy semantics changed");
+		}
+		if (!old || !oldPolicy || !stillPublished(sql, c.record_id, prev?.node_sha256, [recordOf(sql, c.record_id)?.published_at, prev?.published_at])) throw refuse("hosted_changed", "hosted source-policy metadata drift or unsupported adoption");
+	}
 	if (!n || prev?.published_revision !== c.refresh.base_revision || prev.published_content_hash !== c.refresh.base_content_hash || n.revision !== c.refresh.base_revision || n.content_hash !== c.refresh.base_content_hash || !["active", "retired", "superseded"].includes(n.status)) throw refuse("hosted_changed", "the hosted copy changed since this import base; hold the refresh for review");
 }
 
@@ -141,6 +222,7 @@ function prepare(storage: DurableObjectStorage, c: FinalizeStep): ImportResult {
 	if (rec.record_sha256 !== c.record_sha256) throw refuse("record_changed", `record '${c.record_id}' was staged with different content`);
 	const nodeSha = finalizeHash(c);
 	const requests = sql.exec<{ request_id: string; op: string; hash: string }>("SELECT request_id, legacy_op AS op, legacy_hash AS hash FROM requests WHERE node_id = ? ORDER BY request_id", sid).toArray();
+	policyReplay(sql,c,rec);
 	if (rec.state === "published") return { status: "published", requests };
 	refreshAnchor(sql, c);
 	hostedBase(sql, c);
@@ -183,6 +265,7 @@ function publish(storage: DurableObjectStorage, c: FinalizeStep): ImportResult {
 	const sql = storage.sql;
 	const rec = stagedRecord(sql, c);
 	if (rec && rec.record_sha256 !== c.record_sha256) throw refuse("record_changed", "the refresh was staged with different content");
+	if (rec) policyReplay(sql,c,rec);
 	if (rec?.state === "published") return { status: "replayed" };
 	if (rec?.state !== "prepared") throw refuse("not_prepared", `record '${c.record_id}' is not prepared`);
 	const n = c.node;
@@ -238,6 +321,7 @@ function publish(storage: DurableObjectStorage, c: FinalizeStep): ImportResult {
 function link(storage: DurableObjectStorage, c: Extract<ImportStep, { op: "link" }>): ImportResult {
 	const sql = storage.sql;
 	const memory = (id: string) => sql.exec<{ kind: string; memory_type: string | null }>("SELECT kind, memory_type FROM nodes WHERE id = ?", id).toArray()[0];
+	assertArchiveEndpoints(sql,c.src,c.dst,"");
 	const src = memory(c.src), dst = memory(c.dst);
 	if (!src || !dst) throw refuse("endpoint_unpublished", "both records of a supersession must be published in this profile first", { missing: !src ? c.src : c.dst });
 	if (c.src === c.dst || src.memory_type === null || dst.memory_type === null) {
@@ -263,6 +347,16 @@ const digests = <R, D>(rows: Iterable<R>, f: (r: R) => D) => { const out: D[] = 
 export function audit(sql: SqlStorage, q: Extract<ReadQuery, { kind: "import_audit" }>) {
 	const count = (query: string, ...params: SqlStorageValue[]) => sql.exec<{ n: number }>(query, ...params).one().n;
 	if (q.record) {
+		const record = sql.exec<{record_sha256:string}>("SELECT coalesce((SELECT record_sha256 FROM import_refreshes WHERE record_id = ? AND state = 'published' ORDER BY refresh_no DESC LIMIT 1),record_sha256) AS record_sha256 FROM import_records WHERE record_id = ?",q.record,q.record).toArray()[0];
+		const stored = sql.exec(`SELECT ${NODE_COLUMNS} FROM nodes WHERE id = ?`,q.record).toArray()[0];
+		const anchors = stored && (policyOf(stored.attrs as string) || q.rows === "texts") ? {record_sha256:record?.record_sha256 ?? null,node_sha256:nodeDigest(storedNode(stored))} : {};
+		if (q.rows === "texts") {
+			let key: unknown = ["",-1,-1,-1];
+			try { if (q.after !== null) key = JSON.parse(q.after); } catch { throw refuse("audit_cursor","invalid text audit cursor"); }
+			if (!Array.isArray(key) || key.length !== 4 || typeof key[0] !== "string" || key.slice(1).some(v=>!Number.isSafeInteger(v))) throw refuse("audit_cursor","invalid text audit cursor");
+			const rows = digests(sql.exec<TextRow & Record<string,SqlStorageValue>>("SELECT part, revision, seq_no, chunk, body, separator, request_id, created_at, live FROM texts WHERE node_id = ? AND actor = 'migration' AND part IN ('body','entry') AND (part,revision,seq_no,chunk) > (?,?,?,?) ORDER BY part,revision,seq_no,chunk LIMIT ?",q.record,key[0],key[1],key[2],key[3],q.limit),textDigest);
+			return {record_id:q.record,node_revision:stored?.revision ?? null,...anchors,rows,next_after:rows.length===q.limit ? JSON.stringify(textKey(rows.at(-1)!)) : null};
+		}
 		const rows = q.rows === "requests"
 			? digests(sql.exec<RequestRow>(`SELECT ${REQUEST_COLS} FROM requests WHERE node_id = ? AND legacy_op IS NOT NULL AND request_id > ? ORDER BY request_id LIMIT ?`,
 				q.record, q.after ?? "", q.limit), requestDigest)
@@ -270,7 +364,7 @@ export function audit(sql: SqlStorage, q: Extract<ReadQuery, { kind: "import_aud
 				q.record, q.after === null ? -1 : Number(q.after), q.limit), revisionDigest);
 		const last = rows.at(-1);
 		return { record_id: q.record, node_revision: sql.exec<{ revision: number }>("SELECT revision FROM nodes WHERE id = ?", q.record).toArray()[0]?.revision ?? null,
-			rows, next_after: rows.length === q.limit && last ? String("revision" in last ? last.revision : last.request_id) : null };
+			...anchors, rows, next_after: rows.length === q.limit && last ? String("revision" in last ? last.revision : last.request_id) : null };
 	}
 	const records = sql.exec<{ record_id: string; state: string; record_sha256: string; node_sha256: string | null; published_at: string | null }>(
 		`SELECT i.record_id, i.state, coalesce(f.record_sha256, i.record_sha256) AS record_sha256,
@@ -289,9 +383,10 @@ export function audit(sql: SqlStorage, q: Extract<ReadQuery, { kind: "import_aud
 		if (!paged) read += size;
 		const row = sql.exec(`SELECT ${NODE_COLUMNS} FROM nodes WHERE id = ?`, r.record_id).toArray()[0];
 		const n = row && storedNode(row);
+		const identity = n && policyOf(n.attrs as Record<string,unknown>) ? sql.exec<{norm:string;chars:number}>("SELECT substr(norm_name,1,513) AS norm, length(norm_name) AS chars FROM nodes WHERE id = ?",r.record_id).one() : null;
 		// row_sha256 is the node as stored now; node_sha256 is the node as it was published.
 		const node = n ? { revision: n.revision, content_hash: n.content_hash, status: n.status, kind: n.kind, memory_type: n.memory_type, created_at: n.created_at, updated_at: n.updated_at,
-			row_sha256: nodeDigest(n), ...attrsDigest(n.attrs as Record<string, unknown>) } : null;
+			row_sha256: nodeDigest(n), ...attrsDigest(n.attrs as Record<string, unknown>), ...(identity ? {identity_sha256:identity.chars<=512 ? identityDigest(String(n.scope),String(n.memory_type),identity.norm) : null} : {}) } : null;
 		if (paged) {
 			const counted = (table: string, imported: string) => ({ count: count(`SELECT count(*) AS n FROM ${table} WHERE node_id = ? AND ${imported}`, r.record_id), sha256: null,
 				hosted: count(`SELECT count(*) AS n FROM ${table} WHERE node_id = ? AND NOT (${imported})`, r.record_id) });
@@ -319,14 +414,19 @@ export function audit(sql: SqlStorage, q: Extract<ReadQuery, { kind: "import_aud
 	return { ...(totals ? { totals } : {}), records: out, next_after: more && out.length ? out.at(-1)!.record_id : null };
 }
 
-/** One import step in one transaction; a thrown Fail rolls all of it back. */
-export function runImport(storage: DurableObjectStorage, c: ImportStep): ImportResult {
+/** One import step in one transaction; a thrown Fail rolls all of it back. `check` runs only its guards, before account reservations. */
+export function runImport(storage: DurableObjectStorage, c: ImportStep, profile = "", check = false): ImportResult {
 	return storage.transactionSync(() => {
 		assertOpen(storage.sql);
 		for (const id of c.op === "link" ? [c.src, c.dst] : [c.record_id]) {
 			assertNotWiped(storage.sql, id);
 			assertWritable(storage.sql, id);
 		}
+		if (c.op !== "link") {
+			try { policyCheck(storage.sql,c,profile); } catch(e) { if(e instanceof Fail) throw e; throw refuse("policy_invalid","invalid reserved source-policy metadata"); }
+			try { classificationCheck(storage.sql,c,profile); } catch(e) { if(e instanceof Fail) throw e; throw refuse("classification_invalid","invalid reserved owner classification metadata"); }
+		}
+		if (check) return { status: "checked" };
 		if (c.op === "stage") return stage(storage, c);
 		if (c.op === "link") return link(storage, c);
 		return c.op === "prepare" ? prepare(storage, c) : publish(storage, c);

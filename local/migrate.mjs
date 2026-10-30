@@ -2,6 +2,7 @@
 // Agent Memory import, first slice (docs/import-implementation.md): a read-only export of BothQ and the curated Markdown
 // memory, and a deterministic, staged import plan. Nothing here writes to BothQ, to a Markdown file or to the server.
 // Every output is private (directories 0700, files 0600); stdout carries counts and hashes only, never memory text.
+import { importDecision, importPolicy, ownerClassification, ownerSemantic } from "../src/domain/import-policy.ts";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -15,6 +16,7 @@ import { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK, PART_OVERHEAD, pack, publ
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PLAN_VERSION = 1;
+const POLICY_PLAN_VERSION = 2;
 // The transaction budget, the measured row costs and the packer are shared with the server (src/domain/import-cost.ts).
 export { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK } from "../src/domain/import-cost.ts";
 const BATCH = { commands: 50, bytes: 1_000_000 };
@@ -275,6 +277,7 @@ export function readReviewedRoutes(file, exportDir) {
 	const exact = (o, keys) => !!o && typeof o === "object" && !Array.isArray(o) && JSON.stringify(Object.keys(o).sort()) === JSON.stringify([...keys].sort());
 	let doc;
 	try { doc = JSON.parse(bytes.toString("utf8")); } catch { fail("not JSON"); }
+	if (doc?.version === 2) return readOwnerWork(doc, bytes, exportDir, fail, exact);
 	if (!exact(doc, ["version", "export_manifest_sha256", "routes"]) || doc.version !== 1 || !Array.isArray(doc.routes) || !doc.routes.length) fail("schema");
 	if (doc.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json")))) fail("made for another export");
 	const routes = new Map();
@@ -287,6 +290,48 @@ export function readReviewedRoutes(file, exportDir) {
 		routes.set(r.source, { ...r, n });
 	});
 	return { sha256: sha256Bytes(bytes), routes };
+}
+
+/**
+ * Route version 2, effect legacy_work_owner only: the owner's decision that every listed legacy identity of one export goes to
+ * Work. An explicit roster sorted by source key, each entry bound to its id, original scope and exported row; null id or scope
+ * stays held. No other target, default, pattern, alias, me exception or hold waiver can be expressed.
+ */
+function readOwnerWork(doc, bytes, exportDir, fail, exact) {
+	const d = doc.owner_decision;
+	if (!exact(doc, ["version", "effect", "export_manifest_sha256", "owner_decision", "owner_decision_sha256", "roster"]) || doc.effect !== "legacy_work_owner"
+		|| !Array.isArray(doc.roster) || !doc.roster.length || !exact(d, ["reference", "answer", "roster_sha256"]) || !nonEmpty(d.reference) || d.reference.length > 512
+		|| !nonEmpty(d.answer) || d.answer.length > 1024) fail("schema");
+	if (doc.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json")))) fail("made for another export");
+	if (d.roster_sha256 !== sha256(canonicalJson(doc.roster)) || doc.owner_decision_sha256 !== sha256(canonicalJson(d))) fail("owner decision or roster digest differs");
+	const routes = new Map();
+	doc.roster.forEach((r, i) => {
+		const n = i + 1, maybe = (v) => v === null || nonEmpty(v);
+		if (!exact(r, ["source", "id", "scope", "source_sha256"]) || !nonEmpty(r.source) || !maybe(r.id) || !maybe(r.scope) || !/^[0-9a-f]{64}$/.test(r.source_sha256)) fail(`roster ${n} schema`);
+		if (i && !(doc.roster[i - 1].source < r.source)) fail(`roster ${n} is not strictly sorted by source`);
+		routes.set(r.source, { ...r, n });
+	});
+	return { sha256: sha256Bytes(bytes), version: 2, manifest: doc.export_manifest_sha256, owner_decision: d, owner_decision_sha256: doc.owner_decision_sha256, routes };
+}
+
+/** One record's compact owner witness (attrs.source.owner_classification); an archival reference's profile receipt is its digest. */
+export const ownerWitness = (reviewed, r, it) => ({ version: 1, effect: "legacy_work_owner", profile: "work", owner_decision: reviewed.owner_decision,
+	owner_decision_sha256: reviewed.owner_decision_sha256, witness: { export_manifest_sha256: reviewed.manifest, source_key_sha256: sha256(r.source),
+		source_row_sha256: r.source_sha256, id: r.id, scope: r.scope, memory_type: it.node.memory_type } });
+
+/** The owner's Work decision for each exact roster member with an id and scope. The ordinary route stays as evidence; v1 conflict refusal is untouched. */
+function applyOwnerWork(items, rows, reviewed) {
+	const at = new Map(items.map((it, i) => [it.key, i]));
+	for (const r of reviewed.routes.values()) {
+		const fail = (why) => { throw new Error(`reviewed routes refused: roster ${r.n} ${why}`); };
+		const i = at.get(r.source);
+		if (i === undefined) fail("names a source this export does not have");
+		const it = items[i];
+		if ((it.id ?? null) !== r.id || (it.node.scope ?? null) !== r.scope || sha256(canonicalJson(rows[i])) !== r.source_sha256) fail("no longer matches its exported source");
+		if (r.id === null || r.scope === null) continue;
+		it.route = { profile: "work", rule: "legacy_work_owner", automatic: it.route };
+		it.node.attrs.source.owner_classification = ownerWitness(reviewed, r, it);
+	}
 }
 
 /** Routes each reviewed source that is still the exact row it was reviewed as and that no rule routes. Every other hold still applies. */
@@ -302,6 +347,60 @@ function applyReviewed(items, rows, reviewed) {
 		it.route = { profile: r.profile, rule: "reviewed" };
 	}
 }
+
+/** One private exact-source approval input; it changes no routing rule and grants no other hold waiver. */
+export function readSourcePolicy(file, exportDir) {
+	const st = fs.statSync(file), bytes = fs.readFileSync(file);
+	if (st.uid !== process.getuid() || (st.mode & 0o077) || bytes.length > 65536) throw new Error("source policy needs a private owner file within 65536 bytes");
+	const exact = (o, keys) => o && typeof o === "object" && !Array.isArray(o) && canonicalJson(Object.keys(o).sort()) === canonicalJson([...keys].sort());
+	const d = JSON.parse(bytes.toString("utf8"));
+	if (!exact(d, ["version", "export_manifest_sha256", "entries"]) || d.version !== 1 || d.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json"))) || !Array.isArray(d.entries) || !d.entries.length || d.entries.length > 32) throw new Error("source policy version/export/schema differs");
+	const seen = new Set();
+	for (const e of d.entries) {
+		const fields = ["source", "id", "scope", "profile", "source_sha256", "kind", "owner_decision", "owner_decision_sha256", ...(e.kind === "archival_reference" ? ["profile_review_sha256"] : [])];
+		if (!exact(e, fields) || ![e.source,e.id,e.scope].every(nonEmpty) || !["work","personal"].includes(e.profile) || !/^[a-f0-9]{64}$/.test(e.source_sha256) || seen.has(e.source)) throw new Error("source policy entry/schema/profile differs");
+		const decision = importDecision.parse(e.owner_decision);
+		if (decision.kind !== e.kind || !decision.permitted_ids.includes(e.id) || sha256(canonicalJson(decision)) !== e.owner_decision_sha256) throw new Error("source policy decision digest/membership differs");
+		if (e.kind === "archival_reference" && !/^[a-f0-9]{64}$/.test(e.profile_review_sha256)) throw new Error("source policy needs an individual profile review");
+		seen.add(e.source);
+	}
+	return { sha256: sha256Bytes(bytes), manifest: d.export_manifest_sha256, entries: d.entries };
+}
+
+function policyProjection(it, p) {
+	it.node.attrs.import_review = p;
+	if (p.kind === "source_suffix") {
+		it.node.name = p.source_head.name + ` [source ${it.id.slice(0,8)}]`;
+		if (it.node.name.length > 512) throw new Error("source policy name exceeds 512 characters");
+		it.node.content_hash = bothqContentHash({ ...it.node, content: it.content }, it.node.steps ?? []);
+	}
+	return it;
+}
+
+function applySourcePolicy(items, rows, policy) {
+	for (const e of policy.entries) {
+		const i = items.findIndex((it) => it.key === e.source), it = items[i];
+		if (!it || it.id !== e.id || it.node.scope !== e.scope || sha256(canonicalJson(rows[i])) !== e.source_sha256) throw new Error("source policy no longer matches its exact exported source");
+		if (it.route?.profile !== e.profile) throw new Error("source policy cannot route or change its expected profile");
+		const owner = it.node.attrs.source.owner_classification;
+		if (owner && e.kind === "archival_reference" && e.profile_review_sha256 !== sha256(canonicalJson(owner))) throw new Error("source policy profile receipt differs from the owner classification");
+		const category = it.node.attrs.source.category;
+		if ((e.kind === "source_suffix" && !(it.source === "claude" && category === "claude_index")) || (e.kind === "archival_reference" && !(it.source === "codex" && category === "codex_reference_candidate")) || !["source_suffix","archival_reference"].includes(e.kind)) throw new Error("source policy source kind differs");
+		const p = importPolicy.parse({ version: 1, kind: e.kind, owner_decision: e.owner_decision, owner_decision_sha256: e.owner_decision_sha256,
+			witness: { export_manifest_sha256: policy.manifest, source_key_sha256: sha256(it.key), source_row_sha256: e.source_sha256, profile: e.profile, scope: e.scope },
+			source_head: { name: it.node.name, content_hash: it.node.content_hash, revision: it.node.revision }, ...(e.kind === "archival_reference" ? { profile_review_sha256: e.profile_review_sha256 } : {}) });
+		// Do not clear reference review while a different source guard is held.
+		if (it.review.some((r) => !["reference_candidate","duplicate_content"].includes(r))) continue;
+		policyProjection(it, p);
+		const normalized = markdownItem(rows[i], []), restored = structuredClone(it.node);
+		delete restored.attrs.import_review; delete restored.attrs.source.owner_classification; restored.name=p.source_head.name;restored.content_hash=p.source_head.content_hash;
+		if (canonicalJson(restored)!==canonicalJson(normalized.node) || ["texts","revisions","requests","content","supersedes"].some(k=>canonicalJson(it[k])!==canonicalJson(normalized[k]))) throw new Error("source-policy parity differs outside its closed projection");
+		if (redactionChanges(it).changed.length || stripPersonal(it.node.kind,it.node.attrs).stripped.length) throw new Error("source policy projection fails existing privacy guards");
+		if (p.kind === "archival_reference") it.review = it.review.filter((r) => r !== "reference_candidate");
+	}
+}
+
+const policySemantic = (p, id) => p ? canonicalJson({ kind:p.kind, owner:p.owner_decision_sha256, id, key:p.witness.source_key_sha256, profile:p.witness.profile, scope:p.witness.scope, name:p.source_head.name }) : null;
 
 /** BothQ scopes that name a profile (research 05). `bot_hq` mixes work and personal, so it and every other scope go to review. */
 function routeScope(scope) {
@@ -516,6 +615,7 @@ export function planRecords(dir) {
 		if (sha256(fs.readFileSync(file, "utf8")) !== manifest.records_sha256) throw new Error("records.jsonl does not match its plan manifest");
 		return readJsonl(file);
 	}
+	if (manifest?.version === POLICY_PLAN_VERSION) throw new Error("v2 refresh requires hashed records.jsonl");
 	const commands = readJsonl(path.join(dir, "commands.jsonl"));
 	return commands.filter((c) => c.op === "finalize").map((c) => {
 		const rows = commands.filter((s) => s.op === "stage" && s.record_id === c.record_id && s.profile === c.profile).map((s) => s.rows);
@@ -548,13 +648,14 @@ function itemCommands(it, base = null) {
 	let parts = pack([...it.texts.map((t) => ["texts", t]), ...it.revisions.map((r) => ["revisions", r]), ...it.requests.map((q) => ["requests", q])]);
 	if (!parts.length) parts = [{ rows: { texts: [], revisions: [], requests: [] }, cost: { ...PART_OVERHEAD } }];
 	const profile = it.route.profile;
+	const policy = { ...(it.node.attrs.import_review ? { policy_version: 1 } : {}), ...(it.node.attrs.source?.owner_classification ? { classification_version: 1 } : {}) };
 	const recordSha = sha256(canonicalJson({ profile, node: it.node, ...(refresh ? { base_record_sha256: refresh.base_record_sha256, refresh: refresh.no } : {}), parts: parts.map((p) => p.rows) }));
 	const stages = parts.map((p, i) => {
-		const body = { op: "stage", record_id: it.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
+		const body = { ...policy, op: "stage", record_id: it.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
 			...(refresh ? { refresh: { no: refresh.no, base_record_sha256: refresh.base_record_sha256 } } : {}) };
 		return { ...body, part_id: `${it.id}${refresh ? `#r${refresh.no}` : ""}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
 	});
-	const fin = { op: "finalize", record_id: it.id, record_sha256: recordSha, profile, node: it.node, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
+	const fin = { ...policy, op: "finalize", record_id: it.id, record_sha256: recordSha, profile, node: it.node, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
 		request_ids: it.requests.map((q) => q.request_id), ...(refresh ? { refresh } : {}) };
 	const own = [...stages, { ...fin, sha256: sha256(canonicalJson(fin)) }];
 	const flips = base?.texts.filter((t) => t.live && it.body_revision !== undefined) ?? [];
@@ -605,6 +706,14 @@ const adoptionOf = (base, it) => base.revisions.length === 1 && base.revisions[0
 	&& base.revisions[0].revision === it.revisions[0].revision && base.node.content_hash === it.revisions[0].content_hash;
 
 function refreshed(it, base) {
+	const hostedBase = base, freshPolicy = it.node.attrs.import_review, oldPolicy = base.node.attrs.import_review;
+	if (freshPolicy || oldPolicy) {
+		if (!freshPolicy || !oldPolicy || policySemantic(freshPolicy,it.id) !== policySemantic(oldPolicy,base.id)) throw Object.assign(new Error("source policy changed or unsupported adoption"), {code:"policy_changed"});
+		base = structuredClone(base); delete base.node.attrs.import_review;
+		Object.assign(base.node, {name:oldPolicy.source_head.name,content_hash:oldPolicy.source_head.content_hash});
+		it = structuredClone(it); delete it.node.attrs.import_review;
+		Object.assign(it.node,{name:freshPolicy.source_head.name,content_hash:freshPolicy.source_head.content_hash});
+	}
 	const same = (a, b) => canonicalJson(a) === canonicalJson(b);
 	const hold = (reason) => { throw Object.assign(new Error(reason), { code: reason }); };
 	if (it.id !== base.id) hold("history_rewritten");
@@ -624,7 +733,11 @@ function refreshed(it, base) {
 				revisions: [...base.revisions, ...it.revisions.map((r) => ({ ...r, revision, at: it.node.updated_at }))] };
 		}
 	}
-	const own = itemCommands(deltaItem(base, it, adoption), base);
+	if (freshPolicy) {
+		const p = structuredClone(freshPolicy); p.source_head = {name:it.node.name,content_hash:it.node.content_hash,revision:it.node.revision};
+		policyProjection(it,p);
+	}
+	const own = itemCommands(deltaItem(base, it, adoption), hostedBase);
 	return { ...own, record: { ...it, ...own, commands: undefined } };
 }
 
@@ -671,30 +784,32 @@ function refreshCommands(it, base) {
  * commands. Deterministic: the same export and rules give byte-identical commands. A part's id and hash depend only on its
  * record's content, so an unchanged record keeps its parts across plans and the server can replay them.
  */
-export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null } = {}) {
+export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null } = {}) {
 	// A rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
 	if (rehearsal !== null && rehearsal !== "test") throw new Error("a rehearsal goes to the test profile only");
-	if (rehearsal !== null && routes) throw new Error("a rehearsal ignores routing; reviewed routes apply to a routed plan only");
+	if (rehearsal !== null && (routes || sourcePolicy)) throw new Error("a rehearsal ignores routing; reviewed routes apply to a routed plan only");
 	return withLock(async () => {
 		const manifest = readJson(path.join(exportDir, "manifest.json"), null);
 		if (!manifest) throw new Error(`no export manifest in ${exportDir}`);
 		checkExport(exportDir, manifest);
 		if (refreshFrom && path.resolve(refreshFrom) === path.resolve(exportDir)) throw new Error("a refresh needs a fresh export directory");
 		const reviewed = routes ? readReviewedRoutes(routes, exportDir) : null;
+		const policy = sourcePolicy ? readSourcePolicy(sourcePolicy, exportDir) : null;
 		const base = refreshFrom ? completedBase(refreshFrom, rehearsal) : null;
-		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version: PLAN_VERSION, ...(base ? { refresh_base: base.commands_sha256 } : {}),
-			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}) }));
+		const version = policy || reviewed?.version === 2 || base?.records.some(r=>r.node.attrs.import_review || r.node.attrs.source?.owner_classification) ? POLICY_PLAN_VERSION : PLAN_VERSION;
+		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version, ...(base ? { refresh_base: base.commands_sha256 } : {}),
+			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}), ...(policy ? {source_policy:policy.sha256} : {}) }));
 		const out = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan");
 		const statePath = path.join(migrationDir(), "state.json");
 		const state = readJson(statePath, { exports: [], plans: {} });
 		const prior = state.plans[inputSha];
 		const last = readJson(path.join(out, "manifest.json"), null);
 		// Reviewed routes must be rechecked against current remotes and decoded paths.
-		if (!reviewed && !force && prior && last?.commands_sha256 === prior.commands_sha256 && last.input_sha256 === inputSha) return { status: "unchanged", dir: out, manifest: last };
-		if (reviewed) remotes.clear();
+		if (!reviewed && !policy && !force && prior && last?.commands_sha256 === prior.commands_sha256 && last.input_sha256 === inputSha) return { status: "unchanged", dir: out, manifest: last };
+		if (reviewed || policy) remotes.clear();
 		const bothqRows = readJsonl(path.join(exportDir, "bothq", "records.jsonl")), rows = [...bothqRows, ...readJsonl(path.join(exportDir, "markdown", "files.jsonl"))];
 		const items = rows.map((r, i) => (i < bothqRows.length ? bothqItem(r) : markdownItem(r, rules)));
-		if (reviewed) applyReviewed(items, rows, reviewed);
+		if (reviewed) (reviewed.version === 2 ? applyOwnerWork : applyReviewed)(items, rows, reviewed);
 		const review = [], holds = [];
 		const previous = new Map(base?.records.map((r) => [r.key, r]) ?? []), records = new Map(previous);
 		for (const it of items) {
@@ -704,6 +819,13 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			if (stripPersonal(it.node.kind, it.node.attrs).stripped.length) it.review.push("personal_fields");
 			const { changed, derivative } = redactionChanges(it);
 			if (changed.length) { it.review.push("needs_redaction"); holds.push({ key: it.key, changed, derivative }); }
+		}
+		if (policy) applySourcePolicy(items, rows, policy);
+		for (const it of items) {
+			const old = previous.get(it.key);
+			if (old?.node.attrs.import_review && policySemantic(old.node.attrs.import_review,old.id) !== policySemantic(it.node.attrs.import_review,it.id)) it.review.push("policy_changed");
+			// Refresh keeps the same owner choice only; a missing, added or changed classification never adopts a hosted copy in place.
+			if (old && ownerSemantic(old.node.attrs.source?.owner_classification ?? null) !== ownerSemantic(it.node.attrs.source?.owner_classification ?? null)) it.review.push("classification_changed");
 		}
 		// Identity: one id per item, and one active (profile, scope, type, name) per profile, as the hosted unique index requires.
 		const seen = new Map();
@@ -737,7 +859,7 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 				}
 				it.planned = true;
 			} catch (e) {
-				if (!["oversize_row", "oversize_command", "oversize_refresh", "history_rewritten", "route_changed"].includes(e.code)) throw e;
+				if (!["oversize_row", "oversize_command", "oversize_refresh", "history_rewritten", "route_changed", "policy_changed"].includes(e.code)) throw e;
 				it.review.push(e.code);
 			}
 		}
@@ -784,8 +906,9 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		for (const r of review) for (const x of r.reasons) reasons[x] = (reasons[x] ?? 0) + 1;
 		const stages = commands.filter((c) => c.op === "stage");
 		const planManifest = {
-			version: PLAN_VERSION, input_sha256: inputSha, export_dir: tilde(exportDir), rules, rehearsal,
-			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size } } : {}),
+			version, ...(policy ? {source_policy:{version:1,sha256:policy.sha256,entries:policy.entries.length}} : {}), input_sha256: inputSha, export_dir: tilde(exportDir), rules, rehearsal,
+			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size, ...(reviewed.version === 2 ? { version: 2, effect: "legacy_work_owner",
+				owner_decision_sha256: reviewed.owner_decision_sha256, classified: items.filter((x) => x.route?.rule === "legacy_work_owner").length } : {}) } } : {}),
 			items: items.length, planned: ready.filter((x) => x.planned).length, review: review.length, holds: holds.length, reasons, records_by_profile: byProfile,
 			commands: commands.length, stage: stages.length, finalize: count((c) => c.op === "finalize"), link: count((c) => c.op === "link"), batches: batches.length,
 			max_part: { rows: Math.max(0, ...stages.map((s) => s.cost.rows)), bytes: Math.max(0, ...stages.map((s) => s.cost.bytes)), json_bytes: Math.max(0, ...stages.map((s) => utf8(JSON.stringify(s)))) },
@@ -834,6 +957,15 @@ export function dryRun({ exportDir, rehearsal = null }) {
 	const m = readJson(path.join(dir, "manifest.json"), null);
 	if (!m) throw new Error(`no plan in ${dir}; run plan first`);
 	const commands = readJsonl(path.join(dir, "commands.jsonl"));
+	if (![1,2].includes(m.version)) throw new Error("unsupported plan version");
+	if (m.version === 1 && commands.some(c=>c.policy_version !== undefined || c.node?.attrs?.import_review)) throw new Error("source policy cannot downgrade into a v1 plan");
+	if (m.version === 1 && commands.some(c=>c.classification_version !== undefined || c.node?.attrs?.source?.owner_classification)) throw new Error("owner classification cannot downgrade into a v1 plan");
+	if (m.version === 2) {
+		const records = planRecords(dir); const ids = new Set(records.filter(r=>r.node.attrs.import_review).map(r=>r.id)), owned = new Set(records.filter(r=>r.node.attrs.source?.owner_classification).map(r=>r.id));
+		for(const c of commands.filter(c=>c.op==="finalize" && (ids.has(c.record_id) || owned.has(c.record_id)))){const r=records.find(r=>r.id===c.record_id && r.route.profile===c.profile);if(ids.has(c.record_id))importPolicy.parse(c.node.attrs.import_review);if(owned.has(c.record_id))ownerClassification.parse(c.node.attrs.source.owner_classification);if(!r || canonicalJson(c.node)!==canonicalJson(r.node) || c.record_sha256!==r.record_sha256)throw new Error("policy record/finalize digest differs");}
+		for (const c of commands) if (c.op !== "link" && (ids.has(c.record_id) ? c.policy_version !== 1 : c.policy_version !== undefined)) throw new Error("policy command version differs");
+		for (const c of commands) if (c.op !== "link" && (owned.has(c.record_id) ? c.classification_version !== 1 : c.classification_version !== undefined)) throw new Error("classification command version differs");
+	}
 	if (sha256(jsonl(commands)) !== m.commands_sha256) throw new Error("commands.jsonl does not match its plan manifest");
 	// The batch schedule is part of the plan: its hash must match, and it must send every command once, in order.
 	const batchesText = fs.existsSync(path.join(dir, "batches.jsonl")) ? fs.readFileSync(path.join(dir, "batches.jsonl"), "utf8") : null;
@@ -868,10 +1000,10 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process
 	const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 	const run = {
 		export: async () => { const r = await exportAll({ ...DEFAULT_SOURCES, ...(opt("graph-db") ? { graphDb: opt("graph-db") } : {}), ...(opt("python") ? { python: opt("python") } : {}) }); print(r.manifest); },
-		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, routes: opt("routes") ?? null }); print({ status: r.status, ...r.manifest }); },
+		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, sourcePolicy: opt("source-policy"), routes: opt("routes") ?? null }); print({ status: r.status, ...r.manifest }); },
 		verify: async () => print(await verify({ exportDir })),
 		"dry-run": async () => print(dryRun({ exportDir, rehearsal: opt("rehearsal") ?? null })),
 	}[cmd];
-	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
+	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--source-policy FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
 	run().catch((e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 }

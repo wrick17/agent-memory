@@ -1,3 +1,4 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // Capture digests (section 10): immutable digest parts and the completeness manifest, stored on the session's node in the
 // capture lane, outside ordinary recall. A range counts as consolidated only once its manifest tiles it with stored parts.
 import { z } from "zod";
@@ -63,7 +64,7 @@ export const sessionKey = (s: IngestBatch["session"]) => `session:${s.client}:${
 function sessionNode(sql: SqlStorage, s: IngestBatch["session"], seq: number, now: string): string {
 	const key = sessionKey(s);
 	const found = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", key).toArray()[0];
-	if (found) return found.id;
+	if (found) {assertArchiveEndpoints(sql,found.id,found.id,"");return found.id;}
 	const id = sha256(key).slice(0, 32);
 	const hash = sha256(key);
 	sql.exec(`INSERT INTO nodes (id, kind, key, scope, name, norm_name, status, origin, revision, content_hash, card_hash, embed_hash,

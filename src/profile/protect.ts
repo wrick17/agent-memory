@@ -1,3 +1,4 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // Protection (section 12): background actors never retire, supersede, archive, merge, transfer or forget what the owner
 // stated, pinned, or keeps in me. A refusal flags the node for the owner and changes nothing else.
 import type { ArchiveTx } from "./archive";
@@ -16,6 +17,7 @@ export function mayChange(node: { origin: string; pinned: number }, actor: strin
  * reason is model text. The revision is unchanged; undo puts the previous flag back. Returns the activity id.
  */
 export function flagProtected(tx: ArchiveTx, nodeId: string, reason: string, op: string, actor: string): number {
+	assertArchiveEndpoints(tx.sql,nodeId,nodeId,"");
 	const prev = tx.sql.exec<{ flagged: string | null }>("SELECT flagged FROM nodes WHERE id = ?", nodeId).one().flagged;
 	tx.run("UPDATE nodes SET flagged = ?, seq = ? WHERE id = ?", `${op}: ${reason}`, tx.seq, nodeId);
 	return Number(tx.run("INSERT INTO activity (at, actor, op, summary, targets, undo, seq) VALUES (?, ?, 'flag', ?, ?, ?, ?) RETURNING id",

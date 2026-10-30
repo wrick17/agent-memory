@@ -104,6 +104,22 @@ describe("job flow", () => {
 			{ op: "promote_to_me", from_op: 0, company_free: true }] }]);
 		assert.equal(r.profiles.work.dropped_ops, 2);
 	});
+
+	it("sends a weekly review whose links and pointers stay on the item's board subjects, redacted, from a Terra run", async () => {
+		const weekly = item(1, "weekly_review", ["t", "p"]);
+		weekly.allowed_ops = ["strategic_review", "dismiss"];
+		const server = fakeServer({ work: lease("LW", [weekly]) });
+		const secret = `ghp_${"C".repeat(36)}`;
+		const link = (to, ref = to) => ({ to, reason: `discussed this week ${secret}`, evidence: [{ kind: "node", ref }] });
+		const review = (links) => ({ op: "strategic_review", summary: "Two open items.", content: `The ticket leads. ${secret}`, links });
+		const runner = fakeRunner(() => ({ kind: "ok", part: { results: [{ item_id: 1, ops: [review([link("t"), link("p", "t")]), review([link("elsewhere")]), review([link("t", "elsewhere")])] }] } }));
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
+		assert.deepEqual(runner.runs.map((x) => x.model), ["gpt-6.1-terra"]);
+		assert.deepEqual(server.calls.find((c) => c.name === "maintenance_complete").args.results, [{ item_id: 1, ops: [
+			{ op: "strategic_review", summary: "Two open items.", content: "The ticket leads. [REDACTED]",
+				links: [{ to: "t", reason: "discussed this week [REDACTED]", evidence: [{ kind: "node", ref: "t" }] }, { to: "p", reason: "discussed this week [REDACTED]", evidence: [{ kind: "node", ref: "t" }] }] }] }]);
+		assert.equal(r.profiles.work.dropped_ops, 2);
+	});
 });
 
 describe("work is retained on every failure", () => {

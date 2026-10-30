@@ -49,3 +49,14 @@ export function attrsDigest(attrs: Record<string, unknown>) {
 	const source = attrs.source as { system?: unknown } | undefined;
 	return { attrs_sha256: sha256(canonicalJson(attrs)), source_sha256: sha256(canonicalJson(source ?? null)), source_system: typeof source?.system === "string" ? source.system : null };
 }
+
+
+/** Separate additions; legacy revision/request/node digest meanings stay unchanged. */
+export const identityDigest = (scope:string, memory_type:string, norm_name:string) => sha256(canonicalJson({scope,memory_type,norm_name}));
+export type TextRow = {part:string;revision:number;seq_no:number;chunk:number;body:string;separator?:string|null;request_id?:string|null;created_at:string;live:boolean|number};
+export const textKey = (t:Pick<TextRow,"part"|"revision"|"seq_no"|"chunk">) => [t.part,t.revision,t.seq_no,t.chunk] as const;
+export const textDigest = (t:TextRow) => ({part:t.part,revision:t.revision,seq_no:t.seq_no,chunk:t.chunk,body_raw_utf8_sha256:sha256(t.body),body_raw_utf8_bytes:Buffer.byteLength(t.body,"utf8"),
+	separator_raw_utf8_sha256:t.separator == null ? null : sha256(t.separator),request_id:t.request_id ?? null,created_at:t.created_at,live:Boolean(t.live)});
+export function textRowsDigest(rows:ReturnType<typeof textDigest>[]):string {
+	return sha256(canonicalJson([...rows].sort((a,b)=>{const x=textKey(a),y=textKey(b);for(let i=0;i<x.length;i++){if(x[i]!<y[i]!)return -1;if(x[i]!>y[i]!)return 1;}return 0;})));
+}

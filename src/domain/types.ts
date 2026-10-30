@@ -111,6 +111,8 @@ export interface SaveArgs {
 	evidence?: { kind: (typeof EVIDENCE_KINDS)[number]; ref: string; note?: string }[];
 	/** Judgment links from the saved node to nodes of its profile, as record_knowledge edges with an implicit `from`. */
 	links?: Omit<NonNullable<KnowledgeArgs["edges"]>[number], "from">[];
+	/** Internal: only the maintenance batch's strategic_review sets it, as the document's attrs (kind strategic_review). MCP has no attrs. */
+	review?: { as_of: string; item: number; coverage: object };
 }
 export interface AppendArgs {
 	name?: string; memory_id?: string; type?: MemoryType; scope?: string; content: string; separator?: string;
@@ -187,7 +189,7 @@ export type ReadQuery =
 	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; asOf?: string }
 	| { kind: "has"; id: string }
 	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number; asOf?: string }
-	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" }
+	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" | "texts" }
 	| { kind: "batch_status" }
 	| { kind: "owner_model"; after: string | null; limit: number }
 	| ExploreQuery | TraceQuery | TimelineQuery | BoardQuery
@@ -216,13 +218,14 @@ export interface BoardQuery { kind: "board"; asOf: string; limit: number; known:
 
 /** With as_of, the record's stored state then: a field its history does not hold is null, never the current value. */
 export interface RecallHit {
+	import_source?: {name:string;content_hash:string;revision:number}; classification?: "archival_reference"; trust?: "untrusted"; instruction_authority?: false;
 	memory_id: string; profile: string; kind: string; type: string | null; name: string | null; scope: string | null; origin: string;
 	status: string | null; revision: number; passage: string; matched_by: string[]; score: number;
 	objective: string | null; step_count: number;
-	provenance: { source_platform: string | null; updated_source_platform: string | null; source_hash: string | null };
+	provenance: { source_platform: string | null; updated_source_platform: string | null; source_hash: string | null; hosted_view_hash?: string };
 	freshness: { created_at: string | null; updated_at: string | null; valid_from: string | null; valid_until: string | null };
 	/** Set with as_of: when the revision in effect was recorded, whether the record was valid then, and whether its content was rebuilt. */
-	as_of?: { recorded_at: string; valid: boolean; content_known: boolean };
+	as_of?: { recorded_at: string; valid: boolean; content_known: boolean; current?: string[] };
 	/** Row position, used by the inventory cursor. */
 	row: number;
 	/** Set only on a non-inferred preference a profile returns from below its recall cap: its true position there. */

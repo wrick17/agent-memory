@@ -1,3 +1,4 @@
+import { assertArchiveEndpoints } from "./archive-fence";
 // Undo (section 12). Every write stores the inverse of what it changed in activity.undo, in the same transaction; undo runs
 // that inverse through runWrite with request_id "undo:<activity id>", so a retried undo replays its first result. The inverse
 // is row-level, which covers every op type alike: all rows a write touches carry its seq, so afterwards they say what changed,
@@ -226,6 +227,8 @@ export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: 
 	for (const m of inv.mentions ?? []) putRow(tx, "evidence", m.row);
 	for (const n of inv.nodes ?? []) embedDue = putBack(tx, activityId, n, inv.seq, keep) || embedDue;
 	for (const e of inv.reopen ?? []) {
+		const row=sql.exec<Row>("SELECT src,dst,dst_profile FROM edges WHERE id=?",e.id).toArray()[0];
+		if(row)assertArchiveEndpoints(sql,String(row.src),String(row.dst),String(row.dst_profile));
 		try {
 			tx.run("UPDATE edges SET ended_at = NULL, valid_to = ?, seq = ? WHERE id = ?", e.valid_to, tx.seq, e.id);
 		} catch (err) {
@@ -307,6 +310,7 @@ export function undo(storage: DurableObjectStorage, who: Who, activityId: number
  * is itself a write with its activity row and undo: undoing it archives the records again.
  */
 export function restore(tx: UndoTx, args: { activity_id: number }): WriteOutput {
+	if(tx.sql.exec("SELECT 1 FROM activity WHERE id=? AND json_extract(undo,'$.archive_operation') IS NOT NULL",args.activity_id).toArray().length)throw Fail.of("size_budget","use the staged archive operations route for this removal",{reason:"staged_required"});
 	if (tx.ctx.actor !== "owner") throw Fail.of("forbidden", "only the owner restores from the archive");
 	const a = tx.sql.exec<{ op: string; undid: string | null }>("SELECT op, (SELECT u.op FROM activity u WHERE u.id = activity.undo_of) AS undid FROM activity WHERE id = ?", args.activity_id).toArray()[0];
 	if (!a || !(REMOVALS.includes(a.op) || (a.op === "undo" && a.undid === "restore"))) throw Fail.of("not_found", `activity ${args.activity_id} is not a removal in the archive`, { reason: "not_a_removal" });
