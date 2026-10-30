@@ -50,7 +50,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 ### Setup, recovery, and everyday use
 
 - [x] Sign in to the private memory service with an isolated client (owner trial).
-- [ ] Set up and run your own independent deployment.
+- [ ] Set up and run your own independent deployment. A separate test deployment is running; sign-in is not yet verified.
 - [ ] Back up and restore memories; backups have not been built yet.
 - [ ] Use and verify the same memories across multiple machines.
 - [ ] Switch everyday Claude, Codex, and headless agents to Agent Memory after migration and acceptance checks.

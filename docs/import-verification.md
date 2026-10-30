@@ -1,5 +1,11 @@
 # Import verification and rehearsal preparation
 
+## Separate synthetic self-host fixture, 2026-10-30
+
+The packaged setup created a separate workers.dev Worker, version `3ba050f5-8d9f-4dcf-a475-f829319be252`, with fresh AccountStore and ProfileStore SQLite namespaces, its own R2 generation ledger, and a 1,024-dimensional cosine Vectorize index with a string `kind` index. Corpus is unbound, previews are disabled, and no DNS or route change was made. The original generated setup config retains an empty import allowlist and its creation receipts; a separate deployment config permits only `test`.
+
+Public protected-resource metadata matched the new MCP URL and issuer, and an unauthenticated request received a 401 challenge. A valid credential for the earlier trial passed its own signature, claim and whoami checks and was refused by this fixture with 401. An isolated owner login completed, but it did not provide the file-backed credential needed for independent new-audience checks. The file-store retry was canceled after its assigned browser page disappeared; browser-group cleanup remains unconfirmed. New-audience claims, whoami and reverse-audience checks have not passed, and no fixture memory was seeded or synthetic write performed. Refresh, rollback, write-bound and generation-race checks remain open. Private evidence is in `/var/folders/mm/dwsn1_0j0cb2scdpkdw6_4rm0000gp/T/am-selfhost-final-terra-fqo4ir2v/live-fixture/`.
+
 ## Isolated core trial, 2026-10-30
 
 The owner approved a separate trial and its retained-memory copy, subject to authentication passing first. The reviewed core was deployed to a new Worker, version `4a8e64a2-664b-4a54-99a2-047744430952`, with new SQLite Durable Object namespaces, a separate R2 ledger and a 1,024-dimensional cosine Vectorize index. A later listing confirmed the `kind` String metadata index.
