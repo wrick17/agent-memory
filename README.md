@@ -10,7 +10,11 @@ The private MCP server is running for owner testing. Selected memory reads and r
 
 The [feature manifest](docs/feature-manifest.md) has feature-level status and evidence. Checked items below are specific milestones, not completed features.
 
+The owner completion target is every remaining feature and acceptance gate except BothQ shutdown or retirement. BothQ must remain running and readable after the gated caller transition.
+
 The immediate priority is to verify the main MCP as a replacement for BothQ. The reviewed core is deployed to a separate trial. Its isolated authentication checks passed, the retained 1,330-record copy matched the import audit, and the owner-selected recall gate passed 29 of 30. Synthetic client writes and replay passed in the trial. Production migration, refresh, capture and cutover remain open. Detailed evidence is in [import verification](docs/import-verification.md#isolated-core-trial-2026-10-30).
+
+Further synthetic trial checks passed for graph reads, journal compaction and undo, one cross-profile transfer, and archive undo. The imported baseline still matched. A fresh read-only export differs from the retained routing input, so production mapping and reconciliation remain open.
 
 The older rehearsal dashboard page is reachable, but signed-in use has not been verified. Dashboard work is deferred until after the main MCP. The planned dashboard will let the owner explore memory connections and try unsaved what-if changes on a visual canvas; those experiments must not change stored memories.
 

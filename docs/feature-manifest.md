@@ -12,6 +12,8 @@ This is the commitment index. [Confirmed requirements](../research/00-requiremen
 
 **Owner completion target, 2026-10-30:** "finish everything except bothq shutdown." Complete all feature commitments and their acceptance gates, including production reconciliation, capture, final backup and recovery, physical cross-machine checks and caller cutover. BothQ shutdown and retirement are excluded: retain its service and data, running and readable after cutover. The single ordinary writer rule remains; keeping BothQ available does not authorize dual writes. This supersedes shutdown or retirement as a completion step in AM-17 and the earlier migration plan. Dashboard work remains last among features; backup and recovery follow the other features, with cross-machine acceptance and cutover in the final rehearsal.
 
+**Hosted core follow-up, 2026-10-30:** Selected synthetic flows passed on the pinned trial: same-profile graph creation, explore, trace and timeline; journal compaction, replay and targeted undo; one unlinked personal-to-work transfer and replay; and archive undo. The post-check audit still matched all 1,330 imported records, 4,678 revisions, 3,182 requests and eight links in both directions, with no mismatch or drift. These checks do not close the full graph, maintenance, transfer or archive gates. A fresh read-only export passed integrity checks but differs from the retained routing input; fresh reconciliation is required before production import. Maintenance inference and promotion, refresh, rollback, write bounds and wipe remain open ([evidence](import-verification.md#isolated-core-trial-2026-10-30)).
+
 ## Commitments
 
 | ID and feature | Promised behavior and invariant | Phase | Status / evidence and source |
