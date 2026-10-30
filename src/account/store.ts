@@ -462,7 +462,7 @@ export function parseRoutingDefaults(spec: string): Omit<RoutingRule, "id">[] {
 	});
 }
 
-/** Org names from the remote rules that point at `work` (for example `Sequoia-Engineering`), as `me` guard terms. */
+/** Org names from the remote rules that point at `work` (for example `your-org`), as `me` guard terms. */
 function orgTerms(rules: RoutingRule[]): string[] {
 	return rules.filter((r) => r.profile === "work" && r.match === "remote")
 		.map((r) => r.pattern.split("/")[1] ?? "").filter((org) => org && !org.includes("*"));

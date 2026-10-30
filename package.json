@@ -1,14 +1,25 @@
 {
   "name": "agent-memory",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
+  "files": [
+    "src/",
+    "local/setup.mjs",
+    "docs/self-host.md",
+    "wrangler.example.jsonc",
+    "npm-shrinkwrap.json"
+  ],
   "scripts": {
+    "setup": "node local/setup.mjs",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run test && npm run test:local",
-    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/corpus-upload.test.mjs local/migrate.test.mjs local/upload.test.mjs"
+    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/corpus-upload.test.mjs local/migrate.test.mjs local/upload.test.mjs local/setup.test.mjs",
+    "pack:self-host": "node local/package.mjs",
+    "prepack": "node local/package.mjs --source-pack"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",
@@ -22,5 +33,8 @@
     "typescript-eslint": "8.72.1",
     "vitest": "5.0.5",
     "wrangler": "4.154.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
