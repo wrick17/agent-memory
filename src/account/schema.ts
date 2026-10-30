@@ -41,4 +41,12 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 	"ALTER TABLE transfers ADD COLUMN intent TEXT",
 	"ALTER TABLE transfers ADD COLUMN retry_at INTEGER",
 	"CREATE INDEX transfers_retry ON transfers (retry_at) WHERE retry_at IS NOT NULL",
+], [
+	// v5 (account/refresh.ts): the permanent daily refresh day ledger. A row is never deleted; its open states are the profile's one
+	// open claim. Receipts are the canonical control proofs; nothing here names an item, a payload or a query.
+	`CREATE TABLE refresh_days (profile TEXT NOT NULL, day TEXT NOT NULL, claim_id TEXT NOT NULL, device_id TEXT NOT NULL, generation TEXT NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('claiming','pending','done','failed','abandoned')), reason TEXT,
+		claim_receipt TEXT NOT NULL, plan_receipt TEXT, finish_receipt TEXT, created_at TEXT NOT NULL, closed_at TEXT, seq INTEGER NOT NULL,
+		PRIMARY KEY (profile, day)) WITHOUT ROWID`,
+	"CREATE UNIQUE INDEX refresh_days_open ON refresh_days (profile) WHERE state IN ('claiming','pending')",
 ]];

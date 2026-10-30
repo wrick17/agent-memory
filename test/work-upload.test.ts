@@ -2,13 +2,19 @@
 // Each case uses its own profile and routing rule on the owner's account, so no other test file shares or closes it.
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
-import { sha256, uuid5 } from "../src/domain/ids";
+import { describe, expect, it, vi } from "vitest";
+import { resetKeyCache } from "../src/auth";
+import { api } from "../src/api";
+import { plan as accountPlan, type Ledger } from "../src/account/refresh";
+import { canonicalJson, sha256, uuid5 } from "../src/domain/ids";
+import { driveTransfer, transferPorts } from "../src/transfer";
 import { housekeep, OBJECT_LIMIT } from "../src/profile/housekeeping";
 import { undo } from "../src/profile/undo";
+import { BudgetTx } from "../src/profile/archive";
 import { foldStep } from "../src/profile/compact";
 import { readContent, runWrite } from "../src/profile/write";
-import { commitArgs, ticketArgs, uploadTerms } from "../src/profile/work-upload";
+import { commitArgs, prArgs, ticketArgs, uploadTerms } from "../src/profile/work-upload";
+import { ackPart, FINISH_READS, installMirror, markRegistered, partHash, planHash, receiptSeq, sealPlan, terminal, type Binding, type Parts } from "../src/profile/daily-proof";
 import { call, contextFor, deviceToken, outcome, OWNER } from "./helpers";
 // @ts-expect-error -- the untyped Node client, run here as the real local caller of the job ingest route.
 import { uploadPRs } from "../local/pr-upload.mjs";
@@ -1054,4 +1060,796 @@ describe("routing to a profile that is no longer active", () => {
 			expect([tool, await outcome(c, tool, { ...args, repo: { remote: p.remote } })]).toMatchObject([tool, { ok: false, error: { code: "profile_wiped" } }]);
 		}
 	});
+});
+
+describe("daily refresh proofs", () => {
+	const DEVICE = "daily-device", T0 = Date.UTC(2026, 9, 1);
+	const at = (minute: number) => new Date(T0 + minute * 60_000).toISOString();
+	type Wire = Parameters<typeof prArgs>[1];
+	const wire = (number: number, updated_at: string, extra: Partial<Wire> = {}): Wire => ({ number, title: `Daily ${number}`, state: "open", updated_at, head: "daily", reviewers: [], commits: [], closes: [], unknown: [], ...extra });
+	/** Physical rows read and written by every statement f runs here, as workerd SQLite reports them. */
+	function physical<T>(st: DurableObjectStorage, f: () => T) {
+		const sql = st.sql, exec = sql.exec, cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [], queries: string[] = [];
+		sql.exec = ((q: string, ...v: SqlStorageValue[]) => { const c = exec.call(sql, q, ...v); cursors.push(c); queries.push(q); return c; }) as SqlStorage["exec"];
+		try {
+			const value = f();
+			const sum = (k: "rowsRead" | "rowsWritten", only?: RegExp) => cursors.filter((c, i) => !only || only.test(queries[i]!)).reduce((n, c) => n + c[k], 0);
+			return { value, reads: sum("rowsRead"), writes: sum("rowsWritten"), proofWrites: sum("rowsWritten", /upload_re(ceipts|visions)/) };
+		} finally { sql.exec = exec; }
+	}
+	/** An isolated profile with a sealed pending mirror for these PR frames, installed directly as AccountStore would install it. */
+	async function claimed(items: Wire[][], before?: (st: DurableObjectStorage, b: Binding, parts: Parts) => void) {
+		const p = await isolated(), stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		const b = { profile: p.name, generation: p.who.generation, device_id: DEVICE, day: new Date().toISOString().slice(0, 10), claim_id: `claim-${crypto.randomUUID()}` };
+		const asOf = new Date().toISOString(), payloads = items.map((prs) => ({ profile: p.name, as_of: asOf, repo: { remote: p.remote }, prs }));
+		const parts: Parts = { version: 1, selection_hash: sha256("selection"), as_of: asOf,
+			sources: [{ source_id: "web-prs", kind: "pr", namespace: p.ns, selector_hash: sha256("selector"), enumeration_hash: sha256("enumeration"), observed_items: items.flat().length }],
+			frames: payloads.map((payload, part) => ({ part, source_id: "web-prs", kind: "pr", item_count: payload.prs.length, part_hash: partHash(b, part, "web-prs", payload) })) };
+		await p.inProfile((st) => {
+			installMirror(st, p.who, b);
+			before?.(st, b, parts);
+			expect(sealPlan(st, p.who, b, parts, planHash(b, parts))).toEqual({ status: "sealed" });
+		});
+		const frame = (part: number, day = b.day) => {
+			const meta = { day, claim_id: b.claim_id, part, part_hash: parts.frames[part]!.part_hash };
+			return { meta, payload: payloads[part]!, body: sha256(canonicalJson({ ...payloads[part], refresh: meta })) };
+		};
+		const finishWith = (binding: Binding, outcome: "done" | "failed" | "abandoned" = "done") => stub.refreshTerminal(p.who, binding, { outcome, request_id: `finish-${outcome}-1`, body_sha256: sha256(outcome), reason: null });
+		const ctx = { platform: "upload", routedBy: "test", userId: OWNER, deviceId: DEVICE };
+		const ordinary = async (prs: Wire[]) => stub.upload(p.who, { repo: p.ns, commits: [], prs: prs.map((w) => prArgs(p.ns, w, asOf)) }, ctx);
+		const requestOf = (w: Wire, suffix = "") => `upload:${p.name}:github:${p.ns}#${w.number}:${w.updated_at}${suffix}`;
+		const activityOf = (requestId: string) => p.inProfile((st) => (JSON.parse(st.sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ?", requestId).one().result) as { activity_id: number }).activity_id);
+		const undoIt = async (requestId: string) => { const id = await activityOf(requestId); return p.inProfile((st) => undo(st, p.who, id, { actor: "owner", platform: "test", routedBy: "test", userId: OWNER }).result.action); };
+		const claim = () => p.inProfile((st) => ({ ...st.sql.exec("SELECT state, acked FROM refresh_claims WHERE claim_id = ?", b.claim_id).one(), refs: st.sql.exec("SELECT count(*) AS n FROM refresh_refs WHERE claim_id = ?", b.claim_id).one().n }));
+		return { p, stub, b, parts, frame, ctx, ordinary, requestOf, activityOf, undoIt, claim,
+			send: async (part: number, c = ctx, day = b.day) => { const fr = frame(part, day); return stub.uploadPart(p.who, fr.meta, fr.body, fr.payload, c); },
+			finish: async (binding = b, outcome?: "done" | "failed" | "abandoned") => finishWith(binding, outcome) };
+	}
+	type Ack = { proof: { items: { request_id: string; original_action: string; disposition: string }[] }; receipt_hash: string };
+	const acknowledged = (r: unknown) => { expect(r).toMatchObject({ ok: true, value: { refresh: { status: "acknowledged" } } }); return (r as { value: { refresh: Ack } }).value.refresh; };
+
+	it("acknowledges 64 cap-sized parts, finishes all 1,600 refs inside the measured read budget, and refuses past budgets without writing", { timeout: 900_000 }, async () => {
+		const items = Array.from({ length: 64 }, (_, part) => Array.from({ length: 25 }, (_, i) => wire(part * 25 + i + 1, at(part * 25 + i))));
+		// Over the 64-frame or 25-PR caps the plan refuses before anything is sealed.
+		const f = await claimed(items, (st, b, parts) => {
+			const over = (frames: Parts["frames"]) => sealPlan(st, f0.who, b, { ...parts, frames }, "x");
+			const f0 = { who: { userId: OWNER, profile: b.profile, generation: b.generation } };
+			expect(over([...parts.frames, { ...parts.frames[0]!, part: 64 }])).toEqual({ status: "pending", reason: "plan_bounds" });
+			expect(over([{ ...parts.frames[0]!, item_count: 26 }, ...parts.frames.slice(1)])).toEqual({ status: "pending", reason: "plan_bounds" });
+			expect(st.sql.exec("SELECT count(*) AS n FROM refresh_claims WHERE parts IS NOT NULL").one().n).toBe(0);
+		});
+		const started = Date.now();
+		for (let part = 0; part < 63; part++) {
+			const r = acknowledged(await f.send(part));
+			expect([part, r.proof.items.length, r.receipt_hash]).toEqual([part, 25, sha256(canonicalJson(r.proof))]);
+		}
+		const sent = Date.now() - started;
+		// The last frame is stale: each PR already holds a strictly newer revision, whose authority its ref must prove instead.
+		expect((await f.ordinary(items[63]!.map((w, i) => ({ ...w, updated_at: at(5_000 + i) })))).ok).toBe(true);
+		const stale = await f.stub.upload(f.p.who, { repo: f.p.ns, commits: [], prs: items[63]!.map((w) => prArgs(f.p.ns, w, f.parts.as_of)) }, f.ctx);
+		expect(stale.ok && stale.value.prs!.every((r) => r.status === "stale")).toBe(true);
+		const last = f.frame(63), ack = await f.p.inProfile((st) => physical(st, () => ackPart(st, f.p.who, DEVICE, last.meta, last.body, last.payload)));
+		expect(ack.value).toMatchObject({ status: "acknowledged", proof: { part: 63 } });
+		expect((ack.value as unknown as Ack).proof.items.every((i) => i.original_action === "stale" && i.disposition === "superseded")).toBe(true);
+		const budget = await f.p.inProfile((st) => physical(st, () => terminal(st, f.p.who, f.b, { outcome: "done", request_id: "finish-done-1", body_sha256: sha256("done"), reason: null }, 1_000)));
+		expect(budget.value).toMatchObject({ status: "pending", reason: "read_budget" });
+		expect(budget.writes).toBe(0);
+		expect(await f.claim()).toEqual({ state: "pending", acked: 64, refs: 1_600 });
+		const t = Date.now(), done = await f.finish(), finishMs = Date.now() - t;
+		expect(done).toMatchObject({ ok: true, value: { status: "terminal", terminal: { outcome: "done" }, refs: 1_600, cleaned: true } });
+		const value = (done as { value: { reads: number; bytes: number; rows_written: number } }).value;
+		expect(value.reads).toBeLessThanOrEqual(FINISH_READS);
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "terminal", terminal: { outcome: "done" }, cleaned: true } });
+		expect(await f.p.inProfile((st) => [st.sql.exec("SELECT count(*) AS n FROM refresh_refs").one().n, st.sql.exec("SELECT count(*) AS n FROM refresh_parts").one().n])).toEqual([0, 0]);
+		// One more natural PR write: what its receipt and revision rows add to the unchanged per-write 1,000-row bound.
+		const one = prArgs(f.p.ns, wire(9_999, at(9_999)), f.parts.as_of);
+		const stamp = await f.p.inProfile((st) => physical(st, () => runWrite(st, f.p.who, { op: "upload", args: { ...one, request_id: `upload:${f.p.name}:github:${f.p.ns}#9999:${one.updated_at}` } },
+			{ actor: "index", platform: "upload", routedBy: "test", userId: OWNER, payloadHash: sha256("measure") })));
+		expect(stamp.value.result.action).toBe("stored");
+		const registered = await f.p.inProfile((st) => { const id = `upload:${f.p.name}:github:${f.p.ns}#9999:${one.updated_at}`; return physical(st, () => markRegistered(st.sql, id, receiptSeq(st.sql, id)!)); });
+		const sizes = await f.p.inProfile((st) => st.sql.exec<Record<string, number>>(`SELECT
+			(SELECT sum(length(claim_id) + length(key) + length(revision) + length(item_hash) + length(request_id) + length(payload_hash) + length(result_hash) + length(action) + coalesce(length(authority), 0) + 24) FROM refresh_refs) AS refs,
+			(SELECT sum(length(request_id) + length(key) + length(revision) + 24) FROM upload_receipts) AS receipts,
+			(SELECT sum(length(key) + length(revision) + length(request_id) + 24) FROM upload_revisions) AS revisions`).one());
+		console.log("DAILY_PROOF_MEASURE", JSON.stringify({ refs: value, finish_ms: finishMs, upload_parts_0_62_ms: sent, budget_refusal: { reads: budget.reads, writes: budget.writes, reply: budget.value },
+			ack_part_63_stale: { reads: ack.reads, writes: ack.writes }, one_upload: { writes: stamp.writes, proof_writes: stamp.proofWrites, registered_stamp: { reads: registered.reads, writes: registered.writes } }, finish_reads_budget: FINISH_READS, metadata_bytes: sizes }));
+		expect(ack.writes).toBeLessThan(1_000);
+		expect(budget.reads).toBeLessThan(1_000 + 20);
+	});
+
+	/** Physical rows of one statement inside a transaction that is then rolled back, plus what it left the descriptor as. */
+	const rolledBack = (st: DurableObjectStorage, claimId: string, q: string, ...v: SqlStorageValue[]) => {
+		let out: { rows: number; reads: number; erased: boolean } | undefined;
+		try {
+			st.transactionSync(() => {
+				const c = st.sql.exec(q, ...v);
+				out = { rows: c.rowsWritten, reads: c.rowsRead, erased: st.sql.exec("SELECT parts IS NULL AS e FROM refresh_claims WHERE claim_id = ?", claimId).one().e === 1 };
+				throw new Error("rollback");
+			});
+		} catch (e) { if ((e as Error).message !== "rollback") throw e; }
+		return out!;
+	};
+	it("meters request and archive delete shapes on real SQLite, each statement under 1,000 rows", { timeout: 300_000 }, async () => {
+		// (a) One node, 100 requests (99 ordinary revisions and the claim's own), the shape of a protected wipe or transfer batch.
+		const one = await claimed([[wire(1, at(100))]]);
+		for (let i = 1; i < 100; i++) expect((await one.ordinary([wire(1, at(i))])).ok).toBe(true);
+		acknowledged(await one.send(0));
+		const single = await one.p.inProfile((st) => {
+			const node = st.sql.exec<{ node_id: string }>("SELECT node_id FROM requests WHERE op = 'upload' LIMIT 1").one().node_id;
+			expect(st.sql.exec("SELECT count(*) AS n FROM requests WHERE node_id = ?", node).one().n).toBe(100);
+			return rolledBack(st, one.b.claim_id, "DELETE FROM requests WHERE request_id IN (SELECT request_id FROM requests WHERE node_id = ? LIMIT 100)", node);
+		});
+		// (b) 100 nodes in one statement, every request referenced by the one content-bearing claim: housekeeping's 100-id purge shape.
+		const many = await claimed(Array.from({ length: 4 }, (_, part) => Array.from({ length: 25 }, (_, i) => wire(part * 25 + i + 1, at(part * 25 + i)))));
+		for (let part = 0; part < 4; part++) acknowledged(await many.send(part));
+		const fanout = await many.p.inProfile((st) => {
+			const ids = st.sql.exec<{ request_id: string }>("SELECT request_id FROM refresh_refs WHERE claim_id = ?", many.b.claim_id).toArray().map((r) => r.request_id);
+			expect([ids.length, st.sql.exec("SELECT count(*) AS n FROM refresh_parts").one().n]).toEqual([100, 4]);
+			return rolledBack(st, many.b.claim_id, "DELETE FROM requests WHERE request_id IN (SELECT value FROM json_each(?))", JSON.stringify(ids));
+		});
+		// (c) Archived project and PR images forgotten before the claim: protected wipe's 30-row archive batch while the plan is content-bearing.
+		const forgot = await claimed([[wire(1, at(1))]], (st, b, parts) => {
+			const who = { userId: OWNER, profile: b.profile, generation: b.generation }, repo = parts.sources[0]!.namespace;
+			for (let i = 0; i < 30; i++) {
+				const a = prArgs(repo, wire(100 + i, at(i)), at(1_000));
+				const out = runWrite(st, who, { op: "upload", args: { ...a, request_id: `upload:${b.profile}:github:${repo}#${100 + i}:${a.updated_at}` } }, { actor: "index", platform: "upload", routedBy: "test", userId: OWNER, payloadHash: sha256(`m${i}`) });
+				runWrite(st, who, { op: "owner", args: { action: "forget", memory_id: String(out.result.memory_id), request_id: `forget-${i}` } }, { actor: "owner", platform: "test", routedBy: "test", userId: OWNER, payloadHash: sha256(`f${i}`) });
+			}
+			expect(st.sql.exec("SELECT count(*) AS n FROM archive WHERE source = 'nodes' AND json_extract(payload, '$.key') LIKE 'github:%'").one().n).toBe(30);
+		});
+		const archived = await forgot.p.inProfile((st) => rolledBack(st, forgot.b.claim_id, "DELETE FROM archive WHERE id IN (SELECT id FROM archive WHERE source = 'nodes' ORDER BY id LIMIT 30)"));
+		console.log("DAILY_DELETE_FANOUT", JSON.stringify({ single_node_100_requests: single, many_nodes_100_requests: fanout, archive_30_node_images: archived }));
+		for (const m of [single, fanout, archived]) expect(m).toMatchObject({ erased: true });
+		for (const m of [single, fanout, archived]) expect(m.rows).toBeLessThan(1_000);
+	});
+
+	it("refuses a wrong day or device before any item write, replays an acknowledged part's stored proof, and refuses a wrong generation at finish", async () => {
+		const f = await claimed([[wire(1, at(1))]]);
+		expect(await f.send(0, f.ctx, "2000-01-01")).toMatchObject({ ok: true, value: { refresh: { status: "pending", reason: "binding_mismatch" } } });
+		expect(await f.send(0, { ...f.ctx, deviceId: "other" })).toMatchObject({ ok: true, value: { refresh: { status: "pending", reason: "binding_mismatch" } } });
+		await f.p.inProfile((st) => expect(st.sql.exec("SELECT count(*) AS n FROM requests").one().n).toBe(0));
+		const first = acknowledged(await f.send(0)), writes = await f.p.inProfile((st) => st.sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value);
+		expect(await f.send(0)).toEqual({ ok: true, value: { refresh: first } });
+		expect(await f.p.inProfile((st) => st.sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value)).toBe(writes);
+		expect(await f.finish({ ...f.b, generation: "other" })).toMatchObject({ ok: true, value: { status: "pending", reason: "binding_mismatch" } });
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "terminal", terminal: { outcome: "done" }, refs: 1, cleaned: true } });
+	});
+
+	it("acknowledges nothing while a committed item is unregistered, then the retried frame replays, registers and acknowledges", async () => {
+		const f = await claimed([[wire(1, at(1)), wire(2, at(2))]]);
+		const interrupt = (on: boolean) => runInDurableObject(account(), (_i, st) => st.storage.sql.exec(on
+			? `CREATE TRIGGER interrupt_${f.p.name} BEFORE INSERT ON node_index WHEN NEW.profile = '${f.p.name}' BEGIN SELECT RAISE(ABORT, 'synthetic registration interruption'); END`
+			: `DROP TRIGGER interrupt_${f.p.name}`));
+		await interrupt(true);
+		// A daily item's failed registration keeps its commit and leaves the part pending instead of failing the request.
+		try {
+			expect(await f.send(0)).toMatchObject({ ok: true, value: { prs: [{ status: "refused", reason: "registration_unavailable" }, { status: "refused", reason: "registration_unavailable" }],
+				refresh: { status: "pending", reason: "items_not_held" } } });
+		} finally { await interrupt(false); }
+		await f.p.inProfile((st) => expect(st.sql.exec("SELECT count(*) AS n FROM requests WHERE op = 'upload'").one().n).toBe(2));
+		expect(await f.claim()).toEqual({ state: "pending", acked: 0, refs: 0 });
+		const r = await f.send(0);
+		expect((r as { value: { prs: { status: string }[] } }).value.prs.map((x) => x.status)).toEqual(["replayed", "replayed"]);
+		expect(acknowledged(r).proof.items.map((i) => i.original_action)).toEqual(["stored", "stored"]);
+	});
+
+	it("keeps an owner Undo of a ref, or of a later same-revision enrichment, from finishing done", async () => {
+		const a = wire(1, at(1)), b = wire(2, at(2), { unknown: ["reviews"] }), c = wire(3, at(3), { unknown: ["reviews"] });
+		const f = await claimed([[a, b, { ...c, reviewers: ["recovered"], unknown: [] }]]);
+		// c's base receipt is older, so the frame's complete c takes its hash-suffixed request: the actual selected id is bound.
+		expect((await f.ordinary([c])).ok).toBe(true);
+		const proof = acknowledged(await f.send(0)).proof;
+		expect(proof.items[2]!.request_id).toMatch(new RegExp(`^${f.requestOf(c).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:[0-9a-f]{64}$`));
+		// A later enrichment of b's same revision, undone by the owner, makes b's own still-live receipt ineligible.
+		const enriched = { ...b, reviewers: ["late"], unknown: [] };
+		expect((await f.ordinary([enriched])).ok).toBe(true);
+		const sibling = (await f.p.inProfile((st) => st.sql.exec<{ request_id: string }>("SELECT request_id FROM requests WHERE request_id > ? AND request_id < ?", `${f.requestOf(b)}:`, `${f.requestOf(b)};`).one())).request_id;
+		expect(await f.undoIt(sibling)).toBe("undone");
+		const own = await f.activityOf(f.requestOf(b));
+		await f.p.inProfile((st) => expect(st.sql.exec("SELECT undone_by FROM activity WHERE id = ?", own).one().undone_by).toBeNull());
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "pending", reason: "undone", part: 0, index: 1 } });
+		// Undoing a's creation archives its PR node, which also erases the plan naming that repository (lifecycle r2, rule 1).
+		expect(await f.undoIt(f.requestOf(a))).toBe("undone");
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "pending", reason: "descriptor_invalidated" } });
+		expect(await f.claim()).toEqual({ state: "pending", acked: 1, refs: 3 });
+	});
+
+	it("keeps a stale ref pending while its newer authority is committed but unregistered, until a replay registers that exact receipt", async () => {
+		const old = wire(41, at(1)), newer = { ...old, updated_at: at(2) }, f = await claimed([[old]]);
+		const interrupt = (on: boolean) => runInDurableObject(account(), (_i, st) => st.storage.sql.exec(on
+			? `CREATE TRIGGER interrupt_${f.p.name} BEFORE INSERT ON node_index WHEN NEW.profile = '${f.p.name}' BEGIN SELECT RAISE(ABORT, 'synthetic registration interruption'); END`
+			: `DROP TRIGGER interrupt_${f.p.name}`));
+		const indexed = () => runInDurableObject(account(), (_i, st) => Number(st.storage.sql.exec("SELECT count(*) AS n FROM node_index WHERE profile = ?", f.p.name).one().n));
+		await interrupt(true);
+		try { await expect(f.ordinary([newer])).rejects.toThrow("synthetic registration interruption"); } finally { await interrupt(false); }
+		const original = await f.p.inProfile((st) => st.sql.exec("SELECT request_id, payload_hash, result, seq FROM requests WHERE op = 'upload'").toArray());
+		expect([original.length, await indexed()]).toEqual([1, 0]);
+		// The committed newer revision cannot supersede the frame's item until its own nodes are registered.
+		expect(await f.send(0)).toMatchObject({ ok: true, value: { prs: [{ status: "stale" }], refresh: { status: "pending", reason: "authority_unregistered", part: 0, index: 0 } } });
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "pending", reason: "parts_pending" } });
+		expect(await f.claim()).toEqual({ state: "pending", acked: 0, refs: 0 });
+		// Replaying the exact newer request registers its nodes and stamps that receipt; its request bytes stay as committed.
+		expect(await f.ordinary([newer])).toMatchObject({ ok: true, value: { prs: [{ status: "replayed" }] } });
+		expect(await indexed()).toBe(2);
+		await f.p.inProfile((st) => expect(st.sql.exec("SELECT request_id, payload_hash, result, seq FROM requests WHERE op = 'upload' AND request_id = ?", original[0]!.request_id!).toArray()).toEqual(original));
+		expect(acknowledged(await f.send(0)).proof.items[0]).toMatchObject({ original_action: "stale", disposition: "superseded" });
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "terminal", terminal: { outcome: "done" }, refs: 1 } });
+	});
+
+	it("proves a stale ref by its held newer revision, and leaves it unproven once that authority's activity ages out", async () => {
+		const old = wire(7, at(1)), f = await claimed([[old]]);
+		expect((await f.ordinary([{ ...old, updated_at: at(2) }])).ok).toBe(true);
+		const proof = acknowledged(await f.send(0)).proof;
+		expect(proof.items[0]).toMatchObject({ request_id: f.requestOf(old), original_action: "stale", disposition: "superseded" });
+		await f.p.inProfile((st) => {
+			const now = Date.now() + 401 * 86_400_000;
+			for (const stage of ["dedupe", "ttl", "queue"]) st.sql.exec("INSERT INTO cursors (stage, cursor, due_at) VALUES (?, NULL, ?) ON CONFLICT (stage) DO UPDATE SET due_at = excluded.due_at", stage, now + 86_400_000);
+			st.sql.exec("INSERT INTO cursors (stage, cursor, due_at) VALUES ('purge', NULL, 0) ON CONFLICT (stage) DO UPDATE SET due_at = 0");
+			while (housekeep(st, f.p.who, now).more);
+			expect(st.sql.exec("SELECT count(*) AS n FROM activity WHERE op = 'upload'").one().n).toBe(0);
+		});
+		expect(await f.finish()).toMatchObject({ ok: true, value: { status: "pending", reason: "authority_missing", part: 0, index: 0 } });
+	});
+	it("CORRECTION refuses duplicate natural requests within a part and across parts before ack", async () => {
+		const within = await claimed([[wire(1, at(1)), wire(1, at(1))]]);
+		expect(await within.send(0)).toMatchObject({ ok: true, value: { refresh: { status: "pending", reason: "duplicate_request", part: 0, index: 1 } } });
+		expect(await within.claim()).toEqual({ state: "pending", acked: 0, refs: 0 });
+		expect(await within.p.inProfile((st) => st.sql.exec("SELECT count(*) AS n FROM requests WHERE op = 'upload'").one().n)).toBe(0);
+		const across = await claimed([[wire(1, at(1))], [wire(1, at(1))]]);
+		const first = acknowledged(await across.send(0));
+		expect(acknowledged(await across.send(0))).toEqual(first);
+		expect(await across.send(1)).toMatchObject({ ok: true, value: { refresh: { status: "pending", reason: "duplicate_request", part: 1, index: 0 } } });
+		expect(await across.claim()).toEqual({ state: "pending", acked: 1, refs: 1 });
+		await across.p.inProfile((st) => {
+			expect(() => st.sql.exec(`INSERT INTO refresh_refs SELECT claim_id, 1, idx, key, revision, item_hash, request_id, payload_hash, result_hash, action, request_seq, authority, seq FROM refresh_refs WHERE claim_id = ?`, across.b.claim_id)).toThrow(/UNIQUE/);
+		});
+	});
+	it("CORRECTION meters 100 unique requests and all 64 proofs including the actual protected purge", { timeout: 300_000 }, async () => {
+		const frames = (oneNode: boolean) => Array.from({ length: 64 }, (_, part) => Array.from({ length: part < 36 ? 2 : 1 }, (_, i) => wire(oneNode ? 1 : part * 2 + i + 1, at(part * 2 + i))));
+		const unique = await claimed(frames(false));
+		for (let part = 0; part < 64; part++) acknowledged(await unique.send(part));
+		const uniqueMeter = await unique.p.inProfile((st) => {
+			expect([st.sql.exec("SELECT count(*) AS n FROM refresh_refs").one().n, st.sql.exec("SELECT count(*) AS n FROM refresh_parts").one().n]).toEqual([100, 64]);
+			return rolledBack(st, unique.b.claim_id, "DELETE FROM requests WHERE request_id IN (SELECT request_id FROM refresh_refs WHERE claim_id = ?)", unique.b.claim_id);
+		});
+		const single = await claimed(frames(true));
+		for (let part = 0; part < 64; part++) acknowledged(await single.send(part));
+		const node = await single.p.inProfile((st) => st.sql.exec<{ node_id: string }>("SELECT node_id FROM requests WHERE op = 'upload' LIMIT 1").one().node_id);
+		const singleMeter = await single.p.inProfile((st) => {
+			expect(st.sql.exec("SELECT count(*) AS n FROM requests WHERE node_id = ?", node).one().n).toBe(100);
+			expect(st.sql.exec("SELECT count(*) AS n FROM refresh_parts").one().n).toBe(64);
+			return rolledBack(st, single.b.claim_id, "DELETE FROM requests WHERE request_id IN (SELECT request_id FROM requests WHERE node_id = ? LIMIT 100)", node);
+		});
+		const replies = [], wipe = { profile: "work", at: new Date().toISOString(), ids: [node], terms: [] };
+		const requestPages: { rows: number; bytes: number; binds: number }[] = [], run = BudgetTx.prototype.run;
+		const meter = vi.spyOn(BudgetTx.prototype, "run").mockImplementation(function (this: BudgetTx, q, ...params) {
+			const before = this.rows, r = run.call(this, q, ...params);
+			if (q.startsWith("DELETE FROM requests") && this.rows > before) requestPages.push({ rows: this.rows, bytes: this.bytes, binds: params.length });
+			return r;
+		});
+		try {
+			for (let i = 0; i < 8; i++) {
+				const r = await single.stub.purgeOrigin(single.p.who, { op: "purge", wipe });
+				replies.push(r);
+				expect(r.ok, JSON.stringify(r)).toBe(true);
+				if (r.ok && "done" in r.value && r.value.done) break;
+			}
+		} finally { meter.mockRestore(); }
+		expect(requestPages).toHaveLength(1);
+		expect(requestPages[0]!.rows).toBeLessThanOrEqual(1000);
+		expect(requestPages[0]!.bytes).toBeLessThanOrEqual(1_000_000);
+		expect(requestPages[0]!.binds).toBeLessThanOrEqual(100);
+		expect(await single.p.inProfile((st) => st.sql.exec("SELECT count(*) AS n FROM requests WHERE node_id = ?", node).one().n)).toBe(0);
+		console.log("CORRECTION_FANOUT", JSON.stringify({ unique100nodes64proofs: uniqueMeter, single100requests64proofs: singleMeter, protectedRequestPages: requestPages, protectedPurge: replies }));
+		for (const meter of [uniqueMeter, singleMeter]) expect(meter.rows).toBeLessThanOrEqual(1000);
+	});
+
+});
+
+describe("daily refresh server", () => {
+	type Reply = { status: number; data: any }; // response bodies are checked field by field
+	const hit = async (token: string, method: "GET" | "POST", path: string, text?: string): Promise<Reply> => {
+		const res = await exports.default.fetch(new Request(`${origin}${path}`, { method, headers: { authorization: `Bearer ${token}`, ...(text === undefined ? {} : { "content-type": "application/json" }) }, ...(text === undefined ? {} : { body: text }) }));
+		return { status: res.status, data: await res.json() };
+	};
+	const at = (minute: number) => new Date(Date.UTC(2026, 9, 2) + minute * 60_000).toISOString();
+	const prWire = (number: number, updated_at: string) => ({ number, title: `Daily ${number}`, state: "open" as const, updated_at, head: "daily", reviewers: [], commits: [], closes: [], unknown: [] });
+	const ticketWire = (key: string, title: string, updated_at: string) => ({ key, kind: "ticket", type: "Task", title, updated_at, blocked_by: [], blocks: [], related: [], unknown: [] });
+	const days = () => env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER));
+	type Frame = { source: { source_id: string; kind: "pr" | "ticket"; namespace: string }; payload: Record<string, unknown> & { prs?: unknown[]; tickets?: unknown[] } };
+	/** A native-like client: context from markers, then exact claim, plan, part and finish bytes kept for replay. */
+	async function client(token: string, profile: string, frames: Frame[]) {
+		const context = (await hit(token, "GET", `/v1/markers?profile=${profile}`)).data.refresh_context as { profile: string; generation: string; device_id: string; utc_day: string };
+		const claim_id = `claim-${crypto.randomUUID()}`, day = context.utc_day;
+		const b = { profile, generation: context.generation, device_id: context.device_id, day, claim_id };
+		const sources = [...new Map(frames.map((f) => [f.source.source_id, f.source])).values()].sort((x, y) => (x.source_id < y.source_id ? -1 : 1))
+			.map((s) => ({ ...s, selector_hash: sha256(`selector ${s.source_id}`), enumeration_hash: sha256(`enumeration ${s.source_id}`), observed_items: frames.filter((f) => f.source.source_id === s.source_id).reduce((n, f) => n + (f.payload.prs ?? f.payload.tickets)!.length, 0) }));
+		const parts = { version: 1 as const, selection_hash: sha256(`selection ${claim_id}`), as_of: String(frames[0]?.payload.as_of ?? new Date().toISOString()), sources,
+			frames: frames.map((f, part) => ({ part, source_id: f.source.source_id, kind: f.source.kind, item_count: (f.payload.prs ?? f.payload.tickets)!.length, part_hash: partHash(b, part, f.source.source_id, f.payload as never) })) };
+		const body = {
+			claim: JSON.stringify({ profile, day, claim_id, request_id: `claim-req-${claim_id}` }),
+			plan: JSON.stringify({ profile, day, claim_id, request_id: `plan-req-${claim_id}`, parts, manifest_hash: planHash(b, parts) }),
+			part: (i: number) => canonicalJson({ ...frames[i]!.payload, refresh: { day, claim_id, part: i, part_hash: parts.frames[i]!.part_hash } }),
+			finish: (outcome = "done") => JSON.stringify({ profile, day, claim_id, request_id: `finish-req-${outcome}-${claim_id}`, outcome }),
+		};
+		return { context, b, parts, body, claim: (t = body.claim) => hit(token, "POST", "/v1/refresh/claim", t), plan: (t = body.plan) => hit(token, "POST", "/v1/refresh/plan", t),
+			part: (i: number, t = body.part(i)) => hit(token, "POST", "/v1/ingest", t), finish: (outcome = "done", t = body.finish(outcome)) => hit(token, "POST", "/v1/refresh/finish", t),
+			status: (as = token) => hit(as, "GET", `/v1/refresh/status?profile=${profile}&day=${day}&claim_id=${claim_id}`) };
+	}
+	const receipt = (r: Reply, operation: string, text: string) => {
+		expect(r.status, JSON.stringify(r.data)).toBe(200);
+		const p = r.data.refresh_receipt;
+		expect(p.receipt_hash).toBe(sha256(canonicalJson(p.proof)));
+		expect(p.proof).toMatchObject({ version: 1, operation, body_sha256: sha256(text) });
+		return p;
+	};
+	const prFrames = (p: Awaited<ReturnType<typeof isolated>>, items: ReturnType<typeof prWire>[][], asOf = at(10_000)) =>
+		items.map((prs): Frame => ({ source: { source_id: "web-prs", kind: "pr", namespace: p.ns }, payload: { profile: p.name, as_of: asOf, repo: { remote: p.remote }, prs } }));
+	const mirror = (p: Awaited<ReturnType<typeof isolated>>, claimId: string) => p.inProfile((st) => ({ ...st.sql.exec("SELECT state, acked, cleaned, invalid, parts IS NULL AS erased FROM refresh_claims WHERE claim_id = ?", claimId).one(),
+		refs: st.sql.exec("SELECT count(*) AS n FROM refresh_refs WHERE claim_id = ?", claimId).one().n, proofs: st.sql.exec("SELECT count(*) AS n FROM refresh_parts WHERE claim_id = ?", claimId).one().n }));
+	const row = (profile: string, day: string) => runInDurableObject(days(), (_i, st) => st.storage.sql.exec("SELECT claim_id, state, reason FROM refresh_days WHERE profile = ? AND day = ?", profile, day).toArray()[0]);
+
+	it("runs a device's PR and Jira ticket refreshes from markers context to DONE through the real routes, with terms before writes and exact old status", async () => {
+		const p = await isolated();
+		const pr = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1)), prWire(2, at(2))]]));
+		expect(pr.context).toMatchObject({ profile: p.name, generation: p.who.generation, utc_day: new Date().toISOString().slice(0, 10) });
+		const claimed = receipt(await pr.claim(), "claim", pr.body.claim);
+		expect(claimed.proof).toMatchObject({ binding: pr.b, manifest_hash: null, outcome: null });
+		expect(receipt(await pr.plan(), "plan", pr.body.plan).proof.manifest_hash).toBe(planHash(pr.b, pr.parts));
+		const part = await pr.part(0);
+		expect(part.status, JSON.stringify(part.data)).toBe(200);
+		expect(part.data.prs.map((x: { status: string }) => x.status)).toEqual(["stored", "stored"]);
+		expect(part.data.refresh).toMatchObject({ status: "acknowledged", proof: { operation: "part", binding: pr.b, part: 0, body_sha256: sha256(pr.body.part(0)), manifest_hash: planHash(pr.b, pr.parts) } });
+		expect(part.data.refresh.receipt_hash).toBe(sha256(canonicalJson(part.data.refresh.proof)));
+		const done = await pr.finish();
+		expect(receipt(done, "finish", pr.body.finish()).proof).toMatchObject({ outcome: "done", manifest_hash: planHash(pr.b, pr.parts) });
+		expect(done.data.claim).toMatchObject({ ...pr.b, state: "done" });
+		expect((await pr.status()).data).toMatchObject({ operation: "status", claim: { ...pr.b, state: "done" }, progress: { state: "done", cleaned: true } });
+		expect(await mirror(p, pr.b.claim_id)).toEqual({ state: "done", acked: 1, cleaned: 1, invalid: null, erased: 1, refs: 0, proofs: 0 });
+
+		// Jira tickets: the work profile, its me-guard terms registered before any ticket write.
+		const w = await workProfile(), P = jiraProject(), title = `Daily ${P} cardinal term`;
+		const tk = await client(w.token, "work", [{ source: { source_id: "jira-work", kind: "ticket", namespace: "jira:work" }, payload: { profile: "work", as_of: at(10_000), tickets: [ticketWire(`${P}-1`, title, at(3))] } }]);
+		receipt(await tk.claim(), "claim", tk.body.claim);
+		receipt(await tk.plan(), "plan", tk.body.plan);
+		await runInDurableObject(days(), (_i, st) => st.storage.sql.exec(`CREATE TRIGGER deny_terms_${P} BEFORE INSERT ON sensitive_terms BEGIN SELECT RAISE(ABORT, 'synthetic terms refusal'); END`));
+		// A failed term registration fails the request, exactly as an ordinary work upload does, before any ticket is written.
+		try { await expect(tk.part(0)).rejects.toThrow("synthetic terms refusal"); } finally { await runInDurableObject(days(), (_i, st) => st.storage.sql.exec(`DROP TRIGGER deny_terms_${P}`)); }
+		await w.inWork((st) => expect(st.sql.exec("SELECT count(*) AS n FROM requests WHERE request_id LIKE ?", `upload:work:jira:${P}-1:%`).one().n).toBe(0));
+		const ticket = await tk.part(0);
+		expect([ticket.status, ticket.data.tickets[0].status, ticket.data.refresh.status]).toEqual([200, "stored", "acknowledged"]);
+		expect(await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("SELECT count(*) AS n FROM sensitive_terms WHERE term = ?", title).one().n)).toBe(1);
+		expect((await tk.finish()).data.claim.state).toBe("done");
+		expect((await tk.status()).data.claim).toMatchObject({ ...tk.b, state: "done" });
+	});
+
+	it("gives one device the day, replays every control and part as the same bytes, and refuses a changed body", async () => {
+		const p = await isolated(), other = await deviceToken(`job2-${p.name}`, ["ingest"], [p.name]);
+		const a = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		const claimed = await a.claim();
+		const b = await client(other.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		expect(await b.claim()).toMatchObject({ status: 409, data: { error: { details: { reason: "already_claimed" } } } });
+		expect(await a.claim()).toEqual(claimed);
+		expect(await a.claim(a.body.claim.replace("{", "{ "))).toMatchObject({ status: 409, data: { error: { details: { reason: "body_mismatch" } } } });
+		const plan = await a.plan();
+		expect(await a.plan()).toEqual(plan);
+		const part = await a.part(0), writes = () => p.inProfile((st) => st.sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value);
+		const seq = await writes();
+		expect((await a.part(0)).data.refresh).toEqual(part.data.refresh);
+		expect(await writes()).toBe(seq);
+		expect((await a.part(0, a.body.part(0) + " ")).data.refresh).toMatchObject({ status: "pending", reason: "body_mismatch" });
+		const done = await a.finish();
+		expect(await a.finish()).toEqual(done);
+		// Another finish request after the terminal gets the stored terminal receipt, not a new one.
+		expect((await a.finish("failed")).data.refresh_receipt).toEqual(done.data.refresh_receipt);
+		expect(await b.status()).toMatchObject({ status: 404 });
+		expect(await (await client(other.token, p.name, [])).status()).toMatchObject({ status: 404 });
+	});
+
+	it("keeps an older open day blocking today without a row, closes it in order and never lets its late finish touch today", async () => {
+		const p = await isolated(), today = new Date().toISOString().slice(0, 10), yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+		const old = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await old.claim();
+		// Age the genuine open claim to yesterday on both stores, as if its device had claimed it then.
+		const aged = { ...old.b, day: yesterday };
+		await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("UPDATE refresh_days SET day = ? WHERE profile = ? AND day = ?", yesterday, p.name, today));
+		await p.inProfile((st) => st.sql.exec("UPDATE refresh_claims SET binding = ? WHERE claim_id = ?", canonicalJson(aged), old.b.claim_id));
+		const now = await client(p.token, p.name, prFrames(p, [[prWire(2, at(2))]]));
+		expect(await now.claim()).toMatchObject({ status: 409, data: { error: { details: { reason: "prior_refresh_pending" } } } });
+		expect(await row(p.name, today)).toBeUndefined();
+		const finishOld = JSON.stringify({ profile: p.name, day: yesterday, claim_id: old.b.claim_id, request_id: "finish-old-1", outcome: "abandoned" });
+		const closed = await old.finish("abandoned", finishOld);
+		expect(closed.data.claim).toMatchObject({ day: yesterday, state: "abandoned" });
+		expect((await now.claim()).data.claim.state).toBe("pending");
+		expect(await old.finish("abandoned", finishOld)).toEqual(closed);
+		expect(await row(p.name, today)).toMatchObject({ claim_id: now.b.claim_id, state: "pending" });
+		// Today stays this claim's for good: another claim id, even after a generation change, cannot take it.
+		expect((await now.finish("failed")).data.claim.state).toBe("failed");
+		expect(await (await client(p.token, p.name, prFrames(p, [[prWire(3, at(3))]]))).claim()).toMatchObject({ status: 409, data: { error: { details: { reason: "already_claimed" } } } });
+	});
+
+	it("refuses a closed claim's late item before its write or replay, and before its registration stamp, while ordinary replay repair still works", async () => {
+		const p = await isolated(), stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		const item = prWire(1, at(1)), c = await client(p.token, p.name, prFrames(p, [[item]]));
+		const request = `upload:${p.name}:github:${p.ns}#1:${item.updated_at}`, ordinary = async () => stub.upload(p.who, { repo: p.ns, commits: [], prs: [prArgs(p.ns, item, at(10_000))] }, { platform: "upload", routedBy: "test", userId: OWNER });
+		const indexed = (name: string) => runInDurableObject(days(), (_i, st) => Number(st.storage.sql.exec("SELECT count(*) AS n FROM node_index WHERE profile = ?", name).one().n));
+		const interrupt = (on: boolean) => runInDurableObject(days(), (_i, st) => st.storage.sql.exec(on
+			? `CREATE TRIGGER interrupt_${p.name} BEFORE INSERT ON node_index WHEN NEW.profile = '${p.name}' BEGIN SELECT RAISE(ABORT, 'synthetic registration interruption'); END` : `DROP TRIGGER interrupt_${p.name}`));
+		// A genuine committed request whose registration never completed.
+		await interrupt(true);
+		try { await expect(ordinary()).rejects.toThrow("synthetic"); } finally { await interrupt(false); }
+		await c.claim();
+		await c.plan();
+		/**
+		 * Closes the claim at the profile while the part's call is suspended at its `method` await: the abandonment a concurrent
+		 * request would commit there. `after` runs it once the awaited call returned instead of before it.
+		 */
+		const closeDuring = (target: typeof stub, who: typeof p.who, b: Binding, method: "access" | "register", nth: number, after = false) => runInDurableObject(target, (instance) => {
+			const o = instance as unknown as Record<string, (...a: unknown[]) => Promise<unknown>> & { ctx: DurableObjectState }, orig = o[method]!;
+			const close = () => expect(terminal(o.ctx.storage, who, b, { outcome: "abandoned", request_id: "concurrent-abandon", body_sha256: sha256("concurrent"), reason: null })).toMatchObject({ status: "terminal" });
+			let n = 0;
+			o[method] = async function (this: unknown, ...a: unknown[]) {
+				if (++n !== nth) return orig.apply(this, a);
+				o[method] = orig;
+				if (!after) close();
+				const r = await orig.apply(this, a);
+				if (after) close();
+				return r;
+			};
+		});
+		// 1: suspended at the item's access await after preflight: no replay, registration, stamp, proof or progress follows.
+		await closeDuring(stub, p.who, c.b, "access", 2);
+		expect((await c.part(0)).data).toMatchObject({ prs: [{ status: "refused", reason: "refresh_closed" }], refresh: { status: "pending", reason: "items_not_held" } });
+		expect(await indexed(p.name)).toBe(0);
+		await p.inProfile((st) => expect(st.sql.exec("SELECT registered_at FROM upload_receipts WHERE request_id = ?", request).one().registered_at).toBeNull());
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "abandoned", acked: 0, refs: 0, proofs: 0 });
+		expect((await c.finish("abandoned")).data.claim.state).toBe("abandoned");
+		// 2: suspended inside registration after the commit: registration completes, the closed claim gets no stamp and no acknowledgement.
+		const p2 = await isolated(), stub2 = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p2.name}:${p2.who.generation}`));
+		const c2 = await client(p2.token, p2.name, prFrames(p2, [[prWire(5, at(5))]]));
+		await c2.claim();
+		await c2.plan();
+		await closeDuring(stub2, p2.who, c2.b, "register", 1, true);
+		expect((await c2.part(0)).data).toMatchObject({ prs: [{ status: "refused", reason: "refresh_closed" }], refresh: { status: "pending", reason: "items_not_held" } });
+		expect(await indexed(p2.name)).toBe(2);
+		await p2.inProfile((st) => expect(st.sql.exec("SELECT registered_at FROM upload_receipts WHERE request_id = ?", `upload:${p2.name}:github:${p2.ns}#5:${at(5)}`).one().registered_at).toBeNull());
+		expect(await mirror(p2, c2.b.claim_id)).toMatchObject({ state: "abandoned", acked: 0, refs: 0 });
+		// Ordinary replay repair is unchanged: it registers and stamps the exact committed request.
+		expect(await ordinary()).toMatchObject({ ok: true, value: { prs: [{ status: "replayed" }] } });
+		expect(await indexed(p.name)).toBe(2);
+		await p.inProfile((st) => expect(st.sql.exec("SELECT registered_at FROM upload_receipts WHERE request_id = ?", request).one().registered_at).not.toBeNull());
+	});
+
+	it("keeps the account open until the profile's cleanup finishes, resumes it on the exact replay, and only then releases", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1)), prWire(2, at(2))]]));
+		await c.claim();
+		await c.plan();
+		await c.part(0);
+		await p.inProfile((st) => st.sql.exec(`CREATE TRIGGER hold_cleanup BEFORE DELETE ON refresh_refs BEGIN SELECT RAISE(ABORT, 'synthetic cleanup crash'); END`));
+		const held = await c.finish("abandoned");
+		expect(held.data).toMatchObject({ claim: { state: "pending" }, refresh: { status: "pending", reason: "cleanup_incomplete" } });
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "abandoned", cleaned: 0, refs: 2, proofs: 1 });
+		expect((await c.status()).data.claim.state).toBe("pending");
+		await p.inProfile((st) => st.sql.exec("DROP TRIGGER hold_cleanup"));
+		expect(await c.finish("abandoned", c.body.finish("abandoned") + " ")).toMatchObject({ status: 409, data: { error: { code: "idempotency_mismatch" } } });
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "abandoned", cleaned: 0, refs: 2, proofs: 1 });
+		expect((await c.status()).data.claim.state).toBe("pending");
+		const closed = await c.finish("abandoned");
+		const observed = await c.finish("abandoned", JSON.stringify({ ...JSON.parse(c.body.finish("abandoned")), request_id: "later-authorized-observation" }));
+		expect(observed).toEqual(closed);
+		expect(receipt(closed, "finish", c.body.finish("abandoned")).proof.request_id).toBe(JSON.parse(c.body.finish("abandoned")).request_id);
+		expect(closed.data.claim.state).toBe("abandoned");
+		expect(await mirror(p, c.b.claim_id)).toEqual({ state: "abandoned", acked: 1, cleaned: 1, invalid: null, erased: 1, refs: 0, proofs: 0 });
+	});
+
+
+	it("BACKSTOP resumes terminal cleanup in bounded alarm pages without releasing the account day", { timeout: 120_000 }, async () => {
+		const p = await isolated(), pending = await isolated();
+		const active = await client(pending.token, pending.name, prFrames(pending, [[prWire(999, at(1))]]));
+		await active.claim(); await active.plan(); await active.part(0);
+		const snapshot = () => pending.inProfile((st) => ["refresh_claims", "refresh_refs", "refresh_parts", "requests", "upload_receipts", "nodes"].map((t) => st.sql.exec(`SELECT * FROM ${t}`).toArray()));
+		const untouched = await snapshot();
+		// 301 distinct requests over all 64 proofs exercise a full 300-ref page, its tail and final proof/plan erasure.
+		const frames = Array.from({ length: 64 }, (_, part) => Array.from({ length: part < 45 ? 5 : 4 }, (_, i) => prWire(part * 5 + i + 1, at(part * 5 + i))));
+		const c = await client(p.token, p.name, prFrames(p, frames));
+		await c.claim(); await c.plan();
+		for (let part = 0; part < 64; part++) expect((await c.part(part)).data.refresh.status).toBe("acknowledged");
+		// Synthetic old-day fixture, as in the retained rollover control; it does not prove a real clock rollover.
+		const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), b = { ...c.b, day: yesterday };
+		await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("UPDATE refresh_days SET day = ? WHERE profile = ? AND day = ?", yesterday, p.name, c.b.day));
+		await p.inProfile((st) => {
+			st.sql.exec("UPDATE refresh_claims SET binding = ? WHERE claim_id = ?", canonicalJson(b), b.claim_id);
+			st.sql.exec("CREATE TRIGGER backstop_crash BEFORE DELETE ON refresh_refs BEGIN SELECT RAISE(ABORT, 'synthetic crash before cleanup'); END");
+		});
+		const bytes = JSON.stringify({ profile: p.name, day: yesterday, claim_id: b.claim_id, request_id: "backstop-original-finish", outcome: "abandoned" });
+		expect((await c.finish("abandoned", bytes)).data.refresh.reason).toBe("cleanup_incomplete");
+		const terminalBefore = await p.inProfile((st) => st.sql.exec("SELECT binding, manifest_hash, terminal FROM refresh_claims WHERE claim_id = ?", b.claim_id).one());
+		await p.inProfile((st) => st.sql.exec("DROP TRIGGER backstop_crash"));
+		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		const pages = await runInDurableObject(stub, async (instance, state) => {
+			const storage = state.storage, sql = storage.sql, originalEnv = Reflect.get(instance, "env");
+			for (const stage of ["dedupe", "ttl", "purge", "queue", "dangling"]) sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?) ON CONFLICT(stage) DO UPDATE SET due_at = excluded.due_at", stage, Date.now() + 86_400_000);
+			Reflect.set(instance, "env", { ...originalEnv, EMBEDDINGS: "off" });
+			const exec = sql.exec, sync = storage.transactionSync;
+			type Query = { q: string; params: SqlStorageValue[]; c: SqlStorageCursor<Record<string, SqlStorageValue>> };
+			let current: Query[] | null = null, selection: Query["c"] | null = null;
+			const pages: { reads: number; selectionReads: number; writes: number; bytes: number; binds: number }[] = [];
+			sql.exec = ((q: string, ...params: SqlStorageValue[]) => { const c = exec.call(sql, q, ...params); current?.push({ q, params, c }); if (q.startsWith("SELECT claim_id, binding FROM refresh_claims WHERE cleaned")) selection = c; return c; }) as SqlStorage["exec"];
+			storage.transactionSync = ((fn: () => unknown) => sync.call(storage, () => {
+				const before = current; current = [];
+				try { return fn(); } finally {
+					if (current.some((x) => x.q.startsWith("DELETE FROM refresh_refs"))) pages.push({ reads: (selection?.rowsRead ?? 0) + current.reduce((n, x) => n + x.c.rowsRead, 0), selectionReads: selection?.rowsRead ?? 0, writes: current.reduce((n, x) => n + x.c.rowsWritten, 0),
+						bytes: current.reduce((n, x) => n + x.params.reduce<number>((b, v) => b + (typeof v === "string" ? new TextEncoder().encode(v).length : 0), 0), 0), binds: Math.max(...current.map((x) => x.params.length)) });
+					current = before;
+				}
+			})) as DurableObjectStorage["transactionSync"];
+			try {
+				for (const refs of [1, 0, 0]) {
+					const before = pages.length;
+					await instance.alarm();
+					expect(pages.length - before).toBe(1);
+					expect(sql.exec("SELECT count(*) AS n FROM refresh_refs WHERE claim_id = ?", b.claim_id).one().n).toBe(refs);
+				}
+				return pages;
+			} finally { sql.exec = exec; storage.transactionSync = sync; Reflect.set(instance, "env", originalEnv); }
+		});
+		expect(pages).toHaveLength(3);
+		for (const page of pages) { expect(page.writes).toBeLessThanOrEqual(1000); expect(page.bytes).toBeLessThanOrEqual(1_000_000); expect(page.binds).toBeLessThanOrEqual(100); }
+		console.log("BACKSTOP_CLEANUP_PAGES", JSON.stringify(pages));
+		expect(await mirror(p, b.claim_id)).toMatchObject({ state: "abandoned", cleaned: 1, refs: 0, proofs: 0, erased: 1 });
+		expect(await p.inProfile((st) => st.sql.exec("SELECT binding, manifest_hash, terminal FROM refresh_claims WHERE claim_id = ?", b.claim_id).one())).toEqual(terminalBefore);
+		expect(await row(p.name, yesterday)).toMatchObject({ state: "pending" });
+		const today = await client(p.token, p.name, []);
+		expect(await today.claim()).toMatchObject({ status: 409, data: { error: { details: { reason: "prior_refresh_pending" } } } });
+		expect(await c.finish("abandoned", bytes + " ")).toMatchObject({ status: 409, data: { error: { code: "idempotency_mismatch" } } });
+		expect(await row(p.name, yesterday)).toMatchObject({ state: "pending" });
+		const closed = await c.finish("abandoned", bytes);
+		expect(closed.data.claim).toMatchObject({ ...b, state: "abandoned" });
+		const { reason, ...originalTerminal } = JSON.parse(String(terminalBefore.terminal));
+		expect(reason).toBeNull();
+		expect(receipt(closed, "finish", bytes).proof).toMatchObject(originalTerminal);
+		expect(await c.finish("abandoned", bytes)).toEqual(closed);
+		expect((await today.claim()).data.claim.state).toBe("pending");
+		await pending.inProfile((st) => {
+			for (const stage of ["dedupe", "ttl", "purge", "queue"]) st.sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?) ON CONFLICT(stage) DO UPDATE SET due_at=excluded.due_at", stage, Date.now() + 86_400_000);
+			housekeep(st, pending.who);
+		});
+		expect(await snapshot()).toEqual(untouched);
+		await pending.inProfile((st) => st.sql.exec("DELETE FROM requests WHERE request_id IN (SELECT request_id FROM refresh_refs WHERE claim_id = ?)", active.b.claim_id));
+		expect(await mirror(pending, active.b.claim_id)).toMatchObject({ state: "pending", invalid: "source_deleted", cleaned: 0 });
+		const invalidated = await snapshot();
+		await pending.inProfile((st) => housekeep(st, pending.who));
+		expect(await snapshot()).toEqual(invalidated);
+	});
+
+	it("BACKSTOP arms an alarm before a zero-frame terminal can strand cleanup", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, []);
+		await c.claim(); await c.plan();
+		await p.inProfile(async (st) => {
+			await st.deleteAlarm();
+			st.sql.exec("CREATE TRIGGER backstop_empty BEFORE UPDATE OF cleaned ON refresh_claims WHEN NEW.cleaned = 1 BEGIN SELECT RAISE(ABORT, 'synthetic empty cleanup crash'); END");
+		});
+		expect((await c.finish()).data.refresh.reason).toBe("cleanup_incomplete");
+		expect(await p.inProfile((st) => st.getAlarm())).not.toBeNull();
+		await p.inProfile((st) => st.sql.exec("DROP TRIGGER backstop_empty"));
+		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		await runInDurableObject(stub, async (instance) => { await instance.alarm(); });
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "done", cleaned: 1, erased: 1 });
+		expect((await c.status()).data.claim.state).toBe("pending");
+		const proof = receipt(await c.finish(), "finish", c.body.finish());
+		expect(proof.proof.outcome).toBe("done");
+		expect(receipt(await c.finish(), "finish", c.body.finish())).toEqual(proof);
+	});
+
+	it.each(["closed", "recovery", "paused", "wrong binding"] as const)("BACKSTOP preserves terminal work behind the %s gate", async (guard) => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await c.claim(); await c.plan(); await c.part(0);
+		await p.inProfile((st) => st.sql.exec("CREATE TRIGGER backstop_gate BEFORE DELETE ON refresh_refs BEGIN SELECT RAISE(ABORT, 'synthetic interrupted cleanup'); END"));
+		expect((await c.finish("abandoned")).data.refresh.reason).toBe("cleanup_incomplete");
+		await p.inProfile((st) => st.sql.exec("DROP TRIGGER backstop_gate"));
+		const held = () => p.inProfile((st) => ["refresh_claims", "refresh_refs", "refresh_parts"].map((t) => st.sql.exec(`SELECT * FROM ${t}`).toArray()));
+		const before = await held(), day = c.b.day;
+		const counter = await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("SELECT value FROM counters WHERE day = ? AND name = 'rows'", day).toArray());
+		try {
+			if (guard === "closed") await p.inProfile((st) => st.sql.exec("INSERT INTO profile_meta (key, value) VALUES ('closed', 'wiping')"));
+			if (guard === "recovery") await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'restoring')"));
+			if (guard === "paused") await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("INSERT INTO counters (day, name, value) VALUES (?, 'rows', 80000) ON CONFLICT(day,name) DO UPDATE SET value=excluded.value", day));
+			if (guard === "wrong binding") await p.inProfile((st) => expect(() => housekeep(st, { ...p.who, generation: "another-generation" })).toThrow("binding"));
+			else {
+				const stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+				await runInDurableObject(stub, async (instance) => { await instance.alarm(); });
+			}
+			expect(await held()).toEqual(before);
+			if (guard !== "recovery") expect((await c.status()).data.claim.state).toBe("pending");
+		} finally {
+			if (guard === "closed") await p.inProfile((st) => st.sql.exec("DELETE FROM profile_meta WHERE key = 'closed'"));
+			if (guard === "recovery") await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'"));
+			if (guard === "paused") await runInDurableObject(days(), (_i, st) => {
+				if (counter.length) st.storage.sql.exec("UPDATE counters SET value = ? WHERE day = ? AND name = 'rows'", counter[0]!.value!, day);
+				else st.storage.sql.exec("DELETE FROM counters WHERE day = ? AND name = 'rows'", day);
+			});
+		}
+	});
+
+	it("CORRECTION permits a later authorized resume id to confirm the original profile terminal", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await c.claim(); await c.plan(); await c.part(0);
+		await p.inProfile((st) => st.sql.exec("CREATE TRIGGER hold_resume BEFORE DELETE ON refresh_refs BEGIN SELECT RAISE(ABORT, 'synthetic cleanup crash'); END"));
+		expect((await c.finish("abandoned")).data.refresh.reason).toBe("cleanup_incomplete");
+		await p.inProfile((st) => st.sql.exec("DROP TRIGGER hold_resume"));
+		const resumed = await c.finish("abandoned", JSON.stringify({ ...JSON.parse(c.body.finish("abandoned")), request_id: "later-authorized-resume" }));
+		expect(resumed.data.claim.state).toBe("abandoned");
+		expect(receipt(resumed, "finish", c.body.finish("abandoned")).proof.request_id).toBe(JSON.parse(c.body.finish("abandoned")).request_id);
+		expect(await c.finish("abandoned")).toEqual(resumed);
+	});
+
+	it("drops a deleted request's refs and proof with its plan, holds the claim, and still lets the device abandon it", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await c.claim();
+		await c.plan();
+		const part = await c.part(0);
+		// The same statement protected wipe and transfer run for one node's requests.
+		await p.inProfile((st) => st.transactionSync(() => st.sql.exec("DELETE FROM requests WHERE request_id IN (SELECT request_id FROM requests WHERE node_id = ? LIMIT 100)",
+			st.sql.exec<{ node_id: string }>("SELECT node_id FROM requests WHERE op = 'upload' LIMIT 1").one().node_id)));
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "pending", acked: 1, invalid: "source_deleted", erased: 1, refs: 0, proofs: 0 });
+		expect((await c.part(0)).data.refresh).toMatchObject({ status: "pending", reason: "descriptor_invalidated" });
+		expect(part.data.refresh.status).toBe("acknowledged");
+		expect((await c.finish()).data).toMatchObject({ claim: { state: "pending" }, refresh: { status: "pending", reason: "descriptor_invalidated" } });
+		expect(receipt(await c.finish("abandoned"), "finish", c.body.finish("abandoned")).proof).toMatchObject({ outcome: "abandoned", binding: c.b, manifest_hash: planHash(c.b, c.parts) });
+		expect((await c.status()).data.claim.state).toBe("abandoned");
+	});
+
+	/**
+	 * Control 11 on a fresh account: a work-origin PR (or its project), transferred to personal (and, for the archived forms,
+	 * forgotten there before the claim), then a real work wipe. The personal plan naming that repository loses its descriptor
+	 * before the wipe completes; another profile's unrelated plan stays; the claim then holds until it is abandoned.
+	 */
+	it.each(["live PR with an acknowledged part", "archived PR", "archived project"] as const)("erases a personal plan's work-origin repository on a real work wipe: %s", async (variant) => {
+		const userId = `dw-${crypto.randomUUID().slice(0, 8)}`, account = env.ACCOUNT.get(env.ACCOUNT.idFromName(userId));
+		const fresh = await account.context({ kind: "owner", userId }) as { ok: true; value: { profiles: { userId: string; profile: string; generation: string }[]; caller: Parameters<typeof driveTransfer>[2] } };
+		expect(fresh.ok).toBe(true);
+		const ref = (n: string) => fresh.value.profiles.find((r) => r.profile === n)!, work = ref("work"), personal = ref("personal");
+		const stubOf = (r: { profile: string; generation: string }) => env.PROFILE.get(env.PROFILE.idFromName(`${userId}:${r.profile}:${r.generation}`));
+		const inside = <T,>(r: { profile: string; generation: string }, f: (st: DurableObjectStorage) => T) => runInDurableObject(stubOf(r), (_i, st) => f(st.storage));
+		const ns = `dly-${userId}/repo`, ctx = { platform: "upload", routedBy: "test", userId };
+		expect(await stubOf(work).upload(work, { repo: ns, commits: [], prs: [prArgs(ns, prWire(7, at(1)), at(10))] }, ctx)).toMatchObject({ ok: true, value: { prs: [{ status: "stored" }] } });
+		const key = variant === "archived project" ? `github:${ns}` : `github:${ns}#7`;
+		const nodeId = await inside(work, (st) => st.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", key).one().id);
+		expect(await driveTransfer(transferPorts(env, userId), { id: crypto.randomUUID(), nodeId, from: "work", to: "personal", companyFree: false, context: null }, fresh.value.caller)).toMatchObject({ ok: true });
+		expect(await inside(personal, (st) => st.sql.exec("SELECT source_profile FROM nodes WHERE id = ?", nodeId).one().source_profile)).toBe("work");
+		if (variant !== "live PR with an acknowledged part") {
+			const forgot = await stubOf(personal).write(personal, { op: "owner", args: { action: "forget", memory_id: nodeId, request_id: crypto.randomUUID() } }, { actor: "owner", platform: "test", routedBy: "test", payloadHash: sha256(nodeId), userId });
+			expect(forgot).toMatchObject({ ok: true });
+			expect(await inside(personal, (st) => st.sql.exec("SELECT count(*) AS n FROM archive WHERE source = 'nodes' AND json_extract(payload, '$.key') = ?", key).one().n)).toBe(1);
+		}
+		const asOf = at(20), b = { profile: "personal", generation: personal.generation, device_id: "dw-device", day: new Date().toISOString().slice(0, 10), claim_id: `claim-${userId}` };
+		const payload = { profile: "personal", as_of: asOf, repo: { remote: `git@github.com:${ns}.git` }, prs: [prWire(7, at(2))] };
+		const parts: Parts = { version: 1, selection_hash: sha256("s"), as_of: asOf, sources: [{ source_id: "repo-prs", kind: "pr", namespace: ns, selector_hash: sha256("x"), enumeration_hash: sha256("y"), observed_items: 1 }],
+			frames: [{ part: 0, source_id: "repo-prs", kind: "pr", item_count: 1, part_hash: partHash(b, 0, "repo-prs", payload) }] };
+		await inside(personal, (st) => { installMirror(st, personal, b); expect(sealPlan(st, personal, b, parts, planHash(b, parts))).toEqual({ status: "sealed" }); });
+		const meta = { day: b.day, claim_id: b.claim_id, part: 0, part_hash: parts.frames[0]!.part_hash }, body = sha256(canonicalJson({ ...payload, refresh: meta }));
+		const send = () => stubOf(personal).uploadPart(personal, meta, body, payload, { ...ctx, deviceId: b.device_id });
+		if (variant === "live PR with an acknowledged part") expect(await send()).toMatchObject({ ok: true, value: { prs: [{ status: "stored" }], refresh: { status: "acknowledged" } } });
+		// An unrelated repository's plan in another profile of the same account.
+		const other = { profile: "other", generation: crypto.randomUUID().slice(0, 8) };
+		await runInDurableObject(account, (_i, st) => {
+			const now = new Date().toISOString();
+			st.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES ('other', ?, ?, 'active', ?, 1)", `${userId}:other:${other.generation}`, other.generation, now);
+			st.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, 'other', 'live', 'active', ?, 1)", other.generation, now);
+		});
+		const ob = { ...b, profile: "other", generation: other.generation, claim_id: `claim-other-${userId}` }, oparts: Parts = { ...parts, sources: [{ ...parts.sources[0]!, namespace: `dly-${userId}/unrelated` }] };
+		const otherWho = { userId, ...other };
+		await inside(other, (st) => { installMirror(st, otherWho, ob); expect(sealPlan(st, otherWho, ob, oparts, planHash(ob, oparts))).toEqual({ status: "sealed" }); });
+		const descriptor = (r: { profile: string; generation: string }, id: string) => inside(r, (st) => st.sql.exec("SELECT binding, manifest_hash, state, acked, invalid, parts FROM refresh_claims WHERE claim_id = ?", id).one());
+		const before = await descriptor(personal, b.claim_id), otherBefore = await descriptor(other, ob.claim_id);
+		expect(before).toMatchObject({ invalid: null, state: "pending" });
+
+		const wiped = await account.admin({ op: "wipeProfile", profile: "work", typed: "work" }) as unknown as { ok: boolean; value: { report: string } };
+		expect(wiped.ok && JSON.parse(wiped.value.report)).toMatchObject({ state: "done" });
+		const after = await descriptor(personal, b.claim_id);
+		expect(after).toEqual({ ...before, parts: null, invalid: "source_deleted" });
+		expect(JSON.stringify(await inside(personal, (st) => st.sql.exec("SELECT * FROM refresh_claims").toArray()))).not.toContain(ns);
+		expect(await inside(personal, (st) => [st.sql.exec("SELECT count(*) AS n FROM refresh_refs").one().n, st.sql.exec("SELECT count(*) AS n FROM refresh_parts").one().n,
+			st.sql.exec("SELECT count(*) AS n FROM archive WHERE source = 'nodes' AND json_extract(payload, '$.key') = ?", key).one().n])).toEqual([0, 0, 0]);
+		expect(await descriptor(other, ob.claim_id)).toEqual(otherBefore);
+		// Held: no part or DONE on the erased plan; explicit abandonment still closes and cleans it.
+		expect(await send()).toMatchObject({ ok: true, value: { refresh: { status: "pending", reason: "descriptor_invalidated" } } });
+		const close = (outcome: "done" | "abandoned") => stubOf(personal).refreshTerminal(personal, b, { outcome, request_id: `end-${outcome}`, body_sha256: sha256(outcome), reason: null });
+		expect(await close("done")).toMatchObject({ ok: true, value: { status: "pending", reason: "descriptor_invalidated" } });
+		expect(await close("abandoned")).toMatchObject({ ok: true, value: { status: "terminal", terminal: { outcome: "abandoned" }, cleaned: true } });
+	});
+
+	it("lets the owner abandon a stranded claim and shows its device the exact old claim after the generation changes; others get 404", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await c.claim();
+		const abandoned = await days().refreshFinish(p.name, { owner: true, generation: p.who.generation },
+			{ day: c.b.day, claim_id: c.b.claim_id, request_id: "owner-abandon-1", body_sha256: sha256("owner"), outcome: "abandoned", reason: "owner_abandoned" });
+		expect(abandoned).toMatchObject({ ok: true, value: { claim: { state: "abandoned" } } });
+		const next = crypto.randomUUID().slice(0, 8);
+		await runInDurableObject(days(), (_i, st) => {
+			st.storage.sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", next, `${OWNER}:${p.name}:${next}`, p.name);
+			st.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", next, p.name, new Date().toISOString());
+		});
+		expect((await c.status()).data).toMatchObject({ claim: { ...c.b, state: "abandoned" }, progress: null });
+		const other = await deviceToken(`job3-${p.name}`, ["ingest"], [p.name]);
+		expect((await c.status(other.token)).status).toBe(404);
+		expect((await hit(p.token, "GET", `/v1/refresh/status?profile=${p.name}&day=${c.b.day}&claim_id=claim-unknown-0001`)).status).toBe(404);
+	});
+	it("INDEPENDENT plan replay after deletion must refuse the invalidated descriptor", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, prFrames(p, [[prWire(1, at(1))]]));
+		await c.claim(); const sealed = await c.plan(); await c.part(0);
+		await p.inProfile((st) => st.sql.exec("DELETE FROM requests WHERE request_id = (SELECT request_id FROM refresh_refs WHERE claim_id = ? LIMIT 1)", c.b.claim_id));
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ invalid: "source_deleted", erased: 1, refs: 0, proofs: 0 });
+		const replay = await c.plan();
+		console.log("INDEPENDENT_PLAN_REPLAY", JSON.stringify({ sameReceipt: replay.data.refresh_receipt?.receipt_hash === sealed.data.refresh_receipt.receipt_hash, status: replay.status, refresh: replay.data.refresh ?? null }));
+		expect(replay.data.error?.details?.reason ?? replay.data.refresh?.reason).toBe("descriptor_invalidated");
+		expect(replay.data.refresh_receipt).toBeUndefined();
+		expect(await mirror(p, c.b.claim_id)).toMatchObject({ invalid: "source_deleted", erased: 1 });
+		await c.finish("abandoned");
+		expect((await c.plan()).data.refresh_receipt).toEqual(sealed.data.refresh_receipt);
+	});
+	it.each(["generation", "recovery"] as const)("CORRECTION rechecks %s after awaited cached-plan validation", async (change) => {
+		const p = await isolated(), c = await client(p.token, p.name, []);
+		await c.claim(); const sealed = await c.plan();
+		const replay = await runInDurableObject(days(), async (instance, st) => {
+			const ledger = (instance as unknown as { days: Ledger }).days, profiles = ledger.env.PROFILE;
+			const profile = { ...profiles, idFromName: (name: string) => profiles.idFromName(name), get: (id: DurableObjectId) => ({ refreshPlan: async (...args: Parameters<ReturnType<typeof profiles.get>["refreshPlan"]>) => {
+				const result = await profiles.get(id).refreshPlan(...args);
+				if (change === "generation") st.storage.sql.exec("UPDATE profiles SET generation = 'superseded-generation' WHERE name = ?", p.name);
+				else st.storage.sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'restoring')");
+				return result;
+			} }) } as unknown as Env["PROFILE"];
+			try { return await accountPlan({ ...ledger, env: { ...ledger.env, PROFILE: profile } }, p.who, c.b.device_id, { ...JSON.parse(c.body.plan), body_sha256: sha256(c.body.plan) }); }
+			finally { if (change === "recovery") st.storage.sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'"); }
+		});
+		expect(replay).toMatchObject({ ok: false, error: { code: change === "generation" ? "profile_wiped" : "busy" } });
+		expect(await runInDurableObject(days(), (_i, st) => JSON.parse(String(st.storage.sql.exec("SELECT plan_receipt FROM refresh_days WHERE profile = ? AND day = ?", p.name, c.b.day).one().plan_receipt)))).toEqual(sealed.data.refresh_receipt.proof);
+	});
+
+	it("INDEPENDENT owner HTTP abandonment and owner or bound-device exact inactive status", async () => {
+		const p = await isolated(), c = await client(p.token, p.name, []); await c.claim();
+		const kp = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: "SHA-256" }, true, ["sign","verify"]) as CryptoKeyPair;
+		const enc = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+		const now = Math.floor(Date.now()/1000), head = enc(new TextEncoder().encode(JSON.stringify({ alg: "RS256", kid: "independent-owner" }))), body = enc(new TextEncoder().encode(JSON.stringify({ iss: env.CLERK_ISSUER, sub: OWNER, aud: [env.RESOURCE_URL], scope: env.REQUIRED_SCOPE, azp: env.DASHBOARD_ORIGIN, exp: now + 3600 })));
+		const signed = head + "." + body, token = signed + "." + enc(new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", kp.privateKey, new TextEncoder().encode(signed))));
+		resetKeyCache();
+		const jwk = await crypto.subtle.exportKey("jwk",kp.publicKey);
+		const mock = vi.spyOn(globalThis,"fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? String(input) : input.url;
+			if (url !== `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) throw new Error("unexpected outbound request");
+			return Response.json({ keys: [{...jwk,kid:"independent-owner",alg:"RS256",use:"sig"}] });
+		});
+		const ownerHit = async (method: string,path: string, body?: string) => {
+			const res = await api(new Request(origin+path,{method,headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},...(body?{body}:{})}),env);
+			return {status:res.status,data:await res.json() as any};
+		};
+		try {
+			const path = `/api/profiles/${p.name}/refresh/${c.b.claim_id}/abandon`, bytes = JSON.stringify({day:c.b.day,generation:p.who.generation,request_id:"independent-owner-abandon"});
+			for (const [op, body] of [["claim", c.body.claim], ["plan", c.body.plan], ["finish", c.body.finish()]] as const) expect((await ownerHit("POST", `/v1/refresh/${op}`, body)).status).toBe(403);
+			const closed = await ownerHit("POST",path,bytes); expect(closed).toMatchObject({status:200,data:{claim:{state:"abandoned"}}});
+			expect(await ownerHit("POST",path,bytes)).toEqual(closed);
+			await runInDurableObject(days(),(_i,st)=>{st.storage.sql.exec("UPDATE profiles SET status = 'wiped' WHERE name = ?",p.name);st.storage.sql.exec("UPDATE generations SET state = 'wiped' WHERE id = ?",p.who.generation);});
+			const bound = await c.status(); expect(bound).toMatchObject({status:200,data:{claim:{...c.b,state:"abandoned"},progress:null}});
+			const other = await deviceToken(`status-other-${p.name}`,["ingest"],[p.name]); expect((await c.status(other.token)).status).toBe(404);
+			await days().admin({op:"revokeDevice",id:c.b.device_id});
+            const revoked = await c.status(); expect(revoked.status).toBe(401);
+            const ownerStatus = await ownerHit("GET",`/v1/refresh/status?profile=${p.name}&day=${c.b.day}&claim_id=${c.b.claim_id}`);
+			console.log("INDEPENDENT_OWNER",JSON.stringify({abandon:closed.status,boundInactive:bound.status,revokedDevice:revoked.status,ownerStatus}));
+			expect(ownerStatus).toMatchObject({status:200,data:{claim:{...c.b,state:"abandoned"},progress:null}});
+			await runInDurableObject(days(), (_i, st) => st.storage.sql.exec("UPDATE profiles SET generation = 'later-generation' WHERE name = ?", p.name));
+			expect(await ownerHit("GET", `/v1/refresh/status?profile=${p.name}&day=${c.b.day}&claim_id=${c.b.claim_id}`)).toEqual(ownerStatus);
+			expect((await ownerHit("GET", `/v1/refresh/status?profile=${p.name}&day=${c.b.day}&claim_id=unknown-claim-0001`)).status).toBe(404);
+		} finally { mock.mockRestore(); resetKeyCache(); }
+	});
+
+    it("INDEPENDENT terminal same request id with changed raw bytes must refuse",async()=>{
+        const p=await isolated(), c=await client(p.token,p.name,[]); await c.claim(); await c.plan();
+        const bytes=c.body.finish(), done=await c.finish(); expect(done.data.claim.state).toBe("done");
+        const changed=await c.finish("done",bytes+" ");
+        console.log("INDEPENDENT_FINISH_BYTES",JSON.stringify({status:changed.status,sameReceipt:changed.data.refresh_receipt?.receipt_hash===done.data.refresh_receipt.receipt_hash}));
+        expect(changed).toMatchObject({status:409,data:{error:{code:"idempotency_mismatch"}}});
+		expect(await c.finish()).toEqual(done);
+		expect(await c.finish("done", JSON.stringify({ ...JSON.parse(bytes), request_id: "later-authorized-observation" }))).toEqual(done);
+    });
+
 });

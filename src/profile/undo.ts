@@ -6,6 +6,7 @@ import { assertArchiveEndpoints } from "./archive-fence";
 import { fenceOf, queueFold, Unfold } from "./compact";
 import { normalizeName, requestHash } from "../domain/ids";
 import { Fail, type ErrorCode, type WriteCommand, type WriteContext } from "../domain/types";
+import { markUndone } from "./daily-proof";
 import { archivedNodeIds, archiveNode, archiveRows, purgeAfter, putRow, REMOVALS, restoreArchived, type ArchiveTx, type Row } from "./archive";
 import { readNode, runWrite, snapshot, type Who, type WriteOutput } from "./write";
 import type { Consumed } from "./extract";
@@ -243,6 +244,7 @@ export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: 
 		tx.run("UPDATE activity SET undo = ? WHERE id = ?", JSON.stringify({ seq: tx.seq, archived: sql.exec<{ id: number }>("SELECT id FROM archive WHERE activity_id = ? AND seq = ?", activityId, tx.seq).toArray().map((r) => r.id) }), activityId);
 	}
 	tx.run("UPDATE activity SET undone_by = ?, seq = ? WHERE id = ?", activityId, tx.seq, of);
+	markUndone(tx, of, activityId);
 	return { result: { ok: true, action: "undone", activity_id: activityId, undo_of: of }, created: [], embedDue };
 }
 

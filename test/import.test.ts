@@ -78,6 +78,8 @@ describe("profile schema v3 and v4", () => {
 		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:personal:${ref.generation}`)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Put this profile back into its deployed v2 shape, with v2 data, then run the migrations again.
+			for (const q of ["DROP TRIGGER upload_receipts_gone", "DROP TRIGGER refresh_node_gone", "DROP TRIGGER refresh_archive_gone", "DROP TABLE upload_receipts", "DROP TABLE upload_revisions",
+				"DROP TABLE refresh_claims", "DROP TABLE refresh_refs", "DROP TABLE refresh_parts"]) sql.exec(q);
 			for (const q of ["DROP TABLE import_refreshes", "DROP TRIGGER nodes_refresh_fence", "ALTER TABLE import_records DROP COLUMN published_revision", "ALTER TABLE import_records DROP COLUMN published_content_hash", "DROP TABLE archive", "DROP TABLE transfers", "DROP TABLE transfer_parts", "ALTER TABLE activity DROP COLUMN redacted"]) sql.exec(q);
 			for (const q of ["DROP TRIGGER nodes_import_fence", "DROP TABLE import_records", "DROP TABLE import_parts", "DROP INDEX requests_node", "ALTER TABLE requests DROP COLUMN completed_at", "ALTER TABLE requests DROP COLUMN source", "DROP TABLE revisions"]) sql.exec(q);
 			for (const q of PROFILE_MIGRATIONS[0]!.filter((x) => /\brevisions\b/.test(x))) sql.exec(q);
@@ -86,8 +88,10 @@ describe("profile schema v3 and v4", () => {
 			sql.exec("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES ('r-v2', 'save_memory', 'h', '{\"ok\":true}', 'n-v2', ?, 7)", AT);
 			const act = Number(sql.exec("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'agent', 'saved', 'v2 row', '[\"n-v2\"]', 7) RETURNING id", AT).one().id);
 			migrate(s.storage, "profile_meta", PROFILE_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("6");
+			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("7");
 			expect(sql.exec("EXPLAIN QUERY PLAN SELECT id FROM archive WHERE activity_id = 1").toArray().map((r) => String(r.detail)).join(" ")).toContain("archive_activity");
+			expect(sql.exec("PRAGMA index_list('refresh_refs')").toArray()).toContainEqual(expect.objectContaining({ name: "refresh_refs_request", unique: 1 }));
+			expect(sql.exec("EXPLAIN QUERY PLAN SELECT 1 FROM refresh_refs WHERE request_id = 'request' AND claim_id = 'claim'").toArray().map((r) => String(r.detail)).join(" ")).toContain("refresh_refs_request");
 			expect(sql.exec("SELECT summary, redacted FROM activity WHERE id = ?", act).one()).toEqual({ summary: "v2 row", redacted: null });
 			expect(sql.exec("SELECT node_id, revision, op, snapshot, request_id, actor, device_id, at, seq, delta, revision_id FROM revisions WHERE node_id = 'n-v2'").toArray())
 				.toEqual([{ node_id: "n-v2", revision: 1, op: "saved", snapshot: '{"content":"kept"}', request_id: "r-v2", actor: "agent", device_id: "d1", at: AT, seq: 7, delta: null, revision_id: null }]);
@@ -113,11 +117,11 @@ describe("account schema v2 to v4", () => {
 		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Back to the deployed v1 shape, with a v1 binding, then run the migrations again.
-			for (const q of ["DROP TABLE transfers", "DROP TABLE wipes", "ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
+			for (const q of ["DROP TABLE refresh_days", "DROP TABLE transfers", "DROP TABLE wipes", "ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
 			sql.exec("UPDATE account_meta SET value = '1' WHERE key = 'schema_version'");
 			sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq) VALUES ('v1-binding', 'personal', 'save_memory', 'hash-v1', ?, 1)", AT);
 			migrate(s.storage, "account_meta", ACCOUNT_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("4");
+			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("5");
 			expect(sql.exec("SELECT request_id, profile, op, payload_hash, at, seq, legacy, pending FROM request_index WHERE request_id = 'v1-binding'").one())
 				.toEqual({ request_id: "v1-binding", profile: "personal", op: "save_memory", payload_hash: "hash-v1", at: AT, seq: 1, legacy: 0, pending: 0 });
 			sql.exec("INSERT INTO wipes (profile, generations, wiped_at, node_count, marker_key, report, seq) VALUES ('test', '[]', ?, 0, 'k', '{}', 2)", AT);

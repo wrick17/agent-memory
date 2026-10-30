@@ -6,7 +6,7 @@ Give your coding agents a shared place to remember what matters. Agent Memory is
 
 Your everyday agents still use BothQ. Agent Memory has a private owner trial where basic saving, searching, history, and connection exploration work, and an older copy of your memories has been imported and checked. Your latest memory library has not been migrated to production, and your agents have not switched over.
 
-The current source group has passed local combined and self-host package checks; this does not establish everyday readiness. [Verification](docs/combined-verification-2026-10-30.md#final-local-combined-check-2026-10-31).
+The current source groups, including the daily server, have passed local combined and self-host package checks; this does not establish everyday readiness. [Verification](docs/combined-verification-2026-10-30.md#final-local-combined-check-2026-10-31).
 
 Automatic capture is not running. The dashboard, work and project corpus, self-host setup, backups, and multi-machine use are not ready. BothQ will remain running and readable after the eventual caller transition.
 

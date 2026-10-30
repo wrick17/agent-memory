@@ -22,7 +22,8 @@ import { PROFILE_MIGRATIONS } from "./schema";
 import { runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
-import { commitKey, putMarker, uploadKey } from "./work-upload";
+import { commitKey, naturalRequest, putMarker, uploadKey } from "./work-upload";
+import { ackPart, assertRefreshOpen, installMirror, markRegistered, partCheck, progress, receiptSeq, sealPlan, terminal, type Binding, type PartMeta, type PartReply, type Parts, type Payload, type Terminal, type TerminalReply } from "./daily-proof";
 import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
 
 // The profile module's public surface: callers outside src/profile import only from here.
@@ -34,6 +35,7 @@ export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLi
 export { bundleTexts, type Entry, type TransferOut, type TransferStep } from "./transfer";
 export type { Page, PurgeResult, WipeOut, WipeStep } from "./wipe";
 export { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms } from "./work-upload";
+export type { Binding, PartMeta, Parts, Payload, Terminal, TerminalReply } from "./daily-proof";
 
 /** One work upload request: items already validated and normalized by the Worker, and the repo marker to move after them. */
 export interface WorkBatch { repo: string | null; commits: UploadArgs[]; prs?: UploadArgs[]; tickets?: UploadArgs[]; marker?: { head: string; as_of: string } }
@@ -263,7 +265,8 @@ export class ProfileStore extends DurableObject<Env> {
 		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
 		const commits: WorkItemResult[] = [], prs: WorkItemResult[] = [], tickets: WorkItemResult[] = [], created: string[] = [];
 		const refused = (key: string, e: unknown): WorkItemResult => {
-			if (e instanceof Fail) return { key, status: "refused", reason: e.failure.code };
+			// A daily refresh item names why it was refused (refresh_closed, registration_unavailable); ordinary results keep the code.
+			if (e instanceof Fail) return { key, status: "refused", reason: ctx.refresh && typeof e.failure.details?.reason === "string" ? e.failure.details.reason : e.failure.code };
 			if (e instanceof Error && e.message.includes("import_pending")) return { key, status: "refused", reason: "busy" };
 			throw e;
 		};
@@ -271,14 +274,9 @@ export class ProfileStore extends DurableObject<Env> {
 		let embedDue = false;
 		for (const args of [...batch.commits, ...(batch.prs ?? []), ...(batch.tickets ?? [])]) {
 			const key = uploadKey(args), items = args.item === "commit" ? commits : args.item === "pr" ? prs : tickets, op = `upload_${args.item}`;
-			// A snapshot's revision is its source's updated time; when it was read stays out of the hash.
 			const revision = args.item === "commit" ? {} : { updated_at: args.updated_at };
-			const cmd = { op: "upload" as const, args: { ...args, request_id: `upload:${who.profile}:${key}${args.item === "commit" ? "" : `:${args.updated_at}`}` } };
-			const payloadHash = requestHash(op, args.item === "commit" ? { ...cmd.args } : { ...cmd.args, as_of: undefined });
-   if(args.item!=="commit") {
-    const prior=this.ctx.storage.sql.exec<{payload_hash:string}>("SELECT payload_hash FROM requests WHERE request_id = ?",cmd.args.request_id).toArray()[0];
-    if(prior && prior.payload_hash!==payloadHash) cmd.args.request_id+=`:${payloadHash}`;
-   }
+			const { requestId, payloadHash } = naturalRequest(this.ctx.storage.sql, who, args);
+			const cmd = { op: "upload" as const, args: { ...args, request_id: requestId } };
 			let newBinding = false, committed = false;
 			try {
 				await this.access(who, writeIds(who, cmd));
@@ -290,7 +288,16 @@ export class ProfileStore extends DurableObject<Env> {
 				this.bind(who);
 				const out = this.metered(runWrite(this.ctx.storage, who, cmd, { ...ctx, actor: "index", payloadHash }));
 				committed = true;
-				await register((out.result.node_ids ?? []) as string[]);
+				// Read in the write's own turn: the exact receipt (none for commits) that a successful registration below proves.
+				const receipt = receiptSeq(this.ctx.storage.sql, cmd.args.request_id);
+				try { await register((out.result.node_ids ?? []) as string[]); } catch (e) {
+					// A daily item keeps its commit and stays pending; its retried frame replays it and registers again.
+					if (ctx.refresh && !(e instanceof Fail)) throw Fail.of("unavailable", "the item's registration did not complete", { reason: "registration_unavailable" });
+					throw e;
+				}
+				// After the awaits and before the stamp: a daily claim closed meanwhile gets no registration proof from this call.
+				if (ctx.refresh) assertRefreshOpen(this.ctx.storage.sql, ctx.refresh);
+				if (receipt !== undefined) this.metered(markRegistered(this.ctx.storage.sql, cmd.args.request_id, receipt));
 				created.push(...out.created);
 				embedDue ||= out.embedDue;
 				const action = String(out.result.action);
@@ -321,6 +328,72 @@ export class ProfileStore extends DurableObject<Env> {
 			else if (alarm === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
 		}
 		return ok({ commits, ...(batch.prs ? { prs } : {}), ...(batch.tickets ? { tickets } : {}), ...(marker ? { marker } : {}), created });
+	}
+
+	/** The daily claim's mirror, installed by AccountStore after it reserved the day (daily-proof.ts). */
+	async refreshMirror(who: Who, b: Binding): Promise<Outcome<null>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			installMirror(this.ctx.storage, who, b);
+			return ok(this.metered(null));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** Seals the confirmed claim's one plan, for AccountStore. */
+	async refreshPlan(who: Who, b: Binding, parts: Parts, manifestHash: string): Promise<Outcome<{ status: "sealed" } | { status: "pending"; reason: string }>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			return ok(this.metered(sealPlan(this.ctx.storage, who, b, parts, manifestHash)));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/**
+	 * One part of a claimed daily refresh: a wrong binding, day, sequence or part hash refuses before any item write, and an
+	 * acknowledged part returns its stored proof without touching items. The items go through upload above, fenced in their own
+	 * transactions; only after every await is the part acknowledged with its exact item proof.
+	 */
+	async uploadPart(who: Who, m: PartMeta, body: string, payload: Payload, ctx: Omit<WriteContext, "actor" | "payloadHash" | "refresh">): Promise<Outcome<{ prs?: WorkItemResult[]; tickets?: WorkItemResult[]; refresh: PartReply }>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const check = partCheck(this.ctx.storage.sql, who, ctx.deviceId, m, body, payload);
+			if ("status" in check) return ok({ refresh: check });
+			if (check.replay) return ok({ refresh: check.replay });
+			const first = check.items![0]!, pr = first.item === "pr";
+			const up = await this.upload(who, { repo: first.item === "pr" ? first.repo : null, commits: [], ...(pr ? { prs: check.items! } : { tickets: check.items! }) },
+				{ ...ctx, refresh: { claim_id: m.claim_id, part: m.part, device_id: ctx.deviceId ?? "" } });
+			if (!up.ok) return up;
+			const results = (pr ? up.value.prs : up.value.tickets)!, held = results.every((r) => r.status === "stored" || r.status === "replayed" || r.status === "stale");
+			await this.access(who);
+			const refresh: PartReply = held ? this.metered(ackPart(this.ctx.storage, who, ctx.deviceId, m, body, payload)) : { status: "pending", reason: "items_not_held", part: m.part };
+			return ok({ ...(pr ? { prs: results } : { tickets: results }), refresh });
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** The profile terminal for AccountStore: a replay returns the first terminal and resumes cleanup; release waits for `cleaned`. */
+	async refreshTerminal(who: Who, b: Binding, t: Terminal): Promise<Outcome<TerminalReply>> {
+		try {
+			const alarm = await this.ctx.storage.getAlarm();
+			await this.access(who);
+			// Arm recovery before the terminal commit, including claims with no uploaded frame to start housekeeping.
+			if ((alarm ?? Infinity) > Date.now() + 60_000) {
+				await this.ctx.storage.setAlarm(Date.now() + 60_000);
+				await this.access(who);
+			}
+			this.bind(who);
+			return ok(this.metered(terminal(this.ctx.storage, who, b, t)));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** Read-only claim progress for the status route. */
+	async refreshProgress(who: Who, claimId: string): Promise<Outcome<ReturnType<typeof progress>>> {
+		try {
+			await this.access(who);
+			this.bind(who, true);
+			return ok(progress(this.ctx.storage.sql, claimId));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
 	async captureState(who: Who, rangeIds: string[]): Promise<Outcome<ReturnType<typeof captureState>>> {
@@ -548,6 +621,7 @@ export class ProfileStore extends DurableObject<Env> {
 					await gate();
 				});
 				await clean();
+				await gate();
 				// The purge outbox never waits; housekeeping itself does while paused, unless the object's size is under pressure.
 				if (paused && sizeLevel(sql.databaseSize) === "ok") due = midnight;
 				else {

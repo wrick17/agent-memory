@@ -1,5 +1,5 @@
 // Owner-only REST: protected-resource metadata, whoami, device tokens and the minimal Settings page (sections 8 and 15).
-import type { AccountCommand, AccountContext } from "./account/store";
+import type { AccountCommand, AccountContext, AccountStore } from "./account/store";
 import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
@@ -12,6 +12,7 @@ import { trace } from "./graph-tools";
 import { chunkSchema, corpusOn, corpusStub, refreshSchema } from "./corpus-tools";
 import { checkChunk, chunkTerms, HELD, refreshTerms, type RefreshCommand } from "./corpus/store";
 import { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
+import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
 import { mayUse, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
@@ -40,8 +41,9 @@ async function owner(request: Request, env: Env) {
 }
 
 async function body(request: Request): Promise<Record<string, unknown> | null> {
-	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return null;
-	const raw = await request.text();
+	return parseBody((request.headers.get("content-type") ?? "").includes("application/json") ? await request.text() : "");
+}
+function parseBody(raw: string): Record<string, unknown> | null {
 	if (raw.length > 1_048_576) return null;
 	try { const v = JSON.parse(raw) as unknown; return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null; } catch { return null; }
 }
@@ -88,7 +90,7 @@ const ticket = z.object({ key: jiraKey, kind: z.enum(["bug", "feature", "ticket"
 	.refine((t) => (t.assignee_is_owner === true ? !!t.assignee : true) && !(t.unknown.includes("assignee") && (t.assignee || t.assignee_is_owner !== undefined))
 		&& !(t.unknown.includes("status") && (t.state || t.status !== undefined)) && !(t.unknown.includes("priority") && t.priority !== undefined)
 		&& !(t.unknown.includes("due") && t.due) && !(t.unknown.includes("reporter") && t.reporter), { message: "an unknown field carries no value" });
-const workSchema = ingestSchema.extend({
+const workObject = ingestSchema.extend({
 	session: ingestSchema.shape.session.optional(),
 	commits: z.array(z.object({ sha, at: z.iso.datetime({ offset: true }), title: z.string().max(TITLE_MAX), author: login.optional() }).strict()).max(50).default([]),
 	prs: z.array(z.object({ number: z.number().int().min(1).max(2_147_483_647), title: z.string().max(TITLE_MAX), state: z.enum(["open", "closed"]),
@@ -99,7 +101,8 @@ const workSchema = ingestSchema.extend({
 	tickets: z.array(ticket).max(20).default([]),
 	as_of: z.iso.datetime({ offset: true }).optional(),
 	marker: z.object({ head: sha, as_of: z.iso.datetime({ offset: true }) }).strict().optional(),
-}).strict().refine((v) => v.session || (!v.digests.length && !v.manifests.length), { path: ["session"], message: "digests and manifests need a session" })
+}).strict();
+const workSchema = workObject.refine((v) => v.session || (!v.digests.length && !v.manifests.length), { path: ["session"], message: "digests and manifests need a session" })
 	.refine((v) => (!v.prs.length && !v.tickets.length) || v.as_of, { path: ["as_of"], message: "PR and ticket snapshots need as_of" })
 	.refine((v) => !v.tickets.length || v.profile === "work", { path: ["profile"], message: "Jira tickets go only to profile \"work\", named explicitly" });
 
@@ -114,7 +117,8 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot upload captures" } }, 403);
-	const raw = await body(request);
+	const text = (request.headers.get("content-type") ?? "").includes("application/json") ? await request.text() : "", raw = parseBody(text);
+	if (path === "/v1/ingest" && raw && "refresh" in raw) return refreshPart(env, ctx.value, text, raw);
 	const work = path === "/v1/ingest" && !!raw && ("commits" in raw || "prs" in raw || "tickets" in raw || "marker" in raw);
 	const parsed = (path === "/v1/ingest" ? (work ? workSchema : ingestSchema) : stateSchema).safeParse(raw);
 	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
@@ -179,7 +183,10 @@ async function markersRead(request: Request, env: Env): Promise<Response> {
 	const [client, ...id] = (q.data.session ?? "").split(":");
 	const r = await profileStub(env, ref).read(ref, { kind: "markers", repo: q.data.repo ? repoNamespace(q.data.repo) : null,
 		...(q.data.session ? { session: { client: client as "claude-code" | "codex", id: id.join(":") } } : {}) });
-	return r.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(r.value as Record<string, unknown>) })
+	// Daily refresh context for a registered ingest device only: an owner login cannot stand in for a device.
+	const caller = ctx.value.caller, refresh_context = caller.kind === "device" && caller.deviceId
+		? { profile: ref.profile, generation: ref.generation, device_id: caller.deviceId, utc_day: new Date().toISOString().slice(0, 10) } : null;
+	return r.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, refresh_context, ...(r.value as Record<string, unknown>) })
 		: json({ error: r.error }, r.error.code === "busy" ? 503 : 400);
 }
 
@@ -471,8 +478,118 @@ async function corpusStatus(request: Request, env: Env): Promise<Response> {
 	return r.ok ? json({ profile: ref.profile, generation: ref.generation, held: HELD, ...r.value }) : json({ error: r.error }, corpusStatusCode(r.error.code));
 }
 
+// ---------- daily refresh (account/refresh.ts, profile/daily-proof.ts) ----------
+
+const dayId = z.string().regex(/^\d{4}-\d{2}-\d{2}$/), refreshId = z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/);
+const claimBody = z.object({ profile: z.string().regex(PROFILE_NAME).optional(), repo: ingestSchema.shape.repo, day: dayId, claim_id: refreshId, request_id: refreshId }).strict();
+const planBody = claimBody.extend({ parts: z.record(z.string(), z.unknown()), manifest_hash: hex64 }).strict();
+const finishBody = claimBody.extend({ outcome: z.enum(["done", "failed", "abandoned"]), reason: z.string().regex(/^[a-z_]{1,64}$/).optional() }).strict();
+const refreshIngest = workObject.extend({ refresh: z.object({ day: dayId, claim_id: refreshId, part: z.number().int().min(0).max(63), part_hash: hex64 }).strict() }).strict()
+	.refine((v) => !v.session && !v.digests.length && !v.manifests.length && !v.commits.length && !v.marker && !!v.as_of && (v.prs.length > 0) !== (v.tickets.length > 0),
+		{ message: "a daily part holds PR or ticket snapshots only, with as_of" })
+	.refine((v) => !v.tickets.length || v.profile === "work", { path: ["profile"], message: "Jira tickets go only to profile \"work\", named explicitly" });
+const refreshCode = (code: string) => (code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "unavailable" ? 503
+	: code === "already_exists" || code === "busy" || code === "idempotency_mismatch" ? 409 : 400);
+const days = (env: Env, userId: string) => env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "refreshClaim" | "refreshPlan" | "refreshFinish" | "refreshStatus">;
+const invalid = (e: z.ZodError) => json({ error: { code: "validation", message: e.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+
+/** A registered ingest device token: daily refresh is bound to a device, which an owner login cannot supply. */
+async function refreshDevice(request: Request, env: Env): Promise<Response | AccountContext & { deviceId: string }> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	const caller = ctx.value.caller;
+	if (caller.kind !== "device" || !caller.deviceId || !caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "daily refresh needs an ingest device token" } }, 403);
+	return { ...ctx.value, deviceId: caller.deviceId };
+}
+
+/** The exact body text, hashed by the caller before anything parses it. */
+async function rawJson(request: Request, max: number): Promise<Response | { text: string; value: unknown }> {
+	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return json({ error: { code: "validation", message: "send JSON" } }, 400);
+	const text = await request.text();
+	if (Buffer.byteLength(text, "utf8") > max) return json({ error: { code: "size_budget", message: `a daily refresh request may hold at most ${max} bytes`, details: { reason: "request_bytes" } } }, 413);
+	try { return { text, value: JSON.parse(text) as unknown }; } catch { return json({ error: { code: "validation", message: "send JSON" } }, 400); }
+}
+
+/** The active profile a daily request routes to, like an upload, never me. */
+function refreshRoute(ctx: AccountContext, input: { profile?: string | undefined; repo?: { remote?: string | undefined; path?: string | undefined } | undefined }): Response | ProfileRef & { routedBy: string } {
+	const route = routeWrite(ctx.caller, ctx.rules, ctx.known, { ...(input.profile ? { profile: input.profile } : {}), ...(input.repo ? { repo: input.repo } : {}) });
+	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
+	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "daily refresh never goes to me" } }, 403);
+	return { ...ctx.profiles.find((p) => p.profile === route.value.profile)!, routedBy: route.value.routedBy };
+}
+
+/** POST /v1/refresh/claim, /plan and /finish: the device's control requests, bound to their exact body bytes. */
+async function refreshControl(request: Request, env: Env, op: "claim" | "plan" | "finish"): Promise<Response> {
+	const ctx = await refreshDevice(request, env);
+	if (ctx instanceof Response) return ctx;
+	const raw = await rawJson(request, 1_000_000);
+	if (raw instanceof Response) return raw;
+	const parsed = (op === "claim" ? claimBody : op === "plan" ? planBody : finishBody).safeParse(raw.value);
+	if (!parsed.success) return invalid(parsed.error);
+	const ref = refreshRoute(ctx, parsed.data);
+	if (ref instanceof Response) return ref;
+	const d = parsed.data as z.infer<typeof finishBody> & Partial<z.infer<typeof planBody>>, account = days(env, env.OWNER_USER_ID);
+	const c = { day: d.day, claim_id: d.claim_id, request_id: d.request_id, body_sha256: sha256(raw.text) }, who = { userId: ref.userId, profile: ref.profile, generation: ref.generation };
+	const r = op === "claim" ? await account.refreshClaim(who, ctx.deviceId, c)
+		: op === "plan" ? await account.refreshPlan(who, ctx.deviceId, { ...c, parts: d.parts as unknown as Parts, manifest_hash: d.manifest_hash! })
+			: await account.refreshFinish(ref.profile, { deviceId: ctx.deviceId }, { ...c, outcome: d.outcome, reason: d.reason ?? null });
+	return r.ok ? json({ operation: op, profile: ref.profile, routed_by: ref.routedBy, ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
+}
+
+/** GET /v1/refresh/status: read-only, exact, for the owner or bound device, including an explicitly named inactive profile. */
+async function refreshStatus(request: Request, env: Env): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const context = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!context.ok) return json({ error: context.error }, context.error.code === "unavailable" ? 503 : 401);
+	const ctx = context.value, caller = ctx.caller;
+	if (caller.kind !== "owner" && (caller.kind !== "device" || !caller.deviceId || !caller.scopes.includes("ingest"))) return json({ error: { code: "forbidden", message: "daily refresh needs an ingest device token" } }, 403);
+	const q = z.object({ profile: z.string().regex(PROFILE_NAME).optional(), repo: z.string().min(1).max(512).optional(), day: dayId, claim_id: refreshId }).strict()
+		.safeParse(Object.fromEntries(new URL(request.url).searchParams));
+	if (!q.success) return invalid(q.error);
+	let profile = q.data.profile;
+	if (profile) {
+		if (profile === "me" || !mayUse(ctx.caller, profile)) return json({ error: { code: "forbidden", message: `this caller may not use profile '${profile}'` } }, 403);
+	} else {
+		const ref = refreshRoute(ctx, q.data.repo ? { repo: { remote: q.data.repo } } : {});
+		if (ref instanceof Response) return ref;
+		profile = ref.profile;
+	}
+	const r = await days(env, env.OWNER_USER_ID).refreshStatus(caller.kind === "owner" ? { owner: true } : { deviceId: caller.deviceId! }, profile, q.data.day, q.data.claim_id);
+	return r.ok ? json({ profile, ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
+}
+
+/** One frame of a claimed daily refresh through /v1/ingest: the work schema plus `refresh`, terms registered before any item write. */
+async function refreshPart(env: Env, ctx: AccountContext, text: string, raw: Record<string, unknown>): Promise<Response> {
+	const caller = ctx.caller;
+	if (caller.kind !== "device" || !caller.deviceId) return json({ error: { code: "forbidden", message: "daily refresh needs an ingest device token" } }, 403);
+	if (Buffer.byteLength(text, "utf8") > 900_000) return json({ error: { code: "size_budget", message: "a daily part may hold at most 900,000 bytes", details: { reason: "request_bytes" } } }, 413);
+	const parsed = refreshIngest.safeParse(raw);
+	if (!parsed.success) return invalid(parsed.error);
+	const ref = refreshRoute(ctx, parsed.data);
+	if (ref instanceof Response) return ref;
+	const input = parsed.data, repo = repoNamespace(input.repo?.remote ?? "");
+	if (input.prs.length && !repo) return json({ error: { code: "validation", message: "PRs need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
+	const terms = ref.profile === "work" ? uploadTerms(repo, [...input.prs.map((p) => prArgs(repo!, p, input.as_of!)), ...input.tickets.map((t) => ticketArgs(t, input.as_of!))]) : [];
+	if (terms.length) {
+		const added = await accountStub(env, caller.userId).admin({ op: "addSensitiveTerms", terms });
+		if (!added.ok) return json({ error: added.error }, 400);
+	}
+	// The part hash covers the payload exactly as sent: the body without its outer refresh field, before any schema default.
+	const { refresh: m, ...payload } = raw as Record<string, unknown> & { refresh: PartMeta };
+	const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "uploadPart">;
+	const r = await stub.uploadPart({ userId: ref.userId, profile: ref.profile, generation: ref.generation }, m, sha256(text), payload as unknown as Payload,
+		{ platform: "upload", routedBy: ref.routedBy, userId: caller.userId, deviceId: caller.deviceId });
+	return r.ok ? json({ profile: ref.profile, routed_by: ref.routedBy, ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
+}
+
 export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
+	if (url.pathname === "/v1/refresh/status" && request.method === "GET") return refreshStatus(request, env);
+	const control = /^\/v1\/refresh\/(claim|plan|finish)$/.exec(url.pathname);
+	if (control && request.method === "POST") return refreshControl(request, env, control[1] as "claim" | "plan" | "finish");
 	if (corpusOn(env) && url.pathname === "/v1/corpus/import" && request.method === "POST") return corpusImport(request, env);
 	if (corpusOn(env) && url.pathname === "/v1/corpus/status" && request.method === "GET") return corpusStatus(request, env);
 	if (corpusOn(env) && url.pathname === "/v1/corpus/refresh" && request.method === "POST") return corpusRefresh(request, env);
@@ -505,6 +622,17 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		const r = await account.admin(cmd);
 		return r.ok ? json(r.value, cmd.op === "createDevice" ? 201 : 200) : json({ error: r.error }, r.error.code === "not_found" ? 404 : 400);
 	};
+	// The owner's abandonment of a stranded daily claim: the same terminal path, with the expected day and generation.
+	const abandon = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/refresh\/([A-Za-z0-9._:-]{8,128})\/abandon$/.exec(url.pathname);
+	if (abandon && request.method === "POST") {
+		const raw = await rawJson(request, 1_000_000);
+		if (raw instanceof Response) return raw;
+		const b = z.object({ day: dayId, generation: z.string().min(1).max(64), request_id: refreshId }).strict().safeParse(raw.value);
+		if (!b.success) return invalid(b.error);
+		const r = await days(env, auth.principal.userId).refreshFinish(abandon[1]!, { owner: true, generation: b.data.generation },
+			{ day: b.data.day, claim_id: abandon[2]!, request_id: b.data.request_id, body_sha256: sha256(raw.text), outcome: "abandoned", reason: "owner_abandoned" });
+		return r.ok ? json({ operation: "finish", profile: abandon[1], ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
+	}
 	const m = /^\/api\/devices\/([a-z2-7]{16})\/(revoke|default)$/.exec(url.pathname);
 	if (url.pathname === "/api/profiles" && request.method === "GET") return run({ op: "listProfiles" });
 	if (url.pathname === "/api/devices" && request.method === "GET") return run({ op: "listDevices" });

@@ -177,6 +177,8 @@ export interface WriteContext {
 	/** BothQ's hash of the same call (domain/legacy.ts), compared instead when the request id was imported from BothQ. */
 	legacyHash?: string;
 	userId: string;
+	/** A daily refresh item: its write and any replay happen only while this claim is open at this part (daily-proof.ts). */
+	refresh?: { claim_id: string; part: number; device_id: string };
 	/** Inputs for the `me` guard; required on every write to `me`. Checked after a committed replay, before any change. */
 	meGuard?: { explicit: boolean; context: string | null; companyFree: boolean; sensitiveTerms: string[] };
 }

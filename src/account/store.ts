@@ -5,6 +5,7 @@ import { randomBase32, sha256 } from "../domain/ids";
 import { Fail, fail, ok, PROFILE_NAME, PROFILES, SCOPES, type Caller, type Outcome, type ProfileRef, type RoutingRule, type Scope } from "../domain/types";
 import { migrate, nextSeq } from "../storage";
 import { ACCOUNT_MIGRATIONS } from "./schema";
+import * as refresh from "./refresh";
 import { accountTransfer, type AccountTransfer, type TransferCommand } from "./transfers";
 import { resumeTransfer, transferPorts, type TransferInput } from "../transfer";
 import { ROW_PAUSE } from "../profile/store";
@@ -146,6 +147,15 @@ export class AccountStore extends DurableObject<Env> {
 		return ok({ userId, kind: "device", deviceId: row.id, deviceName: row.name, scopes: JSON.parse(row.scopes) as Scope[],
 			profiles: JSON.parse(row.profiles) as string[], ...(row.default_profile ? { defaultProfile: row.default_profile } : {}) });
 	}
+
+	private get days(): refresh.Ledger {
+		return { sql: this.sql, env: this.env, userId: this.meta("user_id")!, write: (fn) => this.write(fn) };
+	}
+	/** Daily refresh claims (account/refresh.ts), for the Worker's authenticated device or owner routes. */
+	async refreshClaim(ref: ProfileRef, deviceId: string, c: refresh.Control) { return refresh.claim(this.days, ref, deviceId, c); }
+	async refreshPlan(ref: ProfileRef, deviceId: string, c: Parameters<typeof refresh.plan>[3]) { return refresh.plan(this.days, ref, deviceId, c); }
+	async refreshFinish(profile: string, actor: Parameters<typeof refresh.finish>[2], c: Parameters<typeof refresh.finish>[3]) { return refresh.finish(this.days, profile, actor, c); }
+	async refreshStatus(viewer: Parameters<typeof refresh.status>[1], profile: string, day: string, claimId: string) { return refresh.status(this.days, viewer, profile, day, claimId); }
 
 	/** Internal RPC: stale contexts and retired generations cannot enter a profile, even for replay. */
 	async profileAccess(ref: ProfileRef, ids: string[] = []): Promise<Outcome<null>> {

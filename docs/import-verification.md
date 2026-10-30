@@ -286,3 +286,7 @@ A separate local SQLite upgrade from profile schema v5 to v6 preserved synthetic
 ## Local combined source check, 2026-10-31
 
 The corrected local source passed the [final combined check](combined-verification-2026-10-30.md#final-local-combined-check-2026-10-31). The separately corrected import module passed 31 tests, including publication, replay and date controls. This does not change the held live fixture, owner 454 Work routing decision, privacy and identity holds, or the earlier 1,155/1,330 evidence. No current real roster, plan or upload was made. Production reconciliation and migration remain open.
+
+## Daily schema upgrade check, 2026-10-31
+
+Selected synthetic populated profile v6-to-v7 and account v4-to-v5 upgrades preserved the checked old state through migration, repeat and reopen. [Scope and limits](combined-verification-2026-10-30.md#daily-server-local-verification-2026-10-31). This does not establish live-fixture preservation. Owner 454 directs legacy sources to Work; the 30 holds, two collisions, 31 missing and 104 vanished entries and old 1,155/1,330 artifacts remain. No real export, roster or upload followed.

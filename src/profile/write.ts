@@ -8,6 +8,7 @@ import { Fail, KINDS_FOR_TYPE, RELATION_ENDPOINTS, type AppendArgs, type Candida
 import { takeSeq } from "../storage";
 import { compact, contentRows, Unfold, unfoldStep } from "./compact";
 import { runArchive, stagedArchiveActivity, stagedUndo } from "./archive-operations";
+import { assertRefreshOpen } from "./daily-proof";
 import { archiveNode, purgeAfter } from "./archive";
 import { linkIdentifiers, resolveMentions, type Consumed } from "./extract";
 import { sizeLevel } from "./housekeeping";
@@ -775,6 +776,8 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 	return storage.transactionSync(() => {
 		const sql = storage.sql;
 		assertOpen(sql);
+		// Before the replay lookup: a closed daily claim gets neither a replay nor a write for its late items.
+		if (ctx.refresh) assertRefreshOpen(sql, ctx.refresh);
 		const requestId = cmd.args.request_id ?? null;
 		if (requestId) {
 			const row = sql.exec<{ payload_hash: string; result: string; node_id: string; legacy_hash: string | null; state: string | null }>(

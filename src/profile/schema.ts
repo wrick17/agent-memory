@@ -15,6 +15,11 @@ const KEYS: Record<string, (r: "OLD" | "NEW") => string> = {
 };
 const SEQ_KEY: Record<string, string> = { nodes: "id", texts: "rowid", edges: "id", evidence: "owner, kind, ref", revisions: "node_id, revision", requests: "request_id", activity: "id" };
 
+/** A content-bearing plan naming this repository (`github:<ns>` or `github:<ns>#<n>`) loses its descriptor and refuses from then on. */
+const ERASE = `UPDATE refresh_claims SET parts = NULL, invalid = 'source_deleted' WHERE parts IS NOT NULL AND EXISTS
+		(SELECT 1 FROM json_each(refresh_claims.parts, '$.sources') s WHERE json_extract(s.value, '$.namespace') = `;
+const NAMESPACE = (key: string) => `CASE WHEN instr(${key}, '#') THEN substr(${key}, 8, instr(${key}, '#') - 8) ELSE substr(${key}, 8) END`;
+
 export const PROFILE_MIGRATIONS: Migration[] = [[
 	`CREATE TABLE nodes (
 		id TEXT PRIMARY KEY,
@@ -250,4 +255,40 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 ], [
 	// v6: the owner archive page and restore find one removal's rows by its activity id.
 	"CREATE INDEX archive_activity ON archive (activity_id, id)",
+], [
+	// v7 (daily-proof.ts): each PR or ticket upload's receipt and each source revision's first receipt and undo, written in the
+	// upload's and the Undo's own transactions and deleted with their request on any path; a receipt is stamped registered only
+	// after its nodes' account registration and access recheck succeed. A claimed plan's mirror and refs.
+	`CREATE TABLE upload_receipts (request_id TEXT PRIMARY KEY, activity_id INTEGER, at TEXT NOT NULL, key TEXT NOT NULL, revision TEXT NOT NULL,
+		seq INTEGER NOT NULL, registered_at TEXT) WITHOUT ROWID`,
+	"CREATE INDEX upload_receipts_activity ON upload_receipts (activity_id) WHERE activity_id IS NOT NULL",
+	`CREATE TABLE upload_revisions (key TEXT NOT NULL, revision TEXT NOT NULL, request_id TEXT NOT NULL, legacy INTEGER NOT NULL, undone_by INTEGER,
+		seq INTEGER NOT NULL, PRIMARY KEY (key, revision)) WITHOUT ROWID`,
+	// A claimed plan's mirror: its exact binding, the sealed plan (content-bearing until cleanup or invalidation), the acknowledged
+	// prefix, the terminal and whether its refs, part proofs and plan are gone. Each acknowledged part keeps its exact proof text.
+	`CREATE TABLE refresh_claims (claim_id TEXT PRIMARY KEY, binding TEXT NOT NULL, manifest_hash TEXT, parts TEXT,
+		state TEXT NOT NULL CHECK (state IN ('pending','done','failed','abandoned')), acked INTEGER NOT NULL, terminal TEXT, invalid TEXT,
+		cleaned INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID`,
+	"CREATE INDEX refresh_claims_content ON refresh_claims (claim_id) WHERE parts IS NOT NULL",
+	`CREATE TABLE refresh_refs (claim_id TEXT NOT NULL, part INTEGER NOT NULL, idx INTEGER NOT NULL, key TEXT NOT NULL, revision TEXT NOT NULL, item_hash TEXT NOT NULL,
+		request_id TEXT NOT NULL, payload_hash TEXT NOT NULL, result_hash TEXT NOT NULL, action TEXT NOT NULL, request_seq INTEGER NOT NULL, authority TEXT,
+		seq INTEGER NOT NULL, PRIMARY KEY (claim_id, part, idx)) WITHOUT ROWID`,
+	"CREATE UNIQUE INDEX refresh_refs_request ON refresh_refs (request_id, claim_id)",
+	`CREATE TABLE refresh_parts (claim_id TEXT NOT NULL, part INTEGER NOT NULL, body_sha256 TEXT NOT NULL, proof TEXT NOT NULL, receipt_hash TEXT NOT NULL,
+		seq INTEGER NOT NULL, PRIMARY KEY (claim_id, part)) WITHOUT ROWID`,
+	// Deleting a request on any path (purge, transfer, wipe) takes its receipt, its revision's first-receipt row, every daily ref to
+	// it with the part proof that names it, and erases any plan naming its GitHub repository (lifecycle r2, rule 1).
+	`CREATE TRIGGER upload_receipts_gone AFTER DELETE ON requests WHEN OLD.op = 'upload' BEGIN
+		DELETE FROM upload_revisions WHERE request_id = OLD.request_id AND (key, revision) IN (SELECT key, revision FROM upload_receipts WHERE request_id = OLD.request_id);
+		DELETE FROM upload_receipts WHERE request_id = OLD.request_id;
+		DELETE FROM refresh_parts WHERE (claim_id, part) IN (SELECT claim_id, part FROM refresh_refs WHERE request_id = OLD.request_id);
+		DELETE FROM refresh_refs WHERE request_id = OLD.request_id;
+		${ERASE}(SELECT CASE WHEN x LIKE 'github:%' THEN substr(x, 8, instr(x, '#') - 8) END FROM (SELECT substr(OLD.request_id, instr(substr(OLD.request_id, 8), ':') + 8) AS x)));
+	END`,
+	`CREATE TRIGGER refresh_node_gone AFTER DELETE ON nodes WHEN OLD.key LIKE 'github:%' BEGIN
+		${ERASE}${NAMESPACE("OLD.key")});
+	END`,
+	`CREATE TRIGGER refresh_archive_gone AFTER DELETE ON archive WHEN OLD.source = 'nodes' AND json_extract(OLD.payload, '$.key') LIKE 'github:%' BEGIN
+		${ERASE}${NAMESPACE("json_extract(OLD.payload, '$.key')")});
+	END`,
 ]];

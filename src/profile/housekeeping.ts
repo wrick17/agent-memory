@@ -2,6 +2,7 @@
 // capture TTL into the archive, and the 300-day purge. Every change except purge keeps its undo; protected nodes are only
 // flagged. The size level (section 6) is measured on every call.
 import { retireArchivePage } from "./archive-operations";
+import { cleanupTerminal } from "./daily-proof";
 import { fenceOf, queueFold } from "./compact";
 import { requestHash } from "../domain/ids";
 import { Fail, type WriteContext } from "../domain/types";
@@ -38,12 +39,13 @@ export async function cleanupPurge(storage: DurableObjectStorage, remove: (ids: 
 }
 
 /**
- * One bounded step of the most overdue stage. A stage with work left stays due now; a finished one is due again in a day.
+ * One terminal refresh cleanup page, otherwise one step of the most overdue stage. Stages with work left stay due now; finished stages wait a day.
  * Returns the purged node ids (the caller deletes their vectors) and when the next stage is due, for the alarm.
  */
 export function housekeep(storage: DurableObjectStorage, who: Who, now = Date.now()): { stage: Stage | null; more: boolean; purged: string[]; size: SizeLevel; nextDue: number } {
 	const sql = storage.sql;
 	const size = sizeLevel(sql.databaseSize);
+	if (cleanupTerminal(storage, who)) return { stage: null, more: true, purged: [], size, nextDue: now };
 	const due = new Map(sql.exec<{ stage: string; cursor: string | null; due_at: number }>("SELECT stage, cursor, due_at FROM cursors WHERE stage IN ('dedupe', 'ttl', 'purge', 'queue')").toArray().map((r) => [r.stage, r]));
 	const stages = (Object.keys(STEP) as Stage[]).map((s) => ({ stage: s, cursor: due.get(s)?.cursor ?? null, dueAt: due.get(s)?.due_at ?? 0 })).sort((a, b) => a.dueAt - b.dueAt);
 	const first = stages[0]!;

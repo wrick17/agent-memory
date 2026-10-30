@@ -2,11 +2,12 @@ import { assertArchiveEndpoints } from "./archive-fence";
 // Work uploads (sections 4, 10 and 13): bounded metadata the owner's machines read locally, published through the shared write
 // path as actor `index`. The server never calls GitHub or Jira. Commits, PR snapshots and Jira ticket snapshots (work only).
 import { knowledgeTerms } from "../domain/guard";
-import { canonicalJson, sha256, collapse, normalizeName } from "../domain/ids";
+import { canonicalJson, sha256, collapse, normalizeName, requestHash } from "../domain/ids";
 import { EMAIL, PHONE } from "../domain/personal";
 import { REDACTED, redactText } from "../domain/redact";
 import { Fail, RELATION_ENDPOINTS, type CommitUploadArgs, type PRUploadArgs, type TicketUploadArgs, type UploadArgs } from "../domain/types";
 import { takeSeq } from "../storage";
+import { stampReceipt } from "./daily-proof";
 import { linkIdentifiers, resolveMentions, structuralEdges } from "./extract";
 import { assertWritable } from "./transfer";
 import { assertOpen } from "./wipe";
@@ -76,6 +77,15 @@ export function ticketArgs(t: Omit<TicketUploadArgs, "item" | "as_of" | "request
 		...(t.assignee ? { assignee: t.assignee } : {}), ...(t.reporter ? { reporter: t.reporter } : {}), ...(t.assignee_is_owner !== undefined ? { assignee_is_owner: t.assignee_is_owner } : {}),
 		blocked_by: set(t.blocked_by), blocks: set(t.blocks), related: set(t.related), unknown: set(t.unknown), as_of: new Date(asOf).toISOString(),
 		request_id: `upload:${ticketKey(t.key)}:${updated}` };
+}
+
+/** The request an item is held under, and its hash: a snapshot's revision id, or that id with its hash once another payload holds it. */
+export function naturalRequest(sql: SqlStorage, who: Who, a: UploadArgs): { requestId: string; payloadHash: string } {
+	const id = `upload:${who.profile}:${uploadKey(a)}${a.item === "commit" ? "" : `:${a.updated_at}`}`;
+	// A snapshot's revision is its source's updated time; when it was read stays out of the hash.
+	const payloadHash = requestHash(`upload_${a.item}`, a.item === "commit" ? { ...a } : { ...a, as_of: undefined });
+	const prior = a.item === "commit" ? undefined : sql.exec<{ payload_hash: string }>("SELECT payload_hash FROM requests WHERE request_id = ?", id).toArray()[0];
+	return { requestId: prior && prior.payload_hash !== payloadHash ? `${id}:${payloadHash}` : id, payloadHash };
 }
 
 /** Same source revision: known fields must agree; unknown fields may gain knowledge. Old receipts remain unchanged. */
@@ -185,8 +195,11 @@ function identifierEdge(tx: Tx, src: string, rel: string, dst: string, validFrom
  */
 export function upload(tx: Tx, who: Who, a: UploadArgs): WriteOutput {
 	if (who.profile === "me") throw Fail.of("forbidden", "uploads never go to me");
-	if (a.item === "pr") return uploadPR(tx, who, a);
-	if (a.item === "ticket") return uploadTicket(tx, who, a);
+	if (a.item === "pr" || a.item === "ticket") {
+		const out = a.item === "pr" ? uploadPR(tx, who, a) : uploadTicket(tx, who, a);
+		stampReceipt(tx, who, a, out.result);
+		return out;
+	}
 	if (a.item !== "commit") throw Fail.of("validation", `unknown upload item '${String((a as { item: unknown }).item)}'`);
 	const key = commitKey(a.repo, a.sha), project = projectKey(a.repo), created: string[] = [];
 	const ids = new Map([[project, ensure(tx, who, created, "project", project, a.repo, {})], [key, ensure(tx, who, created, "commit", key, collapse(a.title) || a.sha.slice(0, 7), { repo: a.repo, sha: a.sha }, a.at)]]);
