@@ -4,19 +4,62 @@ Give your coding agents a shared place to remember what matters. Agent Memory is
 
 ## Where it stands
 
-This is an early build under active development. The private MCP server is deployed for owner testing, with selected live checks for reading and recall through Claude and Codex OAuth and scoped device access. The existing memory system, BothQ, stays live until cutover. This is not yet a one-click deployment template.
+The private MCP server is running for owner testing. Selected memory reads and recall have been checked through Claude, Codex and scoped device access. BothQ remains the live memory system until the replacement passes its remaining checks and cutover is ready. This is not yet a one-click deployment template.
 
 ## Progress
 
+The [feature manifest](docs/feature-manifest.md) has feature-level status and evidence. Checked items below are specific milestones, not completed features.
+
+The immediate priority is to verify the main MCP as a replacement for BothQ. A rehearsal copy of existing memories has been imported and audited. The updated core server is built, reviewed, locally verified and integrated into the project. It has not been deployed; hosted preservation, recall and client checks remain before an owner trial and cutover. Detailed evidence is in [import verification](docs/import-verification.md#combined-candidate-and-private-routing-proof-2026-10-29).
+
+The older rehearsal dashboard page is reachable, but signed-in use has not been verified. Dashboard work is deferred until after the main MCP. The planned dashboard will let the owner explore memory connections and try unsaved what-if changes on a visual canvas; those experiments must not change stored memories.
+
+### Core and import
+
 - [x] Approve the architecture and feature manifest.
-- [x] Deploy the private MCP server and Clerk sign-in for owner testing.
-- [x] Copy initial record bodies into an isolated rehearsal and read them back with history.
-- [ ] Complete and verify the core memory features.
-- [ ] Finish import validation and copy to production. Rehearsal completed its upload and link checks; one of 30 prepared recall candidates missed, and the owner-selected recall gate remains pending.
-- [ ] Install and verify automatic capture.
-- [ ] Complete graph moves, maintenance, and wipe.
-- [ ] Complete the dashboard, work context, corpus, and self-host packaging.
-- [ ] Verify backup and restore and cross-machine use, then complete cutover.
+- [x] Deploy the private MCP server for owner testing and pass selected client, read, and recall checks.
+- [x] Close four core integration findings in independent review of frozen source.
+- [x] Pass the 121-file candidate's combined checks: typecheck, lint, 185 Worker tests, 75 local tests, generated types, and deployment dry runs.
+- [x] Pass the earlier 126-file candidate's combined checks: typecheck, lint, 218 Worker tests, 76 local tests, generated types, and deployment dry runs.
+- [ ] Verify core memory on the updated hosted build and finish client authentication gates.
+- [x] Build read-only export and import planning; check bodies and history for 1,330 records in isolation.
+- [x] Exercise 100 recovered request replay calls in the rehearsal.
+- [x] Complete all 60 rehearsal batches and check supersession links and kind filtering.
+- [x] Audit the rehearsal test profile: 1,330 records, 4,678 revisions, and 3,182 requests matched with no mismatch, extra, or drift.
+- [ ] Run the owner-selected 30-query recall gate on the updated hosted build. An earlier run on an older build matched 29 of 30.
+- [x] Close the three refresh review findings on the corrected frozen source.
+- [ ] Verify refresh, rollback, and write bounds on the updated hosted build.
+- [x] Validate the reviewed routing input locally: 158 bindings plan, two identity conflicts remain held, and all 969 earlier record hashes stay unchanged.
+- [ ] Resolve routing holds, reconcile a fresh source, and validate the production copy.
+- [ ] Complete cutover. BothQ remains the sole live memory system until then.
+
+### Capture and memory tools
+
+- [x] Close the capture lock recovery finding and integrate its fix with local tests.
+- [ ] Verify capture parity and install automatic capture.
+- [x] Close the six graph fixes in scoped source review, including MCP and ingest checks.
+- [ ] Verify the graph fixes on the updated hosted build.
+- [x] Close seven transfer and wipe findings in independent review of frozen source.
+- [ ] Verify transfer and wipe on the updated hosted build; neither is deployed.
+- [x] Close the earlier maintenance review findings and fix undo for edges changed within the same millisecond.
+- [x] Complete a synthetic local job through the real model, job token, Worker and database; verify scope refusals and a skip that leaves work queued.
+- [ ] Verify maintenance and undo on the updated hosted build, including jobs, leases, saves, and owner actions.
+- [ ] Complete the daily batch, queue, pruning, and size limits. The production tool-inventory gate and browser proof of the batch-status indicator remain open.
+- [ ] Complete journal compaction, preference inference, and promotion to `me`.
+- [x] Build and independently review owner-model reads in source, including the local route integration.
+- [ ] Complete the inferred-preference lifecycle and the About you page.
+
+### Dashboard and remaining work
+
+- [x] Build and locally test the first read-only dashboard source; load its signed-out shell in the rehearsal.
+- [ ] Verify signed-in dashboard flows, reader access, and accessibility. An earlier Google sign-in attempt reported a missing client ID; browser setup inspection was blocked by a disconnected extension.
+- [ ] Complete the remaining dashboard pages and actions outside backup and restore.
+- [x] Build and locally test deterministic work-board reads and the reviewed Work page in source.
+- [ ] Complete work-context uploads, daily refresh, and strategic reviews.
+- [ ] Build the optional Paid corpus ingestion, query, and refresh flows.
+- [ ] Complete self-host setup and verify client connections to a separate deployment.
+- [ ] Build and verify backup and restore in the final stage, after the other features.
+- [ ] Verify physical cross-machine use and the final cutover.
 
 ## Connect a client
 

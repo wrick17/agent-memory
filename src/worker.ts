@@ -34,7 +34,7 @@ export default {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") return protectedResource(env);
 		if (pathname === "/mcp") return mcp(request, env);
-		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js") return api(request, env);
+		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js" || pathname === "/app" || pathname === "/app.js") return api(request, env);
 		return new Response("not found", { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;

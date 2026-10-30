@@ -15,13 +15,14 @@ export function migrate(storage: DurableObjectStorage, metaTable: string, migrat
 	});
 }
 
-/** Takes the next write sequence number. Every row a transaction touches is stamped with it. */
-export function nextSeq(sql: SqlStorage, metaTable: string): number {
-	const row = sql.exec<{ value: string }>(
+/** Takes the next write sequence number, and the rows taking it wrote. Every row a transaction touches is stamped with it. */
+export function takeSeq(sql: SqlStorage, metaTable: string): { seq: number; rows: number } {
+	const cursor = sql.exec<{ value: string }>(
 		`INSERT INTO ${metaTable} (key, value) VALUES ('write_seq', '1')
-		 ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1 RETURNING value`).one();
-	return Number(row.value);
+		 ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1 RETURNING value`);
+	return { seq: Number(cursor.one().value), rows: cursor.rowsWritten };
 }
+export const nextSeq = (sql: SqlStorage, metaTable: string): number => takeSeq(sql, metaTable).seq;
 
 /** AFTER DELETE writes a tombstone at the current write_seq; AFTER INSERT removes the key's tombstone. */
 export function tombstoneTriggers(metaTable: string, table: string, pkExpr: (row: "OLD" | "NEW") => string): string[] {

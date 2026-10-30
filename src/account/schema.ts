@@ -26,4 +26,19 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 	"ALTER TABLE request_index ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
 	// Reserved for a record still being imported: every ordinary call with the id gets busy until its record is published.
 	"ALTER TABLE request_index ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
+], [
+	// v3 (phase 3, docs/module-contracts.md): the account's transfer ledger and its record of wipes (sections 5 and 9).
+	`CREATE TABLE transfers (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, from_profile TEXT NOT NULL, to_profile TEXT NOT NULL,
+		state TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, seq INTEGER NOT NULL) WITHOUT ROWID`,
+	`CREATE TABLE wipes (profile TEXT NOT NULL, generations TEXT NOT NULL, wiped_at TEXT NOT NULL, node_count INTEGER NOT NULL,
+		marker_key TEXT NOT NULL, report TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (profile, wiped_at)) WITHOUT ROWID`,
+	"CREATE INDEX transfers_seq ON transfers (seq, id)",
+	"CREATE INDEX wipes_seq ON wipes (seq, profile, wiped_at)",
+	...tombstoneTriggers("account_meta", "transfers", pk("id")),
+	...tombstoneTriggers("account_meta", "wipes", (r) => `json_array(${r}.profile, ${r}.wiped_at)`),
+], [
+	// v4: accepted C3 policy and a wakeup survive a crash before the source fence exists.
+	"ALTER TABLE transfers ADD COLUMN intent TEXT",
+	"ALTER TABLE transfers ADD COLUMN retry_at INTEGER",
+	"CREATE INDEX transfers_retry ON transfers (retry_at) WHERE retry_at IS NOT NULL",
 ]];

@@ -70,6 +70,100 @@ const liveContent = (stages) => stages.flatMap((s) => s.rows.texts).filter((t) =
 	.sort((a, b) => (a.part === "entry") - (b.part === "entry") || a.seq_no - b.seq_no || a.chunk - b.chunk)
 	.map((t) => (t.chunk === 0 && t.separator ? t.separator : "") + t.body).join("");
 
+async function uploaded(dir, opts = {}) {
+	const p = await m.plan({ exportDir: dir, ...opts });
+	fs.writeFileSync(path.join(p.dir, "upload-example.test.json"), JSON.stringify({ server: "https://example.test", commands_sha256: p.manifest.commands_sha256,
+		batches_sha256: p.manifest.batches_sha256, done: Array.from({ length: p.manifest.batches }, (_, i) => i + 1), receipts: {} }));
+	return p;
+}
+function advanceRecord(base, count) {
+	const r = structuredClone(base);
+	for (let i = 0; i < count; i++) {
+		const revision = ++r.props._version, entry = `new entry ${i}`;
+		r.props.content += `\n${entry}`;
+		r.props.rule = r.props.content;
+		r.props.content_hash = m.bothqContentHash(r.props);
+		r.revisions.push({ revision_id: `${r.props.memory_id}:${revision}`, revision, operation: "appended", snapshot_json: canonicalJson({ memory_id: r.props.memory_id, _version: revision }),
+			delta_json: canonicalJson({ content: entry, separator: "\n" }), request_id: `advance-${r.props.memory_id}-${revision}`, _created: dt("2026-04-01T00:00:00Z"), content_hash: r.props.content_hash });
+		r.requests.push({ request_id: `advance-${r.props.memory_id}-${revision}`, operation: "append", request_hash: sha256(`advance-${revision}`), result: canonicalJson({ ok: true, revision }), memory_id: r.props.memory_id,
+			_created: dt("2026-04-01T00:00:00Z"), _completed: dt("2026-04-01T00:00:00Z") });
+	}
+	return r;
+}
+
+describe("refresh plan", () => {
+	it("requires a completed base upload and splits 200 appends into bounded consecutive anchored refreshes", async () => {
+		const base = journal("refresh-large", { appends: 0, size: 1 }), baseDir = makeExport([base]);
+		await m.plan({ exportDir: baseDir });
+		const fresh = advanceRecord(base, 200), dir = makeExport([fresh]);
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: baseDir }), /finish.*base upload/i);
+		const initial = await uploaded(baseDir);
+		const result = await m.plan({ exportDir: dir, refreshFrom: baseDir });
+		const commands = planned(dir), fins = commands.filter((c) => c.op === "finalize");
+		assert.ok(fins.length > 1);
+		assert.equal(result.manifest.planned, 1);
+		let hash = planned(baseDir).find((c) => c.op === "finalize").record_sha256, revision = base.props._version;
+		for (const [i, f] of fins.entries()) {
+			assert.equal(f.refresh.no, i + 1);
+			assert.equal(f.refresh.base_record_sha256, hash);
+			assert.equal(f.refresh.base_revision, revision);
+			assert.ok(f.node.revision > revision);
+			hash = f.record_sha256; revision = f.node.revision;
+		}
+		assert.equal(revision, fresh.props._version);
+		assert.deepEqual(commands.filter((c) => c.op === "stage").flatMap((c) => c.rows.revisions), m.bothqItem(fresh).revisions.slice(base.revisions.length));
+		assert.equal(m.dryRun({ exportDir: dir }).over_budget_parts, 0);
+		assert.equal(initial.manifest.planned, 1);
+	});
+
+	it("marks the body replaced when an update empties it, though no body row is left to send", async () => {
+		const base = journal("refresh-empty", { appends: 2, size: 1 }), baseDir = makeExport([base]);
+		await uploaded(baseDir);
+		const fresh = structuredClone(base), revision = ++fresh.props._version;
+		Object.assign(fresh.props, { content: "", rule: "" });
+		fresh.props.content_hash = m.bothqContentHash(fresh.props);
+		fresh.revisions.push({ revision_id: `${fresh.props.memory_id}:${revision}`, revision, operation: "updated", snapshot_json: canonicalJson({ ...fresh.props }), delta_json: null,
+			request_id: null, _created: dt("2026-04-01T00:00:00Z"), content_hash: fresh.props.content_hash });
+		const dir = makeExport([fresh]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir });
+		const commands = planned(dir), fin = commands.find((c) => c.op === "finalize");
+		assert.equal(fin.refresh.body_revision, revision);
+		assert.deepEqual([fin.node.chars, commands.flatMap((c) => c.rows?.texts ?? []).length], [0, 0]);
+	});
+
+	it("carries an identical legacy adoption into the first of 200 split appends", async () => {
+		const id = uuid5("personal:project:adoption");
+		const legacy = record({ eid: "e-adoption", legacyId: id, name: "Adoption", scope: "personal", props: { content: "legacy", rule: "legacy" } });
+		const baseDir = makeExport([legacy]);
+		await uploaded(baseDir);
+		const fresh = structuredClone(legacy);
+		fresh.props = { ...fresh.props, memory_id: id, memory_type: "project", status: "active", content_hash: m.bothqContentHash({ ...fresh.props, memory_type: "project" }) };
+		fresh.labels.push("MemoryRecord");
+		fresh.revisions = [{ revision: 1, operation: "legacy_adopted", revision_id: `${id}:1`, snapshot_json: canonicalJson({ ...fresh.props, content: "legacy" }), delta_json: null,
+			request_id: null, _created: dt("2026-03-01T00:00:00Z"), content_hash: fresh.props.content_hash }];
+		const dir = makeExport([advanceRecord(fresh, 200)]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir });
+		assert.deepEqual(reviewOf(dir), []);
+		const fins = planned(dir).filter((c) => c.op === "finalize"), stages = planned(dir).filter((c) => c.op === "stage");
+		assert.ok(fins.length > 1);
+		// The adoption row goes in the first refresh only; each later one extends the adopted history.
+		assert.deepEqual(stages.flatMap((c) => c.rows.revisions).filter((r) => r.op === "legacy_adopted").map((r) => r.revision), [1]);
+		assert.ok(stages.filter((c) => c.refresh.no === 1).some((c) => c.rows.revisions.some((r) => r.op === "legacy_adopted")));
+		assert.equal(fins.at(-1).node.revision, 201);
+	});
+
+	it("holds rewritten, vanished and rerouted sources without emitting replacement writes", async () => {
+		const a = journal("refresh-a", { appends: 0 }), b = journal("refresh-b", { appends: 0 }), c = journal("refresh-c", { appends: 0 });
+		const base = makeExport([a, b, c]); await uploaded(base);
+		const changed = advanceRecord(a, 1); changed.revisions[0].snapshot_json = canonicalJson({ content: "rewritten" });
+		const moved = advanceRecord(c, 1); moved.resolved_scope = "sequoia";
+		const dir = makeExport([changed, moved]); await m.plan({ exportDir: dir, refreshFrom: base });
+		assert.equal(planned(dir).length, 0);
+		const reasons = reviewOf(dir).flatMap((r) => r.reasons);
+		for (const reason of ["history_rewritten", "source_vanished", "route_changed"]) assert.ok(reasons.includes(reason), reason);
+	});
+});
+
 describe("BothQ compatibility", () => {
 	it("hashes and ids match values computed by BothQ's own memory_store.py and memory_config.py", () => {
 		// Computed once with BothQ's interpreter: memory_store._prepare(args, op, ...)["request_hash"], content_hash, _json, stable_memory_id.
@@ -390,5 +484,109 @@ describe("export closure fixes", () => {
 		assert.throws(() => m.dryRun({ exportDir: dir, rehearsal: "test" }), /exactly once, in order/);
 		fs.writeFileSync(path.join(sub, "manifest.json"), JSON.stringify({ ...manifest, batches_sha256: undefined }));
 		assert.throws(() => m.dryRun({ exportDir: dir, rehearsal: "test" }), /missing or does not match/);
+	});
+});
+
+// Reviewed routes (`plan --routes FILE`): exact sources of one export, bound to their exported rows, routed only where no rule routes.
+describe("reviewed routes", () => {
+	const legacy = (name, scope, props = {}) => record({ eid: `rr-${name}`, legacyId: uuid5(`${scope}:project:${name}`), scope, name, props: { content: "safe", ...props } });
+	const rollout = (rel, content) => ({ system: "codex", rel, category: "codex_rollout_summary", realpath: `~/rr/${rel}`, paths: [`~/rr/${rel}`], content, sha256: sha256(content),
+		bytes: Buffer.byteLength(content), utf8: true, birthtime: "2026-01-01T00:00:00Z", mtime: "2026-01-01T00:00:00Z" });
+	/** A reviewed routes file for this export, as the owner's reviewed input binds it; `edit` changes the document. */
+	function routesFile(dir, picks, edit = (d) => d) {
+		const rows = [...readJsonl(path.join(dir, "bothq", "records.jsonl")), ...readJsonl(path.join(dir, "markdown", "files.jsonl"))];
+		const routes = picks.map(([source, profile]) => {
+			const row = rows.find((r) => (r.eid ? `bothq:${r.eid}` : `${r.system}:${r.realpath}`) === source);
+			const it = row.eid ? m.bothqItem(row) : m.markdownItem(row, []);
+			return { source, id: it.id, scope: it.node.scope, profile, source_sha256: sha256(canonicalJson(row)) };
+		});
+		const file = path.join(fs.mkdtempSync(path.join(tmp, "routes-")), "routes.json");
+		fs.writeFileSync(file, JSON.stringify(edit({ version: 1, export_manifest_sha256: sha256(fs.readFileSync(path.join(dir, "manifest.json"), "utf8")), routes })));
+		return file;
+	}
+	const outputs = (dir) => Object.fromEntries(["commands.jsonl", "batches.jsonl", "records.jsonl", "review.jsonl", "manifest.json"].map((f) => [f, fs.readFileSync(path.join(dir, "plan", f), "utf8")]));
+
+	it("routes only the reviewed sources, keeps their provenance and every other hold, and leaves a plan without routes byte-identical", async () => {
+		const mixed = legacy("mixed", "bot_hq"), secret = legacy("secret", "bot_hq", { content: "Use token=abc123secret." }), work = legacy("work", "sequoia");
+		const note = rollout("r1.md", "Outcome: done.\n");
+		const dir = makeExport([mixed, secret, work], [note]);
+		const before = await m.plan({ exportDir: dir }), first = outputs(dir);
+		assert.deepEqual(before.manifest.reasons, { unrouted_scope: 2, needs_redaction: 1, unrouted_path: 1 });
+		const file = routesFile(dir, [["bothq:rr-mixed", "personal"], ["bothq:rr-secret", "work"], ["codex:~/rr/r1.md", "work"]]);
+		const r = await m.plan({ exportDir: dir, routes: file });
+		assert.deepEqual(r.manifest.reviewed_routes, { sha256: sha256(fs.readFileSync(file, "utf8")), routes: 3 });
+		assert.notEqual(r.manifest.input_sha256, before.manifest.input_sha256);
+		const fins = Object.fromEntries(planned(dir).filter((c) => c.op === "finalize").map((c) => [c.node.name, c]));
+		assert.deepEqual(Object.keys(fins).sort(), ["codex/r1.md", "mixed", "work"]);
+		assert.deepEqual([fins.mixed.profile, fins["codex/r1.md"].profile, fins.work.profile], ["personal", "work", "work"]);
+		// Nothing but the profile comes from the route: scope, provenance, history and requests are the exported record's own.
+		assert.deepEqual(fins.mixed.node, m.bothqItem(mixed).node);
+		assert.deepEqual(planned(dir).filter((c) => c.op === "stage" && c.record_id === fins.mixed.record_id).flatMap((c) => c.rows.revisions), m.bothqItem(mixed).revisions);
+		assert.deepEqual(reviewOf(dir).map((x) => [x.key, x.reasons, x.proposed]), [["bothq:rr-secret", ["needs_redaction"], { profile: "work", rule: "reviewed" }]]);
+		const repeated = await m.plan({ exportDir: dir, routes: file });
+		assert.equal(repeated.status, "planned");
+		assert.equal(repeated.manifest.commands_sha256, r.manifest.commands_sha256);
+		// A changed review file is a new input: the dropped source is unrouted again.
+		const fewer = routesFile(dir, [["bothq:rr-mixed", "personal"]]);
+		const again = await m.plan({ exportDir: dir, routes: fewer });
+		assert.deepEqual([again.status, again.manifest.reviewed_routes.sha256, again.manifest.reasons], ["planned", sha256(fs.readFileSync(fewer, "utf8")), { unrouted_scope: 1, needs_redaction: 1, unrouted_path: 1 }]);
+		// Routes that change no command still make another plan, with its own review and manifest, so the cache must not reuse it.
+		const heldOnly = await m.plan({ exportDir: dir, routes: routesFile(dir, [["bothq:rr-secret", "work"]]) });
+		assert.equal(heldOnly.manifest.commands_sha256, before.manifest.commands_sha256);
+		assert.equal((await m.plan({ exportDir: dir })).status, "planned");
+		assert.deepEqual(outputs(dir), first);
+	});
+
+	it("refuses another export, a changed or unknown source, me, a bad schema, a rule-routed source and a rehearsal, before any output", async () => {
+		const repo = fs.mkdtempSync(path.join(tmp, "rr-repo-"));
+		spawnSync("git", ["init", "-q", repo]);
+		spawnSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:Sequoia-Engineering/app.git"]);
+		const dir = makeExport([legacy("mixed", "bot_hq"), legacy("work", "sequoia")], [rollout("r2.md", `cwd: ${repo}\n\nOutcome.\n`)]);
+		const one = (edit) => routesFile(dir, [["bothq:rr-mixed", "work"]], edit);
+		const route = (patch) => one((d) => ({ ...d, routes: [{ ...d.routes[0], ...patch }] }));
+		const cases = [
+			[one((d) => ({ ...d, export_manifest_sha256: sha256("another export") })), /made for another export/],
+			[route({ id: uuid5("bot_hq:project:other") }), /route 1 no longer matches/],
+			[route({ scope: "personal" }), /route 1 no longer matches/],
+			[route({ source_sha256: sha256("edited row") }), /route 1 no longer matches/],
+			[route({ source: "bothq:mixed" }), /route 1 names a source this export does not have/],
+			[route({ profile: "me" }), /nothing is routed into me/],
+			[route({ profile: "test" }), /route 1 profile/],
+			[route({ evidence: "extra" }), /route 1 schema/],
+			[one((d) => ({ ...d, routes: [d.routes[0], d.routes[0]] })), /route 2 repeats a source/],
+			[one((d) => ({ ...d, version: 2 })), /refused: schema/],
+			[routesFile(dir, [["bothq:rr-work", "work"]]), /route 1 conflicts with an existing routing rule/],
+			// A work remote comes first: no reviewed route sends its checkout elsewhere.
+			[routesFile(dir, [["codex:~/rr/r2.md", "personal"]]), /route 1 conflicts with an existing routing rule/],
+		];
+		for (const [file, error] of cases) await assert.rejects(m.plan({ exportDir: dir, routes: file }), error);
+		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: one() }), /rehearsal ignores routing/);
+		assert.ok(!fs.existsSync(path.join(dir, "plan")) && !fs.existsSync(path.join(m.migrationDir(), "state.json")), "no plan, review or state written");
+	});
+
+	it("rechecks a reviewed source after its checkout gains a work remote", async () => {
+		const repo = fs.mkdtempSync(path.join(tmp, "rr-cache-repo-"));
+		assert.equal(spawnSync("git", ["init", "-q", repo]).status, 0);
+		const dir = makeExport([], [rollout("reroute.md", `cwd: ${repo}\n\nOutcome.\n`)]);
+		const opts = { exportDir: dir, routes: routesFile(dir, [["codex:~/rr/reroute.md", "personal"]]) };
+		assert.equal((await m.plan(opts)).manifest.records_by_profile.personal, 1);
+		const before = outputs(dir);
+		assert.equal(spawnSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:Sequoia-Engineering/cache-fixture.git"]).status, 0);
+		await assert.rejects(m.plan({ ...opts, force: true }), /conflicts with an existing routing rule/);
+		await assert.rejects(m.plan(opts), /conflicts with an existing routing rule/);
+		assert.deepEqual(outputs(dir), before);
+	});
+
+	it("keeps refresh route_changed protection: the same reviewed route fast-forwards, none or another profile holds", async () => {
+		const base = journal("rr-refresh", { appends: 0, size: 1, scope: "bot_hq" }), baseDir = makeExport([base]), key = `bothq:${base.eid}`;
+		await uploaded(baseDir, { routes: routesFile(baseDir, [[key, "personal"]]) });
+		const dir = makeExport([advanceRecord(base, 2)]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir });
+		assert.deepEqual([planned(dir).length, reviewOf(dir)[0].reasons], [0, ["unrouted_scope", "route_changed"]]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir, routes: routesFile(dir, [[key, "work"]]) });
+		assert.deepEqual([planned(dir).length, reviewOf(dir)[0].reasons], [0, ["route_changed"]]);
+		await m.plan({ exportDir: dir, refreshFrom: baseDir, routes: routesFile(dir, [[key, "personal"]]) });
+		const fin = planned(dir).find((c) => c.op === "finalize");
+		assert.deepEqual([fin.profile, fin.refresh.no, fin.node.revision, reviewOf(dir)], ["personal", 1, base.props._version + 2, []]);
 	});
 });

@@ -19,6 +19,7 @@ Author: Opus (`claude-opus-5-5`), 2026-10-29, on `phase2-capture`. This is the [
 ```sh
 node local/migrate.mjs export                    # BothQ (read transactions) + Markdown (read) into export-<UTC>-<rand>/
 node local/migrate.mjs plan                      # routed plan: work and personal, nothing to me
+node local/migrate.mjs plan --routes FILE        # the same, plus the owner's reviewed routes for exact sources of this export
 node local/migrate.mjs plan --rehearsal test     # every record with an identity and no hold, to test (rehearsal Worker only)
 node local/migrate.mjs verify                    # a fresh read of the sources compared with the export
 node local/migrate.mjs dry-run [--rehearsal test]   # checks every command, part and batch against the budget; no network
@@ -89,6 +90,67 @@ No real link changes:
 |---|---|---|
 | `test/import.test.ts`, links: a rule superseding a decision and a document superseding a journal, replayed; refusals for an unpublished endpoint, a self-link, a component node at either end and a memory of another profile; exactly three edges | Fails: `["refused", "refused"]` for the two pairs | Passes |
 | `local/migrate.test.mjs`, links only to records the plan publishes in the same profile | Fails: links to an oversize and a cross-profile target emitted | Passes |
+
+## Import integrity audit, 2026-10-29
+
+The hosted parity check proved content and history, but the read API does not return each record's request ledger or provenance. This read-only audit closes that gap for migration verification 1 and 2 ([design](import-integrity-design.md)).
+
+- **`GET /v1/import/audit`** (owner, or an `import` device that may use the profile; `me` refused). Summary pages carry, per record:
+  - its stored `record_sha256` and `node_sha256`;
+  - its current node revision, plus digests of the stored attributes and their source;
+  - digests of its imported revisions and request ledger, with a count of later hosted rows.
+
+  Each summary also carries the stored node row's digest (`row_sha256`) and its two dates. Detail pages return the per-row digests. Results are hashed as their exact stored UTF-8 bytes. A summary page holds at most 50 records and hashes at most 5,000 rows, counted before they are read. A larger record comes with its counts only, marked `paged`. Detail pages hold at most 200 rows. The audit only reads: it takes no binding and never replays.
+- **`node local/upload.mjs audit [--export DIR] [--rehearsal test]`** computes the same digests from the uploaded plan with the shared module and pages the server. It writes `audit-<host>.json` (mode 0600) beside the upload state, listing record ids by class: missing, extra, state, record, node, attrs, source, revisions, requests, and hosted drift.
+  - It checks the plan with `dryRun` first, and refuses one that differs from the upload state.
+  - It identifies records by profile and id, and compares each stored node row with the plan's node while the revision is unchanged.
+  - It reads paged records through the detail pages.
+  - It exits 0 only on a full match, with no mismatch and no drift.
+- **Review corrections, 2026-10-29.** The independent review found five P2 defects in the first version: a missing plan passed with 0 records; current node fields went unchecked; a copy of a record in a second profile was hidden; a page could pass its row bound; and drift still passed. Each is fixed. Each regression fails on the reviewed patch (`ef364020…a238`) and passes now.
+- **Against the fixture:** the shared module reproduces Terra's expected-integrity fixture (`89101631…a253f`) for all 1,330 rehearsal records, with 0 mismatches. The hosted run is pending deployment.
+
+| Regression | Result |
+|---|---|
+| `test/import.test.ts`, audit: a journal with a non-canonical, non-ASCII result, a Markdown record and a staged-only record | Totals, summary pages, detail pages and exact byte counts equal digests written out independently in the test |
+| Same test, read only | Table counts, `write_seq` and AccountStore bindings are unchanged; a BothQ request still replays |
+| Same test, drift and tampering | A hosted append raises the node revision and the hosted request count, and leaves the imported digests unchanged. One changed result byte or attribute shows on that record, in that class only |
+| `test/import.test.ts`, access | No token 401; `read`/`write` device 403; device for another profile 403; `me` 400; unknown profile 404; unknown parameter, oversized page or incomplete detail query 400 |
+| `local/upload.test.mjs`, audit | A faithful server over five pages gives `ok`; one changed snapshot byte gives `mismatch`, naming that record under `revisions`; the report is mode 0600 and holds no token |
+| `local/upload.test.mjs`, review corrections | A missing `commands.jsonl` or a plan that differs from the upload state is refused before any request. A node whose stored status changed without a new revision is a `node` mismatch. A copy of a personal record in work is `extra` as `work/<id>`. A paged record is read through its detail pages, and a byte changed in it is found. One hosted request gives status `drift` |
+| `test/import.test.ts`, review corrections | `row_sha256` equals the plan's node, and changes when the status changes with no new revision. Two records of 3,000 rows go on two pages. A 5,001-row record is listed `paged` with its count, and its rows come back on 26 detail pages of at most 200. A non-numeric revision cursor is refused |
+
+## Import refresh (schema v5), 2026-10-29
+
+A fresh export reconciles into the hosted copy before cutover ([design](import-refresh-design.md)): `node local/migrate.mjs plan --export FRESH --refresh-from BASE [--rehearsal test]`, then the usual upload.
+- **Planner.** It runs only when exactly one server has a complete upload of the base plan. Each record is classified against the base:
+  - unchanged: nothing;
+  - BothQ history extended: a fast-forward refresh. One too large to publish whole is split at revision boundaries into consecutive anchored refreshes, each a true BothQ state;
+  - BothQ adoption of a legacy record: the synthetic snapshot is replaced;
+  - Markdown changed: a new revision. With only path aliases changed, the provenance alone is updated;
+  - held, never written: `history_rewritten`, `source_vanished`, `route_changed`, `oversize_refresh` and every first-copy hold.
+
+  Links the base already made are not re-sent.
+- **Server.** A refresh stages under the shadow id `<record>#r<n>`, which has no node, so nothing reads it, and its request ids answer `busy`.
+  - Prepare checks the base anchor and the hosted node: a hosted write since makes it refuse `hosted_changed`. It also checks that the delta only extends history.
+  - Publish re-keys the rows onto the record in one transaction under the 1,000-row budget, and updates the node. A body replacement keeps the earlier body and entries as history (`live = 0`).
+  - Retries replay.
+
+| Regression | Result |
+|---|---|
+| `test/import.test.ts`, fast-forward | A two-append delta stays invisible to get, recall and replay until publish. It publishes in one bounded transaction, replays on retry, and keeps every BothQ request replayable |
+| `test/import.test.ts`, conflict | After a hosted append the refresh is refused `hosted_changed`; the hosted content is unchanged and the staged row stays under its shadow id |
+| `test/import.test.ts`, body replacement | Content becomes the new body and later entry; the first body and both earlier entries are still stored as `live = 0`; old text no longer recalls |
+| `test/import.test.ts`, adoption | An identical `legacy_adopted` replaces the synthetic `legacy_snapshot`; one with other content is refused `history_rewritten` and changes nothing |
+| `local/migrate.test.mjs`, refresh plan | A refresh needs a complete base upload. 200 appends become consecutive anchored refreshes, each within budget and ending at the export's revision. Rewritten, vanished and rerouted sources are held with no commands |
+
+**Review corrections, 2026-10-29.** The independent review of v5 and R6 found three defects. Each is fixed with a regression that fails on the reviewed artifact (`598ae3de…`).
+- **Emptied body:** an update that empties a journal's content sent no body row, so `body_revision` was missing and the old content stayed live. The planner now marks the replacement from the source revision that sets the body, empty or not. The reviewer's real-planner-to-Workers test fails with the old planner's commands and passes with the new.
+- **Adoption before a split:** a legacy adoption followed by 200 appends was held as `history_rewritten`, because the adoption was left out of the split. It now goes in the first step, and later steps keep it.
+- **Sequence row:** the write's sequence row was not charged, so a write of 1,001 real rows committed. It is now charged: that write rolls back, and the 997-row control commits.
+
+An independent review closed all three on the frozen source `bd3a4ce2…`. Combined and runtime verification remain open.
+
+**Real-data proof, private, read-only on the retained export.** On a private copy of the export, the first-copy plans are byte-identical to the recorded ones: rehearsal `b6213e44…`/`0feca7c9…` (1,330 records) and routed `e7eff1cf…`/`5144610b…` (969). A refresh of that identical copy from the uploaded rehearsal base plans 0 commands, with the same 130 review entries. No file in the retained export changed.
 
 ## Real read-only run
 
@@ -175,6 +237,52 @@ They are classified from existing evidence first. An owner question comes only w
 
 No original source is rewritten or deleted. A refresh from a fresh export still comes before cutover. A record that changed in BothQ after its copy is refused as `record_changed`, not overwritten. It takes the refresh and conflict path, which is not built yet.
 
+## Reviewed routes, 2026-10-29
+
+`plan --routes FILE` routes sources that no rule routes, from a private file of owner-reviewed bindings kept outside the repository. It is implemented with scoped local checks only and has not been applied to the retained plan.
+
+- The file names one export by the SHA-256 of its `manifest.json`. Each route gives:
+  - one full source key (`bothq:<element id>` or `<system>:<real path>`);
+  - its id and its scope;
+  - `work` or `personal`;
+  - the SHA-256 of its exported row's canonical JSON.
+
+  A numeric element-id tail is not an identity.
+- Before any output, the plan refuses the whole file for any of these:
+  - another export;
+  - an unknown, repeated or changed source, or a changed id or scope;
+  - a route into `me`, or any other profile or key;
+  - a source that a remote, path or scope rule already routes;
+  - a rehearsal.
+- A route sets only the profile and lifts no other hold. Redaction, missing scope, ambiguous path, reference candidate, personal fields, identity conflict and oversize still hold. Scope, paths, history, requests, anchors and relationships stay the exported record's own.
+- A reviewed plan is never served from the plan cache. Every `plan --routes` run rebuilds the items and checks the current checkout remotes again, with the per-process remote lookup cleared. It also checks the decoded paths, existing-rule refusals and every hold. A source whose checkout gained a work remote since the last plan is refused, not planned from the earlier result. The file's SHA-256 still enters the plan's input hash and its manifest (`reviewed_routes`). Without `--routes`, plan outputs and caching are byte-identical to before.
+- A refresh compares routes as before. A record routed by review keeps its route only with a route bound to the fresh export; otherwise it holds as `route_changed`.
+
+Fixed after review (2026-10-29): the independent review found one P2, the cached return for a reviewed plan. The parent's fix skips the cache for reviewed plans and clears the remote lookup. Its regression plans a reviewed `personal` source, then gives its checkout a work remote. Both the forced and the normal rerun must refuse, with outputs unchanged. The regression fails on the reviewed source and passes on the fix. Restoring only the disk-cache shortcut makes it fail again. The fix had no further independent review.
+
+Historical source check, on the first reviewed-routes source before the fix: on a private copy of the retained export, the plan without routes matched the recorded routed plan and the base code byte for byte. With the 147 accepted bindings (125 `work`, 22 `personal`), 145 records were added to the plan, 123 `work` and 22 `personal`. Two `work` Claude index files from two Claude configuration roots share one name and scope, and the existing identity rule holds both. All 969 earlier records kept their exact record hashes. The review list fell from 491 to 346:
+
+| Reason | Count |
+|---|---|
+| `unrouted_scope` | 199 |
+| `unrouted_path` | 46 |
+| `missing_scope` | 92 |
+| `needs_redaction` | 28 |
+| `reference_candidate` | 11 |
+| `identity_conflict` | 2 |
+
+The plan had 1,114 records (878 `work`, 236 `personal`) and 47 batches, with nothing over budget. It was not promoted, and it is not proof for the final source or for the newer binding set.
+
+Owner decisions, 2026-10-29:
+- The one held `personal` candidate's work login and email mentions are personal metadata. This applies to that exact record only. It is no general rule for company data, `me`, the company-free attestation or redaction.
+- The prepared 148 bindings were later supplemented by 12 independently cleared bindings for the private 160-binding proof below. Binding files remain outside the repository; the historical 147-binding file is unchanged.
+- The two identity conflicts stay held.
+- The existing set of 30 golden queries is selected. The earlier prepared 29/30 result is historical and is not runtime proof for that selection.
+
+## Private 160-binding proof, 2026-10-29
+
+Terra's retained private proof at `/tmp/am-terra-routing-160-proof` has verified routes SHA-256 `a62f1f4bd757fbeda0c37a0eb95aa46266da2631ecb8457ba603ed9eee733ad9` and [proof receipt](/tmp/am-terra-routing-160-proof/proof.log) SHA-256 `d85d67b03d9ac467f977e8b2cd87ce06a6e3e40eeb855e217afa0379d588aa30`. It plans 158 of 160 bindings, with the same two identity conflicts held. The result is 1,127 planned records (881 work, 246 personal), 333 review entries, 28 holds and 51 batches, with no budget violations. The proof records all 969 prior record hashes unchanged and identical retained export/state hashes before and after. These are verified receipt facts from a private planner run; no planner or source-data operation was repeated during adoption. No private identities, bindings or query bodies enter the repository. No upload, production import or hosted golden-query proof follows. The owner-selected 30-query runtime gate remains open.
+
 ## Checks
 
 | Command | Result |
@@ -183,6 +291,7 @@ No original source is rewritten or deleted. A refresh from a fresh export still 
 | `npx vitest run test/import.test.ts` | 11 tests passed (after the closure fixes) |
 | `npx vitest run test/capture.test.ts test/write-details.test.ts test/g3-contracts.test.ts test/isolation-recall.test.ts` | 42 tests passed: the redactor, guard and request-binding paths the fixes touch |
 | `node --test local/migrate.test.mjs local/upload.test.mjs local/agent-memory.test.mjs` | 19 + 6 + 21 tests passed |
+| After the audit review corrections: `npx vitest run test/import.test.ts`, `node --test local/upload.test.mjs`, `npx tsc --noEmit`, ESLint on the changed files | 14 and 10 tests passed; no type or lint errors. On the reviewed patch's code, the three changed Worker audit tests and the four new client tests fail |
 | After the link fix: `npx vitest run test/import.test.ts test/g3-contracts.test.ts test/write-details.test.ts`, `node --test local/migrate.test.mjs`, `npx tsc --noEmit`, ESLint on the changed files | 35 and 20 tests passed; no type or lint errors. The full suites are Terra's combined check |
 | `npx vitest run` and `npm run test:local`, before the closure fixes | 66 and 41 passed; the full suites were not repeated after the fixes, which Terra's combined check covers |
 | `npx wrangler deploy --dry-run` for production and `--env rehearsal` | Both bundle, 1,398.70 KiB; nothing deployed |

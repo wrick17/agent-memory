@@ -2,8 +2,17 @@
 // Ports BothQ memory_store.py semantics. Runs inside one transactionSync per call; never awaits.
 import { guardTexts, meGuard, stripPersonal } from "../domain/guard";
 import { canonicalJson, collapse, isScope, newMemoryId, normalizeName, normalizeScope, sha256, uuid5 } from "../domain/ids";
-import { Fail, KINDS_FOR_TYPE, RELATION_ENDPOINTS, type AppendArgs, type CandidateArgs, type CaptureArgs, type KnowledgeArgs, type KnowledgeRef, type MemoryKind, type MemoryType, type SaveArgs, type Step, type WriteCommand, type WriteContext } from "../domain/types";
-import { nextSeq } from "../storage";
+import { Fail, KINDS_FOR_TYPE, RELATION_ENDPOINTS, type AppendArgs, type CandidateArgs, type CaptureArgs, type KnowledgeArgs, type OwnerArgs, type KnowledgeRef, type MemoryKind, type MemoryType, type SaveArgs, type Step, type WriteCommand, type WriteContext } from "../domain/types";
+import { takeSeq } from "../storage";
+import { compact, contentRows, Unfold, unfoldStep } from "./compact";
+import { archiveNode, purgeAfter } from "./archive";
+import { linkIdentifiers, resolveMentions, type Consumed } from "./extract";
+import { sizeLevel } from "./housekeeping";
+import { flagProtected, mayChange } from "./protect";
+import { assertWritable } from "./transfer";
+import { beforeImages, recordUndo, revert } from "./undo";
+import { assertNotWiped, assertOpen } from "./wipe";
+import { upload, uploadIds } from "./work-upload";
 
 export interface Who { userId: string; profile: string; generation: string }
 
@@ -12,7 +21,7 @@ export type NodeRow = {
 	description: string; why: string | null; how_to_apply: string | null; objective: string | null; steps: string | null;
 	status: string; origin: string; pinned: number; revision: number; chars: number; content_hash: string; card_hash: string;
 	embed_hash: string | null; valid_from: string | null; valid_to: string | null; created_at: string; updated_at: string;
-	source_platform: string | null; updated_source_platform: string | null;
+	source_platform: string | null; updated_source_platform: string | null; attrs: string;
 };
 
 export interface WriteOutput { result: Record<string, unknown>; created: string[]; embedDue: boolean }
@@ -23,23 +32,39 @@ export const APPEND_MAX = 100_000;
 const MAX_ROWS = 1_000;
 const MAX_BYTES = 1_000_000;
 const TEXT_FIELDS = ["description", "content", "why", "how_to_apply", "objective"] as const;
+/** The actors protection applies to (section 12). */
+const BACKGROUND: string[] = ["keep", "index", "maintenance"];
 
-/** Counts the rows and bytes one transaction stamps; refuses past 1,000 rows or 1 MB (section 5). */
-class Tx {
+/**
+ * Counts what one transaction writes, as Workers SQLite reports it per statement (rowsWritten: the row, its index entries
+ * and its full-text rows, final once exec returns), plus the UTF-8 bytes of its parameters; refuses past 1,000 rows or
+ * 1 MB, which rolls the whole write back (sections 5 and 6). `guard` checks material a write takes from elsewhere (an
+ * undo's restored rows) against the me guard inside this transaction; outside me it does nothing.
+ */
+export class Tx {
 	rows = 0;
 	bytes = 0;
-	constructor(readonly sql: SqlStorage, readonly seq: number, readonly now: string, readonly ctx: WriteContext, readonly requestId: string | null) {}
+	/** Mention rows this write resolved, for its undo (extract.ts). */
+	consumed: Consumed[] = [];
+	constructor(readonly sql: SqlStorage, readonly seq: number, readonly now: string, readonly ctx: WriteContext, readonly requestId: string | null,
+		readonly guard: (material: unknown) => void = () => {}) {}
 	run(query: string, ...params: SqlStorageValue[]): SqlStorageCursor<Record<string, SqlStorageValue>> {
+		if (params.length > 100) throw Fail.of("size_budget", "one statement may bind at most 100 parameters");
 		const cursor = this.sql.exec(query, ...params);
-		this.rows += /^\s*DELETE/i.test(query) ? cursor.rowsWritten : 1;
+		this.rows += cursor.rowsWritten;
 		for (const p of params) if (typeof p === "string") this.bytes += Buffer.byteLength(p, "utf8");
-		this.check();
+		// A statement still open (an unread RETURNING cursor) cannot be rolled back: finish it before refusing.
+		try { this.check(); } catch (e) { cursor.toArray(); throw e; }
 		return cursor;
 	}
-	/** For one statement that changes many rows: count them before running it. */
-	touch(rows: number): void {
+	/** Rows this write took outside run(), such as its sequence number. */
+	charge(rows: number): void {
 		this.rows += rows;
 		this.check();
+	}
+	/** Before one statement that changes many rows: refuse at once if even one row each would pass the bound. Its real rows count when it runs. */
+	touch(rows: number): void {
+		if (this.rows + rows > MAX_ROWS) throw Fail.of("size_budget", "one write may touch at most 1,000 rows and 1 MB (UTF-8)");
 	}
 	private check(): void {
 		// A thrown Fail rolls the whole transaction back.
@@ -51,9 +76,19 @@ export function readNode(sql: SqlStorage, id: string): NodeRow | undefined {
 	return sql.exec<NodeRow>("SELECT rowid, * FROM nodes WHERE id = ?", id).toArray()[0];
 }
 
+export const knowledgeId = (who: Who, n: Pick<NonNullable<KnowledgeArgs["nodes"]>[number], "kind" | "key" | "name" | "scope">) => uuid5(n.key ? `${who.userId}:${who.profile}:${n.kind}:${n.key}` : `${who.userId}:${who.profile}:${n.kind}:${n.scope !== undefined ? scopeOf(n.scope) : "default"}:${normalizeName(n.name)}`);
+
+/** Candidate identities for the account's permanent wipe ledger, before dispatch into a generation. */
+export function writeIds(who: Who, cmd: WriteCommand): string[] {
+	if (cmd.op === "knowledge") return (cmd.args.nodes ?? []).map((n) => knowledgeId(who, n));
+	if (cmd.op === "upload") return uploadIds(who, cmd.args);
+	const a = cmd.args as SaveArgs;
+	return [...(a.memory_id ? [a.memory_id] : []), ...(a.name && a.type ? [newMemoryId(who.userId, who.profile, a.scope !== undefined ? scopeOf(a.scope) : "default", a.type, a.name)] : [])];
+}
+
 /** BothQ _find: by memory_id, or by name narrowed by type and scope. Names match case-insensitively on the normalized name. */
 export function findNode(sql: SqlStorage, ident: { memory_id?: string; name?: string; scope?: string; type?: MemoryType }, activeOnly: boolean): NodeRow {
-	const status = activeOnly ? " AND status = 'active'" : "";
+	const status = activeOnly ? " AND status = 'active'" : " AND status IN ('active','retired','superseded','moved')";
 	let rows: NodeRow[];
 	if (ident.memory_id) {
 		rows = sql.exec<NodeRow>(`SELECT rowid, * FROM nodes WHERE id = ? AND memory_type IS NOT NULL${status}`, ident.memory_id).toArray();
@@ -65,6 +100,11 @@ export function findNode(sql: SqlStorage, ident: { memory_id?: string; name?: st
 			.filter((r) => (!ident.type || r.memory_type === ident.type) && (scope === undefined || r.scope === scope));
 	}
 	if (!rows.length) {
+		// A record that is moving or still landing answers moving, not not_found (section 9, step 2).
+		if (activeOnly) {
+			const held = ident.memory_id ? [ident.memory_id] : sql.exec<{ id: string }>("SELECT id FROM nodes WHERE norm_name = ? AND memory_type IS NOT NULL AND status IN ('moving','incoming')", normalizeName(ident.name!)).toArray().map((r) => r.id);
+			for (const id of held) assertWritable(sql, id);
+		}
 		const what = ident.memory_id ? `id '${ident.memory_id}'` : `name '${ident.name}'`;
 		throw Fail.of("not_found", `no ${activeOnly ? "active " : ""}memory found with ${what}`);
 	}
@@ -128,7 +168,7 @@ export const chunks = (text: string) => {
 	return out.length ? out : [""];
 };
 
-function writeHead(tx: Tx, n: NodeRow, steps: Step[], revision: number): void {
+export function writeHead(tx: Tx, n: NodeRow, steps: Step[], revision: number): void {
 	tx.run("DELETE FROM texts WHERE node_id = ? AND part = 'head'", n.id);
 	chunks(headText(n, steps)).forEach((body, chunk) => tx.run(
 		"INSERT INTO texts (node_id, part, revision, chunk, body, actor, created_at, seq) VALUES (?, 'head', ?, ?, ?, ?, ?, ?)",
@@ -142,8 +182,9 @@ function writeHead(tx: Tx, n: NodeRow, steps: Step[], revision: number): void {
  */
 function writeBody(tx: Tx, id: string, content: string, revision: number, requestId: string | null): void {
 	tx.run("DELETE FROM texts WHERE node_id = ? AND part = 'body'", id);
-	tx.touch(Number(tx.sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE node_id = ? AND part = 'entry' AND live = 1", id).one().n));
-	tx.sql.exec("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'entry' AND live = 1", tx.seq, id);
+	tx.run("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'summary' AND live = 1", tx.seq, id);
+	tx.touch(Number(tx.sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > COALESCE((SELECT json_extract(attrs, '$.compacted_through') FROM nodes WHERE id = ?), 0)", id, id).one().n));
+	tx.run("UPDATE texts SET live = 0, seq = ? WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > COALESCE((SELECT json_extract(attrs, '$.compacted_through') FROM nodes WHERE id = ?), 0)", tx.seq, id, id);
 	if (!content) return;
 	chunks(content).forEach((body, chunk) => tx.run(
 		"INSERT INTO texts (node_id, part, revision, chunk, body, request_id, actor, created_at, seq) VALUES (?, 'body', ?, ?, ?, ?, ?, ?, ?)",
@@ -155,8 +196,7 @@ export const CARD_PREFIX = 1200;
 /** The first `max` characters of the current content (body, then live entries), reading only the rows it needs. */
 export function readPrefix(sql: SqlStorage, id: string, max = CARD_PREFIX): string {
 	let out = "";
-	for (const r of sql.exec<{ chunk: number; separator: string | null; body: string }>(
-		"SELECT chunk, separator, body FROM texts WHERE node_id = ? AND part IN ('body', 'entry') AND live = 1 ORDER BY part = 'entry', seq_no, chunk", id)) {
+	for (const r of contentRows(sql, id)) {
 		out += (r.chunk === 0 && r.separator ? r.separator : "") + r.body;
 		if (out.length >= max) break;
 	}
@@ -165,16 +205,14 @@ export function readPrefix(sql: SqlStorage, id: string, max = CARD_PREFIX): stri
 
 /** The full content in order: body chunks, then each entry with the separator it was appended with. */
 export function readContent(sql: SqlStorage, id: string): string {
-	return sql.exec<{ part: string; chunk: number; separator: string | null; body: string }>(
-		"SELECT part, chunk, separator, body FROM texts WHERE node_id = ? AND part IN ('body', 'entry') AND live = 1 ORDER BY part = 'entry', seq_no, chunk", id)
-		.toArray().map((r) => (r.chunk === 0 && r.separator ? r.separator : "") + r.body).join("");
+	return contentRows(sql, id).toArray().map((r) => (r.chunk === 0 && r.separator ? r.separator : "") + r.body).join("");
 }
 
 function stepsOf(n: NodeRow): Step[] {
 	return n.steps ? (JSON.parse(n.steps) as Step[]) : [];
 }
 
-function snapshot(n: NodeRow, content: string | undefined, sql: SqlStorage): string {
+export function snapshot(n: NodeRow, content: string | undefined, sql: SqlStorage): string {
 	return JSON.stringify({
 		memory_id: n.id, name: n.name, memory_type: n.memory_type, kind: n.kind, scope: n.scope, description: n.description,
 		...(content !== undefined ? { content } : { content_unchanged: true }),
@@ -195,17 +233,17 @@ export function relationships(sql: SqlStorage, n: { id: string; scope: string })
 	};
 }
 
-function writeRevision(tx: Tx, n: NodeRow, op: string, content: string | undefined): void {
+export function writeRevision(tx: Tx, n: NodeRow, op: string, content: string | undefined): void {
 	tx.run("INSERT INTO revisions (node_id, revision, op, snapshot, request_id, actor, device_id, at, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		n.id, n.revision, op, snapshot(n, content, tx.sql), tx.requestId, tx.ctx.actor, tx.ctx.deviceId ?? null, tx.now, tx.seq);
 }
 
-function activity(tx: Tx, op: string, summary: string, targets: string[]): number {
+export function activity(tx: Tx, op: string, summary: string, targets: string[]): number {
 	return Number(tx.run("INSERT INTO activity (at, actor, device_id, op, summary, targets, seq) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
 		tx.now, tx.ctx.actor, tx.ctx.deviceId ?? null, op, summary, JSON.stringify(targets), tx.seq).one().id);
 }
 
-function result(n: NodeRow, action: string, extra: Record<string, unknown>): Record<string, unknown> {
+export function result(n: NodeRow, action: string, extra: Record<string, unknown>): Record<string, unknown> {
 	return { ok: true, action, memory_id: n.id, name: n.name, type: n.memory_type, kind: n.kind, scope: n.scope, revision: n.revision, content_hash: n.content_hash, ...extra };
 }
 
@@ -256,7 +294,12 @@ function create(tx: Tx, who: Who, a: SaveArgs, scope: string): WriteOutput {
 	} else if (a.steps !== undefined) {
 		throw Fail.of("validation", "steps are only valid for procedural memories", { reason: "steps_not_supported" });
 	}
+	// Section 12: background actors never state for the owner, and an inference always carries its evidence.
+	if (a.origin === "stated" && BACKGROUND.includes(tx.ctx.actor)) throw Fail.of("forbidden", "a background actor cannot record a stated memory", { reason: "background_stated" });
+	if (a.origin === "inferred" && !a.evidence?.length) throw Fail.of("validation", "an inferred memory needs at least one evidence pointer", { reason: "missing_evidence" });
+	if (kind === "decision" && !a.evidence?.length) throw Fail.of("validation", "a decision needs at least one evidence pointer", { reason: "missing_evidence" });
 	const id = newMemoryId(who.userId, who.profile, scope, a.type, name);
+	assertNotWiped(tx.sql, id);
 	if (readNode(tx.sql, id)) throw Fail.of("already_exists", `memory identity '${id}' already exists`, { memory_id: id });
 	const fields = { name, type: a.type, description: a.description, content, why: a.why, how_to_apply: a.how_to_apply, objective, steps };
 	const hash = contentHash(fields);
@@ -270,10 +313,14 @@ function create(tx: Tx, who: Who, a: SaveArgs, scope: string): WriteOutput {
 	const node = readNode(tx.sql, id)!;
 	writeHead(tx, node, steps, 1);
 	writeBody(tx, id, content, 1, tx.requestId);
+	if (a.evidence?.length) addEvidence(tx, `n:${id}`, a.evidence);
+	// Before identifier links, so a mention of the same target never takes the agent's reason (a current edge is matched).
+	const links = saveLinks(tx, id, a.links);
+	linkIdentifiers(tx, id, [name, a.description, content, a.why ?? "", a.how_to_apply ?? ""].join("\n"));
 	const superseded = supersede(tx, id, a.supersedes);
 	writeRevision(tx, node, "saved", content);
 	const activityId = activity(tx, "save", `created ${kind} '${name}'`, [id, ...superseded]);
-	return { result: result(node, "created", { superseded, activity_id: activityId }), created: [id], embedDue: true };
+	return { result: result(node, "created", { superseded, activity_id: activityId, ...links }), created: [id], embedDue: true };
 }
 
 /** `type` picks the kind: feedback to rule, user to preference, procedural and reference to document, project to decision when it has a why, else journal. */
@@ -288,7 +335,7 @@ function kindFor(type: MemoryType, kind: MemoryKind | undefined, why: string | u
 function update(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string; scope?: string; type?: MemoryType }): WriteOutput {
 	const node = findNode(tx.sql, lookup, true);
 	const changed = [...TEXT_FIELDS, "steps", "scope", "new_name"].filter((f) => (a as Record<string, unknown>)[f] !== undefined);
-	if (!changed.length && a.supersedes === undefined) throw Fail.of("validation", "update needs at least one changed field", { reason: "no_changes" });
+	if (!changed.length && a.supersedes === undefined && !a.evidence && !a.links) throw Fail.of("validation", "update needs at least one changed field", { reason: "no_changes" });
 	if (a.kind && a.kind !== node.kind) throw Fail.of("validation", "kind cannot change on an existing memory", { reason: "invalid_kind" });
 	expectRevision(a.expected_revision, node.revision);
 	const type = node.memory_type!;
@@ -305,6 +352,10 @@ function update(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string
 	};
 	if (!next.name) throw Fail.of("validation", "name must be a non-empty string", { reason: "invalid_name" });
 	if (node.kind === "decision" && !next.why?.trim()) throw Fail.of("validation", "a decision needs why", { reason: "missing_why" });
+	// Supplied evidence adds to the node's own; a decision that would still have none (an imported one, say) is refused, never filled in.
+	if (node.kind === "decision" && !a.evidence?.length && !tx.sql.exec("SELECT 1 FROM evidence WHERE owner = ? LIMIT 1", `n:${node.id}`).toArray().length) {
+		throw Fail.of("validation", "a decision needs at least one evidence pointer; pass evidence", { reason: "missing_evidence" });
+	}
 	let content: string | undefined = a.content;
 	if (type === "procedural") {
 		if (!next.objective?.trim()) throw Fail.of("validation", "objective is required for procedural memories", { reason: "missing_objective" });
@@ -316,9 +367,13 @@ function update(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string
 		throw Fail.of("already_exists", `an active ${type} memory named '${next.name}' already exists`);
 	}
 	if (!changed.length) {
+		// Evidence and links add rows around the node, as record_knowledge does; the node keeps its revision.
+		if (a.evidence?.length) addEvidence(tx, `n:${node.id}`, a.evidence);
+		const links = saveLinks(tx, node.id, a.links);
 		const superseded = supersede(tx, node.id, a.supersedes);
-		const activityId = activity(tx, "supersede", `superseded ${superseded.length} records with '${node.name}'`, [node.id, ...superseded]);
-		return { result: result(node, "updated", { superseded, activity_id: activityId }), created: [], embedDue: false };
+		const activityId = a.evidence || a.links ? activity(tx, "update", `added evidence or links to ${node.kind} '${node.name}'`, [node.id, ...superseded])
+			: activity(tx, "supersede", `superseded ${superseded.length} records with '${node.name}'`, [node.id, ...superseded]);
+		return { result: result(node, "updated", { superseded, activity_id: activityId, ...links }), created: [], embedDue: false };
 	}
 	const body = content ?? readContent(tx.sql, node.id);
 	const revision = node.revision + 1;
@@ -331,14 +386,17 @@ function update(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string
 	const updated = readNode(tx.sql, node.id)!;
 	writeHead(tx, updated, steps, revision);
 	if (content !== undefined) writeBody(tx, node.id, content, revision, tx.requestId);
+	if (a.evidence?.length) addEvidence(tx, `n:${node.id}`, a.evidence);
+	const links = saveLinks(tx, node.id, a.links);
+	linkIdentifiers(tx, node.id, [next.name, next.description, content ?? "", next.why ?? "", next.how_to_apply ?? ""].join("\n"));
 	const superseded = supersede(tx, node.id, a.supersedes);
 	writeRevision(tx, updated, "updated", body);
 	const activityId = activity(tx, "update", `updated ${node.kind} '${updated.name}'`, [node.id, ...superseded]);
-	return { result: result(updated, "updated", { superseded, activity_id: activityId }), created: [], embedDue: card !== node.card_hash };
+	return { result: result(updated, "updated", { superseded, activity_id: activityId, ...links }), created: [], embedDue: card !== node.card_hash };
 }
 
 function retire(tx: Tx, a: SaveArgs, lookup: { memory_id?: string; name?: string; scope?: string; type?: MemoryType }): WriteOutput {
-	const extra = [...TEXT_FIELDS, "steps", "new_name", "supersedes"].filter((f) => (a as Record<string, unknown>)[f] !== undefined);
+	const extra = [...TEXT_FIELDS, "steps", "new_name", "supersedes", "evidence", "links"].filter((f) => (a as Record<string, unknown>)[f] !== undefined);
 	if (extra.length) throw Fail.of("validation", `retire takes no other changes (${extra.join(", ")})`, { reason: "invalid_arguments" });
 	const node = findNode(tx.sql, lookup, true);
 	expectRevision(a.expected_revision, node.revision);
@@ -358,6 +416,7 @@ export function save(tx: Tx, who: Who, a: SaveArgs): WriteOutput {
 	if (a.scope !== undefined && !isScope(a.scope)) scopeOf(a.scope);
 	const lookupScope = a.from_scope ?? (a.retire ? a.scope : undefined);
 	const lookup = { ...(a.memory_id ? { memory_id: a.memory_id } : { name: a.name }), ...(lookupScope !== undefined ? { scope: lookupScope } : {}), ...(a.type ? { type: a.type } : {}) };
+	if (a.compact !== undefined) return compact(tx, a, findNode(tx.sql, lookup, true));
 	if (a.retire) return retire(tx, a, lookup);
 	if (a.memory_id || a.from_scope !== undefined || a.new_name !== undefined) return update(tx, a, lookup);
 	const scope = scopeOf(a.scope ?? "default");
@@ -392,9 +451,73 @@ export function append(tx: Tx, a: AppendArgs): WriteOutput {
 	const card = node.chars < CARD_PREFIX ? sha256(cardText(node, readPrefix(tx.sql, node.id))) : node.card_hash;
 	tx.run("UPDATE nodes SET revision = ?, chars = chars + ?, content_hash = ?, card_hash = ?, updated_at = ?, updated_source_platform = ?, seq = ? WHERE id = ?",
 		revision, used.length + a.content.length, hash, card, tx.now, tx.ctx.platform, tx.seq, node.id);
+	linkIdentifiers(tx, node.id, a.content);
 	const appended = readNode(tx.sql, node.id)!;
 	const activityId = activity(tx, "append", `appended entry ${entrySeq} to '${node.name}'`, [node.id]);
 	return { result: result(appended, "appended", { entry_seq: entrySeq, activity_id: activityId }), created: [], embedDue: card !== node.card_hash };
+}
+
+const CONTENT_ARGS = ["content", "description", "why", "how_to_apply", "objective", "steps", "new_name", "from_scope", "evidence", "links"];
+/** A save that only retires an existing record: what a full profile still accepts. */
+const shrinks = (cmd: WriteCommand) => cmd.op === "save" && (typeof cmd.args.memory_id === "string" || typeof cmd.args.name === "string")
+	&& (cmd.args.retire === true || cmd.args.compact !== undefined) && !cmd.args.supersedes && !CONTENT_ARGS.some((k) => k in cmd.args);
+
+/**
+ * The shared gates every write passes inside its transaction. At 90% of the object limit (section 6) only retire,
+ * forget and undo are accepted. A background actor never retires or
+ * supersedes a stated, pinned or me node (section 12); its callers flag those first, so reaching here is refused.
+ */
+function gate(sql: SqlStorage, _who: Who, cmd: WriteCommand, ctx: WriteContext): void {
+	if (sizeLevel(sql.databaseSize) !== "ok" && ctx.actor === "index" && (cmd.op === "upload" || (cmd.op === "knowledge" && cmd.args.nodes?.some((n) => n.kind === "commit")))) {
+		throw Fail.of("size_budget", "aggregated commit uploads pause at 70% of the profile size limit", { reason: "uploads_refused" });
+	}
+	if (sizeLevel(sql.databaseSize) === "shrink_only" && cmd.op !== "undo" && !(cmd.op === "owner" && cmd.args.action === "forget") && !shrinks(cmd)) {
+		throw Fail.of("size_budget", "this profile is over 90% of its size limit and accepts only retire, forget and undo", { reason: "shrink_only" });
+	}
+}
+
+/** Background callers may not bypass protection by going directly to the shared write path. */
+function protectedTargets(sql: SqlStorage, who: Who, cmd: WriteCommand, ctx: WriteContext) {
+	let primary: string[] = [];
+	if (cmd.op === "save" || cmd.op === "append") {
+		try { primary = [findNode(sql, cmd.args, false).id]; } catch (e) { if (!(e instanceof Fail) || e.failure.code !== "not_found") throw e; }
+	}
+	const ids = cmd.op === "save" ? [...primary, ...[cmd.args.supersedes ?? []].flat()]
+		: cmd.op === "append" ? primary : cmd.op === "owner" ? [cmd.args.memory_id] : cmd.op === "candidate" ? [cmd.args.candidate_id] : [];
+	if (cmd.op === "knowledge") {
+		for (const n of cmd.args.nodes ?? []) {
+			const row = n.key ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND status <> 'moved'", n.key).toArray()[0]
+				: sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = ? AND scope = ? AND norm_name = ? AND key IS NULL AND memory_type IS NOT 'project' AND status = 'active' LIMIT 1", n.kind, n.scope !== undefined ? scopeOf(n.scope) : "default", normalizeName(n.name)).toArray()[0];
+			if (row) ids.push(row.id);
+		}
+		for (const end of cmd.args.end ?? []) for (const row of sql.exec<{ src: string; dst: string; dst_profile: string }>("SELECT src, dst, dst_profile FROM edges WHERE id = ?", end.edge).toArray()) {
+			ids.push(row.src); if (!row.dst_profile) ids.push(row.dst);
+		}
+	}
+	return [...new Set(ids)].flatMap((id) => {
+		const node = readNode(sql, id), why = node && mayChange(node, ctx.actor, who.profile);
+		return why ? [{ id, why }] : [];
+	});
+}
+
+/**
+ * The owner's actions on one node (section 15), each a write with activity and undo: pin protects it from the background
+ * actors (mayChange), unpin lifts that, unflag clears a protection flag, and forget archives it, restorable for 300 days.
+ */
+function owner(tx: Tx, a: OwnerArgs): WriteOutput {
+	if (tx.ctx.actor !== "owner") throw Fail.of("forbidden", "only the owner pins, unpins, forgets or unflags");
+	const node = readNode(tx.sql, a.memory_id);
+	if (!node || ["moving", "incoming", "moved"].includes(node.status)) throw Fail.of("not_found", `no node '${a.memory_id}' in this profile`);
+	if (a.action === "forget") {
+		const activityId = activity(tx, "forget", `forgot '${node.name}'`, [node.id]);
+		archiveNode(tx, activityId, node.id, purgeAfter(tx.now));
+		return { result: { ok: true, action: "forgotten", memory_id: node.id, name: node.name, activity_id: activityId }, created: [], embedDue: false };
+	}
+	const change = { pin: "pinned = 1", unpin: "pinned = 0", unflag: "flagged = NULL" }[a.action];
+	if (!change) throw Fail.of("validation", `unknown owner action '${String(a.action)}'`);
+	tx.run(`UPDATE nodes SET ${change}, revision = revision + 1, updated_at = ?, seq = ? WHERE id = ?`, tx.now, tx.seq, node.id);
+	const activityId = activity(tx, a.action, `${a.action} '${node.name}'`, [node.id]);
+	return { result: result(readNode(tx.sql, node.id)!, { pin: "pinned", unpin: "unpinned", unflag: "unflagged" }[a.action], { activity_id: activityId }), created: [], embedDue: false };
 }
 
 export const captureText = (sql: SqlStorage, id: string) =>
@@ -446,10 +569,13 @@ function candidate(tx: Tx, who: Who, a: CandidateArgs): WriteOutput {
 
 type Evidence = { kind: string; ref: string; note?: string };
 
+/** A node of this profile a write may point at; landing, moving and moved nodes answer as absent. */
+const visible = (sql: SqlStorage, id: string) => sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status NOT IN ('incoming','moving','moved')", id).toArray().length > 0;
+
 /** Evidence rows for a node or edge. A node pointer must name a node of this profile. */
 function addEvidence(tx: Tx, owner: string, evidence: Evidence[]): void {
 	for (const ev of evidence) {
-		if (ev.kind === "node" && !readNode(tx.sql, ev.ref)) throw Fail.of("not_found", `evidence names no node '${ev.ref}' in this profile`, { reason: "bad_evidence" });
+		if (ev.kind === "node" && !visible(tx.sql, ev.ref)) throw Fail.of("not_found", `evidence names no node '${ev.ref}' in this profile`, { reason: "bad_evidence" });
 		tx.run("INSERT OR REPLACE INTO evidence (owner, kind, ref, note, seq) VALUES (?, ?, ?, ?, ?)", owner, ev.kind, ev.ref, ev.note ?? null, tx.seq);
 	}
 }
@@ -462,6 +588,72 @@ function checkEndpoints(rel: string, from: string, to: string): void {
 	const want = rel === "supersedes" ? "two nodes of the same kind" : `${allowed!.from.join("|")} to ${allowed!.to.join("|")}`;
 	throw Fail.of("validation", `${rel} connects ${want}, not ${from} to ${to}; use rel other with other_label for anything else`,
 		{ reason: "invalid_endpoints", rel, from, to, ...(allowed ? { allowed } : {}) });
+}
+
+type EdgeInput = Omit<NonNullable<KnowledgeArgs["edges"]>[number], "from" | "to">;
+
+/**
+ * One judgment edge (section 4), the graph writer record_knowledge and save_memory links share: a reason of 8 to 600
+ * characters, at least one evidence pointer, endpoints inside the table. A current edge with the same relation and target is
+ * matched: its evidence merges, its own reason and basis stay. `ends` resolves after the checks.
+ */
+function judgmentEdge(tx: Tx, e: EdgeInput, ends: () => [string, string]): { id: number; action: string } {
+	if (e.rel === "other" && !e.other_label) throw Fail.of("validation", "rel other needs other_label", { reason: "invalid_rel" });
+	if (typeof e.reason !== "string" || e.reason.trim().length < 8 || e.reason.length > 600) throw Fail.of("validation", "a judgment edge needs a reason of 8 to 600 characters", { reason: "missing_reason" });
+	if (!e.evidence?.length) throw Fail.of("validation", "a judgment edge needs at least one evidence pointer", { reason: "missing_evidence" });
+	const [src, dst] = ends();
+	assertWritable(tx.sql, src);
+	if (src === dst) throw Fail.of("validation", "an edge needs two different nodes", { reason: "self_edge" });
+	checkEndpoints(e.rel, readNode(tx.sql, src)!.kind, readNode(tx.sql, dst)!.kind);
+	const prior = tx.sql.exec<{ id: number }>("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst_profile = '' AND dst = ? AND ended_at IS NULL", src, e.rel, dst).toArray()[0];
+	const id = prior ? prior.id : Number(tx.run(`INSERT INTO edges (src, rel, other_label, dst, dst_profile, basis, reason, valid_from, valid_to, recorded_at, actor, request_id, seq)
+		VALUES (?, ?, ?, ?, '', 'judgment', ?, ?, ?, ?, ?, ?, ?) RETURNING id`, src, e.rel, e.other_label ?? null, dst, e.reason.trim(), e.valid_from ?? null, e.valid_to ?? null, tx.now, tx.ctx.actor, tx.requestId, tx.seq).one().id);
+	addEvidence(tx, `e:${id}`, e.evidence);
+	return { id, action: prior ? "matched" : "created" };
+}
+
+/** A knowledge ref to a node of this profile: by this call's index, id, kind and key, or kind, scope and name. An unreadable node answers as absent. */
+function resolveRef(tx: Tx, r: KnowledgeRef, made: { id: string }[]): string {
+	if ("ref" in r) { const hit = made[r.ref]; if (!hit) throw Fail.of("validation", `ref ${r.ref} names no node in this call`, { reason: "bad_ref" }); return hit.id; }
+	if ("id" in r) { if (!visible(tx.sql, r.id)) throw Fail.of("not_found", `no node with id '${r.id}' in this profile; links across profiles are not written here`); return r.id; }
+	const row = "key" in r
+		? tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND kind = ? AND status NOT IN ('moved','moving','incoming')", r.key, r.kind).toArray()[0]
+		: tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = ? AND norm_name = ? AND scope = ? AND status = 'active' ORDER BY rowid LIMIT 1", r.kind, normalizeName(r.name), r.scope !== undefined ? scopeOf(r.scope) : "default").toArray()[0];
+	if (!row) throw Fail.of("not_found", `no ${r.kind} node matches ${"key" in r ? r.key : r.name}`);
+	return row.id;
+}
+
+/** save_memory links: judgment edges from the saved node, in the same transaction; `links` joins the result only when asked for. */
+function saveLinks(tx: Tx, from: string, links: SaveArgs["links"]): { links?: { id: number; action: string }[] } {
+	if (links === undefined) return {};
+	if (!Array.isArray(links) || !links.length) throw Fail.of("validation", "links must be a non-empty list", { reason: "invalid_links" });
+	return { links: links.map((l) => judgmentEdge(tx, l, () => [from, resolveRef(tx, l.to, [])])) };
+}
+
+type EntityInput = Pick<NonNullable<KnowledgeArgs["nodes"]>[number], "kind" | "key" | "name" | "scope" | "other_label" | "valid_from" | "valid_to">;
+
+/** An entity's content and card hashes. Decisions are memories (BothQ type project) and get an embedding card; other entities only with a description. */
+export const entityHashes = (kind: string, name: string, description: string, why: string | null, attrs: Record<string, unknown>) => ({
+	hash: sha256(canonicalJson({ name, kind, description, why: why ?? "", attrs })),
+	card: sha256(cardText({ kind, name, description, why }, "")),
+	embeds: kind === "decision" || !!description,
+});
+
+/** A new active entity at its record_knowledge id, with its searchable head and first revision. A wiped or taken id is refused. */
+export function createEntity(tx: Tx, who: Who, n: EntityInput, origin: "agent" | "upload", f: { name: string; scope: string; description: string; why: string | null; attrs: Record<string, unknown> }): string {
+	const id = knowledgeId(who, n);
+	assertNotWiped(tx.sql, id);
+	if (readNode(tx.sql, id)) throw Fail.of("already_exists", `node identity '${id}' already exists`, { memory_id: id });
+	const { hash, card, embeds } = entityHashes(n.kind, f.name, f.description, f.why, f.attrs);
+	tx.run(`INSERT INTO nodes (id, kind, other_label, key, memory_type, scope, name, norm_name, description, why, attrs, status, origin, revision,
+		content_hash, card_hash, embed_hash, valid_from, valid_to, recorded_at, created_at, updated_at, source_platform, updated_source_platform, seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, n.kind, n.other_label ?? null, n.key ?? null, n.kind === "decision" ? "project" : null, f.scope, f.name, normalizeName(f.name), f.description, f.why,
+		JSON.stringify(f.attrs), origin, hash, card, embeds ? null : card, n.valid_from ?? null, n.valid_to ?? null, tx.now, tx.now, tx.now, tx.ctx.platform, tx.ctx.platform, tx.seq);
+	const node = readNode(tx.sql, id)!;
+	writeHead(tx, node, [], 1);
+	writeRevision(tx, node, "saved", undefined);
+	return id;
 }
 
 /**
@@ -492,12 +684,10 @@ function knowledge(tx: Tx, who: Who, a: KnowledgeArgs): WriteOutput {
 		const cur = existing ? readNode(tx.sql, existing.id)! : undefined;
 		if (cur && cur.kind !== n.kind) throw Fail.of("validation", `key '${n.key}' belongs to a ${cur.kind} node, not a ${n.kind}`, { reason: "key_kind_conflict", memory_id: cur.id, kind: cur.kind });
 		const why = n.why ?? cur?.why ?? null;
-		const hash = sha256(canonicalJson({ name, kind: n.kind, description, why: why ?? "", attrs }));
-		const card = sha256(cardText({ kind: n.kind, name, description, why }, ""));
-		// Decisions are memories (BothQ type project) and get an embedding card; other entities only with a description.
-		const embeds = n.kind === "decision" || !!description;
+		const { hash, card, embeds } = entityHashes(n.kind, name, description, why, attrs);
 		let id: string;
 		if (cur) {
+			assertWritable(tx.sql, cur.id);
 			id = cur.id;
 			if (cur.content_hash !== hash) {
 				tx.run(`UPDATE nodes SET name = ?, norm_name = ?, description = ?, why = ?, attrs = ?, valid_from = COALESCE(?, valid_from), valid_to = COALESCE(?, valid_to),
@@ -511,72 +701,55 @@ function knowledge(tx: Tx, who: Who, a: KnowledgeArgs): WriteOutput {
 				made.push({ id, action: "updated", ...(stripped.length ? { stripped } : {}) });
 			} else made.push({ id, action: "matched", ...(stripped.length ? { stripped } : {}) });
 		} else {
-			id = uuid5(n.key ? `${who.userId}:${who.profile}:${n.kind}:${n.key}` : `${who.userId}:${who.profile}:${n.kind}:${scope}:${normalizeName(name)}`);
-			if (readNode(tx.sql, id)) throw Fail.of("already_exists", `node identity '${id}' already exists`, { memory_id: id });
-			tx.run(`INSERT INTO nodes (id, kind, other_label, key, memory_type, scope, name, norm_name, description, why, attrs, status, origin, revision,
-				content_hash, card_hash, embed_hash, valid_from, valid_to, recorded_at, created_at, updated_at, source_platform, updated_source_platform, seq)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'agent', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				id, n.kind, n.other_label ?? null, n.key ?? null, n.kind === "decision" ? "project" : null, scope, name, normalizeName(name), description, why,
-				JSON.stringify(attrs), hash, card, embeds ? null : card, n.valid_from ?? null, n.valid_to ?? null, tx.now, tx.now, tx.now, tx.ctx.platform, tx.ctx.platform, tx.seq);
-			const node = readNode(tx.sql, id)!;
-			writeHead(tx, node, [], 1);
-			writeRevision(tx, node, "saved", undefined);
+			id = createEntity(tx, who, n, "agent", { name, scope, description, why, attrs });
 			embedDue ||= embeds;
 			made.push({ id, action: "created", ...(stripped.length ? { stripped } : {}) });
 			created.push(id);
 		}
 		if (n.evidence?.length) addEvidence(tx, `n:${id}`, n.evidence);
+		if (made[made.length - 1]!.action !== "matched") linkIdentifiers(tx, id, [name, description, why ?? ""].join("\n"));
 	}
-	const resolve = (r: KnowledgeRef): string => {
-		if ("ref" in r) { const hit = made[r.ref]; if (!hit) throw Fail.of("validation", `ref ${r.ref} names no node in this call`, { reason: "bad_ref" }); return hit.id; }
-		if ("id" in r) { if (!readNode(tx.sql, r.id)) throw Fail.of("not_found", `no node with id '${r.id}' in this profile; links across profiles arrive in phase 3`); return r.id; }
-		const row = "key" in r
-			? tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND kind = ? AND status <> 'moved'", r.key, r.kind).toArray()[0]
-			: tx.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = ? AND norm_name = ? AND scope = ? AND status = 'active' ORDER BY rowid LIMIT 1", r.kind, normalizeName(r.name), r.scope !== undefined ? scopeOf(r.scope) : "default").toArray()[0];
-		if (!row) throw Fail.of("not_found", `no ${r.kind} node matches ${"key" in r ? r.key : r.name}`);
-		return row.id;
-	};
-	const edgeIds: { id: number; action: string }[] = [];
-	for (const e of edges) {
-		if (e.rel === "other" && !e.other_label) throw Fail.of("validation", "rel other needs other_label", { reason: "invalid_rel" });
-		if (typeof e.reason !== "string" || e.reason.trim().length < 8 || e.reason.length > 600) throw Fail.of("validation", "a judgment edge needs a reason of 8 to 600 characters", { reason: "missing_reason" });
-		if (!e.evidence?.length) throw Fail.of("validation", "a judgment edge needs at least one evidence pointer", { reason: "missing_evidence" });
-		const src = resolve(e.from), dst = resolve(e.to);
-		if (src === dst) throw Fail.of("validation", "an edge needs two different nodes", { reason: "self_edge" });
-		checkEndpoints(e.rel, readNode(tx.sql, src)!.kind, readNode(tx.sql, dst)!.kind);
-		const prior = tx.sql.exec<{ id: number }>("SELECT id FROM edges WHERE src = ? AND rel = ? AND dst_profile = '' AND dst = ? AND ended_at IS NULL", src, e.rel, dst).toArray()[0];
-		let id: number;
-		if (prior) { id = prior.id; edgeIds.push({ id, action: "matched" }); }
-		else {
-			id = Number(tx.run(`INSERT INTO edges (src, rel, other_label, dst, dst_profile, basis, reason, valid_from, valid_to, recorded_at, actor, request_id, seq)
-				VALUES (?, ?, ?, ?, '', 'judgment', ?, ?, ?, ?, ?, ?, ?) RETURNING id`, src, e.rel, e.other_label ?? null, dst, e.reason.trim(), e.valid_from ?? null, e.valid_to ?? null, tx.now, tx.ctx.actor, tx.requestId, tx.seq).one().id);
-			edgeIds.push({ id, action: "created" });
-		}
-		addEvidence(tx, `e:${id}`, e.evidence);
-	}
+	const edgeIds = edges.map((e) => judgmentEdge(tx, e, () => [resolveRef(tx, e.from, made), resolveRef(tx, e.to, made)]));
 	const ended: number[] = [];
 	for (const x of ends) {
 		if (!x.reason?.trim()) throw Fail.of("validation", "ending an edge needs a reason", { reason: "missing_reason" });
+		const edge = tx.sql.exec<{ src: string }>("SELECT src FROM edges WHERE id = ?", x.edge).toArray()[0];
+		if (edge) assertWritable(tx.sql, edge.src);
 		const changed = tx.run("UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE id = ? AND ended_at IS NULL", tx.now, x.valid_to, tx.seq, x.edge).rowsWritten;
 		if (!changed) throw Fail.of("not_found", `no current edge ${x.edge}`);
 		ended.push(x.edge);
 	}
+	// Mentions written before a node with this key existed link to it now, whatever its kind, in the rows this write has left;
+	// the keys with mentions still waiting are named, and the next write of each key resolves more.
+	const left = nodes.flatMap((n, i) => (n.key && resolveMentions(tx, made[i]!.id, n.key).left ? [n.key] : []));
 	const activityId = activity(tx, "knowledge", `recorded ${made.length} nodes, ${edgeIds.length} edges, ended ${ended.length}`, [...made.map((m) => m.id), ...edgeIds.map((e) => `e:${e.id}`)]);
-	return { result: { ok: true, action: "recorded", nodes: made, edges: edgeIds, ended, activity_id: activityId }, created, embedDue };
+	return { result: { ok: true, action: "recorded", nodes: made, edges: edgeIds, ended, activity_id: activityId, ...(left.length ? { mentions_waiting: left } : {}) }, created, embedDue };
+}
+
+/** Undo restores rows in place, so it refuses a record that is moving, landing or already moved to another profile (section 9). */
+function unmoved(sql: SqlStorage, activityId: number): void {
+	const row = sql.exec<{ targets: string }>("SELECT targets FROM activity WHERE id = ?", activityId).toArray()[0];
+	for (const id of row ? (JSON.parse(row.targets) as string[]) : []) {
+		assertWritable(sql, id);
+		if (sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status = 'moved'", id).toArray().length) throw Fail.of("revision_conflict", "changed since; review by hand", { node: id, reason: "moved" });
+	}
 }
 
 /**
  * One transaction: replay or refuse by request_id, then apply, stamp every row with the next sequence number,
  * write activity and store the request's result. A thrown Fail rolls everything back.
  */
-export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, ctx: WriteContext): WriteOutput {
+function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, ctx: WriteContext): WriteOutput {
 	return storage.transactionSync(() => {
 		const sql = storage.sql;
+		assertOpen(sql);
 		const requestId = cmd.args.request_id ?? null;
 		if (requestId) {
-			const row = sql.exec<{ payload_hash: string; result: string; legacy_hash: string | null; state: string | null }>(
-				`SELECT r.payload_hash, r.result, r.legacy_hash, i.state FROM requests r LEFT JOIN import_records i ON i.record_id = r.node_id WHERE r.request_id = ?`, requestId).toArray()[0];
+			const row = sql.exec<{ payload_hash: string; result: string; node_id: string; legacy_hash: string | null; state: string | null }>(
+				`SELECT r.payload_hash, r.result, r.node_id, r.legacy_hash, coalesce(f.state, i.state) AS state FROM requests r
+				LEFT JOIN import_records i ON i.record_id = r.node_id LEFT JOIN import_refreshes f ON f.shadow_id = r.node_id WHERE r.request_id = ?`, requestId).toArray()[0];
 			if (row) {
+				assertNotWiped(sql, row.node_id);
 				// An imported request replays only once its record is published, and only for the same call by BothQ's own hash.
 				if (row.state && row.state !== "published") throw Fail.of("busy", `request_id '${requestId}' belongs to a record that is still being imported; retry later`);
 				if (row.payload_hash !== (row.legacy_hash ? ctx.legacyHash : ctx.payloadHash)) {
@@ -586,20 +759,45 @@ export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteComm
 			}
 		}
 		// Only a committed result above may skip the guard; a pending binding or a retry that can still write may not.
+		let guard: (material: unknown) => void = () => {};
 		if (who.profile === "me") {
 			if (!ctx.meGuard?.explicit) throw Fail.of("validation", "writes to me must name profile: \"me\" explicitly");
 			// Work terms registered before a work write committed here first, so this read inside the transaction cannot miss them.
 			const stored = sql.exec<{ term: string }>("SELECT term FROM guard_terms").toArray().map((r) => r.term);
-			const guard = meGuard({ ...ctx.meGuard, sensitiveTerms: [...ctx.meGuard.sensitiveTerms, ...stored], texts: guardTexts(cmd.args as unknown as Record<string, unknown>) });
-			if (!guard.ok) throw new Fail(guard.error);
+			const me = ctx.meGuard;
+			guard = (material) => {
+				const r = meGuard({ ...me, sensitiveTerms: [...me.sensitiveTerms, ...stored], texts: guardTexts(material) });
+				if (!r.ok) throw new Fail(r.error);
+			};
+			guard(cmd.args);
 		}
-		const tx = new Tx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString(), ctx, requestId);
-		const out = cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : candidate(tx, who, cmd.args);
+		gate(sql, who, cmd, ctx);
+		if (cmd.op === "undo") unmoved(sql, cmd.args.activity_id);
+		const seq = takeSeq(sql, "profile_meta");
+		const tx = new Tx(sql, seq.seq, new Date().toISOString(), ctx, requestId, guard);
+		tx.charge(seq.rows);
+		const refused = BACKGROUND.includes(ctx.actor) ? protectedTargets(sql, who, cmd, ctx) : [];
+		// Every write keeps what it changes, so the activity row holds its inverse; an undo is itself a write.
+		const before = cmd.op === "undo" || refused.length ? undefined : beforeImages(sql, cmd);
+		const flags = refused.map((n) => flagProtected(tx, n.id, n.why, cmd.op, ctx.actor));
+		const out: WriteOutput = flags.length ? { result: { action: "flagged", memory_id: refused[0]!.id, activity_id: flags.at(-1) }, created: [], embedDue: false }
+			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
+		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed });
 		if (requestId) {
 			tx.run("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
 				requestId, cmd.op, ctx.payloadHash, JSON.stringify(out.result), String(out.result.memory_id ?? out.result.capture_id ?? ""), tx.now, tx.seq);
 		}
 		return out;
 	});
+}
+
+/** Undo reindexes behind the still-current fence, in bounded transactions, before publishing the restored fence. */
+export function runWrite(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, ctx: WriteContext): WriteOutput {
+	for (;;) {
+		try { return writeOnce(storage, who, cmd, ctx); } catch (e) {
+			if (!(e instanceof Unfold)) throw e;
+			unfoldStep(storage, e);
+		}
+	}
 }

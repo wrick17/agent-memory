@@ -7,6 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import { beforeEach, describe, it } from "node:test";
 import { sha256, uuid5 } from "../src/domain/ids.ts";
+import { attrsDigest, nodeDigest, requestDigest, requestSource, revisionDigest, rowsDigest } from "../src/domain/import-audit.ts";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-upload-test-"));
 let n = 0;
@@ -15,21 +16,21 @@ const m = await import("./migrate.mjs");
 const u = await import("./upload.mjs");
 
 const dt = { $neo4j: "DateTime", iso: "2026-01-02T03:04:05+00:00" };
-const record = (i) => ({ eid: `e${i}`, labels: ["Decision", "Entity"], anchors: [], steps: [], relationships: [], has_revision_links: 0, revisions: [], requests: [],
+const record = (i, scope = "personal") => ({ eid: `e${i}`, labels: ["Decision", "Entity"], anchors: [], steps: [], relationships: [], has_revision_links: 0, revisions: [], requests: [],
 	props: { name: `Note ${i}`, content: `note ${i}`, _created: dt, _updated: dt, _version: 1 }, fingerprint: { version: 1 }, attempts: 1, bothq_type: "project",
-	resolved_scope: "personal", legacy_id: uuid5(`personal:project:note ${i}`) });
+	resolved_scope: scope, legacy_id: uuid5(`${scope}:project:note ${i}`) });
 
-/** A planned rehearsal export with `count` records: two commands each, so more than 50 commands make two batches. */
-async function plannedExport(count = 30) {
+/** A planned export with `count` records: two commands each, so more than 50 commands make two batches. */
+async function plannedExport(count = 30, rehearsal = "test", scopeOf = () => "personal") {
 	const dir = fs.mkdtempSync(path.join(tmp, "export-"));
-	const records = Array.from({ length: count }, (_, i) => record(i));
+	const records = Array.from({ length: count }, (_, i) => record(i, scopeOf(i)));
 	const jsonl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "");
 	fs.mkdirSync(path.join(dir, "bothq"));
 	fs.mkdirSync(path.join(dir, "markdown"));
 	fs.writeFileSync(path.join(dir, "bothq", "records.jsonl"), jsonl(records));
 	fs.writeFileSync(path.join(dir, "markdown", "files.jsonl"), "");
 	fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ version: 1, bothq: { records: count, records_jsonl_sha256: sha256(jsonl(records)) }, markdown: { distinct: 0, files_sha256: sha256("") } }));
-	await m.plan({ exportDir: dir, rehearsal: "test" });
+	await m.plan({ exportDir: dir, rehearsal });
 	return dir;
 }
 
@@ -152,5 +153,145 @@ describe("upload closure fixes", () => {
 		fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, "utf8")), batches_sha256: "0".repeat(64) }));
 		await assert.rejects(u.upload({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: next.fetch, sleep: noSleep }), /plan changed since this upload began/);
 		assert.equal(next.calls, 0);
+	});
+});
+
+// The read-only audit client against a fake /v1/import/audit that digests what a faithful server would have stored.
+describe("upload audit", () => {
+	/**
+	 * Pages per profile from the plan's own rows. `tamper` changes one stored snapshot byte; `status` changes one stored
+	 * node's status without a new revision; `copy` puts a copy of a record into a second profile.
+	 */
+	function fakeAudit(dir, { sub = "plan-rehearsal-test", tamper, status, copy, paged, hosted } = {}) {
+		const recs = new Map();
+		for (const c of m.readJsonl(path.join(dir, sub, "commands.jsonl"))) {
+			if (c.op === "stage") {
+				const r = recs.get(c.record_id) ?? { revisions: [], requests: [] };
+				r.revisions.push(...c.rows.revisions);
+				r.requests.push(...c.rows.requests);
+				recs.set(c.record_id, r);
+			} else if (c.op === "finalize") {
+				const published_at = "2026-02-01T00:00:00.000Z";
+				Object.assign(recs.get(c.record_id), { profile: c.profile, record_sha256: c.record_sha256, node: c.node, published_at,
+					stored: { ...c.node, created_at: c.node.created_at ?? published_at, updated_at: c.node.updated_at ?? published_at } });
+			}
+		}
+		const ids = [...recs.keys()].sort();
+		if (tamper !== undefined) { const r = recs.get(ids[tamper]); r.revisions[0] = { ...r.revisions[0], snapshot: `${r.revisions[0].snapshot} ` }; }
+		if (status !== undefined) { const r = recs.get(ids[status]); r.stored = { ...r.node, status: "retired" }; }
+		const rowsIn = (profile) => ids.filter((id) => recs.get(id).profile === profile || (copy && copy.into === profile && id === ids[copy.index]));
+		const digestsOf = (r) => ({ revisions: r.revisions.map(revisionDigest).sort((a, b) => a.revision - b.revision),
+			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })).sort((a, b) => (a.request_id < b.request_id ? -1 : 1)) });
+		return async (url, init) => {
+			const u = new URL(url), after = u.searchParams.get("after"), profile = u.searchParams.get("profile"), record = u.searchParams.get("record");
+			assert.equal([u.pathname, init.redirect, init.method ?? "GET"].join(" "), "/v1/import/audit manual GET");
+			if (record) {
+				const r = recs.get(record), rows = digestsOf(r)[u.searchParams.get("rows")], limit = Number(u.searchParams.get("limit"));
+				const page = rows.filter((x) => after === null || ("revision" in x ? x.revision > Number(after) : x.request_id > after)).slice(0, limit);
+				const last = page.at(-1);
+				return Response.json({ record_id: record, node_revision: r.stored.revision, rows: page, next_after: page.length === limit ? String(last.revision ?? last.request_id) : null });
+			}
+			// Small pages, as a server stopping at its row bound returns them.
+			const page = rowsIn(profile).filter((id) => !after || id > after).slice(0, 7);
+			const records = page.map((id) => {
+				const r = recs.get(id), d = digestsOf(r), big = paged !== undefined && id === ids[paged];
+				// A record over the server's row bound comes with counts only; its rows are on the detail pages.
+				return { record_id: id, state: "published", published_at: r.published_at, record_sha256: r.record_sha256, node_sha256: nodeDigest(r.node), ...(big ? { paged: true } : {}),
+					node: { revision: r.stored.revision, created_at: r.stored.created_at, updated_at: r.stored.updated_at, row_sha256: nodeDigest(r.stored), ...attrsDigest(r.stored.attrs) },
+					revisions: { count: d.revisions.length, sha256: big ? null : rowsDigest(d.revisions), hosted: 0 },
+					requests: { count: d.requests.length, sha256: big ? null : rowsDigest(d.requests), hosted: hosted !== undefined && id === ids[hosted] ? 1 : 0 } };
+			});
+			return Response.json({ profile, records, next_after: page.length === 7 ? page.at(-1) : null });
+		};
+	}
+
+	it("passes a faithful server over several pages, and names the one record whose stored bytes changed", async () => {
+		const dir = await plannedExport();
+		const cfg = u.loadConfig(config());
+		const clean = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir) });
+		assert.deepEqual([clean.status, clean.records, clean.found, Object.values(clean.mismatches).every((n) => n === 0), clean.drift], ["ok", 30, 30, true, 0]);
+		const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { tamper: 3 }) });
+		assert.deepEqual([changed.status, changed.mismatches.revisions, changed.mismatches.requests, changed.mismatches.missing], ["mismatch", 1, 0, 0]);
+		const reportPath = path.join(dir, "plan-rehearsal-test", "audit-memory-rehearsal.example.json");
+		const report = fs.readFileSync(reportPath, "utf8");
+		assert.equal(fs.statSync(reportPath).mode & 0o777, 0o600);
+		assert.ok(!report.includes("SECRET-TOKEN-VALUE"));
+		const ids = m.readJsonl(path.join(dir, "plan-rehearsal-test", "commands.jsonl")).filter((c) => c.op === "finalize").map((c) => c.record_id).sort();
+		assert.deepEqual(JSON.parse(report).mismatches.revisions.ids, [ids[3]]);
+	});
+
+	it("reads a record too large for a summary page through its detail pages, and fails on any hosted drift", async () => {
+		const dir = await plannedExport();
+		const cfg = u.loadConfig(config());
+		const ids = m.readJsonl(path.join(dir, "plan-rehearsal-test", "commands.jsonl")).filter((c) => c.op === "finalize").map((c) => c.record_id).sort();
+		assert.equal((await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { paged: 2 }) })).status, "ok");
+		const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { paged: 2, tamper: 2 }) });
+		assert.deepEqual([changed.status, changed.mismatches.revisions], ["mismatch", 1]);
+		// A full match is required: a hosted request since the import makes the audit unsuccessful, and names the record.
+		const drifted = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { hosted: 4 }) });
+		assert.deepEqual([drifted.status, drifted.drift, Object.values(drifted.mismatches).every((n) => n === 0)], ["drift", 1, true]);
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "plan-rehearsal-test", "audit-memory-rehearsal.example.json"), "utf8")).drift.ids, [ids[4]]);
+	});
+
+	it("refuses a plan that is missing or not the one uploaded, before any request", async () => {
+		const dir = await plannedExport();
+		const cfg = u.loadConfig(config());
+		let calls = 0;
+		const counting = async () => { calls++; return Response.json({ records: [], next_after: null }); };
+		const state = path.join(dir, "plan-rehearsal-test", "upload-memory-rehearsal.example.json");
+		fs.writeFileSync(state, JSON.stringify({ commands_sha256: "0".repeat(64) }), { mode: 0o600 });
+		await assert.rejects(u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: counting }), /plan changed since it was uploaded/);
+		fs.rmSync(path.join(dir, "plan-rehearsal-test", "commands.jsonl"));
+		await assert.rejects(u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: counting }), /commands\.jsonl does not match/);
+		assert.equal(calls, 0);
+	});
+
+	it("checks null import dates against publication time, not the current stored dates", async () => {
+		const dir = await plannedExport(1);
+		const source = path.join(dir, "bothq", "records.jsonl"), row = JSON.parse(fs.readFileSync(source, "utf8"));
+		row.props._created = null;
+		row.props._updated = null;
+		const data = `${JSON.stringify(row)}\n`;
+		fs.writeFileSync(source, data);
+		const manifestFile = path.join(dir, "manifest.json"), manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+		manifest.bothq.records_jsonl_sha256 = sha256(data);
+		fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+		await m.plan({ exportDir: dir, rehearsal: "test" });
+		const node = m.readJsonl(path.join(dir, "plan-rehearsal-test", "commands.jsonl")).find((c) => c.op === "finalize").node;
+		assert.equal(node.created_at, null);
+		assert.equal(node.updated_at, null);
+		const cfg = u.loadConfig(config());
+		assert.equal((await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir) })).status, "ok");
+		for (const field of ["created_at", "updated_at"]) {
+			const faithful = fakeAudit(dir);
+			const fetchImpl = async (url, init) => {
+				const page = await (await faithful(url, init)).json();
+				for (const record of page.records) {
+					const stored = { ...node, created_at: record.node.created_at, updated_at: record.node.updated_at, [field]: "2040-12-31T00:00:00Z" };
+					record.node = { ...record.node, [field]: stored[field], row_sha256: nodeDigest(stored) };
+				}
+				return Response.json(page);
+			};
+			const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl });
+			assert.deepEqual([changed.status, changed.mismatches.node, changed.drift], ["mismatch", 1, 0]);
+		}
+	});
+
+	it("reports a stored node changed without a new revision, and a copy of a record in a second audited profile", async () => {
+		const dir = await plannedExport();
+		const cfg = u.loadConfig(config());
+		const ids = m.readJsonl(path.join(dir, "plan-rehearsal-test", "commands.jsonl")).filter((c) => c.op === "finalize").map((c) => c.record_id).sort();
+		const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { status: 5 }) });
+		assert.deepEqual([changed.status, changed.mismatches.node, changed.drift], ["mismatch", 1, 0]);
+		const report = (base, name) => JSON.parse(fs.readFileSync(path.join(base, name, "audit-memory-rehearsal.example.json"), "utf8"));
+		assert.deepEqual(report(dir, "plan-rehearsal-test").mismatches.node.ids, [ids[5]]);
+		// A routed plan over two profiles; the server holds a copy of one personal record in work as well.
+		const routed = await plannedExport(12, null, (i) => (i % 2 ? "sequoia" : "personal"));
+		const rcfg = u.loadConfig(config({ rehearsal: false }));
+		const personal = m.readJsonl(path.join(routed, "plan", "commands.jsonl")).filter((c) => c.op === "finalize" && c.profile === "personal").map((c) => c.record_id).sort();
+		const all = m.readJsonl(path.join(routed, "plan", "commands.jsonl")).filter((c) => c.op === "finalize").map((c) => c.record_id).sort();
+		const dup = await u.audit({ exportDir: routed, config: rcfg, fetchImpl: fakeAudit(routed, { sub: "plan", copy: { into: "work", index: all.indexOf(personal[0]) } }) });
+		assert.deepEqual([dup.status, dup.records, dup.found, dup.mismatches.extra, dup.mismatches.missing], ["mismatch", 12, 13, 1, 0]);
+		assert.deepEqual(report(routed, "plan").mismatches.extra.ids, [`work/${personal[0]}`]);
 	});
 });

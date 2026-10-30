@@ -4,6 +4,8 @@ Status: v3.2, revised for owner approval on 2026-10-28. Author: Opus design sub-
 
 Agent Memory is a hosted memory at `https://memory.wrick17.com`. It stores what the owner's agents learn, indexes how every record links to every other record and why, and returns that knowledge through MCP. It is a storage system. It never acts on the owner's behalf: it never calls GitHub or Jira, never syncs, and runs no LLM judgment. The owner's agents do the thinking and write the results through MCP.
 
+Source status, 2026-10-30: the owner-authorized shared root now contains the reviewed CORE719 MCP source, including L1/L2 and the bounded shared/common-context privacy corrections. The [canonical adoption receipt](module-contracts.md#core-mcp-source-adoption-2026-10-30) records exact pins, independent SOURCE CLEAR and Terra's full local PASS. It supersedes historical private/not-adopted/pending-combined implementation labels for those slices only; the approved design and its limits are unchanged. No optional L3 feature or new dashboard source is included. Read-only preservation evidence, rehearsal, target/runtime/client/deployment gates and cutover remain separate; local capture/automation stays uninstalled/inactive and BothQ stays live.
+
 ## Decisions at a glance
 
 | Area | Decision |
@@ -122,7 +124,11 @@ The agent passes repo identity. The server picks the profile and says why.
 		"why": "Owner correction on 2026-10-28 after npm broke the lockfile.",
 		"how_to_apply": "Before any install or script run in a Sequoia-Engineering repo.",
 		"origin": "stated",
-		"links": [{ "rel": "part_of", "to": { "kind": "project", "key": "github:Sequoia-Engineering/web" } }],
+		"links": [{
+			"rel": "relates_to", "to": { "kind": "project", "key": "github:Sequoia-Engineering/web" },
+			"reason": "The rule governs installs in this repo.",
+			"evidence": [{ "kind": "session", "ref": "session:claude:cc-7f3a", "note": "owner correction in this session" }]
+		}],
 		"repo": { "remote": "git@github.com:Sequoia-Engineering/web.git", "path": "/Users/p/work/web" },
 		"request_id": "cc-7f3a-save-1"
 	}
@@ -130,8 +136,10 @@ The agent passes repo identity. The server picks the profile and says why.
 ```
 
 ```json
-{ "memory_id": "5b0d4e52-3f7e-5c55-9a0e-6d1f0e2b9c11", "profile": "work", "routed_by": "rule:github.com/Sequoia-Engineering/*", "revision": 1, "action": "created", "activity_id": 812 }
+{ "memory_id": "5b0d4e52-3f7e-5c55-9a0e-6d1f0e2b9c11", "profile": "work", "routed_by": "rule:github.com/Sequoia-Engineering/*", "revision": 1, "action": "created", "activity_id": 812, "links": [{ "id": 41, "action": "created" }] }
 ```
+
+The result also carries BothQ's fields (`name`, `type`, `kind`, `scope`, `content_hash`, `superseded`). Each link is a judgment edge from the saved record to a node that already exists in its profile, so it needs a reason and evidence like any agent-written edge (section 4). The endpoint table admits no rule `part_of` a project, so this rule `relates_to` the project; the project node comes from an earlier `record_knowledge` or upload. `test/write-details.test.ts` runs this exact call, with the project node created first.
 
 ### An agent appends to its task journal from a second machine
 
@@ -646,7 +654,8 @@ Every base table has a `seq` column and an index on `(seq, primary key)`. Each w
 -- v1 (phase 1): profile_meta, nodes, texts, texts_fts, texts_tri, edges, evidence, revisions, requests, activity, cursors, deleted_rows.
 -- v2 (phase 2): captures_fts, markers, maintenance, guard_terms. v3 (import vertical, 2026-10-29): revisions rebuilt for BothQ's
 -- operations and source fields, requests.completed_at and source, import_records, import_parts. v4 (phase 3): archive, transfers,
--- transfer_parts (planned as v3 before the import vertical took that number).
+-- transfer_parts (planned as v3 before the import vertical took that number), activity.redacted. v5 (import refresh, 2026-10-29):
+-- import_refreshes, and each import record's published revision and content hash as the next refresh's anchor.
 -- Control state not exported (rebuilt after a restore): cursors, transfer_parts. profile_meta goes into the export manifest.
 CREATE TABLE profile_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; -- user_id, profile, generation, schema_version, write_seq
 
@@ -820,7 +829,8 @@ CREATE TABLE node_index (node_id TEXT PRIMARY KEY, profile TEXT NOT NULL, seq IN
 CREATE TABLE request_index (request_id TEXT PRIMARY KEY, profile TEXT NOT NULL, op TEXT NOT NULL, payload_hash TEXT NOT NULL,
 	at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE transfers (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, from_profile TEXT NOT NULL, to_profile TEXT NOT NULL,
-	state TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, seq INTEGER NOT NULL) WITHOUT ROWID;
+	state TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, seq INTEGER NOT NULL,
+	intent TEXT, retry_at INTEGER) WITHOUT ROWID;  -- private account v4: accepted policy/generations and cleanup retry
 CREATE TABLE restores (id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('pitr','export')),
 	target TEXT NOT NULL, bookmark TEXT, undo_bookmark TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, seq INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE review_list (id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, suggested_profile TEXT, payload TEXT NOT NULL,
@@ -889,6 +899,8 @@ Size caps run in the write path, whatever the source:
 ### Rows written per day
 
 Each `ProfileStore` reports `rowsWritten` from its cursors to `AccountStore.meter()` once per alarm step. On Paid the daily total (section 17) is a small fraction of the included amount. On Free, Durable Objects allow 100k rows written a day per account. The background stages (similarity edges, queue computation, dedupe, purge) pause when the day passes 80k, so agent writes keep the remaining room. This costs nothing on Paid, so it stays. Agent writes are never deferred.
+
+Source implementation, 2026-10-30: the private D4/D5 contribution implements the daily counter and pause in `ProfileStore`, with scoped synthetic Workers tests only. Similarity, dangling checks and housekeeping wait until UTC midnight at `rows >= 80000`; size pressure still allows housekeeping. Embedding, fold, transfer and maintenance outbox recovery, purge cleanup and agent writes remain unpaused. Counts are the profile cursors' surfaced `rowsWritten`, durably flushed and reported once per alarm step. Counter/report failures fail open and retain pending counts; the generation gate runs after awaits and before further local writes. Rolled-back statement counts and ambiguous report retries may overcount; pre-flush crashes and deferred FTS internals may undercount. AccountStore's own rows use the approved 20k headroom shortcut. This is a scheduling guard, not an exact billing counter or a Free benchmark gate. See [the source contract and accounting limits](module-contracts.md#d4d5-dangling-links-and-daily-row-meter-private-source-contribution). A transfer step flushes its meter rows only after the access check passes again after the step's await, and a failed acknowledgement fails open like a failed report (parent fixes after review). Independent reviews cleared this slice and both fixes; it is in the private [integration candidate](module-contracts.md#d2-d5-and-public-save-integration-candidate-2026-10-30), with root adoption and runtime verification pending.
 ## 7. MCP tools
 
 Twelve tools for interactive agents (eleven on Free, since `corpus` is Paid-only) and two for the job-scoped token, down from BothQ's 52. `tools/list` is filtered by the caller's scopes, so an interactive agent never sees the maintenance tools and the job token sees only those. Every tool accepts `profile` (explicit override) and `repo` (`{remote, path}`). Reads accept `as_of`. Write results always include `profile`, `routed_by`, `action` and `activity_id`. BothQ's argument and result names are kept: `keyword`, `description`, `results`, `matched_by`, `provenance`, `freshness`, `next_before_revision`.
@@ -897,7 +909,7 @@ Twelve tools for interactive agents (eleven on Free, since `corpus` is Paid-only
 
 | Tool | Input | Output | Contract |
 |---|---|---|---|
-| `save_memory` | `name`, `type` (BothQ type), `description`, optional `kind`, `memory_id` or identity, `content`, `why`, `how_to_apply`, `scope`, `from_scope`, `new_name`, `objective`, `steps`, `origin` (`stated` or `agent`), `retire`, `supersedes`, `links`, `compact`, `company_free`, `expected_revision`, `request_id` | `memory_id`, `revision`, `action` (`created`, `updated`, `retired`, `replayed`, `transfer_started`), `superseded[]` | No identity: create, or `already_exists` if the active identity is taken and `expected_revision` is absent (BothQ routes a save with `expected_revision` to update; so does this). With identity: update, rename (id kept), scope move, retire or supersede. A different `profile` on an existing record starts a transfer (section 9). `kind` defaults from `type` (feedback to rule, user to preference, procedural and reference to document, project to decision, or journal for journals). Procedural needs `objective` and ordered `steps`. A `decision` needs `why` and one evidence pointer. `compact: {through_seq, summary}` folds journal entries into a summary. |
+| `save_memory` | `name`, `type` (BothQ type), `description`, optional `kind`, `memory_id` or identity, `content`, `why`, `how_to_apply`, `scope`, `from_scope`, `new_name`, `objective`, `steps`, `origin` (`stated` or `agent`), `retire`, `supersedes`, `evidence`, `links`, `compact`, `company_free`, `expected_revision`, `request_id` | `memory_id`, `revision`, `action` (`created`, `updated`, `retired`, `replayed`, `transfer_started`), `superseded[]`, and `links[]` (`id`, `action`) when the call had links | No identity: create, or `already_exists` if the active identity is taken and `expected_revision` is absent (BothQ routes a save with `expected_revision` to update; so does this). With identity: update, rename (id kept), scope move, retire or supersede. A different `profile` on an existing record starts a transfer (section 9). `kind` defaults from `type` (feedback to rule, user to preference, procedural and reference to document, project to decision, or journal for journals). Procedural needs `objective` and ordered `steps`. A `decision` needs `why` and one evidence pointer, at creation and after every update; nothing adds a pointer for it. `evidence` (1 to 20 `{kind, ref, note}`) adds pointers and keeps the earlier ones; a `node` pointer names a node of the same profile. `links` (1 to 20) add judgment edges from the record: `rel`, `to` (a node of the same profile by `id`, `kind` and `key`, or `kind`, `name` and `scope`), a reason of 8 to 600 characters, evidence and optional valid times. A current edge with the same relation and target keeps its reason and merges the evidence. `record_knowledge` ends links. Evidence and links commit with the rest of the call or not at all, and undo removes what they added. A move to another profile takes no other change. `compact: {through_seq, summary}` folds journal entries into a summary. |
 | `append_memory` | identity, `content` (up to 100k characters), `request_id` (required), `expected_revision`, `separator` | `memory_id`, `revision`, `entry_seq`, `action` | Atomic. Rejected for procedural memories. Without `expected_revision`, concurrent appends from two machines both land, in arrival order. A node being transferred returns `moving` with `retry_after`. |
 | `get_memory` | `memory_id`, or `name` with `scope` and `type`, `include_retired`, `history {limit, before_revision}`, `content {complete, cursor}` | The node, its steps, its current edges with reasons, the history window with `next_before_revision`, and `complete` | Content up to 100k characters returns whole, as BothQ did. Larger content returns head, latest summary and newest entries with `complete: false` and a `cursor`. `content.complete: true` pages through the whole text in order, 100k characters per page, so nothing is out of reach. Each page cursor binds the node id, revision and content hash: if the record changes between pages, the next page returns `revision_conflict` with the current revision and the caller starts again, so no caller assembles text that never existed at one revision. A bare `memory_id` resolves through `AccountStore.node_index`. |
 | `recall_memories` | `keyword`, `type`, `kinds`, `scope`, `limit` (1 to 100), `token_budget` (64 to 32,000), `include_captures`, `include_history`, `expand` (default true), `cursor` | `read_set`, `results[]` with `passage`, `matched_by`, `via`, `provenance`, `freshness`, `profile`, `revision`, then `estimated_tokens`, `truncated`, `lexical_only`, `diagnostics`, `next_cursor` | Section 11. An empty `keyword` enumerates every record of the read set in stable creation order (each profile's row order, `me` after the routed profile) and returns `next_cursor` until the inventory ends. That covers BothQ `list_memories`. Records created during enumeration appear at the end; updates do not move a record. |
@@ -932,7 +944,7 @@ Every BothQ caller (skills, dotfiles instructions, Codex `AGENTS.md`) changes at
 
 | BothQ | Agent Memory | What differs | Caller change |
 |---|---|---|---|
-| `save_memory` | `save_memory`, same arguments | Adds `kind`, `origin`, `links`, `profile`, `repo`, `company_free` | Pass `repo`. Pass `profile: "me"` and `company_free` to write to `me`. |
+| `save_memory` | `save_memory`, same arguments | Adds `kind`, `origin`, `evidence`, `links`, `profile`, `repo`, `company_free`. A decision (`type: "project"` with `why`) needs evidence. | Pass `repo`. Pass `evidence` with every decision. Pass `profile: "me"` and `company_free` to write to `me`. |
 | `update_memory` (`memory_id` or `name`, `from_scope`, destination `scope`, `new_name`, fields) | `save_memory` with the same identity arguments | Same semantics. A different `profile` starts a transfer. | Change the tool name |
 | `retire_memory` | `save_memory` with `retire: true` | Same semantics | Change the tool name |
 | `append_memory` | `append_memory` | Same arguments and result | None |
@@ -1044,7 +1056,8 @@ sequenceDiagram
 	end
 ```
 
-1. **Intent.** `AccountStore` records the transfer with a new id and checks that the caller may write both profiles. No content is checked yet.
+1. **Intent.** `AccountStore` records the transfer with a new id and checks that the caller may write both profiles. No content is checked yet. The one exception is the daily batch's `promote_to_me` (section 7): a job token, which has no write scope, may begin a transfer only into `me`, from another profile, when it may use both. Every other begin needs write scope (accepted delta, 2026-10-29).
+   Private C3 source addition, 2026-10-30: account v4 stores the first accepted source/target generations and company-free/context/protection policy with minimal caller metadata in the existing intent row. The account alarm is armed before begin can commit. It re-drives up to ten due rows through C3 after five minutes even without a source fence, and retries transport/busy in 60 seconds until terminal cleanup. Undecided maintenance intents recheck the current device grant; no stored token or owner fallback authorizes them. The accepted generations never redirect to replacements. A deterministic refusal cleans target then source, with a durable abort marker even before the first source fence. Public result bytes are fixed in the existing request record on account completion. Legacy rows without policy keep their prior recovery behavior. [Contract and scoped evidence](module-contracts.md#c3-public-transfer-intent-recovery-private-additive-capsule). Its independent source review was clear, and it is [layer 2](module-contracts.md#layer-2-c3-accepted-intent-recovery-2026-10-30) of the private integration candidate, with no root adoption or hosted claim.
 2. **Fence.** The source, in one transaction, sets the node's status to `moving` and writes the bundle into `transfer_parts`: the node, every text chunk (live and archived), every revision, every request record that touched it, its evidence and its outgoing edges. Each part records the node's revision and its SHA-256. From now on every write to the node, appends included, returns `moving` with `retry_after`, so the bundle cannot change.
 3. **Validate the exact bundle.** The Worker reads the parts, checks their hashes and the bound revision, and runs the target's guard over every copied field: for `me`, the full `me` guard of section 5 (sensitive terms, person rule, personal fields). If any check fails, the Worker sends `transfer_abort`, the source deletes the parts and unfences, and nothing is published.
 4. **Land.** The target applies the parts, each idempotent by `(transfer id, part)` and rejected if its hash does not match. It runs its own guard again on the materialized rows before it accepts the last part. Collision rules: a tombstone of an earlier transfer of the same node is replaced; any other node with the id, or an active node with the same identity (scope, type, name), stops the transfer with `transfer_collision`, and the owner chooses merge or rename in the dashboard. The landed node stays `incoming`, invisible to reads. Its `transferred_in` revision records the transfer's immutable identity: the transfer id, the bundle's SHA-256 and the source revision the fence bound. The node's `source_profile`, `source_id` and `source_revision` are set if they are still empty, so the first origin stays.
@@ -1103,7 +1116,7 @@ Under T3 Code, Codex custom hooks run only after hook trust: the test saw truste
 
 The hosted store never receives whole messages. The run reads everything locally and uploads a bounded digest. Precisely, no digest field holds a raw transcript record or unbounded text: every item is an excerpt or paraphrase within its limit (160 characters for asks, 280 for the rest), and a part is at most 8 KB. An owner message shorter than its limit can still appear in full as one bounded excerpt. The phase-2 scan checks that no message longer than the excerpt limits appears in uploads, spools or logs. The run keeps two cursors per session in `~/.agent-memory/state/<client>/<session>.json` (step 9), plus an epoch: the SHA-256 of the transcript's first min(size, 4 KB) bytes when the session is first read. The run stores that length and hash, checks those bytes on every later run, and extends the check toward 4 KB as the file grows, so an ordinary append keeps the epoch.
 
-1. **Debounce.** For each queued session, the run waits until no new trigger for that session has arrived for 45 seconds (at most 10 minutes in total), so a burst of turns becomes one pass. The run stays until each queued trigger is due. It claims each trigger generation by an atomic rename before handling it, so a trigger that arrives meanwhile is kept and handled next. One run per machine holds an exclusive lock; a lock whose process died is reclaimed by exactly one worker.
+1. **Debounce.** For each queued session, the run waits until no new trigger for that session has arrived for 45 seconds (at most 10 minutes in total), so a burst of turns becomes one pass. The run stays until each queued trigger is due. It claims each trigger generation by an atomic rename before handling it, so a trigger that arrives meanwhile is kept and handled next. One run per machine holds an exclusive lock: a one-entry directory installed by rename. A dead owner's entry is removed by its unique name, so a worker killed at any step never blocks the next one ([lock design](capture-lock-recovery-design.md)).
 2. **Find the source.** Use the hook's `transcript_path`. If it is null or missing, look the session up in the client's own session store: Codex keeps `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`, and Claude Code keeps `<config dir>/projects/<project>/<session id>.jsonl`. If no file is found, the session is marked `pending` locally and nothing is acknowledged. Every later run and every `SessionStart` sweep retries the lookup for 7 days, and a pending session older than that shows on the dashboard health card by session id only. A last assistant message alone never stands in for a range.
 3. **Read the new part in full.** From the cursor to the last complete JSONL line. Every owner message and every assistant message is read whole. Tool calls, tool output, file contents, thinking, and injected system or hook text are skipped.
 4. **Build a heuristic digest at once, locally.** No model runs. One digest per input range, at most 8 KB after redaction, labeled `capture_status: heuristic`:
@@ -1247,12 +1260,13 @@ The server never decides what a record means. It computes, deterministically, wh
 | `embed` | `card_hash` differs from `embed_hash` | 16 cards per Workers AI call | Upserts `g<generation>:<node id>` vectors into its generation's namespace. Records `embed_hash` only if `card_hash` still matches, the BothQ rule. Pauses when the account's embedding counter passes 8,000 neurons for the day, which keeps the owner inside the free daily allotment; paused cards embed after 00:00 UTC. |
 | `similar` | After `embed` | 20 cards | Queries the namespace with each new card (`topK: 6`) and keeps up to 5 `relates_to` edges with cosine at least 0.85, basis `similarity`. Old similarity edges end. |
 | `queue` | Nightly, and after `similar` | 200 nodes | Writes `maintenance` items (below). |
+| `dangling` | Nightly | 200 current edges | Account absence check, generation gate, then one bounded transaction rechecks source/edge and queues `dangling_link`. Indexed, moving/transfer-backed and wiped targets stay opaque. Source-cleared D4 in the private integration candidate, not runtime verified. |
 | `dedupe` | Nightly | 100 nodes | Active memory nodes with the same kind, scope and content hash: the newer gets `superseded` by the older with a `supersedes` edge. Protected nodes get `flagged` instead. |
 | `ttl` | Nightly | 100 nodes | Candidates and digests neither promoted, consolidated nor used within 90 days move to the archive. |
 | `purge` | Nightly | 200 rows | Archive rows older than 300 days are deleted, with their vectors. Request records go with their purged node. Activity older than 400 days is deleted. |
 | `size` | After each write batch | 1 check | Enforces the 70% and 90% caps (section 6). |
 | `export` | Nightly tick | one 512 KB part | Section 18. |
-| `transfer` | A transfer older than five minutes in an unfinished state | 1 step | Section 9. |
+| `transfer` | A transfer older than five minutes in an unfinished state, including an accepted account intent without a source fence | Profile stage as before; account alarm up to 10 intents | Section 9; private C3 recovery retries in 60 s until cleanup. |
 | `reconcile` | After a restore | 200 nodes | Section 18. |
 
 ### The maintenance queue
@@ -1284,6 +1298,7 @@ project_doc_max_bytes = 0
 mcp_servers = {}
 [features]
 shell_tool = false
+view_image = false
 multi_agent = false
 apps = false
 plugins = false
@@ -1351,10 +1366,15 @@ rm -rf "$run_dir" "$codex_home"
 	The batch runs only when every positive control passes and every denial probe is `denied`, with the same configuration file, by hash, for the probes and for `codex exec`. Skipping releases the lease, records `batch_skipped` with the reason, and exits. The queue items stay open for agents' inline consolidation. Storage, capture and recall keep working. The denial message is defined for macOS in phase 2. On any platform without a tested message, every probe is `indeterminate`, so the batch stays inline-only there. A Codex update that weakens the sandbox is caught on its first run.
 - **What the probes do not prove.** They prove that the effective profile denies reading home and temp files and reaching the network. They do not prove that no tool exists. Safety rests on three things together: tools switched off, the proven denial of everything a tool could disclose, and detection.
 - **Detection stays.** The runner parses the `--json` event stream and accepts only the known envelopes (thread, turn and item events); any other event type fails closed like a configuration notice. Any tool item discards the run's output, marks the lease `stuck` and reports it, so an unexpected tool call is visible even though the sandbox already contained it.
+- **Stderr-only tool rejections fail closed (2026-10-29).** Codex 0.165 can reject an unregistered tool call only in its stderr (`unsupported call:`) and still exit zero with a valid result. The common executor checks stderr for that diagnostic before the exit status or output and treats it as a tool event. Ordinary stderr progress is still accepted. This is a source fix with a regression and an independent review. It is evidence for P3 of the confinement criterion in section 22, not for P1.
 - **Configuration notices fail closed.** Codex reports a setting it ignores as an `error` item in the event stream ("Codex is ignoring 1 unrecognized configuration setting"). The runtime is then not the one the probes proved, so the run is discarded. The batch is skipped, and a capture range stays `pending` rather than being acknowledged. Unknown event or item types fail the same way.
 - **Confined output.** The runner validates the output against the schema. The server validates it again through the normal write path, keeps each op inside its item's subjects, logs it with undo, and turns any change to a protected node into a flag. The token stays with the runner script, never with the model.
 
 Luna (`gpt-6-luna`, low effort) gets `unlinked`, `stale_journal` and `dangling_link` items, and Terra (`gpt-6.1-terra`, high effort) gets the rest. Model slugs come from the owner's current Codex catalog. The same confined runtime and probes run the capture consolidation pass of section 10 and the corpus judgment steps of section 14. Phase 2 builds them, because capture needs them first.
+
+### Journal compaction implementation seam
+
+D1's isolated source uses a prefix fence in `attrs.compacted_through`. Current content is the live body, live summary and live entries beyond that fence. Folded entries keep their bytes as `live = 2`, outside both indexes. Folding takes at most 100 text rows per transaction. Undo first checks conflicts and the current guard, reindexes the restored prefix in bounded transactions while the existing fence still hides it, then atomically restores the old fence and summary. Content and lexical recall are exact before undo returns. Interrupted preparation leaves the compacted view intact. The inverse stores no entry images. Existing text and revision columns suffice; there is no DDL. This is source-only work awaiting sole-integrator adoption and independent review; [the module contract](module-contracts.md#d1-journal-compaction-private-additive-capsule) records its scoped evidence.
 
 ### Inline consolidation at task end
 
@@ -1368,6 +1388,13 @@ The rewritten `task-journal` skill makes the agent that finishes a task do the c
 ### The model of the owner
 
 `preference` nodes with origin `stated` (the owner said it) or `inferred` (an agent concluded it, with at least one evidence pointer). Inferred preferences go live at once with the label, rank below stated ones in recall, and appear on the dashboard with their evidence, where the owner can pin them (which protects them) or forget them (archive, with undo). Work-learned preferences reach `me` only through an explicit, company-free write that passes the `me` guard (section 5).
+
+Implementation seam (D2/D3, source-cleared and in the private [integration candidate](module-contracts.md#d2-d5-and-public-save-integration-candidate-2026-10-30) of 2026-10-30, not in root and not runtime-proven):
+- `infer_preference` runs on `preference_signal` and `unprocessed_capture` items. It creates a `user` preference with origin `inferred` through the internal `SaveArgs.origin`, which MCP never accepts as `inferred`, and `SaveArgs.evidence`, which public saves may also pass. The shared `create()` refuses an inference without evidence and a `stated` origin from a background actor. Updates never change origin.
+- Recall's Worker merge refills only the preference positions, non-inferred first, before the limit and token packing (`statedFirst`). Each profile also returns up to `limit` non-inferred preferences from below its cap, tagged with their original rank, so neither cap discards a stated preference needed at an inferred preference's position. These extra candidates do not seed graph expansion; the Worker strips the internal rank. Inventory order and cursors are unchanged.
+- `promote_to_me` is a Worker-driven C3 transfer with a deterministic id. The profile checks the target and records `transfer_started`. The Worker drives the move with the op's `company_free: true`, the leased profile as context and the current sensitive terms. Its outcome is applied, rejected or `moving`. Each finished item also leaves a content-free outbox row (created ids; promotion id, node, `me` generation, job device). The source's alarm, armed before the row commits, registers and promotes from that row, or aborts through C3, with no client replay. The account rereads the job device's grant at that begin, for a new intent and for one already open; an open job intent whose grant is gone is aborted and cleaned up through C3. [The module contract](module-contracts.md#d2d3-inferred-preferences-and-promotion-private-additive-capsule) records the details and scoped evidence.
+- The private corrective candidate also checks both accepted generations atomically at account begin, including an existing intent, and checks background protection inside the source's first fencing transaction. A protected node is flagged in place and the begun transfer aborts. Same-lease retries union accepted intents and created ids with the prior unsettled outbox, keeping each prior intent's metadata. These four review fixes and the later current-grant fix passed bounded independent closure reviews; combined and runtime gates remain open ([correction evidence](module-contracts.md#d2d3-four-finding-correction)).
+
 ## 13. Work graph
 
 Cloudflare never talks to GitHub or Jira and holds none of their credentials. All repos and Jira projects are private, and work data enters memory only from the owner's machines while work happens:
@@ -1429,6 +1456,8 @@ The local refresh for checkout tables follows the owner's rule: the hook compare
 `corpus` with `search` (FTS5 over search documents, passages), `get` (exact commit, PR, ticket, repo, person or session by key), and `sql` (read-only, 500-row cap, 30 s CPU on Paid). Every response carries the `as_of` of the tables it read.
 
 ## 15. Dashboard
+
+**Source status, 2026-10-30:** `/app` contains overview, profile, About you and Work pages, served like `/settings` rather than from static assets. About you retains its pin, unpin, unflag, forget and undo controls. The source-reviewed Work page reads the existing owner board for one active profile and displays the returned ranking, reasons and as-of data. The house module still uses neither Preact nor Cytoscape. The author's 15 DOM cases and the independent review's 6 selected plus 9 serialized controls passed; these are scoped synthetic checks. Current combined, protected HTTP, real browser and axe/reader acceptance remain pending. Other pages below stay planned ([module contract](module-contracts.md#work-integrated-source-2026-10-30)).
 
 Workers Static Assets serves a small static app (Preact plus Cytoscape.js for the map) from the same Worker at `/app`. Clerk JS signs the owner in. The app calls `/api/*` with the Clerk session token. The API runs the same commands as MCP with actor `owner`.
 
@@ -1532,6 +1561,8 @@ Imported records keep BothQ's ids, and their request ids are bound account-wide.
 
 1. Counts per source, type and profile match the manifest. Every source id appears in the provenance map or in an explicit drop list with a reason.
 2. Revision and request counts and hashes match the export, record by record.
+
+On 2026-10-29 they passed for the rehearsal's `test` profile: 1,330 records, 0 mismatch, extra or drift. They have not run on any other profile. Checks 1 and 2 run as `node local/upload.mjs audit`, a read-only comparison of the uploaded plan with `GET /v1/import/audit` ([integrity audit](import-integrity-design.md)): every record's stored hashes, attributes, provenance, revision digests and request ledger, with each result's exact stored bytes.
 3. Twenty random judgment edges have a reason and evidence that point at real entries or commits.
 4. Thirty golden queries chosen by the owner: the hosted top 5 contains BothQ's top result for at least 28.
 5. The largest journal's entry count matches its BothQ append count, and `get_memory` with `complete: true` returns the same text BothQ returns.
@@ -1975,7 +2006,13 @@ Added by the owner priority of 2026-10-29. It makes the existing memory availabl
 		- Default recall does not follow it.
 	- Batch:
 		- The batch runs only after the phase-2 probes classify every probe `denied` in that run, and a skipped run leaves its queue items open with `batch_skipped` on the dashboard.
-		- A canary item that asks for a home-directory file gets the command denied by the sandbox, and the event check reports the attempt.
+		- Confinement criterion (owner-delegated decision, 2026-10-29: the owner answered "Whichever makes more sense", and the parent chose the conditional criterion). It replaces the requirement that a real-model canary item asking for a home-directory file has its command denied. It changes the check, not any permission: no tool, filesystem or network access or integration is enabled for this test.
+			- P1, effective production tool capability: for the installed CLI version, the production config and the provider and model capability actually used, establish the effective tool inventory, including command, file-read and network capabilities. The absence of a shell tool alone does not suffice, and neither do config flags alone, output contaminated by prompt input, or an unproved provider substitution.
+			- P2, the applicable boundary: if a command, file or network capability is exposed, exercise that execution path deterministically and prove the configured permissions deny access beyond the allowed working directory and network boundary, with no synthetic home-canary content revealed. If no relevant I/O tool is exposed, an injected unregistered command must be rejected by the router without dispatch; that path proves prevention, not an operating-system denial of a dispatched command.
+			- P3, fail-closed handling: a rejected or attempted tool call discards the whole lease and parks its work as stuck, including a stderr-only rejection followed by a valid final result and exit 0. No earlier tier result or item operation applies. The record is real local Worker and SQLite state, not parser output alone.
+			- The per-run positive controls and the same-run rule above (every classified filesystem and network probe `denied`) stay. Runtime and config notices and unknown events still fail closed. The actual model's acceptance of the changed batch schema and a genuine scoped job-token and server flow remain separate requirements.
+			- A genuine real-model adversarial canary is supporting evidence; the model is not required to volunteer a command.
+			- Status, 2026-10-29: OPEN. The real sandbox controls and the four denial probes passed on the recorded production config. P3's stderr path passed an independent source review, the 75 local tests and an exact recorded CLI replay into a real isolated Worker that parked the item as stuck with no item operation. P1 (production provider and catalog equivalence and the effective tool exposure) is unproved, so the gate is not passed.
 		- The batch runs at most once per profile per day and never mixes profiles.
 	- Cleanup: undo round-trips for every op type. Protected nodes are only flagged.
 	- Transfers:

@@ -86,7 +86,7 @@ describe("recall channels and the vector fallback", () => {
 	it("finds a record by exact name, literal substring and full text, and by vector once embedded", async () => {
 		const c = await contextFor();
 		const saved = await call(c, "save_memory", { name: "Token refresh client", type: "project", description: "Moved refresh into one shared client",
-			why: "Three call sites each retried", content: "The SEQ-1234 refresh loop came from per-call retries in web.", profile: "test" });
+			why: "Three call sites each retried", content: "The SEQ-1234 refresh loop came from per-call retries in web.", evidence: [{ kind: "ticket", ref: "jira:SEQ-1234" }], profile: "test" });
 		const lexical = await call<{ results: { memory_id: string; matched_by: string[] }[]; lexical_only: boolean }>(c, "recall_memories", { keyword: "SEQ-1234", profile: "test" });
 		expect(lexical.results[0]).toMatchObject({ memory_id: saved.memory_id });
 		expect(lexical.results[0]!.matched_by).toEqual(expect.arrayContaining(["fulltext", "literal"]));

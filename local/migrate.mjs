@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { canonicalJson, collapse, normalizeName, normalizeScope, sha256, uuid5 } from "../src/domain/ids.ts";
 import { redactPayload, redactText } from "../src/domain/redact.ts";
 import { stripPersonal } from "../src/domain/personal.ts";
-import { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK, pack, publishCost } from "../src/domain/import-cost.ts";
+import { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK, PART_OVERHEAD, pack, publishCost, refreshPublishCost } from "../src/domain/import-cost.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PLAN_VERSION = 1;
@@ -265,6 +265,44 @@ function routePath(dir, rules) {
 	return hit && hit.profile !== "me" ? { profile: hit.profile, rule: hit.pattern, evidence: remote ? `remote ${normalizeRemote(remote)}` : `path ${tilde(dir)}` } : null;
 }
 
+/**
+ * The owner's reviewed routes (`plan --routes FILE`): exact sources of one export, each bound to its id, scope and the SHA-256
+ * of its exported row, sent to `work` or `personal`, never `me`. Refused whole, before any output, when anything differs.
+ */
+export function readReviewedRoutes(file, exportDir) {
+	const bytes = fs.readFileSync(file);
+	const fail = (why) => { throw new Error(`reviewed routes refused: ${why}`); };
+	const exact = (o, keys) => !!o && typeof o === "object" && !Array.isArray(o) && JSON.stringify(Object.keys(o).sort()) === JSON.stringify([...keys].sort());
+	let doc;
+	try { doc = JSON.parse(bytes.toString("utf8")); } catch { fail("not JSON"); }
+	if (!exact(doc, ["version", "export_manifest_sha256", "routes"]) || doc.version !== 1 || !Array.isArray(doc.routes) || !doc.routes.length) fail("schema");
+	if (doc.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json")))) fail("made for another export");
+	const routes = new Map();
+	doc.routes.forEach((r, i) => {
+		const n = i + 1;
+		if (!exact(r, ["source", "id", "scope", "profile", "source_sha256"]) || ![r.source, r.id, r.scope].every(nonEmpty) || !/^[0-9a-f]{64}$/.test(r.source_sha256)) fail(`route ${n} schema`);
+		if (r.profile === "me") fail(`route ${n} goes to me; nothing is routed into me`);
+		if (r.profile !== "work" && r.profile !== "personal") fail(`route ${n} profile`);
+		if (routes.has(r.source)) fail(`route ${n} repeats a source`);
+		routes.set(r.source, { ...r, n });
+	});
+	return { sha256: sha256Bytes(bytes), routes };
+}
+
+/** Routes each reviewed source that is still the exact row it was reviewed as and that no rule routes. Every other hold still applies. */
+function applyReviewed(items, rows, reviewed) {
+	const at = new Map(items.map((it, i) => [it.key, i]));
+	for (const r of reviewed.routes.values()) {
+		const fail = (why) => { throw new Error(`reviewed routes refused: route ${r.n} ${why}`); };
+		const i = at.get(r.source);
+		if (i === undefined) fail("names a source this export does not have");
+		const it = items[i];
+		if (it.id !== r.id || it.node.scope !== r.scope || sha256(canonicalJson(rows[i])) !== r.source_sha256) fail("no longer matches its exported source");
+		if (it.route) fail("conflicts with an existing routing rule");
+		it.route = { profile: r.profile, rule: "reviewed" };
+	}
+}
+
 /** BothQ scopes that name a profile (research 05). `bot_hq` mixes work and personal, so it and every other scope go to review. */
 function routeScope(scope) {
 	if (scope === "sequoia" || scope === "sequioa") return { profile: "work", rule: `scope:${scope}` };
@@ -470,29 +508,195 @@ export function checkExport(dir, manifest) {
 	if (problems.length) throw new Error(`the export bundle in ${dir} does not match its manifest (${problems.join(", ")}); export again`);
 }
 
+/** Full imported state, including earlier body rows retained by refresh. Older first-copy plans need no new metadata. */
+export function planRecords(dir) {
+	const manifest = readJson(path.join(dir, "manifest.json"), null);
+	const file = path.join(dir, "records.jsonl");
+	if (manifest?.records_sha256) {
+		if (sha256(fs.readFileSync(file, "utf8")) !== manifest.records_sha256) throw new Error("records.jsonl does not match its plan manifest");
+		return readJsonl(file);
+	}
+	const commands = readJsonl(path.join(dir, "commands.jsonl"));
+	return commands.filter((c) => c.op === "finalize").map((c) => {
+		const rows = commands.filter((s) => s.op === "stage" && s.record_id === c.record_id && s.profile === c.profile).map((s) => s.rows);
+		const source = c.node.attrs.source, system = source.system;
+		const texts = rows.flatMap((r) => r.texts);
+		const content = texts.filter((t) => t.live).sort((a, b) => (a.part === "entry") - (b.part === "entry") || a.seq_no - b.seq_no || a.chunk - b.chunk)
+			.map((t) => (t.chunk === 0 ? t.separator ?? "" : "") + t.body).join("");
+		return { key: system === "bothq" ? `bothq:${source.element_id}` : `${system}:${source.realpath}`, source: system, id: c.record_id,
+			route: { profile: c.profile }, node: c.node, texts, revisions: rows.flatMap((r) => r.revisions), requests: rows.flatMap((r) => r.requests),
+			supersedes: [], content, record_sha256: c.record_sha256, refresh_no: 0,
+			linked: commands.filter((l) => l.op === "link" && l.src === c.record_id && l.profile === c.profile).map((l) => l.dst) };
+	});
+}
+
+function completedBase(exportDir, rehearsal) {
+	const manifest = readJson(path.join(exportDir, "manifest.json"), null);
+	if (!manifest) throw new Error("no base export manifest");
+	checkExport(exportDir, manifest);
+	const dir = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan"), check = dryRun({ exportDir, rehearsal });
+	const states = fs.readdirSync(dir).filter((f) => /^upload-.+\.json$/.test(f)).map((f) => readJson(path.join(dir, f), null));
+	const complete = states.filter((s) => s && !s.stopped && s.commands_sha256 === check.commands_sha256 && s.batches_sha256 === check.batches_sha256
+		&& s.done?.length === check.batches && Array.from({ length: check.batches }, (_, i) => i + 1).every((b) => s.done.includes(b)));
+	if (complete.length !== 1) throw new Error("finish the base upload to exactly one server before planning a refresh");
+	return { records: planRecords(dir), commands_sha256: check.commands_sha256, server: complete[0].server };
+}
+
+function itemCommands(it, base = null) {
+	const refresh = base ? { no: base.refresh_no + 1, base_record_sha256: base.record_sha256, base_revision: base.node.revision,
+		base_content_hash: base.node.content_hash, ...(it.body_revision === undefined ? {} : { body_revision: it.body_revision }) } : null;
+	let parts = pack([...it.texts.map((t) => ["texts", t]), ...it.revisions.map((r) => ["revisions", r]), ...it.requests.map((q) => ["requests", q])]);
+	if (!parts.length) parts = [{ rows: { texts: [], revisions: [], requests: [] }, cost: { ...PART_OVERHEAD } }];
+	const profile = it.route.profile;
+	const recordSha = sha256(canonicalJson({ profile, node: it.node, ...(refresh ? { base_record_sha256: refresh.base_record_sha256, refresh: refresh.no } : {}), parts: parts.map((p) => p.rows) }));
+	const stages = parts.map((p, i) => {
+		const body = { op: "stage", record_id: it.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
+			...(refresh ? { refresh: { no: refresh.no, base_record_sha256: refresh.base_record_sha256 } } : {}) };
+		return { ...body, part_id: `${it.id}${refresh ? `#r${refresh.no}` : ""}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
+	});
+	const fin = { op: "finalize", record_id: it.id, record_sha256: recordSha, profile, node: it.node, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
+		request_ids: it.requests.map((q) => q.request_id), ...(refresh ? { refresh } : {}) };
+	const own = [...stages, { ...fin, sha256: sha256(canonicalJson(fin)) }];
+	const flips = base?.texts.filter((t) => t.live && it.body_revision !== undefined) ?? [];
+	const pub = base ? refreshPublishCost(it.node, it, flips) : publishCost(it.node);
+	if (own.some((c) => commandBytes(c) + ENVELOPE > BATCH.bytes) || pub.rows > BUDGET.rows || pub.bytes > BUDGET.bytes) throw Object.assign(new Error("publication exceeds the transaction budget"), { code: base ? "oversize_refresh" : "oversize_command" });
+	return { commands: own, record_sha256: recordSha, refresh_no: refresh?.no ?? 0 };
+}
+
+/** Advance only to a source revision's actual state. Text and request histories stay cumulative for the next refresh. */
+function advancePrefix(base, fresh, revision) {
+	const it = structuredClone(base);
+	it.node.attrs = structuredClone(fresh.node.attrs);
+	it.revisions.push(revision);
+	const snap = parse(revision.snapshot), delta = parse(revision.delta);
+	const at = revision.at;
+	for (const k of ["name", "description", "why", "how_to_apply", "objective", "steps", "status"]) if (snap && k in snap) it.node[k] = snap[k];
+	if (BODY_OPS.has(revision.op)) {
+		it.content = snap.content;
+		for (const t of it.texts) t.live = false;
+		it.texts.push(...chunkText(it.content).filter(Boolean).map((body, chunk) => ({ part: "body", revision: revision.revision, seq_no: 0, chunk, body, created_at: at, live: true })));
+	} else if (revision.op === "appended") {
+		const seq = Math.max(0, ...it.texts.filter((t) => t.part === "entry").map((t) => t.seq_no)) + 1;
+		const separator = it.content ? delta.separator ?? "\n" : "";
+		it.content += separator + delta.content;
+		it.texts.push(...chunkText(delta.content).map((body, chunk) => ({ part: "entry", revision: revision.revision, seq_no: seq, chunk, body, separator: chunk === 0 ? separator : null,
+			request_id: revision.request_id, created_at: at, live: true })));
+	}
+	if (["retired", "superseded"].includes(revision.op)) it.node.status = revision.op;
+	it.node.kind = kindOf(it.node.memory_type, it.texts.some((t) => t.part === "entry"), it.node.why);
+	Object.assign(it.node, { revision: revision.revision, chars: it.content.length, content_hash: revision.content_hash, updated_at: at, updated_source_platform: revision.source_platform });
+	if (["saved", "updated", "appended"].includes(revision.op)) it.node.valid_from = at;
+	if (it.node.status !== "active") it.node.valid_to = snap?._valid_until ?? at;
+	return it;
+}
+
+function deltaItem(base, full, adoption = false) {
+	const texts = full.texts.filter((t) => t.revision > base.node.revision);
+	// The body is replaced by the latest new revision that sets it, as bothqItem reads history, even when the new content is
+	// empty and leaves no body row; a Markdown change is a new legacy_snapshot.
+	const sets = full.revisions.filter((r) => r.revision > base.node.revision && (r.op === "legacy_snapshot" || (BODY_OPS.has(r.op) && "content" in (parse(r.snapshot) ?? {}))));
+	return { ...full, texts, revisions: full.revisions.filter((r) => r.revision > base.node.revision || (adoption && r.revision === base.node.revision)),
+		requests: full.requests.filter((r) => !base.requests.some((q) => q.request_id === r.request_id)),
+		...(sets.length ? { body_revision: Math.max(...sets.map((r) => r.revision)) } : {}) };
+}
+
+/** BothQ adopting a legacy record: the synthetic snapshot may be replaced, once, by an adoption with identical content. */
+const adoptionOf = (base, it) => base.revisions.length === 1 && base.revisions[0].op === "legacy_snapshot" && it.revisions[0]?.op === "legacy_adopted"
+	&& base.revisions[0].revision === it.revisions[0].revision && base.node.content_hash === it.revisions[0].content_hash;
+
+function refreshed(it, base) {
+	const same = (a, b) => canonicalJson(a) === canonicalJson(b);
+	const hold = (reason) => { throw Object.assign(new Error(reason), { code: reason }); };
+	if (it.id !== base.id) hold("history_rewritten");
+	if (it.route?.profile !== base.route.profile) hold("route_changed");
+	let adoption = false;
+	if (it.source === "bothq") {
+		adoption = adoptionOf(base, it);
+		if (base.revisions.some((r, i) => !(adoption && i === 0) && !same(r, it.revisions[i])) || base.requests.some((r) => !it.requests.some((q) => same(q, r)))) hold("history_rewritten");
+	} else {
+		if (base.node.attrs.source.sha256 === it.node.attrs.source.sha256) {
+			// Path aliases alone change provenance, retaining every earlier body and revision.
+			it = { ...base, node: { ...base.node, attrs: it.node.attrs }, route: it.route };
+		} else {
+			const revision = base.node.revision + 1;
+			it = { ...it, node: { ...it.node, revision, created_at: base.node.created_at },
+				texts: [...base.texts.map((t) => ({ ...t, live: false })), ...it.texts.map((t) => ({ ...t, revision }))],
+				revisions: [...base.revisions, ...it.revisions.map((r) => ({ ...r, revision, at: it.node.updated_at }))] };
+		}
+	}
+	const own = itemCommands(deltaItem(base, it, adoption), base);
+	return { ...own, record: { ...it, ...own, commands: undefined } };
+}
+
+function refreshCommands(it, base) {
+	try { return refreshed(it, base); }
+	catch (e) {
+		if (e.code !== "oversize_refresh" || it.source !== "bothq") throw e;
+		// Split on revision boundaries only. One body reset that cannot publish whole remains held.
+		const commands = [];
+		let current = structuredClone(base), prefix = structuredClone(base), pending = null;
+		// An allowed adoption goes in the first step, and every later prefix keeps it as history.
+		if (adoptionOf(base, it)) prefix.revisions[0] = structuredClone(it.revisions[0]);
+		const emit = () => { commands.push(...pending.commands); current = pending.record; prefix = structuredClone(current); pending = null; };
+		for (const rev of it.revisions.filter((r) => r.revision > base.node.revision)) {
+			let next = advancePrefix(prefix, it, rev);
+			next.requests = [...next.requests, ...it.requests.filter((q) => q.request_id === rev.request_id && !next.requests.some((r) => r.request_id === q.request_id))];
+			try { pending = refreshed(next, current); prefix = next; }
+			catch (error) {
+				if (error.code !== "oversize_refresh" || !pending) throw error;
+				emit();
+				next = advancePrefix(prefix, it, rev);
+				next.requests.push(...it.requests.filter((q) => q.request_id === rev.request_id && !next.requests.some((r) => r.request_id === q.request_id)));
+				pending = refreshed(next, current); prefix = next;
+			}
+		}
+		// The last step reaches the fresh export's top revision: it is compiled from the fresh record itself, so it carries the
+		// export's exact final provenance, requests and node metadata, and no metadata-only refresh follows it.
+		if (pending) {
+			let last = null;
+			try { last = refreshed(it, current); } catch (error) { if (error.code !== "oversize_refresh") throw error; }
+			if (last) { commands.push(...last.commands); return { ...last, commands }; }
+			emit();
+		}
+		const same = (a, b) => canonicalJson(a) === canonicalJson(b);
+		if (same(current.node, it.node) && same(current.requests, it.requests)) return { ...pending, record: current, commands };
+		const final = refreshed(it, current);
+		commands.push(...final.commands);
+		return { ...final, commands };
+	}
+}
+
 /**
  * `plan`: normalizes every exported record and file, routes it, holds what needs review, and writes the staged import
  * commands. Deterministic: the same export and rules give byte-identical commands. A part's id and hash depend only on its
  * record's content, so an unchanged record keeps its parts across plans and the server can replay them.
  */
-export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null } = {}) {
+export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null } = {}) {
 	// A rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
 	if (rehearsal !== null && rehearsal !== "test") throw new Error("a rehearsal goes to the test profile only");
+	if (rehearsal !== null && routes) throw new Error("a rehearsal ignores routing; reviewed routes apply to a routed plan only");
 	return withLock(async () => {
 		const manifest = readJson(path.join(exportDir, "manifest.json"), null);
 		if (!manifest) throw new Error(`no export manifest in ${exportDir}`);
 		checkExport(exportDir, manifest);
-		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version: PLAN_VERSION }));
+		if (refreshFrom && path.resolve(refreshFrom) === path.resolve(exportDir)) throw new Error("a refresh needs a fresh export directory");
+		const reviewed = routes ? readReviewedRoutes(routes, exportDir) : null;
+		const base = refreshFrom ? completedBase(refreshFrom, rehearsal) : null;
+		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version: PLAN_VERSION, ...(base ? { refresh_base: base.commands_sha256 } : {}),
+			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}) }));
 		const out = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan");
 		const statePath = path.join(migrationDir(), "state.json");
 		const state = readJson(statePath, { exports: [], plans: {} });
 		const prior = state.plans[inputSha];
-		if (!force && prior && readJson(path.join(out, "manifest.json"), null)?.commands_sha256 === prior.commands_sha256) return { status: "unchanged", dir: out, manifest: readJson(path.join(out, "manifest.json"), null) };
-		const items = [
-			...readJsonl(path.join(exportDir, "bothq", "records.jsonl")).map(bothqItem),
-			...readJsonl(path.join(exportDir, "markdown", "files.jsonl")).map((f) => markdownItem(f, rules)),
-		];
+		const last = readJson(path.join(out, "manifest.json"), null);
+		// Reviewed routes must be rechecked against current remotes and decoded paths.
+		if (!reviewed && !force && prior && last?.commands_sha256 === prior.commands_sha256 && last.input_sha256 === inputSha) return { status: "unchanged", dir: out, manifest: last };
+		if (reviewed) remotes.clear();
+		const bothqRows = readJsonl(path.join(exportDir, "bothq", "records.jsonl")), rows = [...bothqRows, ...readJsonl(path.join(exportDir, "markdown", "files.jsonl"))];
+		const items = rows.map((r, i) => (i < bothqRows.length ? bothqItem(r) : markdownItem(r, rules)));
+		if (reviewed) applyReviewed(items, rows, reviewed);
 		const review = [], holds = [];
+		const previous = new Map(base?.records.map((r) => [r.key, r]) ?? []), records = new Map(previous);
 		for (const it of items) {
 			if (rehearsal && it.id) it.route = { profile: rehearsal, rule: "rehearsal" };
 			if (!it.route && !it.review.includes("missing_scope")) it.review.push(it.source === "bothq" ? "unrouted_scope" : "unrouted_path");
@@ -516,34 +720,40 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		for (const group of bySha.values()) if (group.length > 1) for (const it of group) it.review.push("duplicate_content");
 		const commands = [];
 		const ready = items.filter((it) => it.route && !it.review.some((r) => r !== "duplicate_content"));
+		for (const old of previous.values()) {
+			const found = items.find((it) => it.key === old.key);
+			if (!found) review.push({ key: old.key, id: old.id, reasons: ["source_vanished"], planned: false });
+			else if (found.route?.profile !== old.route.profile || found.review.some((r) => r !== "duplicate_content")) found.review.push("route_changed");
+		}
 		for (const it of ready) {
-			let parts;
-			try { parts = pack([...it.texts.map((t) => ["texts", t]), ...it.revisions.map((x) => ["revisions", x]), ...it.requests.map((x) => ["requests", x])]); }
-			catch (e) { if (e.code !== "oversize_row") throw e; it.review.push("oversize_row"); continue; }
-			const profile = it.route.profile;
-			const recordSha = sha256(canonicalJson({ profile, node: it.node, parts: parts.map((p) => p.rows) }));
-			const staged = parts.map((p, i) => {
-				const body = { op: "stage", record_id: it.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost };
-				return { ...body, part_id: `${it.id}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
-			});
-			const fin = { op: "finalize", record_id: it.id, record_sha256: recordSha, profile, node: it.node, parts: staged.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
-				request_ids: it.requests.map((q) => q.request_id) };
-			const own = [...staged, { ...fin, sha256: sha256(canonicalJson(fin)) }];
-			// Every command must fit one upload request with its envelope, and its publish transaction the budget; a record that
-			// cannot is held, never trimmed.
-			const pub = publishCost(it.node);
-			if (own.some((c) => commandBytes(c) + ENVELOPE > BATCH.bytes) || pub.rows > BUDGET.rows || pub.bytes > BUDGET.bytes) { it.review.push("oversize_command"); continue; }
-			commands.push(...own);
-			it.planned = true;
+			if (it.review.some((r) => r !== "duplicate_content")) continue;
+			const old = previous.get(it.key);
+			try {
+				if (!old && [...previous.values()].some((r) => r.id === it.id)) { it.review.push("history_rewritten"); continue; }
+				const compiled = old ? refreshCommands(it, old) : itemCommands(it);
+				if (!old || canonicalJson(old.node) !== canonicalJson(compiled.record.node) || canonicalJson(old.revisions) !== canonicalJson(compiled.record.revisions) || canonicalJson(old.requests) !== canonicalJson(compiled.record.requests)) {
+					commands.push(...compiled.commands);
+					records.set(it.key, compiled.record ?? { ...it, ...compiled, commands: undefined });
+				}
+				it.planned = true;
+			} catch (e) {
+				if (!["oversize_row", "oversize_command", "oversize_refresh", "history_rewritten", "route_changed"].includes(e.code)) throw e;
+				it.review.push(e.code);
+			}
 		}
 		// A supersession is linked only inside one profile, to a record this plan publishes; the rest go to review.
-		const planned = new Map(ready.filter((x) => x.planned).map((x) => [x.id, x.route.profile]));
+		const planned = new Map([...records.values()].map((x) => [x.id, x.route.profile]));
 		for (const it of ready.filter((x) => x.planned)) {
+			// A link the base already made is not sent again; every record carries the links made so far to the next refresh.
+			const linked = new Set(previous.get(it.key)?.linked ?? []);
 			for (const dst of it.supersedes) {
+				if (linked.has(dst)) continue;
 				if (planned.get(dst) !== it.route.profile) { review.push({ key: it.key, id: it.id, reasons: ["link_endpoint_unresolved"], link: { rel: "supersedes", dst } }); continue; }
 				const link = { op: "link", src: it.id, rel: "supersedes", dst, basis: "identifier", profile: it.route.profile };
 				commands.push({ ...link, sha256: sha256(canonicalJson(link)) });
+				linked.add(dst);
 			}
+			records.get(it.key).linked = [...linked];
 		}
 		for (const it of items.filter((x) => x.review.length || !x.planned)) {
 			review.push({ key: it.key, source: it.source, id: it.id ?? null, name: it.node.name ?? null, reasons: [...new Set(it.review)], ...(it.route ? { proposed: it.route } : {}),
@@ -561,6 +771,9 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		privateDir(out);
 		writePrivate(path.join(out, "commands.jsonl"), commandsText);
 		writePrivate(path.join(out, "batches.jsonl"), jsonl(batches));
+		// The next refresh's base: every imported record's full state, without this run's review notes.
+		const recordsText = jsonl([...records.values()].map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== "review" && k !== "planned"))));
+		writePrivate(path.join(out, "records.jsonl"), recordsText);
 		writePrivate(path.join(out, "review.jsonl"), jsonl(review.sort((a, b) => a.key.localeCompare(b.key))));
 		fs.rmSync(path.join(out, "holds"), { recursive: true, force: true });
 		for (const h of holds) writePrivate(path.join(out, "holds", `${sha256(h.key).slice(0, 24)}.json`), JSON.stringify(h));
@@ -572,11 +785,13 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		const stages = commands.filter((c) => c.op === "stage");
 		const planManifest = {
 			version: PLAN_VERSION, input_sha256: inputSha, export_dir: tilde(exportDir), rules, rehearsal,
+			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size } } : {}),
 			items: items.length, planned: ready.filter((x) => x.planned).length, review: review.length, holds: holds.length, reasons, records_by_profile: byProfile,
 			commands: commands.length, stage: stages.length, finalize: count((c) => c.op === "finalize"), link: count((c) => c.op === "link"), batches: batches.length,
 			max_part: { rows: Math.max(0, ...stages.map((s) => s.cost.rows)), bytes: Math.max(0, ...stages.map((s) => s.cost.bytes)), json_bytes: Math.max(0, ...stages.map((s) => utf8(JSON.stringify(s)))) },
 			max_batch_bytes: Math.max(0, ...batches.map((b) => b.bytes)), budget: BUDGET, chunk: CHUNK,
 			commands_sha256: sha256(commandsText), batches_sha256: sha256(jsonl(batches)),
+			records_sha256: sha256(recordsText), ...(base ? { refresh_from: tilde(refreshFrom), refresh_base_sha256: base.commands_sha256, refresh_server: base.server } : {}),
 		};
 		writePrivate(path.join(out, "manifest.json"), JSON.stringify(planManifest, null, 2));
 		state.plans[inputSha] = { dir: tilde(out), commands_sha256: planManifest.commands_sha256 };
@@ -653,10 +868,10 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process
 	const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 	const run = {
 		export: async () => { const r = await exportAll({ ...DEFAULT_SOURCES, ...(opt("graph-db") ? { graphDb: opt("graph-db") } : {}), ...(opt("python") ? { python: opt("python") } : {}) }); print(r.manifest); },
-		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null }); print({ status: r.status, ...r.manifest }); },
+		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, routes: opt("routes") ?? null }); print({ status: r.status, ...r.manifest }); },
 		verify: async () => print(await verify({ exportDir })),
 		"dry-run": async () => print(dryRun({ exportDir, rehearsal: opt("rehearsal") ?? null })),
 	}[cmd];
-	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
+	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
 	run().catch((e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 }

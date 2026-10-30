@@ -1,4 +1,6 @@
 // Phase-1 reads: get (with revision-bound paging and history), recall channels, and the inventory listing.
+import { contentRows, VISIBLE } from "./compact";
+import { owned } from "./graph";
 import { normalizeName, normalizeScope } from "../domain/ids";
 import { Fail, type MemoryKind, type MemoryType, type RecallHit, type Step } from "../domain/types";
 import { captureText, findNode, readContent, relationships, type NodeRow, type Who } from "./write";
@@ -17,6 +19,12 @@ export function get(sql: SqlStorage, who: Who, q: { target: { memory_id?: string
 	const n = findNode(sql, q.target, !q.includeRetired);
 	const full = readContent(sql, n.id);
 	const page = contentPage(n, full, q.content);
+	// Current links whose source is readable here, as graph reads show them, each with its reason and evidence pointers.
+	const edges = owned(sql, sql.exec<{ id: number; src: string }>(`SELECT id, src, rel, other_label, dst AS to_id, dst_profile, basis, reason, valid_from, valid_to, recorded_at
+		FROM edges WHERE (src = ? OR dst = ?) AND ended_at IS NULL ORDER BY id`, n.id, n.id).toArray());
+	const evidence = new Map<string, { kind: string; ref: string; note: string | null }[]>();
+	for (const r of sql.exec<{ owner: string; kind: string; ref: string; note: string | null }>("SELECT owner, kind, ref, note FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) ORDER BY owner, kind, ref",
+		JSON.stringify([`n:${n.id}`, ...edges.map((e) => `e:${e.id}`)])).toArray()) (evidence.get(r.owner) ?? evidence.set(r.owner, []).get(r.owner)!).push({ kind: r.kind, ref: r.ref, note: r.note });
 	return {
 		ok: true, memory_id: n.id, profile: who.profile, kind: n.kind, name: n.name, type: n.memory_type, scope: n.scope, revision: n.revision,
 		description: n.description, content: page.content, why: n.why ?? "", how_to_apply: n.how_to_apply ?? "", objective: n.objective ?? "",
@@ -24,7 +32,8 @@ export function get(sql: SqlStorage, who: Who, q: { target: { memory_id?: string
 		steps: n.steps ? (JSON.parse(n.steps) as Step[]) : [],
 		embedding_status: n.embed_hash === n.card_hash ? "embedded" : "pending",
 		relationships: relationships(sql, n),
-		edges: sql.exec("SELECT id, src AS from_id, rel, dst AS to_id, dst_profile, basis, reason, recorded_at FROM edges WHERE (src = ? OR dst = ?) AND ended_at IS NULL ORDER BY id", n.id, n.id).toArray(),
+		evidence: evidence.get(`n:${n.id}`) ?? [],
+		edges: edges.map(({ id, src, ...e }) => ({ id, from_id: src, ...e, evidence: evidence.get(`e:${id}`) ?? [] })),
 		freshness: { created_at: n.created_at, updated_at: n.updated_at, valid_from: n.valid_from, valid_until: n.valid_to },
 		...(q.history ? history(sql, n, q.history) : {}),
 	};
@@ -108,7 +117,7 @@ export function lexicalChannels(sql: SqlStorage, q: RecallQuery, diagnostics: Re
 		try {
 			return dedupe(sql.exec<{ id: string; chunk: number }>(
 				`SELECT n.id, t.rowid AS chunk FROM ${table} JOIN texts t ON t.rowid = ${table}.rowid JOIN nodes n ON n.id = t.node_id
-				 WHERE ${table} MATCH ? AND ${f.where} ORDER BY ${table}.rank LIMIT 200`, match, ...f.params).toArray());
+				 WHERE ${table} MATCH ? AND ${VISIBLE} AND ${f.where} ORDER BY ${table}.rank LIMIT 200`, match, ...f.params).toArray());
 		} catch (e) {
 			diagnostics[table === "texts_tri" ? "literal" : "fulltext"] = `error:${(e as Error).message.slice(0, 80)}`;
 			return [];
@@ -155,16 +164,20 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, channels: Record
 		if (matched.get(id)!.has("literal")) s += n.norm_name === norm ? 2 : 1;
 		s *= ORIGIN_WEIGHT[n.origin] ?? 0.9;
 		return [{ n, s }];
-	}).sort((a, b) => b.s - a.s || a.n.name.toLowerCase().localeCompare(b.n.name.toLowerCase()) || a.n.id.localeCompare(b.n.id)).slice(0, q.limit);
-	return ranked.map(({ n, s }) => hit(sql, who, n, s, [...matched.get(n.id)!].sort(), q.keyword, chunk.get(n.id)));
+	}).sort((a, b) => b.s - a.s || a.n.name.toLowerCase().localeCompare(b.n.name.toLowerCase()) || a.n.id.localeCompare(b.n.id));
+	// Section 12: up to `limit` non-inferred preferences from below the cap travel with their true rank, so the Worker's
+	// stated-first order equals the uncapped one at both caps. Only their bodies are read beyond the capped hits.
+	const below = ranked.slice(q.limit).flatMap((x, i) => (x.n.kind === "preference" && x.n.origin !== "inferred" ? [{ ...x, rank: q.limit + i }] : [])).slice(0, q.limit);
+	return [...ranked.slice(0, q.limit), ...below].map((x: { n: NodeRow; s: number; rank?: number }) =>
+		({ ...hit(sql, who, x.n, x.s, [...matched.get(x.n.id)!].sort(), q.keyword, chunk.get(x.n.id)), ...(x.rank !== undefined ? { rank: x.rank } : {}) }));
 }
 
 export function hit(sql: SqlStorage, who: Who, n: NodeRow, score: number, matchedBy: string[], keyword: string, chunkRow?: number): RecallHit {
 	const chunkText = chunkRow !== undefined
-		? sql.exec<{ part: string; body: string }>("SELECT part, body FROM texts WHERE rowid = ?", chunkRow).toArray()[0]
+		? sql.exec<{ part: string; body: string }>(`SELECT t.part, t.body FROM texts t JOIN nodes n ON n.id = t.node_id WHERE t.rowid = ? AND ${VISIBLE}`, chunkRow).toArray()[0]
 		: undefined;
 	const body = chunkText && chunkText.part !== "head" ? chunkText.body
-		: sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part IN ('body','entry') AND live = 1 ORDER BY part = 'entry', seq_no, chunk LIMIT 1", n.id).toArray()[0]?.body ?? "";
+		: contentRows(sql, n.id).toArray()[0]?.body ?? "";
 	return {
 		memory_id: n.id, profile: who.profile, kind: n.kind, type: n.memory_type, name: n.name, scope: n.scope, origin: n.origin, status: n.status,
 		revision: n.revision, passage: passage([body, n.why ?? "", n.how_to_apply ?? "", n.objective ?? "", n.description, n.name], keyword),

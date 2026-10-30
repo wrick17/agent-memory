@@ -58,7 +58,7 @@ export const PROFILE_NAME = /^[a-z][a-z0-9-]{0,11}$/;
 
 export type ErrorCode = "not_found" | "ambiguous" | "revision_conflict" | "idempotency_mismatch" | "already_exists" | "validation"
 	| "protected" | "forbidden" | "route_required" | "me_requires_company_free" | "me_sensitive_term" | "size_budget"
-	| "moving" | "busy" | "unauthorized" | "unavailable";
+	| "moving" | "busy" | "unauthorized" | "unavailable" | "transfer_collision" | "profile_wiped" | "undo_redacted" | "lease_expired";
 
 export interface Failure { code: ErrorCode; message: string; details?: Record<string, unknown> }
 /** Errors are values. Thrown errors lose their fields across Durable Object RPC. */
@@ -103,8 +103,14 @@ export interface Step { order: number; action: string; success_criteria: string 
 export interface SaveArgs {
 	name?: string; memory_id?: string; type?: MemoryType; kind?: MemoryKind; description?: string; content?: string;
 	why?: string; how_to_apply?: string; objective?: string; steps?: Step[]; scope?: string; from_scope?: string;
-	new_name?: string; origin?: "stated" | "agent"; retire?: boolean; supersedes?: string | string[];
+	new_name?: string; retire?: boolean; supersedes?: string | string[];
 	expected_revision?: number; request_id?: string;
+	compact?: { through_seq: number; summary: string };
+	/** `inferred` is internal: only the maintenance batch's infer_preference sets it. MCP exposes `evidence`, never `inferred`. */
+	origin?: "stated" | "agent" | "inferred";
+	evidence?: { kind: (typeof EVIDENCE_KINDS)[number]; ref: string; note?: string }[];
+	/** Judgment links from the saved node to nodes of its profile, as record_knowledge edges with an implicit `from`. */
+	links?: Omit<NonNullable<KnowledgeArgs["edges"]>[number], "from">[];
 }
 export interface AppendArgs {
 	name?: string; memory_id?: string; type?: MemoryType; scope?: string; content: string; separator?: string;
@@ -127,10 +133,19 @@ export interface KnowledgeArgs {
 	request_id?: string;
 }
 
-export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs };
+/**
+ * One uploaded work item (section 10), already validated, redacted and stripped of personal fields by the Worker. `repo` is
+ * the GitHub namespace `Org/repo`; `request_id` is the item's natural id, so a repeat replays and a changed item is refused.
+ */
+export interface UploadArgs { item: "commit"; repo: string; sha: string; at: string; title: string; author?: string; request_id: string }
+
+export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs } | { op: "undo"; args: { activity_id: number; request_id: string } }
+	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs };
+/** The owner's dashboard actions on one node (section 15). */
+export interface OwnerArgs { action: "pin" | "unpin" | "forget" | "unflag"; memory_id: string; request_id?: string }
 
 export interface WriteContext {
-	actor: "agent" | "owner";
+	actor: "agent" | "owner" | "keep" | "index" | "maintenance";
 	deviceId?: string;
 	platform: string;
 	routedBy: string;
@@ -147,10 +162,25 @@ export interface Identity { memory_id?: string; name?: string; scope?: string; t
 
 export type ReadQuery =
 	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string } }
-	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number }
+	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number; expand: boolean }
 	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean }
 	| { kind: "has"; id: string }
-	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number };
+	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number }
+	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" }
+	| { kind: "batch_status" }
+	| { kind: "owner_model"; after: string | null; limit: number }
+	| ExploreQuery | TraceQuery | TimelineQuery | BoardQuery;
+
+// Graph reads (section 7), defined here so domain/ imports nothing from a store; src/profile/graph.ts takes the same shapes.
+type GraphRef = { id: string } | { key: string } | { name: string; kind?: NodeKind; scope?: string };
+export interface ExploreQuery { kind: "explore"; node: GraphRef; depth: number; rels?: (typeof RELATIONS)[number][]; asOf?: string; known: string[]; maxEdges: number }
+export type TraceQuery = { kind: "trace"; known: string[]; maxEdges: number; asOf?: string } & (
+	| { mode: "why"; from: GraphRef; maxDepth: number }
+	| { mode: "step"; ids: string[]; similarity: boolean }
+	| { mode: "detail"; nodes: string[]; edges: number[] });
+export interface TimelineQuery { kind: "timeline"; from: string; to: string; node?: GraphRef; kinds?: NodeKind[]; limit: number; known: string[] }
+/** work_board (section 13); src/profile/board.ts takes the same shape. The Worker supplies asOf. */
+export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[] }
 
 export interface RecallHit {
 	memory_id: string; profile: string; kind: string; type: string | null; name: string; scope: string; origin: string;
@@ -160,6 +190,10 @@ export interface RecallHit {
 	freshness: { created_at: string; updated_at: string; valid_from: string | null; valid_until: string | null };
 	/** Row position, used by the inventory cursor. */
 	row: number;
+	/** Set only on a non-inferred preference a profile returns from below its recall cap: its true position there. */
+	rank?: number;
+	/** Set when the graph channel found it: the strongest link from a seed. */
+	via?: { from: string; rel: string; basis: string; reason: string | null };
 }
 
 export interface RecallPage { hits: RecallHit[]; diagnostics: Record<string, string>; vectorUsed: boolean }

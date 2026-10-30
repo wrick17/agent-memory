@@ -4,6 +4,8 @@ import { z } from "zod";
 import { canonicalJson, sha256 } from "../domain/ids";
 import { redactText } from "../domain/redact";
 import { nextSeq } from "../storage";
+import { resolveMentionsAlone } from "./extract";
+import { sizeLevel } from "./housekeeping";
 import type { Who } from "./write";
 
 export const PART_MAX_BYTES = 8192;
@@ -111,6 +113,7 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 		out.push(storage.transactionSync(() => {
 			const prior = stored(sql, d.range_id, d.capture_status, d.part_id);
 			if (prior) return prior.sha256 === d.sha256 ? result("replayed") : result("refused", "hash_conflict");
+			if (sizeLevel(sql.databaseSize) === "shrink_only") return result("refused", "size_budget");
 			const seq = nextSeq(sql, "profile_meta");
 			const now = new Date().toISOString();
 			const node = sessionNode(sql, batch.session, seq, now);
@@ -139,6 +142,7 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 		out.push(storage.transactionSync(() => {
 			const prior = stored(sql, m.range_id, "consolidated", "manifest");
 			if (prior) return prior.sha256 === hash ? result("replayed") : result("refused", "hash_conflict");
+			if (sizeLevel(sql.databaseSize) === "shrink_only") return result("refused", "size_budget");
 			const rows = parts.map((p) => ({ p, row: stored(sql, m.range_id, "consolidated", p.part_id) }));
 			const missing = rows.find(({ p, row }) => !row || row.sha256 !== p.sha256);
 			if (missing) return result("refused", `part_missing:${missing.p.part_id}`);
@@ -159,6 +163,9 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 			return result("stored");
 		}));
 	}
+	// Mentions of this session written before it was uploaded link to it, in a budgeted transaction of their own; any still
+	// waiting resolve on the session's next upload.
+	resolveMentionsAlone(storage, sessionKey(batch.session), "upload");
 	return out;
 }
 

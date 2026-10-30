@@ -68,36 +68,46 @@ export function hook(client, input, { spawnRun = true } = {}) {
 
 // ---------- lock ----------
 
-const lockFile = () => path.join(home(), "run.lock");
+const lockDir = () => path.join(home(), "run.lock.d");
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const live = (entry) => { const pid = Number(/^owner\.(\d+)\./.exec(entry)?.[1]); return pid > 0 && alive(pid); };
+// Until this version first makes run.lock.d, a worker of the previous version may still hold its run.lock file.
+const legacyLive = () => {
+	if (fs.existsSync(lockDir())) return false;
+	const pid = readJson(path.join(home(), "run.lock"), null)?.pid;
+	return Number.isInteger(pid) && pid > 0 && alive(pid);
+};
 let ownLock = null;
 function lockHeld() {
-	const l = readJson(lockFile(), null);
-	return !!l && Number.isInteger(l.pid) && alive(l.pid);
+	try { if (fs.readdirSync(lockDir()).some(live)) return true; } catch { /* no lock yet */ }
+	return legacyLive();
 }
 /**
- * Exclusive ownership that never deletes a live worker's lock. The lock is created by hard link, which fails if it exists.
- * A lock whose process is dead is removed by exactly one worker: the one that creates that lock's reclaim marker.
+ * One owner: the lock is a directory with at most one entry, owner.<pid>.<nonce>. A private directory holding that entry is
+ * renamed onto run.lock.d, which succeeds only while run.lock.d is absent or empty. A dead owner's entry is removed by its
+ * unique name, so a reclaimer, even a late one, can only remove that dead entry, and one killed at any step blocks no one.
  */
 export function takeLock() {
 	fs.mkdirSync(home(), { recursive: true, mode: 0o700 });
-	const mine = JSON.stringify({ pid: process.pid, at: Date.now(), nonce: randomBytes(8).toString("hex") });
+	if (legacyLive()) return false;
+	const name = `owner.${process.pid}.${randomBytes(8).toString("hex")}`;
 	for (let i = 0; i < 3; i++) {
-		const tmp = `${lockFile()}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-		fs.writeFileSync(tmp, mine, { mode: 0o600 });
-		try { fs.linkSync(tmp, lockFile()); ownLock = mine; return true; } catch (e) { if (e.code !== "EEXIST") throw e; } finally { fs.rmSync(tmp, { force: true }); }
-		let held;
-		try { held = fs.readFileSync(lockFile(), "utf8"); } catch { continue; } // released meanwhile
-		let pid = null;
-		try { pid = JSON.parse(held).pid; } catch { /* unreadable: no live owner */ }
-		if (Number.isInteger(pid) && alive(pid)) return false;
-		try { fs.writeFileSync(`${lockFile()}.reclaimed-${sha(held).slice(0, 16)}`, "", { flag: "wx", mode: 0o600 }); } catch { return false; }
-		fs.rmSync(lockFile(), { force: true });
+		// shortcut: a worker killed before the rename leaves this small directory behind; sweep dead pids' ones if they pile up.
+		const tmp = `${lockDir()}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+		fs.mkdirSync(tmp, { mode: 0o700 });
+		fs.writeFileSync(path.join(tmp, name), "", { flag: "wx", mode: 0o600 });
+		try { fs.renameSync(tmp, lockDir()); ownLock = name; return true; } catch (e) {
+			fs.rmSync(tmp, { recursive: true, force: true });
+			if (e.code !== "ENOTEMPTY" && e.code !== "EEXIST") throw e;
+		}
+		const entries = fs.readdirSync(lockDir());
+		if (entries.some(live)) return false;
+		for (const e of entries) fs.rmSync(path.join(lockDir(), e), { force: true });
 	}
 	return false;
 }
 export const dropLock = () => {
-	try { if (fs.readFileSync(lockFile(), "utf8") === ownLock) fs.unlinkSync(lockFile()); } catch { /* gone */ }
+	if (ownLock) fs.rmSync(path.join(lockDir(), ownLock), { force: true });
 	ownLock = null;
 };
 
@@ -390,13 +400,14 @@ function keep(partsDir, partId, body) {
 /** The hosted API, or a spool when it cannot be reached. The spool holds digests and manifests only. */
 export function httpServer(config) {
 	const token = () => fs.readFileSync(config.token_file, "utf8").trim();
-	const post = async (p, body) => {
-		const res = await fetch(new URL(p, config.server), { method: "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+	const post = async (p, body, options = {}) => {
+		const res = await fetch(new URL(p, config.server), { method: "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" }, body: JSON.stringify(body), ...options });
 		if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
 		return res.json();
 	};
 	return {
 		ingest: (batch) => post("/v1/ingest", batch).then((r) => r.results),
+		work: (batch) => post("/v1/ingest", batch, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		state: (ids, repo) => post("/v1/capture", { range_ids: ids, ...(repo ? { repo } : {}) }).then((r) => r.ranges),
 	};
 }
@@ -575,6 +586,10 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
+		if (config.batch_profiles?.length) {
+			const { batch } = await import("./batch.mjs");
+			results.batch = await batch({ runner, config, clock });
+		}
 	} finally {
 		runner?.cleanup?.();
 	}
@@ -597,8 +612,7 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 
 // ---------- confined runtime (section 12) ----------
 
-// Section 12's config, adjusted to Codex 0.165.0 on 2026-10-28: it ignores \`tools.view_image\` (removed) and enables
-// browser_use, browser_use_external, computer_use and image_generation by default (switched off here).
+// Codex 0.165 ignores tools.view_image; disable its separate view_image feature as well as shell tools.
 export const CONFIG_TOML = `approval_policy = "never"
 default_permissions = "am_batch"
 web_search = "disabled"
@@ -606,6 +620,7 @@ project_doc_max_bytes = 0
 mcp_servers = {}
 [features]
 shell_tool = false
+view_image = false
 multi_agent = false
 apps = false
 plugins = false
@@ -665,8 +680,6 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	const configFile = path.join(codexHome, "config.toml");
 	fs.writeFileSync(configFile, CONFIG_TOML, { mode: 0o400 });
 	const configSha = sha(fs.readFileSync(configFile));
-	const schemaFile = path.join(codexHome, "part.schema.json");
-	fs.writeFileSync(schemaFile, JSON.stringify(PART_SCHEMA), { mode: 0o400 });
 	const auth = path.join(config.codex_home || path.join(os.homedir(), ".codex"), "auth.json");
 	if (!fs.existsSync(auth)) return fail("indeterminate", "codex_login_missing");
 	fs.symlinkSync(auth, path.join(codexHome, "auth.json"));
@@ -695,16 +708,34 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	}
 	if (sha(fs.readFileSync(configFile)) !== configSha) return fail("indeterminate", "config_changed");
 	const model = config.consolidation_model || "gpt-6-luna";
+	const execute = confinedExec({ exec, codex, runDir, env, configFile, configSha, schemaDir: codexHome });
 	return {
 		available: true, classification: "denied", cleanup,
+		exec: execute,
 		/** One subrange through `codex exec`: the text arrives on stdin; any tool item in the event stream discards the run. */
 		async run(sub) {
 			const prompt = `${PROMPT}\n<transcript>\n${sub.messages.map((m) => `@${m.pos} ${m.role}: ${m.text}`).join("\n")}\n</transcript>\n`;
-			const r = exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", "model_reasoning_effort=low", "--output-schema", schemaFile, "-"],
+			return execute({ prompt, schema: PART_SCHEMA, model, effort: "low" });
+		},
+	};
+}
+
+/** Same proved CODEX_HOME, config and cwd for captures and batch items. Check the config before and after every exec. */
+export function confinedExec({ exec, codex, runDir, env, configFile, configSha, schemaDir }) {
+	const unchanged = () => { try { return sha(fs.readFileSync(configFile)) === configSha; } catch { return false; } };
+	return async ({ prompt, schema, model, effort }) => {
+		if (!unchanged()) return { kind: "runtime_warning" };
+		const schemaFile = path.join(schemaDir, `output-${randomBytes(8).toString("hex")}.schema.json`);
+		try {
+			fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o400 });
+			const r = exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile, "-"],
 				{ cwd: runDir, env, input: prompt, encoding: "utf8", timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
+			if (!unchanged()) return { kind: "runtime_warning" };
+			// shortcut: recognize Codex 0.165's stderr-only router diagnostic; revisit when upgrading the CLI.
+			if (r.stderr?.includes("unsupported call:")) return { kind: "tool_event" };
 			if (r.error || r.status !== 0) return { kind: "runtime_error" };
 			return parseEvents(r.stdout);
-		},
+		} finally { fs.rmSync(schemaFile, { force: true }); }
 	};
 }
 
@@ -751,8 +782,11 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 	fs.mkdirSync(path.dirname(bin), { recursive: true, mode: 0o700 });
 	fs.copyFileSync(fileURLToPath(import.meta.url), bin);
 	fs.chmodSync(bin, 0o700);
+	// batch.mjs imports the CLI by its module name; the command alias keeps the existing hook path.
+	fs.copyFileSync(fileURLToPath(import.meta.url), `${bin}.mjs`);
+	fs.copyFileSync(new URL("./batch.mjs", import.meta.url), path.join(path.dirname(bin), "batch.mjs"));
 	const cfg = path.join(home(), "config.json");
-	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna" }, null, 2));
+	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna", batch_profiles: [], batch_luna_model: "gpt-6-luna", batch_terra_model: "gpt-6.1-terra" }, null, 2));
 	fs.mkdirSync(path.join(home(), "probe"), { recursive: true, mode: 0o700 });
 	return { bin, config: cfg, claude: { hooks: Object.fromEntries(["Stop", "SessionEnd", "SessionStart"].map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...(e === "Stop" ? { async: true } : {}) }] }]])) },
 		codex: ["Stop", "SessionEnd", "SessionStart"].map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${e === "Stop" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 10" : ""}`).join("\n\n") };

@@ -1,3 +1,4 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import type { Principal } from "../src/account/store";
 import type { Outcome } from "../src/domain/types";
@@ -36,3 +37,20 @@ export function devicePrincipal(token: string): Principal {
 
 export const journal = (c: ToolContext, name: string, profile = "personal") =>
 	call(c, "save_memory", { name, type: "project", kind: "journal", description: "test journal", profile });
+
+/** A fresh account whose profiles are active at new generations, so account checks pass until a test closes one or starts a recovery. */
+export async function registered(...names: string[]) {
+	const userId = `seam-${crypto.randomUUID().slice(0, 8)}`;
+	const refs = (names.length ? names : ["personal"]).map((profile) => ({ userId, profile, generation: crypto.randomUUID().slice(0, 8) }));
+	const account = <T,>(f: (sql: SqlStorage) => T) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)), (_i, s) => f(s.storage.sql));
+	await account((sql) => {
+		sql.exec("INSERT INTO account_meta (key, value) VALUES ('user_id', ?)", userId);
+		for (const r of refs) sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)",
+			r.profile, `${userId}:${r.profile}:${r.generation}`, r.generation, new Date().toISOString());
+	});
+	const of = (profile: string) => {
+		const who = refs.find((r) => r.profile === profile)!;
+		return { who, stub: env.PROFILE.get(env.PROFILE.idFromName(`${userId}:${profile}:${who.generation}`)) };
+	};
+	return { userId, account, of, ...of(refs[0]!.profile) };
+}

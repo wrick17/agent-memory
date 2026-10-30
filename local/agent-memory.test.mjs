@@ -2,8 +2,9 @@
 // follows the /v1/ingest contract (the real server contract is tested in test/capture.test.ts). Probe tests use the real
 // `codex sandbox` when it is installed on macOS.
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -338,7 +339,8 @@ describe("review regressions", () => {
 		assert.equal(r.status, "ran");
 		assert.equal(server.manifests.size, 1);
 		assert.deepEqual(fs.readdirSync(queueDir()), []);
-		assert.equal(fs.existsSync(path.join(am.home(), "run.lock")), false);
+		assert.ok(am.takeLock(), "the run released its lock");
+		am.dropLock();
 	});
 
 	it("L3: a trigger that arrives during a run is kept and handled, so the final correction is captured", async () => {
@@ -356,31 +358,85 @@ describe("review regressions", () => {
 		assert.deepEqual(fs.readdirSync(queueDir()), []);
 	});
 
-	it("L4: two workers reclaiming a dead worker's lock, each paused before it removes the lock, end with exactly one owner", async () => {
-		const { spawn: spawnChild, spawnSync: run } = await import("node:child_process");
-		const amUrl = new URL("./agent-memory.mjs", import.meta.url).href;
-		fs.mkdirSync(am.home(), { recursive: true });
-		const lock = path.join(am.home(), "run.lock");
-		const dead = run(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" }).stdout.trim();
-		fs.writeFileSync(lock, JSON.stringify({ pid: Number(dead), at: Date.now(), nonce: "dead" }));
-		// Each worker pauses whenever it is about to delete the lock file, until the test releases it, as in the review's repro.
-		const worker = (name) => spawnChild(process.execPath, ["--input-type=module", "-e", `
+	// L4 workers are child processes on the test home that call takeLock once and stay alive. A worker given `pause` stops
+	// before it removes any lock path (not its own temporary one) until release-<pause> exists, as in the review's repro.
+	const amUrl = new URL("./agent-memory.mjs", import.meta.url).href;
+	const lockWorker = (pause) => {
+		const k = spawn(process.execPath, ["--input-type=module", "-e", `
 			const fs = await import("node:fs");
-			const hold = (f) => { if (String(f) === ${JSON.stringify(lock)}) { console.log("paused"); while (!fs.existsSync(${JSON.stringify(path.join(am.home(), "release-"))} + ${JSON.stringify(name)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } };
+			const hold = (f) => { const p = String(f); if (${JSON.stringify(!!pause)} && p.startsWith(${JSON.stringify(path.join(am.home(), "run.lock"))}) && !p.endsWith(".tmp")) { console.log("paused"); while (!fs.existsSync(${JSON.stringify(path.join(am.home(), `release-${pause}`))})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } };
 			for (const k of ["unlinkSync", "rmSync"]) { const real = fs.default[k]; fs.default[k] = function (f, ...a) { hold(f); return real.call(this, f, ...a); }; }
 			const am = await import(${JSON.stringify(amUrl)});
 			console.log(am.takeLock() ? "won" : "lost"); setInterval(() => {}, 1000);`], { env: { ...process.env, AGENT_MEMORY_HOME: am.home() }, stdio: ["ignore", "pipe", "inherit"] });
-		const lines = (k) => { const out = []; k.stdout.on("data", (d) => out.push(...String(d).trim().split("\n"))); return out; };
-		const a = worker("a"), b = worker("b"), la = lines(a), lb = lines(b);
-		const settle = () => new Promise((r) => setTimeout(r, 400));
-		await settle();
+		k.out = [];
+		k.stdout.on("data", (d) => k.out.push(...String(d).trim().split("\n")));
+		return k;
+	};
+	const said = async (k, ...lines) => {
+		for (let i = 0; i < 400 && !lines.some((l) => k.out.includes(l)); i++) await new Promise((r) => setTimeout(r, 25));
+		assert.ok(lines.some((l) => k.out.includes(l)), JSON.stringify({ want: lines, got: k.out }));
+	};
+	const kill = async (k) => { if (k.exitCode === null && k.signalCode === null) { k.kill("SIGKILL"); await once(k, "exit"); } };
+	const deadOwner = async () => { const k = lockWorker(); await said(k, "won"); await kill(k); };
+	// A queued session whose text is kept pending (no runner yet), and the run that must capture it in full.
+	const pendingSession = async (name) => {
+		const f = transcript(name, [claudeLine("user", "Use the other timeout.")]);
+		const server = fakeServer();
+		await am.processSession(trigger("claude-code", `sess-${name}`, f), { server, runner: null });
+		enqueue(`sess-${name}`, f);
+		return { f, server };
+	};
+	const capturesAll = async ({ f, server }) => {
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		assert.equal(r.status, "ran");
+		assert.equal(Object.values(r.results)[0].consolidated_to, fs.statSync(f).size);
+		assert.deepEqual(fs.readdirSync(queueDir()), []);
+	};
+
+	it("L4: two workers reclaiming a dead worker's lock, each paused before it removes the lock, end with exactly one owner", async () => {
+		await deadOwner();
+		const a = lockWorker("a"), b = lockWorker("b");
+		for (const k of [a, b]) await said(k, "paused", "lost");
 		fs.writeFileSync(path.join(am.home(), "release-a"), "");
-		await settle();
+		await said(a, "won", "lost");
 		fs.writeFileSync(path.join(am.home(), "release-b"), "");
-		await settle();
-		a.kill(); b.kill();
-		const results = [...la, ...lb].filter((x) => x === "won" || x === "lost");
-		assert.deepEqual([results.length, results.filter((x) => x === "won").length], [2, 1], JSON.stringify({ a: la, b: lb }));
+		await said(b, "won", "lost");
+		assert.deepEqual([...a.out, ...b.out].filter((x) => x === "won" || x === "lost").sort(), ["lost", "won"]);
+		assert.equal(am.takeLock(), false, "the owner keeps its lock");
+		await kill(a); await kill(b);
+	});
+
+	it("L4: a reclaimer killed before it removes a dead worker's lock does not block later runs", async () => {
+		const s = await pendingSession("l4-crash");
+		await deadOwner();
+		const reclaimer = lockWorker("never");
+		await said(reclaimer, "paused");
+		await kill(reclaimer);
+		await capturesAll(s);
+	});
+
+	it("L4: a stopped live owner keeps the lock, and the trigger and pending text wait until it is killed", async () => {
+		const s = await pendingSession("l4-stopped");
+		const owner = lockWorker();
+		await said(owner, "won");
+		owner.kill("SIGSTOP");
+		assert.equal((await am.run({ server: s.server, runner: keepAllRunner(), debounceMs: 0 })).status, "locked");
+		assert.equal(fs.readdirSync(queueDir()).length, 1);
+		assert.equal(fs.readdirSync(path.join(am.home(), "pending")).length, 1);
+		await kill(owner);
+		await capturesAll(s);
+	});
+
+	it("L4 upgrade: a live run.lock of the previous version blocks, and a home it left stuck recovers on the first run", async () => {
+		const s = await pendingSession("l4-legacy");
+		const lock = path.join(am.home(), "run.lock");
+		fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now(), nonce: "live" }));
+		assert.equal(am.takeLock(), false);
+		// The stuck state: a dead worker's lock and the marker of a reclaimer killed before it removed that lock.
+		const held = JSON.stringify({ pid: Number(spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" }).stdout), at: Date.now(), nonce: "dead" });
+		fs.writeFileSync(lock, held);
+		fs.writeFileSync(`${lock}.reclaimed-${sha(held).slice(0, 16)}`, "");
+		await capturesAll(s);
 	});
 
 	it("L5: an append to a short transcript keeps the epoch and captures only the new tail", async () => {
@@ -444,5 +500,41 @@ describe("review regressions", () => {
 		assert.equal(am.parseEvents(ev({ type: "runtime.notice", message: "A confinement setting was ignored" }, final, { type: "turn.completed" })).kind, "runtime_warning");
 		assert.equal(am.parseEvents(ev({ type: "item.completed" }, final)).kind, "bad_events");
 		assert.equal(am.parseEvents(ev({ type: "thread.started" }, { type: "turn.started" }, final, { type: "turn.completed" })).kind, "ok");
+	});
+});
+
+
+describe("general confined executor", () => {
+	it("uses the proved config and environment for each requested schema and discards notices, tools, rejected calls and config drift", async () => {
+		const dir = fs.mkdtempSync(path.join(tmp, "executor-")), configFile = path.join(dir, "config.toml");
+		fs.writeFileSync(configFile, am.CONFIG_TOML);
+		const env = { CODEX_HOME: dir, HOME: dir, PATH: "/usr/bin:/bin" };
+		const { OPS_SCHEMA } = await import("./batch.mjs");
+		let calls = 0, mode = "ok";
+		const execute = am.confinedExec({ codex: "fake-codex", runDir: dir, env, configFile, configSha: sha(am.CONFIG_TOML), schemaDir: dir,
+			exec(command, args, options) {
+				calls++;
+				assert.equal(command, "fake-codex"); assert.equal(options.env, env); assert.equal(options.cwd, dir);
+				assert.equal(options.input, "private input");
+				assert.match(fs.readFileSync(configFile, "utf8").split("[features]\n")[1]?.split("\n[")[0] ?? "", /^view_image = false$/m);
+				assert.ok(args.includes("model_reasoning_effort=high"));
+				const schemaFile = args[args.indexOf("--output-schema") + 1];
+				assert.deepEqual(JSON.parse(fs.readFileSync(schemaFile)), OPS_SCHEMA);
+				assert.equal(fs.statSync(schemaFile).mode & 0o777, 0o400);
+				if (mode === "drift") fs.writeFileSync(configFile, "changed");
+				const item = mode === "tool" ? { type: "command_execution" } : mode === "notice" ? { type: "error" }
+					: { type: "agent_message", text: JSON.stringify({ results: [] }) };
+				return { status: mode === "unsupported_exit" ? 1 : 0, stdout: JSON.stringify({ type: "item.completed", item }),
+					stderr: mode.startsWith("unsupported") ? "WARN codex_core::tools::router: unsupported call: exec_command\n" : "Reading prompt from stdin...\n" };
+			} });
+		const args = { prompt: "private input", schema: OPS_SCHEMA, model: "fake-model", effort: "high" };
+		assert.deepEqual(await execute(args), { kind: "ok", part: { results: [] } });
+		mode = "tool"; assert.equal((await execute(args)).kind, "tool_event");
+		mode = "notice"; assert.equal((await execute(args)).kind, "runtime_warning");
+		mode = "unsupported"; assert.equal((await execute(args)).kind, "tool_event");
+		mode = "unsupported_exit"; assert.equal((await execute(args)).kind, "tool_event");
+		mode = "drift"; assert.equal((await execute(args)).kind, "runtime_warning");
+		assert.equal((await execute(args)).kind, "runtime_warning"); assert.equal(calls, 6, "changed config cannot start another exec");
+		assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith(".schema.json")).length, 0);
 	});
 });

@@ -1,15 +1,16 @@
 // Owner-only REST: protected-resource metadata, whoami, device tokens and the minimal Settings page (sections 8 and 15).
-import type { AccountCommand } from "./account/store";
+import type { AccountCommand, AccountContext } from "./account/store";
 import { authenticate, verifyJwt } from "./auth";
-import { canonicalJson, sha256 } from "./domain/ids";
+import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
 import { redactPayload } from "./domain/redact";
-import { MEMORY_KINDS, MEMORY_TYPES, SCOPES } from "./domain/types";
+import { MEMORY_KINDS, MEMORY_TYPES, ok, SCOPES, type OwnerArgs, type ProfileRef, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, profileStub } from "./mcp";
-import type { ImportStep } from "./profile/store";
+import { commitArgs, repoNamespace, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
 import { mayUse, routeWrite } from "./routing";
+import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
@@ -66,10 +67,21 @@ const ingestSchema = z.object({
 	manifests: z.array(z.object({ range_id: rangeId, parts: z.array(z.object({ part_id: z.string().max(64), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict()).min(1).max(512) }).strict()).max(16).default([]),
 }).strict();
 const stateSchema = z.object({ range_ids: z.array(rangeId).min(1).max(64), repo: ingestSchema.shape.repo, profile: ingestSchema.shape.profile }).strict();
+// Work uploads (section 10): a body naming commits or a marker. Strict and bounded: full SHAs, a GitHub login as author (never
+// an email), a title of at most 280 characters, and no field for diffs, paths or free text. Digests in the same body still need
+// their session. Bodies without these keys keep the capture schema above unchanged.
+const sha = z.string().regex(/^[0-9a-f]{40}$/i);
+const workSchema = ingestSchema.extend({
+	session: ingestSchema.shape.session.optional(),
+	commits: z.array(z.object({ sha, at: z.iso.datetime({ offset: true }), title: z.string().max(TITLE_MAX),
+		author: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$/).optional() }).strict()).max(50).default([]),
+	marker: z.object({ head: sha, as_of: z.iso.datetime({ offset: true }) }).strict().optional(),
+}).strict().refine((v) => v.session || (!v.digests.length && !v.manifests.length), { path: ["session"], message: "digests and manifests need a session" });
 
 /**
  * Capture upload and recovery for the job-scoped device token (scope `ingest`), routed like any write and never to `me`.
  * Only bounded digests and manifests are accepted: the strict body schema has no field for a raw transcript record, and every string is bounded.
+ * The same token uploads bounded work items (commits and the repo marker) through the work schema.
  */
 async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/capture"): Promise<Response> {
 	const auth = await authenticate(request, env, "resource", true);
@@ -78,17 +90,42 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot upload captures" } }, 403);
 	const raw = await body(request);
-	const parsed = (path === "/v1/ingest" ? ingestSchema : stateSchema).safeParse(raw);
+	const work = path === "/v1/ingest" && !!raw && ("commits" in raw || "marker" in raw);
+	const parsed = (path === "/v1/ingest" ? (work ? workSchema : ingestSchema) : stateSchema).safeParse(raw);
 	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
-	const input = parsed.data as z.infer<typeof stateSchema> & Partial<z.infer<typeof ingestSchema>>;
+	const input = parsed.data as z.infer<typeof stateSchema> & Partial<z.infer<typeof workSchema>>;
 	const route = routeWrite(ctx.value.caller, ctx.value.rules, ctx.value.known, { ...(input.profile ? { profile: input.profile } : {}), ...(input.repo ? { repo: input.repo } : {}) });
 	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
 	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "captures never go to me" } }, 403);
 	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile)!;
+	if (work) return workUpload(env, ctx.value, ref, route.value.routedBy, input);
 	const res = path === "/v1/ingest"
 		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [] })
 		: await profileStub(env, ref).captureState(ref, input.range_ids);
 	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
+}
+
+/**
+ * Work items: the namespace comes from the same remote that routed the body; GitHub only, so keys match extract.ts. New work
+ * names and handles guard me before the write, as record_knowledge's do. Capture digests in the body are stored first, unchanged.
+ */
+async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, routedBy: string, input: Partial<z.infer<typeof workSchema>>): Promise<Response> {
+	const repo = repoNamespace(input.repo?.remote ?? "");
+	if (!repo) return json({ error: { code: "validation", message: "commits and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
+	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [] }) : ok([]);
+	if (!results.ok) return json({ error: results.error }, 400);
+	if (input.marker && results.value.some((r) => r.status !== "stored" && r.status !== "replayed")) return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: [], marker: { status: "refused", reason: "capture_not_held" } });
+	const commits = (input.commits ?? []).map((c) => commitArgs(repo, c));
+	const terms = ref.profile === "work" ? uploadTerms(repo, commits) : [];
+	if (terms.length) {
+		const added = await accountStub(env, account.caller.userId).admin({ op: "addSensitiveTerms", terms });
+		if (!added.ok) return json({ error: added.error }, 400);
+	}
+	const res = await profileStub(env, ref).upload(ref, { repo, commits, ...(input.marker ? { marker: input.marker } : {}) },
+		{ platform: "upload", routedBy, userId: account.caller.userId, ...(account.caller.deviceId ? { deviceId: account.caller.deviceId } : {}) });
+	if (!res.ok) return json({ error: res.error }, 400);
+	
+	return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: res.value.commits, ...(res.value.marker ? { marker: res.value.marker } : {}) });
 }
 
 // ---------- staged import (section 16) ----------
@@ -112,12 +149,14 @@ const importNode = z.object({
 	valid_from: iso.nullable(), valid_to: iso.nullable(), created_at: iso.nullable(), updated_at: iso.nullable(), source_platform: z.string().max(256).nullable(),
 	updated_source_platform: z.string().max(256).nullable(), attrs: z.record(z.string(), z.unknown()),
 }).strict();
+const refreshStage = z.object({ no: z.number().int().min(1), base_record_sha256: hex64 }).strict();
+const refreshFinalize = refreshStage.extend({ base_revision: z.number().int().min(1), base_content_hash: hex64, body_revision: z.number().int().min(1).optional() }).strict();
 const importCommand = z.discriminatedUnion("op", [
 	z.object({ op: z.literal("stage"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), part: z.number().int().min(1), parts: z.number().int().min(1).max(1000),
 		rows: z.object({ texts: z.array(importText).max(1000), revisions: z.array(importRevision).max(1000), requests: z.array(importRequest).max(1000) }).strict(),
-		cost: z.object({ rows: z.number().int(), bytes: z.number().int() }).strict(), part_id: z.string().max(300), sha256: hex64 }).strict(),
+		cost: z.object({ rows: z.number().int(), bytes: z.number().int() }).strict(), part_id: z.string().max(300), sha256: hex64, refresh: refreshStage.optional() }).strict(),
 	z.object({ op: z.literal("finalize"), record_id: id, record_sha256: hex64, profile: z.string().regex(PROFILE_NAME), node: importNode,
-		parts: z.array(z.object({ part_id: z.string().max(300), sha256: hex64 }).strict()).min(1).max(1000), request_ids: z.array(z.string().min(1).max(256)).max(5000), sha256: hex64 }).strict(),
+		parts: z.array(z.object({ part_id: z.string().max(300), sha256: hex64 }).strict()).min(1).max(1000), request_ids: z.array(z.string().min(1).max(256)).max(5000), sha256: hex64, refresh: refreshFinalize.optional() }).strict(),
 	z.object({ op: z.literal("link"), src: id, rel: z.literal("supersedes"), dst: id, basis: z.literal("identifier"), profile: z.string().regex(PROFILE_NAME), sha256: hex64 }).strict(),
 ]);
 const importSchema = z.object({ import_id: z.string().max(128).optional(), batch: z.number().int().min(1).optional(), commands: z.array(importCommand).min(1).max(50) }).strict();
@@ -164,7 +203,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 		const { sha256: claimed, ...body } = c as ImportCommand & { part_id?: string };
 		const hashed = c.op === "stage" ? (({ part_id: _p, ...rest }) => rest)(body as typeof body & { part_id: string }) : body;
 		if (sha256(canonicalJson(hashed)) !== claimed) { refused("hash_mismatch", "the command does not match its sha256"); continue; }
-		if (c.op === "stage" && c.part_id !== `${c.record_id}:${c.record_sha256.slice(0, 16)}:${c.part}`) { refused("part_id", "the part id does not name this record and part"); continue; }
+		if (c.op === "stage" && c.part_id !== `${c.record_id}${c.refresh ? `#r${c.refresh.no}` : ""}:${c.record_sha256.slice(0, 16)}:${c.part}`) { refused("part_id", "the part id does not name this record and part"); continue; }
 		if (c.op === "finalize" && c.node.id !== c.record_id) { refused("node_id", "the node id must be the record id"); continue; }
 		// No automatic me: the import never writes to me.
 		if (c.profile === "me") { refused("me", "the import never writes to me"); continue; }
@@ -192,7 +231,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 				if (!r.ok) { refused(String(r.error.details?.reason ?? r.error.code), r.error.message); reserved = false; break; }
 			}
 			if (!reserved) continue;
-			const r = take(await step({ op: "stage", record_id: c.record_id, record_sha256: c.record_sha256, part: c.part, parts: c.parts, part_id: c.part_id, sha256: c.sha256, rows: c.rows }));
+			const r = take(await step({ op: "stage", record_id: c.record_id, record_sha256: c.record_sha256, part: c.part, parts: c.parts, part_id: c.part_id, sha256: c.sha256, rows: c.rows, ...(c.refresh ? { refresh: c.refresh } : {}) }));
 			if (r) receipts.push({ ...base, status: r.status, rows_written: r.rows_written ?? 0, bytes: r.bytes ?? 0 });
 			continue;
 		}
@@ -201,7 +240,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 			if (r) receipts.push({ ...base, status: r.status });
 			continue;
 		}
-		const fin = { record_id: c.record_id, record_sha256: c.record_sha256, node: c.node, parts: c.parts, request_ids: c.request_ids };
+		const fin = { record_id: c.record_id, record_sha256: c.record_sha256, node: c.node, parts: c.parts, request_ids: c.request_ids, ...(c.refresh ? { refresh: c.refresh } : {}) };
 		const prep = take(await step({ op: "prepare", ...fin }));
 		if (!prep) continue;
 		if (prep.status === "published") { receipts.push({ ...base, status: "replayed" }); continue; }
@@ -219,15 +258,53 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 	return json({ ...(input.import_id ? { import_id: input.import_id } : {}), ...(input.batch ? { batch: input.batch } : {}), receipts });
 }
 
+const boardQuery = z.object({ as_of: z.string().max(40).refine((s) => !Number.isNaN(Date.parse(s)), "must be an ISO date").optional(),
+	limit: z.coerce.number().int().min(1).max(200).optional() }).strict();
+const auditQuery = z.object({ profile: z.string().regex(PROFILE_NAME), after: z.string().min(1).max(300).optional(), limit: z.coerce.number().int().min(1).max(200).optional(),
+	record: id.optional(), rows: z.enum(["revisions", "requests"]).optional() }).strict();
+
+/**
+ * GET /v1/import/audit: read-only digests of what the import stored, for the owner or an import device that may use the
+ * profile (docs/import-integrity-design.md). It returns digests, counts and ids, never content, and changes nothing.
+ */
+async function importAudit(request: Request, env: Env): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	const caller = ctx.value.caller;
+	if (caller.kind !== "owner" && !caller.scopes.includes("import")) return json({ error: { code: "forbidden", message: "this token cannot audit imports" } }, 403);
+	const r = auditQuery.safeParse(Object.fromEntries(new URL(request.url).searchParams));
+	if (!r.success) return json({ error: { code: "validation", message: r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+	const { profile, after, record, rows } = r.data, limit = r.data.limit ?? 20;
+	if (!record !== !rows) return json({ error: { code: "validation", message: "record and rows go together" } }, 400);
+	if (rows === "revisions" && after !== undefined && !/^\d+$/.test(after)) return json({ error: { code: "validation", message: "after is a revision number for revision rows" } }, 400);
+	if (!record && limit > 50) return json({ error: { code: "validation", message: "a summary page holds at most 50 records" } }, 400);
+	if (profile === "me") return json({ error: { code: "validation", message: "the import never writes to me" } }, 400);
+	const ref = ctx.value.profiles.find((p) => p.profile === profile);
+	if (!ref) return json({ error: { code: "not_found", message: `profile '${profile}' is not active` } }, 404);
+	if (!mayUse(caller, profile)) return json({ error: { code: "forbidden", message: `this caller may not use profile '${profile}'` } }, 403);
+	const out = await profileStub(env, ref).read(ref, { kind: "import_audit", after: after ?? null, limit, ...(record ? { record, rows } : {}) });
+	return out.ok ? json({ profile, ...(out.value as Record<string, unknown>) }) : json({ error: out.error }, 400);
+}
+
 export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
 	if (url.pathname === "/v1/import" && request.method === "POST") return importBatch(request, env);
+	if (url.pathname === "/v1/import/audit" && request.method === "GET") return importAudit(request, env);
 	if (url.pathname === "/settings" && request.method === "GET") {
 		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}
 	if (url.pathname === "/settings.js" && request.method === "GET") {
 		return new Response(SETTINGS_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
+	}
+	// The dashboard shell and script are public, as /settings is; every data route below stays behind owner().
+	if (url.pathname === "/app" && request.method === "GET") {
+		return new Response(DASHBOARD_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
+	}
+	if (url.pathname === "/app.js" && request.method === "GET") {
+		return new Response(DASHBOARD_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
 	}
 	const auth = await owner(request, env);
 	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
@@ -253,7 +330,54 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			...(typeof b.default_profile === "string" ? { defaultProfile: b.default_profile } : {}),
 			...(typeof b.expires_at === "string" ? { expiresAt: b.expires_at } : {}) });
 	}
+	// The owner's node actions and undo (section 15): ordinary writes as actor owner, each with its activity row and undo.
+	const node = /^\/api\/profiles\/([^/]+)\/nodes\/([^/]{1,128})\/(pin|unpin|forget|unflag)$/.exec(url.pathname);
+	const undo = /^\/api\/profiles\/([^/]+)\/activity\/(\d{1,15})\/undo$/.exec(url.pathname);
+	if ((node || undo) && request.method === "POST") {
+		const name = (node ?? undo)![1]!;
+		const ref = PROFILE_NAME.test(name) ? ctx.value.profiles.find((p) => p.profile === name) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${name}' is not active` } }, 404);
+		const cmd: WriteCommand = node ? { op: "owner", args: { action: node[3] as OwnerArgs["action"], memory_id: decodeURIComponent(node[2]!) } }
+			: { op: "undo", args: { activity_id: Number(undo![2]), request_id: `undo:${undo![2]}` } };
+		const r = await profileStub(env, ref).write(ref, cmd, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: auth.principal.userId,
+			payloadHash: requestHash(cmd.op, cmd.args as unknown as Record<string, unknown>),
+			...(name === "me" ? { meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: ctx.value.sensitiveTerms } } : {}) });
+		return r.ok ? json(r.value) : json({ error: r.error }, r.error.code === "not_found" ? 404 : r.error.code === "revision_conflict" ? 409 : 400);
+	}
+	// The daily batch's last lease and last skip or park, for the dashboard's profile card (section 15).
+	const batch = /^\/api\/profiles\/([^/]+)\/batch$/.exec(url.pathname);
+	if (batch && request.method === "GET") {
+		const ref = PROFILE_NAME.test(batch[1]!) ? ctx.value.profiles.find((p) => p.profile === batch[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${batch[1]}' is not active` } }, 404);
+		const r = await profileStub(env, ref).read(ref, { kind: "batch_status" });
+		return r.ok ? json(r.value) : json({ error: r.error }, 400);
+	}
+	// The model of the owner for the About you page (section 15), read-only; pin, unpin, forget and unflag are the node actions above.
+	const model = /^\/api\/profiles\/([^/]+)\/owner-model$/.exec(url.pathname);
+	if (model && request.method === "GET") {
+		const ref = PROFILE_NAME.test(model[1]!) ? ctx.value.profiles.find((p) => p.profile === model[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${model[1]}' is not active` } }, 404);
+		const limit = url.searchParams.get("limit");
+		const r = await profileStub(env, ref).read(ref, { kind: "owner_model", after: url.searchParams.get("after"), limit: limit === null ? 50 : Number(limit) });
+		return r.ok ? json(r.value) : json({ error: r.error }, 400);
+	}
+	// One profile's work board, for the dashboard's work page (sections 13 and 15). It never follows a link into another profile.
+	const brd = /^\/api\/profiles\/([^/]+)\/board$/.exec(url.pathname);
+	if (brd && request.method === "GET") {
+		const ref = PROFILE_NAME.test(brd[1]!) ? ctx.value.profiles.find((p) => p.profile === brd[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${brd[1]}' is not active` } }, 404);
+		const q = boardQuery.safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200" } }, 400);
+		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known });
+		return r.ok ? json(r.value) : json({ error: r.error }, 400);
+	}
 	if (m && request.method === "POST" && m[2] === "revoke") return run({ op: "revokeDevice", id: m[1]! });
+	// Owner only, like every route here; the typed name must equal the profile (section 9, wipe).
+	const w = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/wipe$/.exec(url.pathname);
+	if (w && request.method === "POST") {
+		const b = await body(request);
+		return run({ op: "wipeProfile", profile: w[1]!, typed: typeof b?.typed === "string" ? b.typed : "" });
+	}
 	if (m && request.method === "POST" && m[2] === "default") {
 		const b = await body(request);
 		return run({ op: "setDeviceDefault", id: m[1]!, defaultProfile: typeof b?.default_profile === "string" ? b.default_profile : null });

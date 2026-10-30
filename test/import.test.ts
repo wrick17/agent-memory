@@ -8,6 +8,7 @@ import { pack, type Table } from "../src/domain/import-cost";
 import { legacyRequestHash } from "../src/domain/legacy";
 import { migrate } from "../src/storage";
 import { PROFILE_MIGRATIONS } from "../src/profile/schema";
+import { runWrite } from "../src/profile/write";
 import { ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import shapes from "./fixtures/import-part-shapes.json";
 import { call, contextFor, deviceToken, outcome } from "./helpers";
@@ -29,15 +30,16 @@ function node(id: string, over: Row = {}): Row {
 }
 
 /** Stage and finalize commands for one record, packed as the planner packs them (src/domain/import-cost.ts). */
-function commandsFor(profile: string, n: Row, rows: [Table, Row][]) {
+function commandsFor(profile: string, n: Row, rows: [Table, Row][], refresh?: { no: number; base_record_sha256: string; base_revision: number; base_content_hash: string; body_revision?: number }) {
 	const parts = pack(rows);
-	const recordSha = sha256(canonicalJson({ profile, node: n, parts: parts.map((p) => p.rows) }));
+	const recordSha = sha256(canonicalJson({ profile, node: n, ...(refresh ? { base_record_sha256: refresh.base_record_sha256, refresh: refresh.no } : {}), parts: parts.map((p) => p.rows) }));
 	const stages = parts.map((p, i) => {
-		const body = { op: "stage", record_id: n.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost };
-		return { ...body, part_id: `${n.id}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
+		const body = { op: "stage", record_id: n.id, record_sha256: recordSha, profile, part: i + 1, parts: parts.length, rows: p.rows, cost: p.cost,
+			...(refresh ? { refresh: { no: refresh.no, base_record_sha256: refresh.base_record_sha256 } } : {}) };
+		return { ...body, part_id: `${n.id}${refresh ? `#r${refresh.no}` : ""}:${recordSha.slice(0, 16)}:${i + 1}`, sha256: sha256(canonicalJson(body)) };
 	});
 	const fin = { op: "finalize", record_id: n.id, record_sha256: recordSha, profile, node: n, parts: stages.map((s) => ({ part_id: s.part_id, sha256: s.sha256 })),
-		request_ids: rows.filter(([t]) => t === "requests").map(([, q]) => q.request_id) };
+		request_ids: rows.filter(([t]) => t === "requests").map(([, q]) => q.request_id), ...(refresh ? { refresh } : {}) };
 	return { stages, finalize: { ...fin, sha256: sha256(canonicalJson(fin)) } };
 }
 const linkCommand = (src: string, dst: string, profile = "test") => { const l = { op: "link", src, rel: "supersedes", dst, basis: "identifier", profile }; return { ...l, sha256: sha256(canonicalJson(l)) }; };
@@ -65,19 +67,22 @@ const profileSql = async <T,>(profile: string, fn: (sql: SqlStorage) => T) => {
 };
 const accountSql = <T,>(fn: (sql: SqlStorage) => T) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, s) => fn(s.storage.sql));
 
-describe("schema v3", () => {
-	it("upgrades a v2 profile in place and keeps every revision and request", async () => {
+describe("profile schema v3 and v4", () => {
+	it("upgrades a v2 profile in place and keeps every revision, request and activity row", async () => {
 		const ref = (await contextFor()).account.profiles.find((p) => p.profile === "personal")!;
 		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:personal:${ref.generation}`)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Put this profile back into its deployed v2 shape, with v2 data, then run the migrations again.
+			for (const q of ["DROP TABLE import_refreshes", "DROP TRIGGER nodes_refresh_fence", "ALTER TABLE import_records DROP COLUMN published_revision", "ALTER TABLE import_records DROP COLUMN published_content_hash", "DROP TABLE archive", "DROP TABLE transfers", "DROP TABLE transfer_parts", "ALTER TABLE activity DROP COLUMN redacted"]) sql.exec(q);
 			for (const q of ["DROP TRIGGER nodes_import_fence", "DROP TABLE import_records", "DROP TABLE import_parts", "DROP INDEX requests_node", "ALTER TABLE requests DROP COLUMN completed_at", "ALTER TABLE requests DROP COLUMN source", "DROP TABLE revisions"]) sql.exec(q);
 			for (const q of PROFILE_MIGRATIONS[0]!.filter((x) => /\brevisions\b/.test(x))) sql.exec(q);
 			sql.exec("UPDATE profile_meta SET value = '2' WHERE key = 'schema_version'");
 			sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, request_id, actor, device_id, at, seq) VALUES ('n-v2', 1, 'saved', '{\"content\":\"kept\"}', 'r-v2', 'agent', 'd1', ?, 7)", AT);
 			sql.exec("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES ('r-v2', 'save_memory', 'h', '{\"ok\":true}', 'n-v2', ?, 7)", AT);
+			const act = Number(sql.exec("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'agent', 'saved', 'v2 row', '[\"n-v2\"]', 7) RETURNING id", AT).one().id);
 			migrate(s.storage, "profile_meta", PROFILE_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("3");
+			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("5");
+			expect(sql.exec("SELECT summary, redacted FROM activity WHERE id = ?", act).one()).toEqual({ summary: "v2 row", redacted: null });
 			expect(sql.exec("SELECT node_id, revision, op, snapshot, request_id, actor, device_id, at, seq, delta, revision_id FROM revisions WHERE node_id = 'n-v2'").toArray())
 				.toEqual([{ node_id: "n-v2", revision: 1, op: "saved", snapshot: '{"content":"kept"}', request_id: "r-v2", actor: "agent", device_id: "d1", at: AT, seq: 7, delta: null, revision_id: null }]);
 			expect(sql.exec("SELECT request_id, payload_hash, result, completed_at FROM requests WHERE request_id = 'r-v2'").one()).toEqual({ request_id: "r-v2", payload_hash: "h", result: '{"ok":true}', completed_at: null });
@@ -86,23 +91,34 @@ describe("schema v3", () => {
 			sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES ('n-v2', 2, 'appended', '{}', 'migration', ?, 8)", AT);
 			sql.exec("DELETE FROM revisions WHERE node_id = 'n-v2' AND revision = 2");
 			expect(sql.exec("SELECT count(*) AS n FROM deleted_rows WHERE tbl = 'revisions'").one().n).toBe(1);
+			// v4's exported tables keep tombstones; transfer parts are control state and keep none.
+			const arch = Number(sql.exec("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, 'texts', '{}', 8) RETURNING id", act, AT, AT).one().id);
+			sql.exec("INSERT INTO transfers (id, node_id, direction, peer, state, created_at, updated_at, seq) VALUES ('t1', 'n-v2', 'out', 'work', 'fenced', ?, ?, 8)", AT, AT);
+			sql.exec("INSERT INTO transfer_parts (transfer_id, n, payload, sha256) VALUES ('t1', 1, '{}', 's')");
+			for (const q of ["DELETE FROM archive", "DELETE FROM transfers", "DELETE FROM transfer_parts"]) sql.exec(q);
+			expect(sql.exec("SELECT tbl, pk FROM deleted_rows WHERE tbl IN ('archive', 'transfers', 'transfer_parts') ORDER BY tbl").toArray()).toEqual([{ tbl: "archive", pk: String(arch) }, { tbl: "transfers", pk: "t1" }]);
 		});
 	});
 });
 
-describe("account schema v2", () => {
+describe("account schema v2 to v4", () => {
 	it("upgrades a v1 account in place and keeps every modern binding as it was", async () => {
 		await contextFor();
 		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Back to the deployed v1 shape, with a v1 binding, then run the migrations again.
-			for (const q of ["ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
+			for (const q of ["DROP TABLE transfers", "DROP TABLE wipes", "ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
 			sql.exec("UPDATE account_meta SET value = '1' WHERE key = 'schema_version'");
 			sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq) VALUES ('v1-binding', 'personal', 'save_memory', 'hash-v1', ?, 1)", AT);
 			migrate(s.storage, "account_meta", ACCOUNT_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("2");
+			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("4");
 			expect(sql.exec("SELECT request_id, profile, op, payload_hash, at, seq, legacy, pending FROM request_index WHERE request_id = 'v1-binding'").one())
 				.toEqual({ request_id: "v1-binding", profile: "personal", op: "save_memory", payload_hash: "hash-v1", at: AT, seq: 1, legacy: 0, pending: 0 });
+			sql.exec("INSERT INTO wipes (profile, generations, wiped_at, node_count, marker_key, report, seq) VALUES ('test', '[]', ?, 0, 'k', '{}', 2)", AT);
+			sql.exec("INSERT INTO transfers (id, node_id, from_profile, to_profile, state, created_at, seq) VALUES ('t1', 'n1', 'test', 'personal', 'fenced', ?, 2)", AT);
+			expect(sql.exec("SELECT intent, retry_at FROM transfers WHERE id = 't1'").one()).toEqual({ intent: null, retry_at: null });
+			for (const q of ["DELETE FROM wipes", "DELETE FROM transfers"]) sql.exec(q);
+			expect(sql.exec("SELECT tbl, pk FROM deleted_rows WHERE tbl IN ('wipes', 'transfers') ORDER BY tbl").toArray()).toEqual([{ tbl: "transfers", pk: "t1" }, { tbl: "wipes", pk: JSON.stringify(["test", AT]) }]);
 		});
 	});
 });
@@ -335,3 +351,274 @@ describe("staged import", () => {
 	});
 });
 
+
+describe("import refresh", () => {
+	it("publishes an invisible delta atomically, replays retries and preserves BothQ requests and history", async () => {
+		const { token } = await deviceToken("refresh", ["import"], ["test"], "test");
+		const id = newMemoryId("test-user", "test", "personal", "project", "refresh"), j = journal(id, 2, (i) => `refresh-old-${i}`);
+		const n = node(id, { revision: 3, chars: j.content.length });
+		const base = commandsFor("test", n, j.rows);
+		expect((await send(token, [...base.stages, base.finalize])).data.receipts.at(-1)?.status).toBe("published");
+		const full = journal(id, 4, (i) => i < 2 ? `refresh-old-${i}` : `refresh-new-${i}`);
+		const delta = full.rows.filter(([t, r]) => t === "requests" ? !j.requests.some((q) => q.request_id === r.request_id) : Number(r.revision) > 3);
+		const next = commandsFor("test", { ...n, revision: 5, chars: full.content.length, content_hash: sha256(full.content) }, delta,
+			{ no: 1, base_record_sha256: base.finalize.record_sha256, base_revision: 3, base_content_hash: String(n.content_hash) });
+		for (const st of next.stages) expect((await send(token, [st])).data.receipts[0], "refresh stage").toMatchObject({ status: "stored" });
+		const ctx = await contextFor(), off = { ...ctx, env: { ...ctx.env, EMBEDDINGS: "off" } };
+		expect((await call<{ content: string }>(ctx, "get_memory", { memory_id: id, content: { complete: true }, history: { limit: 100 } })).content).toBe(j.content);
+		expect((await call<{ results: { memory_id: string }[] }>(off, "recall_memories", { keyword: "refresh-new", profile: "test" })).results.map((r) => r.memory_id)).not.toContain(id);
+		expect(await outcome(ctx, "append_memory", { memory_id: id, content: "refresh-new-2", separator: "\n", request_id: `${id}:r4` })).toMatchObject({ ok: false, error: { code: "busy" } });
+		const pub = (await send(token, [next.finalize])).data.receipts[0]!;
+		expect(pub).toMatchObject({ status: "published" });
+		expect(pub.rows_written).toBeLessThanOrEqual(1000);
+		expect((await send(token, [...next.stages, next.finalize])).data.receipts.map((r) => r.status)).toEqual([...next.stages.map(() => "replayed"), "replayed"]);
+		expect((await call<{ content: string; revision: number }>(ctx, "get_memory", { memory_id: id, content: { complete: true } }))).toMatchObject({ content: full.content, revision: 5 });
+		expect(await call(ctx, "append_memory", { memory_id: id, content: "refresh-new-2", separator: "\n", request_id: `${id}:r4` })).toMatchObject({ action: "replayed", revision: 4 });
+		await profileSql("test", (sql) => {
+			expect(sql.exec("SELECT count(*) AS n FROM revisions WHERE node_id = ?", id).one().n).toBe(5);
+			expect(sql.exec("SELECT card_hash FROM nodes WHERE id = ?", id).one().card_hash).toBeTypeOf("string");
+		});
+	});
+
+	it("holds a refresh after a hosted write without exposing staged rows or changing the hosted content", async () => {
+		const { token } = await deviceToken("refresh-conflict", ["import"], ["test"], "test");
+		const id = newMemoryId("test-user", "test", "personal", "project", "refresh-conflict"), j = journal(id, 0, () => ""), n = node(id, { chars: j.content.length });
+		const base = commandsFor("test", n, j.rows);
+		await send(token, [...base.stages, base.finalize]);
+		const ctx = await contextFor();
+		await call(ctx, "append_memory", { memory_id: id, content: "hosted writer", separator: "\n", request_id: `hosted-${id}` });
+		const next = commandsFor("test", { ...n, revision: 3 }, [["revisions", { revision: 3, op: "retired", snapshot: "{}", delta: null, request_id: null, at: AT, content_hash: null, revision_id: null, source_platform: null, source_platform_version: null }]],
+			{ no: 1, base_record_sha256: base.finalize.record_sha256, base_revision: 1, base_content_hash: String(n.content_hash) });
+		expect((await send(token, [...next.stages, next.finalize])).data.receipts.at(-1)).toMatchObject({ status: "refused", reason: "hosted_changed" });
+		expect((await call<{ content: string; revision: number }>(ctx, "get_memory", { memory_id: id, content: { complete: true } }))).toMatchObject({ content: "start\nhosted writer", revision: 2 });
+		// The hosted append keeps its delta as an entry, not a revision row; the held refresh's row stays under its shadow id.
+		await profileSql("test", (sql) => expect([id, `${id}#r1`].map((x) => sql.exec("SELECT count(*) AS n FROM revisions WHERE node_id = ?", x).one().n)).toEqual([1, 1]));
+	});
+});
+
+describe("shared write budget at its edge", () => {
+	it("charges the write's sequence row too: a write of exactly 1,001 real rows rolls back, one entry fewer commits", async () => {
+		const { token } = await deviceToken("budget-edge", ["import"], ["test"], "test");
+		const ref = (await contextFor()).account.profiles.find((p) => p.profile === "test")!;
+		let journals = 0;
+		/** An imported journal of `entries` live entries, replaced by a body of `chunks` text rows; every statement's real rows summed. */
+		const replace = async (entries: number, chunks: number) => {
+			const id = newMemoryId("test-user", "test", "personal", "project", `budget-edge-${++journals}`), j = journal(id, entries, (i) => `line ${i}`);
+			const base = commandsFor("test", node(id, { revision: entries + 1, chars: j.content.length }), j.rows);
+			for (const c of [...base.stages, base.finalize]) expect((await send(token, [c])).data.receipts[0]!.status).not.toBe("refused");
+			return runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, s) => {
+				let rows = 0, code = "ok";
+				const sql = { exec(query: string, ...params: SqlStorageValue[]) { const c = s.storage.sql.exec(query, ...params); rows += c.rowsWritten; return c; } };
+				try {
+					runWrite({ sql, transactionSync: s.storage.transactionSync.bind(s.storage) } as unknown as DurableObjectStorage, ref,
+						{ op: "save", args: { memory_id: id, content: "r".repeat(16_000 * (chunks - 1) + 1), request_id: `budget-edge-${journals}` } },
+						{ actor: "owner", platform: "test", routedBy: "explicit", payloadHash: sha256(`budget-edge-${journals}`), userId: ref.userId } as never);
+				} catch (e) { code = (e as { failure?: { code: string } }).failure?.code ?? String(e); }
+				return { code, rows, revision: Number(s.storage.sql.exec("SELECT revision FROM nodes WHERE id = ?", id).one().revision),
+					saved: Number(s.storage.sql.exec("SELECT count(*) AS n FROM requests WHERE request_id = ?", `budget-edge-${journals}`).one().n) };
+			});
+		};
+		// Each live entry that leaves costs 4 rows and each body text row 5 (measured), so one probe gives the fixed part, and
+		// some chunk count puts a write at exactly 1,001 real rows, one row past the bound, whatever the fixed part is.
+		const probe = await replace(200, 1);
+		expect(probe.code).toBe("ok");
+		const fixed = probe.rows - 4 * 200;
+		const chunks = [1, 2, 3, 4].find((k) => (1001 - fixed - 5 * (k - 1)) % 4 === 0)!;
+		const entries = (1001 - fixed - 5 * (chunks - 1)) / 4;
+		const over = await replace(entries, chunks), under = await replace(entries - 1, chunks);
+		expect(over).toMatchObject({ code: "size_budget", revision: entries + 1, saved: 0 });
+		expect(under).toMatchObject({ code: "ok", rows: 997, revision: entries + 1, saved: 1 }); // its own journal, one revision on
+	});
+});
+
+describe("import refresh, body replacement and adoption", () => {
+	const rev = (revision: number, op: string, extra: Row = {}): [Table, Row] => ["revisions", { revision, op, snapshot: "{}", delta: null, request_id: null, at: AT, content_hash: null,
+		revision_id: null, source_platform: null, source_platform_version: null, ...extra }];
+	it("replaces the body losslessly: earlier body and entries stay as history, the new body and later entries are current", async () => {
+		const { token } = await deviceToken("refresh-body", ["import"], ["test"], "test");
+		const id = newMemoryId("test-user", "test", "personal", "project", "refresh-body"), j = journal(id, 2, (i) => `body-old-${i}`);
+		const n = node(id, { revision: 3, chars: j.content.length });
+		const base = commandsFor("test", n, j.rows);
+		await send(token, [...base.stages, base.finalize]);
+		const delta: [Table, Row][] = [["texts", { part: "body", revision: 4, seq_no: 0, chunk: 0, body: "replaced body", created_at: AT, live: true }],
+			["texts", { part: "entry", revision: 5, seq_no: 3, chunk: 0, body: "after", separator: "\n", request_id: `${id}:r5`, created_at: AT, live: true }],
+			rev(4, "updated", { snapshot: canonicalJson({ content: "replaced body" }) }), rev(5, "appended", { delta: canonicalJson({ content: "after", separator: "\n" }), request_id: `${id}:r5` }),
+			["requests", { request_id: `${id}:r5`, legacy_op: "append", legacy_hash: sha256("r5"), result: canonicalJson({ ok: true, revision: 5 }), memory_id: id, at: AT, completed_at: AT }]];
+		const next = commandsFor("test", { ...n, revision: 5, chars: "replaced body\nafter".length, content_hash: sha256("replaced") }, delta,
+			{ no: 1, base_record_sha256: base.finalize.record_sha256, base_revision: 3, base_content_hash: String(n.content_hash), body_revision: 4 });
+		expect((await send(token, [...next.stages, next.finalize])).data.receipts.at(-1)).toMatchObject({ status: "published" });
+		const ctx = await contextFor(), off = { ...ctx, env: { ...ctx.env, EMBEDDINGS: "off" } };
+		expect(await call(ctx, "get_memory", { memory_id: id, content: { complete: true } })).toMatchObject({ content: "replaced body\nafter", revision: 5 });
+		expect((await call<{ results: { memory_id: string }[] }>(off, "recall_memories", { keyword: "body-old-1", profile: "test" })).results.map((r) => r.memory_id)).not.toContain(id);
+		await profileSql("test", (sql) => {
+			// Nothing was deleted: the first body and both earlier entries are still stored, no longer live.
+			expect(sql.exec("SELECT part, body FROM texts WHERE node_id = ? AND part IN ('body','entry') AND live = 0 ORDER BY part, seq_no", id).toArray().map((t) => t.body))
+				.toEqual(["start", "body-old-0", "body-old-1"]);
+			expect(sql.exec("SELECT count(*) AS n FROM revisions WHERE node_id = ?", id).one().n).toBe(5);
+		});
+	});
+
+	it("replaces the synthetic legacy snapshot with BothQ's identical adoption, and refuses an adoption with other content", async () => {
+		const { token } = await deviceToken("refresh-adopt", ["import"], ["test"], "test");
+		const hash = sha256("legacy content");
+		const make = (name: string) => {
+			const id = newMemoryId("test-user", "test", "personal", "project", name);
+			const n = node(id, { kind: "document", memory_type: "reference", name, revision: 1, chars: "legacy body".length, content_hash: hash });
+			const base = commandsFor("test", n, [["texts", { part: "body", revision: 1, seq_no: 0, chunk: 0, body: "legacy body", created_at: AT, live: true }],
+				rev(1, "legacy_snapshot", { content_hash: hash })]);
+			return { id, n, base };
+		};
+		const good = make("adopt-good"), bad = make("adopt-bad");
+		await send(token, [...good.base.stages, good.base.finalize, ...bad.base.stages, bad.base.finalize]);
+		const adoption = (r: ReturnType<typeof make>, adoptedHash: string) => commandsFor("test", { ...r.n, revision: 2, chars: "legacy body\nlater".length }, [
+			["texts", { part: "entry", revision: 2, seq_no: 1, chunk: 0, body: "later", separator: "\n", request_id: `${r.id}:r2`, created_at: AT, live: true }],
+			rev(1, "legacy_adopted", { snapshot: canonicalJson({ adopted: true }), content_hash: adoptedHash }), rev(2, "appended", { delta: canonicalJson({ content: "later", separator: "\n" }), request_id: `${r.id}:r2` }),
+			["requests", { request_id: `${r.id}:r2`, legacy_op: "append", legacy_hash: sha256("adopt-r2"), result: canonicalJson({ ok: true, revision: 2 }), memory_id: r.id, at: AT, completed_at: AT }]],
+			{ no: 1, base_record_sha256: r.base.finalize.record_sha256, base_revision: 1, base_content_hash: hash });
+		const ok = adoption(good, hash), wrong = adoption(bad, sha256("other content"));
+		expect((await send(token, [...ok.stages, ok.finalize])).data.receipts.at(-1)).toMatchObject({ status: "published" });
+		expect((await send(token, [...wrong.stages, wrong.finalize])).data.receipts.at(-1)).toMatchObject({ status: "refused", reason: "history_rewritten" });
+		await profileSql("test", (sql) => {
+			expect(sql.exec("SELECT revision, op FROM revisions WHERE node_id = ? ORDER BY revision", good.id).toArray()).toEqual([{ revision: 1, op: "legacy_adopted" }, { revision: 2, op: "appended" }]);
+			expect(sql.exec("SELECT revision, op FROM revisions WHERE node_id = ? ORDER BY revision", bad.id).toArray()).toEqual([{ revision: 1, op: "legacy_snapshot" }]);
+		});
+	});
+});
+
+describe("import audit", () => {
+	type Digest = { count: number; sha256: string; hosted: number };
+	type AuditRecord = { record_id: string; state: string; record_sha256: string; node_sha256: string | null;
+		node: { revision: number; row_sha256: string; attrs_sha256: string; source_sha256: string; source_system: string | null } | null; revisions: Digest; requests: Digest };
+	type Page = { totals?: unknown; records: AuditRecord[]; rows: Row[]; node_revision: number | null; next_after: string | null; error?: { code: string } };
+	const auditGet = async (token: string | null, q: Record<string, string | number>) => {
+		const url = new URL(`${origin}/v1/import/audit`);
+		for (const [k, v] of Object.entries(q)) url.searchParams.set(k, String(v));
+		const res = await exports.default.fetch(new Request(url, { headers: token ? { authorization: `Bearer ${token}` } : {} }));
+		return { status: res.status, data: await res.json() as Page };
+	};
+	// The audit's row and record digests, written out here from the fixture's definition, independent of the server's module.
+	const revRow = (r: Row) => ({ revision: r.revision, op: r.op, snapshot_raw_utf8_sha256: sha256(r.snapshot as string), delta_raw_utf8_sha256: r.delta === null ? null : sha256(r.delta as string),
+		request_id: r.request_id, at: r.at, content_hash: r.content_hash, revision_id: r.revision_id, source_platform: r.source_platform, source_platform_version: r.source_platform_version });
+	const reqRow = (q: Row) => ({ request_id: q.request_id, legacy_op: q.legacy_op, legacy_hash: q.legacy_hash, result_raw_utf8_sha256: sha256(q.result as string),
+		result_raw_utf8_bytes: new TextEncoder().encode(q.result as string).length, memory_id: q.memory_id ?? null, at: q.at, completed_at: q.completed_at,
+		source_canonical_sha256: sha256(canonicalJson({ ...(q.extra ? { extra: q.extra } : {}), memory_id: q.memory_id })) });
+	const expected = (cmds: ReturnType<typeof commandsFor>, rows: [Table, Row][]) => {
+		const n = cmds.finalize.node as Row & { attrs: Row & { source?: Row } };
+		const revs = rows.filter(([t]) => t === "revisions").map(([, r]) => revRow(r)).sort((a, b) => Number(a.revision) - Number(b.revision));
+		const reqs = rows.filter(([t]) => t === "requests").map(([, q]) => reqRow(q)).sort((a, b) => String(a.request_id) < String(b.request_id) ? -1 : 1);
+		return { revs, reqs, summary: { record_id: n.id, state: "published", record_sha256: cmds.finalize.record_sha256, node_sha256: sha256(canonicalJson(n)),
+			node: expect.objectContaining({ revision: n.revision, row_sha256: sha256(canonicalJson(n)), attrs_sha256: sha256(canonicalJson(n.attrs)), source_sha256: sha256(canonicalJson(n.attrs.source)) }),
+			revisions: { count: revs.length, sha256: sha256(canonicalJson(revs)), hosted: 0 }, requests: { count: reqs.length, sha256: sha256(canonicalJson(reqs)), hosted: 0 } } };
+	};
+
+	it("reports exactly what the import stored, byte for byte, in bounded pages, and changes nothing", async () => {
+		const c = await contextFor();
+		const { token } = await deviceToken("import-audit", ["import"], ["test"], "test");
+		const [jid, lid, sid] = ["fffffff1-0000-5000-8000-000000000001", "fffffff1-0000-5000-8000-000000000002", "fffffff1-0000-5000-8000-000000000003"];
+		const j = journal(jid, 3, (i) => `audit entry ${i} é日本語🙂`);
+		// A stored result that is not canonical JSON (spacing, key order, non-ASCII): it is hashed as stored, never reserialized.
+		j.rows.find(([t, r]) => t === "requests" && r.request_id === `${jid}:r2`)![1].result = '{"revision": 2,  "ok":true, "note":"é"}';
+		const jc = commandsFor("test", node(jid), j.rows);
+		const lrows: [Table, Row][] = [["texts", { part: "body", revision: 1, seq_no: 0, chunk: 0, body: "legacy body", created_at: AT, live: true }],
+			["revisions", { revision: 1, op: "legacy_snapshot", snapshot: canonicalJson({ name: "audit legacy note" }), delta: null, request_id: null, at: AT, content_hash: null, revision_id: null, source_platform: null, source_platform_version: null }]];
+		const lc = commandsFor("test", node(lid, { kind: "document", memory_type: "reference", name: "audit legacy note",
+			attrs: { validity: "unknown", source: { system: "claude", realpath: "/x/notes.md", paths: ["/x/notes.md", "/y/notes.md"] } } }), lrows);
+		const sc = commandsFor("test", node(sid, { name: "audit staged only" }), [["texts", { part: "body", revision: 1, seq_no: 0, chunk: 0, body: "staged", created_at: AT, live: true }]]);
+		// Storage is shared across this file's tests: totals are checked as deltas, and pages start past the other tests' ids.
+		type Totals = { records: Record<string, number>; revisions: number; requests: number };
+		const base = (await auditGet(token, { profile: "test", limit: 1 })).data.totals as Totals;
+		const ours = { profile: "test", after: "fffffff0" };
+		const sent = await send(token, [...jc.stages, jc.finalize, ...lc.stages, lc.finalize, ...sc.stages]);
+		expect(sent.data.receipts.every((x) => x.status === "stored" || x.status === "published")).toBe(true);
+		const [ej, el] = [expected(jc, j.rows), expected(lc, lrows)];
+		const state = async () => [await profileSql("test", (sql) => [...["nodes", "texts", "revisions", "requests", "import_records", "import_parts", "activity"].map((t) => sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
+			sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value]), await accountSql((sql) => sql.exec("SELECT count(*) AS n, sum(pending) AS p FROM request_index").one())];
+		const before = await state();
+
+		expect((await auditGet(token, { profile: "test", limit: 1 })).data.totals).toEqual({ records: { staging: base.records.staging! + 1, prepared: base.records.prepared, published: base.records.published! + 2 },
+			revisions: base.revisions + ej.summary.revisions.count + 1, requests: base.requests + ej.summary.requests.count });
+		const first = await auditGet(token, { ...ours, limit: 2 });
+		expect(first.status).toBe(200);
+		expect(first.data.records).toEqual([expect.objectContaining(ej.summary), expect.objectContaining(el.summary)]);
+		expect(first.data.records[1]!.node!.source_system).toBe("claude");
+		expect(first.data.next_after).toBe(lid);
+		const second = await auditGet(token, { profile: "test", limit: 2, after: lid });
+		expect(second.data.totals).toBeUndefined();
+		expect(second.data.records).toEqual([expect.objectContaining({ record_id: sid, state: "staging", node: null, node_sha256: null })]);
+		expect(second.data.next_after).toBeNull();
+		// Detail pages reassemble every request row, including the non-canonical result's exact UTF-8 byte count.
+		const rows: Row[] = [];
+		for (let after: string | null = null, i = 0; i < 10; i++) {
+			const page = await auditGet(token, { profile: "test", record: jid, rows: "requests", limit: 3, ...(after ? { after } : {}) });
+			expect(page.data.node_revision).toBe((jc.finalize.node as Row).revision);
+			rows.push(...page.data.rows);
+			if (!(after = page.data.next_after)) break;
+		}
+		expect(rows).toEqual(ej.reqs);
+		expect((await auditGet(token, { profile: "test", record: jid, rows: "revisions", limit: 200 })).data.rows).toEqual(ej.revs);
+		expect(await state()).toEqual(before);
+		// The audit took no binding: a BothQ request still replays its stored result.
+		expect(await call(c, "append_memory", { memory_id: jid, content: "audit entry 2 é日本語🙂", separator: "\n", request_id: `${jid}:r4`, profile: "test" })).toMatchObject({ action: "replayed", revision: 4 });
+
+		// A later hosted write shows as drift (its request, and the node revision; an append keeps its delta as an entry, not a
+		// revision row), and the imported digests stay as they were.
+		await call(c, "append_memory", { memory_id: jid, content: "hosted entry", request_id: "audit-hosted-1", profile: "test" });
+		const drifted = (await auditGet(token, { ...ours, limit: 1 })).data.records[0]!;
+		expect([drifted.node!.revision, drifted.revisions, drifted.requests]).toEqual([Number((jc.finalize.node as Row).revision) + 1, ej.summary.revisions, { ...ej.summary.requests, hosted: 1 }]);
+		// A stored node changed without a new revision: the row digest moves; the published node's hash and the attrs stay.
+		await profileSql("test", (sql) => sql.exec("UPDATE nodes SET status = 'retired' WHERE id = ?", lid));
+		const retired = (await auditGet(token, { ...ours, limit: 2 })).data.records[1]!;
+		expect([retired.node!.revision, retired.node_sha256, retired.node!.attrs_sha256, retired.node!.row_sha256 === sha256(canonicalJson(lc.finalize.node))])
+			.toEqual([1, el.summary.node_sha256, first.data.records[1]!.node!.attrs_sha256, false]);
+		// One changed stored byte shows on that record only, in the class it belongs to.
+		await profileSql("test", (sql) => {
+			sql.exec("UPDATE requests SET result = result || ' ' WHERE request_id = ?", `${jid}:r2`);
+			sql.exec("UPDATE nodes SET attrs = json_set(attrs, '$.validity', 'changed') WHERE id = ?", lid);
+		});
+		const [tj, tl] = (await auditGet(token, { ...ours, limit: 2 })).data.records;
+		expect([tj!.requests.sha256 === ej.summary.requests.sha256, tj!.revisions.sha256 === ej.summary.revisions.sha256]).toEqual([false, true]);
+		const lattrs = (lc.finalize.node as Row).attrs as Row;
+		expect([tl!.node!.attrs_sha256 === sha256(canonicalJson(lattrs)), tl!.node!.source_sha256 === sha256(canonicalJson(lattrs.source)), tl!.revisions]).toEqual([false, true, el.summary.revisions]);
+	});
+
+	it("hashes at most 5,000 rows for a summary page, and lists a larger record with counts only for its detail pages", async () => {
+		const { token } = await deviceToken("import-audit-b", ["import"], ["test"], "test");
+		const ids = ["fffffff2-0000-5000-8000-000000000001", "fffffff2-0000-5000-8000-000000000002", "fffffff2-0000-5000-8000-000000000003"];
+		await profileSql("test", (sql) => {
+			for (const [i, id] of ids.entries()) {
+				sql.exec("INSERT INTO import_records (record_id, record_sha256, parts, state, staged_at, seq) VALUES (?, ?, 1, 'staging', ?, 1)", id, "0".repeat(64), AT);
+				for (let r = 1; r <= (i < 2 ? 3000 : 5001); r++) sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, ?, 'appended', '{}', 'migration', ?, 1)", id, r, AT);
+			}
+		});
+		const pages: string[][] = [];
+		for (let after = "fffffff1-~", i = 0; after && i < 5; i++) {
+			const page = (await auditGet(token, { profile: "test", after, limit: 50 })).data;
+			pages.push(page.records.map((r) => `${r.record_id}:${r.revisions.count}:${r.revisions.sha256 === null ? "paged" : "hashed"}`));
+			after = page.next_after!;
+		}
+		expect(pages).toEqual([[`${ids[0]}:3000:hashed`], [`${ids[1]}:3000:hashed`, `${ids[2]}:5001:paged`]]);
+		// The paged record's rows are all on its detail pages, each at most 200 rows.
+		let rows = 0, calls = 0;
+		for (let after: string | null = null; calls < 40; calls++) {
+			const page: Page = (await auditGet(token, { profile: "test", record: ids[2]!, rows: "revisions", limit: 200, ...(after ? { after } : {}) })).data;
+			rows += page.rows.length;
+			if (!(after = page.next_after)) break;
+		}
+		expect([rows, calls + 1]).toEqual([5001, 26]);
+	});
+
+	it("is open only to the owner or an import device that may use the profile, and checks every parameter", async () => {
+		const { token } = await deviceToken("import-audit-a", ["import"], ["test"], "test");
+		const { token: reader } = await deviceToken("import-audit-r", ["read", "write"], ["test"], "test");
+		const { token: personalOnly } = await deviceToken("import-audit-p", ["import"], ["personal"], "personal");
+		expect((await auditGet(null, { profile: "test" })).status).toBe(401);
+		expect((await auditGet(reader, { profile: "test" })).status).toBe(403);
+		expect((await auditGet(personalOnly, { profile: "test" })).status).toBe(403);
+		expect((await auditGet(token, { profile: "me" })).status).toBe(400);
+		expect((await auditGet(token, { profile: "nosuch" })).status).toBe(404);
+		for (const q of <Record<string, string | number>[]>[{ profile: "test", sql: "SELECT 1" }, { profile: "test", limit: 51 }, { profile: "test", record: "x" }, { profile: "test", rows: "requests" }, { profile: "test", record: "x", rows: "texts" }, { profile: "test", record: "x", rows: "revisions", after: "abc" }]) {
+			expect((await auditGet(token, q)).status).toBe(400);
+		}
+		expect((await auditGet(token, { profile: "test", after: "ffffffff" })).data).toMatchObject({ profile: "test", records: [], next_after: null });
+	});
+});

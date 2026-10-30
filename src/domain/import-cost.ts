@@ -35,6 +35,13 @@ export function publishCost(node: Record<string, unknown>): { rows: number; byte
 	return { rows: 40 + headChunks * ROW_COST.live, bytes: utf8(JSON.stringify(node)) + 3 * utf8(head) + PART_OVERHEAD.bytes };
 }
 
+/** Re-key each staged row and its indexes; disabling old live rows also updates both full-text indexes. */
+export function refreshPublishCost(node: Record<string, unknown>, rows: { texts: Row[]; revisions: Row[]; requests: Row[] }, flips: Row[]): { rows: number; bytes: number } {
+	const base = publishCost(node);
+	return { rows: base.rows + rows.texts.length * 5 + rows.revisions.length * 4 + rows.requests.length * 5 + flips.length * 5 + 12,
+		bytes: base.bytes + 512 * (rows.texts.length + rows.revisions.length + rows.requests.length + flips.length) };
+}
+
 export interface Part { rows: { texts: Row[]; revisions: Row[]; requests: Row[] }; cost: { rows: number; bytes: number } }
 
 /** Rows into parts, in order, each within the budget with its overhead. Throws `oversize_row` for a row no part can hold. */

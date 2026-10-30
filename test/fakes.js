@@ -50,6 +50,9 @@ export class FakeVectors extends WorkerEntrypoint {
 		for (const it of items) vectors.set(it.id, { values: it.values, namespace: it.namespace, metadata: it.metadata });
 		return { mutationId: "fake" };
 	}
+	async getByIds(ids) {
+		return ids.filter((id) => vectors.has(id)).map((id) => ({ id, values: vectors.get(id).values, namespace: vectors.get(id).namespace, metadata: vectors.get(id).metadata }));
+	}
 	async deleteByIds(ids) {
 		for (const id of ids) vectors.delete(id);
 		return { mutationId: "fake" };

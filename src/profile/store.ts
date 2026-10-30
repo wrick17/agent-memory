@@ -1,38 +1,91 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type WriteCommand, type WriteContext } from "../domain/types";
+import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
 import { candidates, fuse, get, inventory, lexicalChannels } from "./read";
 import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
-import { runImport, type ImportResult, type ImportStep } from "./import";
+import { expandLinks, explore, timeline, trace } from "./graph";
+import { board } from "./board";
+import { similarStep } from "./similar";
+import { audit, runImport, type ImportResult, type ImportStep } from "./import";
+import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
+import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
+import { ownerModel } from "./owner-model";
 import { PROFILE_MIGRATIONS } from "./schema";
-import { runWrite, type Who } from "./write";
+import { runWrite, writeIds, type Who } from "./write";
+import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
+import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
+import { commitKey, putMarker } from "./work-upload";
+import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { APPEND_MAX, NOTE_MAX } from "./write";
 export type { ImportStep } from "./import";
+export type { OpOutcome } from "./maintenance";
+export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLink, type NodeRef, type NodeSummary } from "./graph";
+export { bundleTexts, type Entry, type TransferOut, type TransferStep } from "./transfer";
+export type { Page, PurgeResult, WipeOut, WipeStep } from "./wipe";
+export { commitArgs, repoNamespace, TITLE_MAX, uploadTerms } from "./work-upload";
+
+/** One work upload request: items already validated and normalized by the Worker, and the repo marker to move after them. */
+export interface WorkBatch { repo: string; commits: UploadArgs[]; marker?: { head: string; as_of: string } }
+export type WorkItemResult = { key: string; status: "stored" | "replayed" | "refused"; reason?: string };
+export type MarkerResult = ReturnType<typeof putMarker>;
+
+import { foldDue, foldStep } from "./compact";
+import { danglingPage, enqueueDangling } from "./dangling";
+import { ackRows, countRows, flushRows, nextUtcDay, pendingRows } from "./meter";
+export { ROW_PAUSE } from "./meter";
 
 const RETRY_MS = 60_000;
+/** The account or the local closed marker refused this generation during an alarm; `retry` when it was an account recovery. */
+class Stopped { constructor(readonly retry: boolean) {} }
 
 export class ProfileStore extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		void ctx.blockConcurrencyWhile(async () => migrate(ctx.storage, "profile_meta", PROFILE_MIGRATIONS));
+		void ctx.blockConcurrencyWhile(async () => { migrate(ctx.storage, "profile_meta", PROFILE_MIGRATIONS); countRows(ctx.storage); });
+	}
+
+	/** After a mutating entry point: the rows it wrote join the durable meter count (section 6). */
+	private metered<T>(value: T): T {
+		flushRows(this.ctx.storage);
+		return value;
 	}
 
 	/** Records which (user, profile, generation) this object is on first use, and refuses any other afterwards. */
-	private bind(who: Who): void {
+	/** readOnly: an object never bound yet stays untouched (it holds nothing to read). */
+	private bind(who: Who, readOnly = false, internal = false): void {
+		if (!internal) assertOpen(this.ctx.storage.sql);
 		const sql = this.ctx.storage.sql;
 		const meta = Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM profile_meta WHERE key IN ('user_id','profile','generation')").toArray().map((r) => [r.key, r.value]));
 		if (!meta.user_id) {
+			if (readOnly) return;
 			this.ctx.storage.transactionSync(() => {
 				for (const [k, v] of [["user_id", who.userId], ["profile", who.profile], ["generation", who.generation]]) sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, ?)", k, v);
 			});
 		} else if (meta.user_id !== who.userId || meta.profile !== who.profile || meta.generation !== who.generation) {
 			throw Fail.of("validation", "profile object identity mismatch");
 		}
+	}
+
+	private async access(who: Who, ids: string[] = []): Promise<void> {
+		assertOpen(this.ctx.storage.sql);
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "profileAccess">;
+		const r = await account.profileAccess(who, ids);
+		if (!r.ok) throw new Fail(r.error);
+		assertOpen(this.ctx.storage.sql);
+	}
+
+	/** A durable result names its nodes; those still active here are registered for this generation, then rechecked (B1). */
+	private async register(who: Who, ids: string[]): Promise<void> {
+		const held = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active'", JSON.stringify(ids)).toArray().map((n) => n.id);
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "recordNodes">;
+		await account.recordNodes(who.profile, held, who.generation);
+		await this.access(who, held);
 	}
 
 	private who(): Who | undefined {
@@ -46,9 +99,11 @@ export class ProfileStore extends DurableObject<Env> {
 	 */
 	async write(who: Who, cmd: WriteCommand, ctx: WriteContext): Promise<Outcome<Record<string, unknown> & { created: string[] }>> {
 		try {
+			await this.access(who, writeIds(who, cmd));
 			this.bind(who);
-			const out = runWrite(this.ctx.storage, who, cmd, ctx);
-			if (out.embedDue && embeddingsOn(this.env) && !(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now());
+			const out = this.metered(runWrite(this.ctx.storage, who, cmd, ctx));
+			if (((out.embedDue && embeddingsOn(this.env)) || foldDue(this.ctx.storage.sql)) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
+			else if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 60_000); // starts housekeeping
 			return ok({ ...out.result, created: out.created });
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -59,24 +114,29 @@ export class ProfileStore extends DurableObject<Env> {
 
 	/** The me guard's term table, written only by AccountStore before it confirms a term registration (section 5). */
 	async addGuardTerms(who: Who, terms: string[], source: string): Promise<Outcome<number>> {
-		this.bind(who);
-		if (who.profile !== "me") return { ok: false, error: { code: "validation", message: "guard terms live in the me profile" } };
-		const sql = this.ctx.storage.sql;
-		const at = new Date().toISOString();
-		this.ctx.storage.transactionSync(() => {
-			const seq = nextSeq(sql, "profile_meta");
-			for (const t of terms) sql.exec("INSERT OR IGNORE INTO guard_terms (term, source, added_at, seq) VALUES (?, ?, ?, ?)", t, source, at, seq);
-		});
-		return ok(terms.length);
+		try {
+			await this.access(who);
+			this.bind(who);
+			if (who.profile !== "me") return { ok: false, error: { code: "validation", message: "guard terms live in the me profile" } };
+			const sql = this.ctx.storage.sql;
+			const at = new Date().toISOString();
+			this.ctx.storage.transactionSync(() => {
+				const seq = nextSeq(sql, "profile_meta");
+				for (const t of terms) sql.exec("INSERT OR IGNORE INTO guard_terms (term, source, added_at, seq) VALUES (?, ?, ?, ?)", t, source, at, seq);
+			});
+			return ok(this.metered(terms.length));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
 	/** Capture digests and manifests (section 10). Never through the memory write path: digests are not memories. */
 	/** One step of the staged import (stage, prepare, publish, link), in one transaction. Publishing an active record schedules its embedding. */
 	async importStep(who: Who, step: ImportStep): Promise<Outcome<ImportResult>> {
 		try {
+			await this.access(who, step.op === "link" ? [step.src, step.dst] : [step.record_id]);
 			this.bind(who);
-			const out = runImport(this.ctx.storage, step);
-			if (out.embed && embeddingsOn(this.env) && !(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now());
+			if (sizeLevel(this.ctx.storage.sql.databaseSize) === "shrink_only") throw Fail.of("size_budget", "this profile is over 90% of its size limit; imports are paused");
+			const out = this.metered(runImport(this.ctx.storage, step));
+			if (out.embed && embeddingsOn(this.env) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
 			return ok(out);
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -84,19 +144,137 @@ export class ProfileStore extends DurableObject<Env> {
 		}
 	}
 
+	/** The maintenance job's lease and results (section 12): every op runs through runWrite as actor maintenance, with undo. */
+	async maintenance(who: Who, cmd: MaintenanceCmd, job: JobContext): Promise<Outcome<unknown>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			if (cmd.op === "next") return ok(this.metered(next(this.ctx.storage, cmd)));
+			if ("status" in cmd) return ok(this.metered(finishBatch(this.ctx.storage, cmd, job)));
+			// The wakeup is armed before an item can commit its outbox row, so a crash right after the commit is still settled.
+			if (cmd.results.some((r) => r.ops.some((o) => o.op === "infer_preference" || o.op === "promote_to_me"))) {
+				const due = Date.now() + RESUME_MS, at = await this.ctx.storage.getAlarm();
+				if (at === null || at > due) await this.ctx.storage.setAlarm(due);
+				await this.access(who);
+			}
+			const out = this.metered(complete(this.ctx.storage, who, cmd, job));
+			if (((out.embedDue && embeddingsOn(this.env)) || foldDue(this.ctx.storage.sql)) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
+			// Inferred preferences, fresh or replayed, are registered for this generation before any result is acknowledged.
+			const created = out.results.flatMap((r) => ("ops" in r && Array.isArray(r.ops) ? (r.ops as OpOutcome[]) : []).flatMap((o) => o.created ?? []));
+			if (created.length) try { await this.register(who, created); } catch (e) {
+				if (e instanceof Fail) throw e;
+				return { ok: false, error: { code: "unavailable", message: "created records are not registered yet; retry this completion" } };
+			}
+			return ok({ results: out.results });
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** One step of a transfer between profiles (section 9), in one transaction. */
+	async transfer(who: Who, step: TransferStep): Promise<Outcome<TransferOut>> {
+		try {
+			const ids = "nodeId" in step && step.nodeId ? [step.nodeId] : this.ctx.storage.sql.exec<{ node_id: string }>("SELECT node_id FROM transfers WHERE id = ?", step.id).toArray().map((t) => t.node_id);
+			await this.access(who, ids);
+			this.bind(who);
+			const out = await transferStep(this.ctx.storage, this.env, who, step);
+			await this.access(who, ids);
+			return this.metered(out);
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** One step of a profile wipe (section 9). clear deletes this object's storage, so it skips bind on a repeat. */
+	async purgeOrigin(who: Who, step: WipeStep): Promise<Outcome<WipeOut>> {
+		if (step.op !== "clear") this.bind(who, false, true);
+		return this.metered(await purgeOrigin(this.ctx.storage, this.env, who, step));
+	}
+
 	async ingest(who: Who, batch: IngestBatch): Promise<Outcome<ItemResult[]>> {
-		this.bind(who);
-		return ok(ingest(this.ctx.storage, who, batch));
+		try {
+			await this.access(who);
+			this.bind(who);
+			const out = this.metered(ingest(this.ctx.storage, who, batch));
+			if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
+			return ok(out);
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/**
+	 * Work uploads (section 10): each item in its own runWrite transaction as actor index, after the account's generation and
+	 * wipe-ledger check for its ids, so a refusal or failure leaves nothing behind and a retry starts clean. The repo marker moves
+	 * only when every item of the request is held.
+	 */
+	async upload(who: Who, batch: WorkBatch, ctx: Omit<WriteContext, "actor" | "payloadHash">): Promise<Outcome<{ commits: WorkItemResult[]; marker?: MarkerResult; created: string[] }>> {
+		if (who.profile === "me") return { ok: false, error: { code: "forbidden", message: "uploads never go to me" } };
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
+		const commits: WorkItemResult[] = [], created: string[] = [];
+		const refused = (key: string, e: unknown): WorkItemResult => {
+			if (e instanceof Fail) return { key, status: "refused", reason: e.failure.code };
+			if (e instanceof Error && e.message.includes("import_pending")) return { key, status: "refused", reason: "busy" };
+			throw e;
+		};
+		const register = (ids: string[]) => this.register(who, ids);
+		let embedDue = false;
+		for (const args of batch.commits) {
+			const key = commitKey(args.repo, args.sha);
+			const cmd = { op: "upload", args: { ...args, request_id: `upload:${who.profile}:${key}` } } as const;
+			const payloadHash = requestHash("upload_commit", { ...cmd.args });
+			let newBinding = false, committed = false;
+			try {
+				await this.access(who, writeIds(who, cmd));
+				const bound = await account.bindRequest({ requestId: cmd.args.request_id, profile: who.profile, op: "upload_commit", payloadHash, generation: who.generation });
+				if (!bound.ok) throw new Fail(bound.error);
+				newBinding = !bound.value.existing;
+				if (bound.value.profile !== who.profile) throw Fail.of("idempotency_mismatch", "upload belongs to another profile");
+				await this.access(who, writeIds(who, cmd));
+				this.bind(who);
+				const out = this.metered(runWrite(this.ctx.storage, who, cmd, { ...ctx, actor: "index", payloadHash }));
+				committed = true;
+				await register((out.result.node_ids ?? []) as string[]);
+				created.push(...out.created);
+				embedDue ||= out.embedDue;
+				commits.push({ key, status: out.result.action === "replayed" ? "replayed" : "stored" });
+			} catch (e) {
+				if (newBinding && !committed) await account.releaseRequest(cmd.args.request_id, payloadHash);
+				commits.push(refused(key, e));
+			}
+		}
+		let marker: MarkerResult | undefined;
+		if (batch.marker) {
+			if (commits.some((c) => c.status === "refused")) marker = { status: "refused", reason: "commits_not_held" };
+			else {
+				try {
+					await this.access(who);
+					this.bind(who);
+					// Marker-only included: a registration that failed after its upload committed completes before anything is acknowledged.
+					const head = this.ctx.storage.sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ? AND op = 'upload'", `upload:${who.profile}:${commitKey(batch.repo, batch.marker.head)}`).toArray()[0];
+					if (head) await register((JSON.parse(head.result) as { node_ids?: string[] }).node_ids ?? []);
+					marker = this.metered(putMarker(this.ctx.storage, batch.repo, batch.marker));
+				} catch (e) { const r = refused(batch.repo, e); marker = { status: "refused", ...(r.reason ? { reason: r.reason } : {}) }; }
+			}
+		}
+		if (commits.some((c) => c.status === "stored")) {
+			const alarm = await this.ctx.storage.getAlarm();
+			await this.access(who);
+			if (embedDue && embeddingsOn(this.env) && (alarm ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
+			else if (alarm === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
+		}
+		return ok({ commits, ...(marker ? { marker } : {}), created });
 	}
 
 	async captureState(who: Who, rangeIds: string[]): Promise<Outcome<ReturnType<typeof captureState>>> {
-		this.bind(who);
-		return ok(captureState(this.ctx.storage.sql, rangeIds));
+		try {
+			await this.access(who);
+			this.bind(who);
+			return ok(captureState(this.ctx.storage.sql, rangeIds));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
 	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
 		try {
-			this.bind(who);
+			await this.access(who);
+			this.bind(who, q.kind === "import_audit" || q.kind === "batch_status" || q.kind === "owner_model" || q.kind === "board");
 			const sql = this.ctx.storage.sql;
 			switch (q.kind) {
 				case "get":
@@ -106,9 +284,24 @@ export class ProfileStore extends DurableObject<Env> {
 				case "candidates":
 					return ok(candidates(sql, q));
 				case "has":
-					return ok(sql.exec("SELECT 1 FROM nodes WHERE id = ?", q.id).toArray().length > 0);
+					// Ownership probe: a record still landing or a tombstone left behind never claims the id.
+					return ok(sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status IN ('active','retired','superseded','moving','candidate','dismissed')", q.id).toArray().length > 0);
 				case "recall":
 					return ok(await this.recall(who, q));
+				case "import_audit":
+					return ok(audit(sql, q));
+				case "explore":
+					return ok(explore(sql, q));
+				case "trace":
+					return ok(trace(sql, q));
+				case "timeline":
+					return ok(timeline(sql, q));
+				case "board":
+					return ok(board(sql, q));
+				case "batch_status":
+					return ok(batchStatus(sql));
+				case "owner_model":
+					return ok(ownerModel(sql, q));
 			}
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -164,21 +357,164 @@ export class ProfileStore extends DurableObject<Env> {
 				diagnostics.vector = ids.length ? `hits:${ids.length}` : "no_results";
 			}
 		}
-		return { hits: fuse(this.ctx.storage.sql, who, q, filterVector(this.ctx.storage.sql, q, channels)), diagnostics, vectorUsed };
+		await this.access(who);
+		const sql = this.ctx.storage.sql;
+		const filtered = filterVector(sql, q, channels);
+		let hits = fuse(sql, who, q, filtered);
+		if (q.expand && hits.length) {
+			// The graph channel (section 11): one hop from the top 10, inside this profile, under the same filters.
+			// Seeds are the capped hits only; preferences from below the cap never widen the graph walk.
+			const g = expandLinks(sql, hits.filter((h) => h.rank === undefined).map((h) => ({ id: h.memory_id, score: h.score })));
+			const allowed = g.neighbors.length ? lexicalFilterIds(sql, q, g.neighbors.map((n) => n.id)) : new Set<string>();
+			const graph = g.neighbors.filter((n) => allowed.has(n.id));
+			diagnostics.graph = graph.length ? `hits:${graph.length}` : "no_results";
+			if (g.budget.exhausted) diagnostics.graph_budget = `stopped:${g.budget.stopped}:${g.budget.edges_read}`;
+			if (graph.length) {
+				const via = new Map(graph.map((n) => [n.id, n.via]));
+				hits = fuse(sql, who, q, { ...filtered, graph: graph.map((n) => ({ id: n.id })) }).map((h) => (via.has(h.memory_id) ? { ...h, via: via.get(h.memory_id)! } : h));
+			}
+		}
+		return { hits, diagnostics, vectorUsed };
 	}
 
 	async alarm(): Promise<void> {
 		const who = this.who();
 		if (!who) return;
+		if (this.ctx.storage.sql.exec("SELECT 1 FROM profile_meta WHERE key = 'closed'").toArray().length) return;
+		// Any await may outlive this generation or meet an account recovery, so every local write after one passes this gate first.
+		// A refusal ends the alarm with nothing more written; only a recovery, which ends, brings it back.
+		const gate = async () => {
+			try { await this.access(who); } catch (e) { throw e instanceof Fail ? new Stopped(e.failure.code === "busy") : e; }
+		};
+		const failed = async (stage: string, e: unknown) => {
+			if (e instanceof Stopped) throw e;
+			await gate();
+			this.stage(stage, (e as Error).message.slice(0, 500));
+		};
 		try {
+			await gate();
 			const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "meter">;
-			const more = await embedStep(this.ctx.storage, this.env, who, async (neurons) => (await account.meter({ day: new Date().toISOString().slice(0, 10), neurons })).embed);
-			if (more) await this.ctx.storage.setAlarm(Date.now() + 1_000);
-			this.stage("embed", null);
+			const sql = this.ctx.storage.sql, day = new Date().toISOString().slice(0, 10), midnight = nextUtcDay(Date.now());
+			// The row meter (section 6), once per step: the flushed count goes to the account, which says whether background stages
+			// may run today. A failed report fails open and keeps its count; only an acknowledged count is taken off, after the gate.
+			let reported = 0;
+			let background = true, meterError: string | null = null;
+			try { reported = pendingRows(sql); background = (await account.meter({ day, rowsWritten: reported })).background; } catch (e) { meterError = (e as Error).message.slice(0, 500); }
+			await gate();
+			let more = false, embedError: string | null = null;
+			// An embedding outage must not stop retention, cleanup or queue work; the gate below still stops a closed generation.
+			try {
+				more = await embedStep(this.ctx.storage, this.env, who, async (neurons) => (await account.meter({ day: new Date().toISOString().slice(0, 10), neurons })).embed, gate);
+			} catch (e) {
+				if (e instanceof Stopped) throw e;
+				embedError = (e as Error).message.slice(0, 500);
+			}
+			await gate();
+			if (meterError === null) try { ackRows(sql, reported); } catch (e) { meterError = (e as Error).message.slice(0, 500); }
+			if (meterError !== null) this.stage("meter", meterError);
+			this.stage("embed", embedError);
+			// Past the day's rows only similarity, the dangling check and housekeeping wait, until 00:00 UTC.
+			const paused = meterError === null && !background;
+			let folding = false;
+			try { folding = foldStep(this.ctx.storage).more; } catch (e) { await failed("fold", e); folding = true; }
+			let next: number | null = null;
+			if (paused) next = embeddingsOn(this.env) ? midnight : null;
+			else try {
+				next = await similarStep(this.ctx.storage, this.env, who, Date.now(), gate);
+				this.stage("similar", null);
+			} catch (e) {
+				await failed("similar", e);
+				next = Date.now() + RETRY_MS;
+			}
+			// Unfinished transfers this profile is the source of, after five minutes, from the step they reached (section 9).
+			const stale = dueTransfers(this.ctx.storage.sql);
+			if (stale.length) {
+				const ctx = await (account as unknown as Pick<import("../account/store").AccountStore, "context">).context({ kind: "owner", userId: who.userId });
+				for (const id of stale) await resumeTransfer(transferPorts(this.env, who.userId), id, ctx.ok ? ctx.value.sensitiveTerms : []);
+			}
+			// Finished maintenance items whose caller never saw or acted on the result: register, then promote or abort (section 12).
+			try {
+				const boxes = dueOutbox(this.ctx.storage.sql, Date.now());
+				const ctx = boxes.some((b) => b.box.promote.length) ? await (account as unknown as Pick<import("../account/store").AccountStore, "context">).context({ kind: "owner", userId: who.userId }) : null;
+				if (ctx && !ctx.ok) throw new Error(`account context: ${ctx.error.code}`);
+				for (const b of boxes) await this.settle(who, b.stage, b.box, ctx?.value.sensitiveTerms ?? [], gate);
+				await gate();
+				this.stage("outbox", null);
+			} catch (e) { await failed("outbox", e); }
+			const moves = nextTransferAlarm(this.ctx.storage.sql);
+			await gate();
+			// Housekeeping (section 12): one bounded step per alarm, of the most overdue of dedupe, TTL and purge.
+			let due = Date.now() + 86_400_000;
+			try {
+				const clean = () => cleanupPurge(this.ctx.storage, async (ids) => {
+					if (ids.nodes.length && this.env.VECTORS) await this.env.VECTORS.deleteByIds(ids.nodes.map((id) => vectorId(who, id)));
+					const pruned = await (this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "prunePurged">).prunePurged(who, ids);
+					if (!pruned.ok) throw new Fail(pruned.error);
+					// The outbox is acknowledged only while this generation is still open.
+					await gate();
+				});
+				await clean();
+				// The purge outbox never waits; housekeeping itself does while paused, unless the object's size is under pressure.
+				if (paused && sizeLevel(sql.databaseSize) === "ok") due = midnight;
+				else {
+					const h = housekeep(this.ctx.storage, who);
+					await clean();
+					due = h.more ? Date.now() : h.nextDue;
+					this.stage("housekeeping", null);
+				}
+			} catch (e) {
+				await failed("housekeeping", e);
+				due = Date.now() + RETRY_MS;
+			}
+			let dangling = midnight;
+			if (!paused) try { dangling = await this.dangling(who, gate); } catch (e) { await failed("dangling", e); dangling = Date.now() + RETRY_MS; }
+			await gate();
+			flushRows(this.ctx.storage);
+			// The alarm always comes back for the earliest stage due, so housekeeping runs with or without embeddings.
+			await this.ctx.storage.setAlarm(Math.max(Math.min(more ? Date.now() : embedError === null && meterError === null ? Infinity : Date.now() + RETRY_MS, next ?? Infinity, moves ?? Infinity, nextOutbox(this.ctx.storage.sql) ?? Infinity, (folding || foldDue(this.ctx.storage.sql)) ? Date.now() : Infinity, due, dangling), Date.now() + 1_000));
 		} catch (e) {
-			this.stage("embed", (e as Error).message.slice(0, 500));
+			const stop = e instanceof Stopped ? e : await gate().then(() => null, (s: unknown) => (s instanceof Stopped ? s : null));
+			if (stop && !stop.retry) return;
+			if (!stop) { this.stage("embed", (e as Error).message.slice(0, 500)); flushRows(this.ctx.storage); }
 			await this.ctx.storage.setAlarm(Date.now() + RETRY_MS);
 		}
+	}
+
+	/**
+	 * One page of the nightly dangling-link check (section 12): the account's answer for the page's foreign and locally absent
+	 * targets, then the gate, then one bounded transaction that rechecks, queues and moves the cursor. Returns when it is next due.
+	 */
+	private async dangling(who: Who, gate: () => Promise<void>): Promise<number> {
+		const page = danglingPage(this.ctx.storage.sql, Date.now());
+		if (page.due > Date.now()) return page.due;
+		const ids = [...new Set(page.edges.map((e) => e.dst))];
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "nodeStates">;
+		const states = ids.length ? await account.nodeStates(who, ids) : ok([] as boolean[]);
+		if (!states.ok) throw new Fail(states.error);
+		await gate();
+		return enqueueDangling(this.ctx.storage, page, new Set(ids.filter((_, i) => states.value[i])));
+	}
+
+	/**
+	 * Settles one outbox row: registers the item's created ids for this generation, then drives each promotion under its
+	 * deterministic id as the job device it was authorized for. The account rereads that device's grant and checks, atomically
+	 * at begin, that this source and the stored me generation are still current; the source fence refuses a target the owner
+	 * protected since. A target that is no longer promotable goes down C3's abort path, so a begun transfer never stays open.
+	 * A transport failure, or a transfer C3 still reports moving, keeps the row for a retry.
+	 */
+	private async settle(who: Who, stage: string, box: Outbox, terms: string[], gate: () => Promise<void>): Promise<void> {
+		let kept = false;
+		if (box.created.length) await this.register(who, box.created).catch(() => { kept = true; });
+		for (const p of box.promote) {
+			const go = promotable(this.ctx.storage.sql, p);
+			const caller = { userId: who.userId, kind: "device" as const, deviceId: p.device, scopes: ["maintenance" as const], profiles: [who.profile, "me"] };
+			const r = await driveTransfer(transferPorts(this.env, who.userId), { id: p.id, nodeId: p.node, from: who.profile, to: "me", companyFree: p.company_free === true, context: who.profile,
+				expect: { from: who.generation, to: p.me }, protect: true }, go ? caller : undefined, terms, !go).catch(() => null);
+			if (!r || (!r.ok && r.error.code === "moving")) kept = true;
+		}
+		await gate();
+		if (kept) this.ctx.storage.sql.exec("UPDATE cursors SET due_at = ?, last_run_at = ? WHERE stage = ?", Date.now() + RETRY_MS, new Date().toISOString(), stage);
+		else this.ctx.storage.sql.exec("DELETE FROM cursors WHERE stage = ?", stage);
 	}
 
 	private stage(name: string, error: string | null): void {

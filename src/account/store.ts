@@ -2,11 +2,19 @@
 import { DurableObject } from "cloudflare:workers";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { randomBase32, sha256 } from "../domain/ids";
-import { fail, ok, PROFILE_NAME, PROFILES, SCOPES, type Caller, type Outcome, type ProfileRef, type RoutingRule, type Scope } from "../domain/types";
+import { Fail, fail, ok, PROFILE_NAME, PROFILES, SCOPES, type Caller, type Outcome, type ProfileRef, type RoutingRule, type Scope } from "../domain/types";
 import { migrate, nextSeq } from "../storage";
 import { ACCOUNT_MIGRATIONS } from "./schema";
+import { accountTransfer, type AccountTransfer, type TransferCommand } from "./transfers";
+import { resumeTransfer, transferPorts, type TransferInput } from "../transfer";
+import { ROW_PAUSE } from "../profile/store";
+import { wipePorts, wipeProfile } from "../wipe";
+
+export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
 export type Principal = { kind: "owner"; userId: string; device?: string } | { kind: "device"; id: string; secret: string };
+
+export interface TransferRequest { input: TransferInput; result?: Record<string, unknown> }
 
 export interface AccountContext { caller: Caller; rules: RoutingRule[]; profiles: ProfileRef[]; known: string[]; sensitiveTerms: string[] }
 
@@ -18,7 +26,8 @@ export type AccountCommand =
 	| { op: "setRules"; rules: Omit<RoutingRule, "id">[] }
 	| { op: "addSensitiveTerm"; term: string }
 	| { op: "addSensitiveTerms"; terms: string[] }
-	| { op: "listProfiles" };
+	| { op: "listProfiles" }
+	| { op: "wipeProfile"; profile: string; typed: string };
 
 type DeviceRow = { id: string; name: string; token_hash: string | null; scopes: string; profiles: string; default_profile: string | null;
 	enabled: number; expires_at: string | null; created_at: string; last_used_at: string | null; revoked_at: string | null };
@@ -137,30 +146,63 @@ export class AccountStore extends DurableObject<Env> {
 			profiles: JSON.parse(row.profiles) as string[], ...(row.default_profile ? { defaultProfile: row.default_profile } : {}) });
 	}
 
+	/** Internal RPC: stale contexts and retired generations cannot enter a profile, even for replay. */
+	async profileAccess(ref: ProfileRef, ids: string[] = []): Promise<Outcome<null>> {
+		if (this.meta("user_id") !== ref.userId) return fail("forbidden", "account identity mismatch");
+		if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+		if (this.sql.exec("SELECT 1 FROM account_meta WHERE key IN (SELECT 'wiped:' || value FROM json_each(?)) LIMIT 1", JSON.stringify(ids)).toArray().length) return fail("profile_wiped", "this record was purged by a profile wipe");
+		const p = this.sql.exec<{ status: string; generation: string }>("SELECT status, generation FROM profiles WHERE name = ?", ref.profile).toArray()[0];
+		return p?.status === "active" && p.generation === ref.generation ? ok(null) : fail("profile_wiped", "this profile generation is closed");
+	}
+
+	private activeProfile(profile: string): boolean {
+		return this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND status = 'active'", profile).toArray().length > 0;
+	}
+
 	/**
 	 * Binds a request_id to the profile and payload hash of its first use, or returns the existing binding.
 	 * With `profile: null` it only looks up. A changed payload is refused before any write.
 	 */
-	async bindRequest(r: { requestId: string; profile: string | null; op: string; payloadHash: string; legacyHash?: string }): Promise<Outcome<{ profile: string | null; existing: boolean }>> {
+	async bindRequest(r: { requestId: string; profile: string | null; op: string; payloadHash: string; legacyHash?: string; generation?: string; transfer?: Omit<TransferInput, "id"> }): Promise<Outcome<{ profile: string | null; existing: boolean; transfer?: TransferRequest }>> {
+		if (r.generation && (this.meta("recovery_state") || !this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND generation = ? AND status = 'active'", r.profile, r.generation).toArray().length)) return fail("busy", "upload generation is closed or recovering");
 		const row = this.sql.exec<{ profile: string; op: string; payload_hash: string; legacy: number; pending: number }>("SELECT profile, op, payload_hash, legacy, pending FROM request_index WHERE request_id = ?", r.requestId).toArray()[0];
 		if (row) {
+			if (!this.activeProfile(row.profile)) return fail("profile_wiped", "the bound profile is closed");
+			if (row.op === "wiped") return fail("profile_wiped", `request_id '${r.requestId}' belonged to a record a profile wipe purged`, { request_id: r.requestId });
 			if (row.pending) return fail("busy", `request_id '${r.requestId}' belongs to a record that is still being imported; retry later`);
 			// A binding imported from BothQ is checked with BothQ's hash of the call, before the modern hash could refuse it.
 			const same = row.legacy ? row.payload_hash === r.legacyHash : row.payload_hash === r.payloadHash && row.op === r.op;
 			if (!same) {
 				return fail("idempotency_mismatch", `request_id '${r.requestId}' was already used with different arguments`, { request_id: r.requestId });
 			}
-			return ok({ profile: row.profile, existing: true });
+			const raw = this.meta(`transfer_request:${r.requestId}`);
+			const transfer = raw ? JSON.parse(raw) as TransferRequest : undefined;
+			if (transfer && this.meta(`wiped:${transfer.input.nodeId}`)) return fail("profile_wiped", "this transfer record was purged by a profile wipe");
+			return ok({ profile: row.profile, existing: true, ...(transfer ? { transfer } : {}) });
 		}
 		if (!r.profile) return ok({ profile: null, existing: false });
-		this.write((seq) => this.sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq) VALUES (?, ?, ?, ?, ?, ?)",
-			r.requestId, r.profile, r.op, r.payloadHash, now(), seq));
-		return ok({ profile: r.profile, existing: false });
+		if (!this.activeProfile(r.profile)) return fail("profile_wiped", "the target profile is closed");
+		const transfer: TransferRequest | undefined = r.transfer ? { input: { ...r.transfer, id: crypto.randomUUID() } } : undefined;
+		this.write((seq) => {
+			this.sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq) VALUES (?, ?, ?, ?, ?, ?)", r.requestId, r.profile, r.op, r.payloadHash, now(), seq);
+			if (transfer) this.sql.exec("INSERT INTO account_meta (key, value) VALUES (?, ?)", `transfer_request:${r.requestId}`, JSON.stringify(transfer));
+		});
+		return ok({ profile: r.profile, existing: false, ...(transfer ? { transfer } : {}) });
+	}
+
+	/** Persist the public transfer result once; retries keep the original result bytes and transfer identity. */
+	async finishTransferRequest(requestId: string, payloadHash: string, result: Record<string, unknown>): Promise<Outcome<Record<string, unknown>>> {
+		const bound = await this.bindRequest({ requestId, profile: null, op: "save_memory", payloadHash });
+		if (!bound.ok) return bound;
+		if (!bound.value.transfer) return fail("idempotency_mismatch", "request does not own a transfer");
+		const transfer = bound.value.transfer;
+		if (!transfer.result) this.write(() => this.sql.exec("UPDATE account_meta SET value = ? WHERE key = ?", JSON.stringify({ ...transfer, result }), `transfer_request:${requestId}`));
+		return ok(transfer.result ?? result);
 	}
 
 	/** Drops a binding this request created when the profile refused the write, so a corrected retry is not refused (BothQ rolls its request node back). */
 	async releaseRequest(requestId: string, payloadHash: string): Promise<void> {
-		this.write(() => this.sql.exec("DELETE FROM request_index WHERE request_id = ? AND payload_hash = ?", requestId, payloadHash));
+		this.write(() => this.sql.exec("DELETE FROM request_index WHERE request_id = ? AND payload_hash = ? AND op <> 'wiped'", requestId, payloadHash));
 	}
 
 	/** Imported request ids already held: missing ones, and a refusal if any is bound to another call or profile. */
@@ -182,6 +224,7 @@ export class AccountStore extends DurableObject<Env> {
 	 * binding is kept, so a retry after a crash repairs; any other existing binding refuses the call, which writes nothing.
 	 */
 	async reserveImport(b: { profile: string; requests: { request_id: string; op: string; hash: string }[] }): Promise<Outcome<{ reserved: number }>> {
+		if (!this.activeProfile(b.profile)) return fail("profile_wiped", "the import profile is closed");
 		if (b.requests.length > 400) return fail("validation", "reserve at most 400 imported requests per call");
 		const held = this.importBindings(b.profile, b.requests);
 		if (!held.ok) return held;
@@ -197,7 +240,9 @@ export class AccountStore extends DurableObject<Env> {
 	 * any other existing binding refuses the whole call, which then writes nothing.
 	 */
 	async bindImport(b: { profile: string; recordId: string; requests: { request_id: string; op: string; hash: string }[] }): Promise<Outcome<{ bound: number }>> {
+		if (!this.activeProfile(b.profile)) return fail("profile_wiped", "the import profile is closed");
 		if (b.requests.length > 400) return fail("validation", "bind at most 400 imported requests per call");
+		if (this.meta(`wiped:${b.recordId}`)) return fail("profile_wiped", "this record was purged by a profile wipe");
 		const node = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", b.recordId).toArray()[0];
 		if (node && node.profile !== b.profile) return fail("validation", `node '${b.recordId}' already belongs to profile '${node.profile}'`, { reason: "node_conflict" });
 		const held = this.importBindings(b.profile, b.requests);
@@ -210,21 +255,66 @@ export class AccountStore extends DurableObject<Env> {
 		return ok({ bound: held.value.missing.length + held.value.pending.length });
 	}
 
-	async recordNodes(profile: string, ids: string[]): Promise<void> {
+	async recordNodes(profile: string, ids: string[], generation?: string): Promise<void> {
+		if (generation && (this.meta("recovery_state") || !this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND generation = ? AND status = 'active'", profile, generation).toArray().length)) throw Fail.of("busy", "upload generation is closed or recovering");
 		if (!ids.length) return;
-		this.write((seq) => { for (const id of ids) this.sql.exec("INSERT OR REPLACE INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", id, profile, seq); });
+		if (!this.activeProfile(profile) || ids.some((id) => this.meta(`wiped:${id}`))) throw Fail.of("profile_wiped", "profile or record was wiped");
+		// A generation-scoped registration (an upload or its repair) never takes a node back from the profile a move gave it to.
+		this.write((seq) => { for (const id of ids) this.sql.exec(`INSERT OR ${generation ? "IGNORE" : "REPLACE"} INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)`, id, profile, seq); });
+	}
+
+	/** Forgets the index rows of nodes a profile purged for good (the 300-day archive purge). */
+	async dropNodes(profile: string, ids: string[]): Promise<void> {
+		if (ids.length) this.write(() => this.sql.exec("DELETE FROM node_index WHERE profile = ? AND node_id IN (SELECT value FROM json_each(?))", profile, JSON.stringify(ids)));
+	}
+
+	/**
+	 * Idempotent acknowledgement of a profile's durable purge outbox. Only the active, current generation of an account not in
+	 * recovery prunes, and never a wipe fence: `wiped` request bindings and the `wiped:` and `transfer_request:` keys stay permanent.
+	 * A refusal writes nothing, so the profile keeps its outbox and retries.
+	 */
+	async prunePurged(who: ProfileRef, ids: { nodes: string[]; requests: string[] }): Promise<Outcome<null>> {
+		if (ids.nodes.length + ids.requests.length > 200) throw new Error("purge cleanup exceeds one batch");
+		const access = await this.profileAccess(who);
+		if (!access.ok) return access;
+		this.write(() => {
+			if (ids.nodes.length) this.sql.exec("DELETE FROM node_index WHERE profile = ? AND node_id IN (SELECT value FROM json_each(?))", who.profile, JSON.stringify(ids.nodes));
+			if (ids.requests.length) this.sql.exec("DELETE FROM request_index WHERE profile = ? AND op <> 'wiped' AND request_id IN (SELECT value FROM json_each(?))", who.profile, JSON.stringify(ids.requests));
+		});
+		return ok(null);
 	}
 
 	async resolveNode(id: string): Promise<string | null> {
 		return this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", id).toArray()[0]?.profile ?? null;
 	}
 
-	/** Daily embedding budget: pauses embedding past 8,000 neurons, the free daily allotment. */
-	async meter(m: { day: string; neurons: number }): Promise<{ embed: boolean }> {
-		const row = this.write(() => this.sql.exec<{ value: number }>(
-			`INSERT INTO counters (day, name, value) VALUES (?, 'neurons', ?)
-			 ON CONFLICT (day, name) DO UPDATE SET value = value + excluded.value RETURNING value`, m.day, Math.ceil(m.neurons)).one());
-		return { embed: row.value < DAILY_NEURONS };
+	/**
+	 * Daily UTC counters (section 6): embedding pauses past 8,000 neurons, the free daily allotment, and the profiles'
+	 * background stages once the day's rows written reach ROW_PAUSE. A missing or zero amount only reads its counter.
+	 */
+	async meter(m: { day: string; neurons?: number; rowsWritten?: number }): Promise<{ embed: boolean; background: boolean }> {
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(m.day) || !Number.isFinite(Date.parse(`${m.day}T00:00:00Z`)) || new Date(`${m.day}T00:00:00Z`).toISOString().slice(0, 10) !== m.day
+			|| [m.neurons, m.rowsWritten].some((n) => n !== undefined && (!Number.isFinite(n) || n < 0 || n > Number.MAX_SAFE_INTEGER))) throw Fail.of("validation", "meter needs a UTC day and nonnegative finite counters");
+		const count = (name: string, add?: number) => add ? this.write(() => this.sql.exec<{ value: number }>(
+			`INSERT INTO counters (day, name, value) VALUES (?, ?, ?)
+			 ON CONFLICT (day, name) DO UPDATE SET value = value + excluded.value RETURNING value`, m.day, name, Math.ceil(add)).one().value)
+			: this.sql.exec<{ value: number }>("SELECT value FROM counters WHERE day = ? AND name = ?", m.day, name).toArray()[0]?.value ?? 0;
+		return { embed: count("neurons", m.neurons) < DAILY_NEURONS, background: count("rows", m.rowsWritten) < ROW_PAUSE };
+	}
+
+	/**
+	 * For a profile's dangling-link check (section 12): per id, whether it is in no profile's node_index and has no permanent
+	 * `wiped:` tombstone. Booleans only, in the order asked, after the caller's generation check, so a recovering account is
+	 * `busy` and never reports a record it is still restoring as absent.
+	 */
+	async nodeStates(who: ProfileRef, ids: string[]): Promise<Outcome<boolean[]>> {
+		if (ids.length > 200) return fail("validation", "ask about at most 200 ids at once");
+		const access = await this.profileAccess(who);
+		if (!access.ok) return access;
+		const absent = new Set(this.sql.exec<{ id: string }>(`SELECT j.value AS id FROM json_each(?) j WHERE NOT EXISTS (SELECT 1 FROM node_index WHERE node_id = j.value)
+			AND NOT EXISTS (SELECT 1 FROM account_meta WHERE key = 'wiped:' || j.value)
+			AND NOT EXISTS (SELECT 1 FROM transfers WHERE node_id = j.value AND state IN ('open', 'committing'))`, JSON.stringify(ids)).toArray().map((r) => r.id));
+		return ok(ids.map((id) => absent.has(id)));
 	}
 
 	/** Owner-only administration, reached only through the dashboard API. */
@@ -245,9 +335,45 @@ export class AccountStore extends DurableObject<Env> {
 		}
 	}
 
+	/** The account's part of a transfer between profiles (section 9). */
+	async transfer(cmd: TransferCommand): Promise<Outcome<AccountTransfer>> {
+		if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+		// Arm before begin can commit: a process loss at its return still has a durable wakeup.
+		if (cmd.op === "begin" && cmd.policy) {
+			const at = await this.ctx.storage.getAlarm();
+			if (at === null || at > Date.now() + 300_000) await this.ctx.storage.setAlarm(Date.now() + 300_000);
+		}
+		if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+		return accountTransfer(this.ctx.storage, cmd);
+	}
+
+	/** Re-drive at most ten accepted intents, including ones with no source transfer row yet. */
+	async alarm(): Promise<void> {
+		const ports = { ...transferPorts(this.env, this.meta("user_id")!), account: (cmd: TransferCommand) => this.transfer(cmd) };
+		try {
+			if (this.meta("recovery_state")) return;
+			const ctx = await this.context({ kind: "owner", userId: this.meta("user_id")! });
+			if (!ctx.ok) return;
+			const due = this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE retry_at <= ? ORDER BY retry_at, id LIMIT 10", Date.now()).toArray();
+			for (const { id } of due) {
+				// Persist the retry before transport; an interrupted cleanup retains the same accepted intent.
+				this.write((seq) => this.sql.exec("UPDATE transfers SET retry_at = ?, seq = ? WHERE id = ? AND retry_at IS NOT NULL", Date.now() + 60_000, seq, id));
+				await resumeTransfer(ports, id, ctx.value.sensitiveTerms).catch(() => null);
+			}
+		} finally {
+			const at = this.sql.exec<{ at: number | null }>("SELECT min(retry_at) at FROM transfers").one().at;
+			if (at !== null) await this.ctx.storage.setAlarm(Math.max(Date.now() + 60_000, at));
+		}
+	}
+
 	async admin(cmd: AccountCommand): Promise<Outcome<unknown>> {
 		const known = this.sql.exec<{ name: string }>("SELECT name FROM profiles").toArray().map((r) => r.name);
 		switch (cmd.op) {
+			case "wipeProfile": {
+				const userId = this.meta("user_id");
+				if (!userId) return fail("unavailable", "the account is not set up");
+				return wipeProfile(this.env, wipePorts(this.env, this.ctx.storage), { userId, kind: "owner", scopes: ["read", "write"], profiles: "*" }, cmd.profile, cmd.typed);
+			}
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
 			case "listDevices":

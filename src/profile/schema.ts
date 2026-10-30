@@ -204,4 +204,47 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	"CREATE INDEX import_parts_seq ON import_parts (seq, part_id)",
 	...tombstoneTriggers("profile_meta", "import_records", (r) => `${r}.record_id`),
 	...tombstoneTriggers("profile_meta", "import_parts", (r) => `${r}.part_id`),
+], [
+	// v4 (phase 3, docs/module-contracts.md): removed rows kept restorable until they purge, and the transfer protocol's
+	// state in each profile it touches (sections 5 and 9).
+	`CREATE TABLE archive (
+		id INTEGER PRIMARY KEY, activity_id INTEGER NOT NULL, at TEXT NOT NULL, purge_after TEXT NOT NULL,
+		source TEXT NOT NULL CHECK (source IN ('nodes','texts','edges','evidence','revisions','requests')),
+		payload TEXT NOT NULL, seq INTEGER NOT NULL
+	)`,
+	"CREATE INDEX archive_purge ON archive (purge_after)",
+	"CREATE INDEX archive_seq ON archive (seq, id)",
+	...tombstoneTriggers("profile_meta", "archive", (r) => `CAST(${r}.id AS TEXT)`),
+	`CREATE TABLE transfers (
+		id TEXT PRIMARY KEY, node_id TEXT NOT NULL, direction TEXT NOT NULL CHECK (direction IN ('out','in')),
+		peer TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('fenced','sent','landed','published','committed','aborted')),
+		parts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL
+	) WITHOUT ROWID`,
+	"CREATE INDEX transfers_seq ON transfers (seq, id)",
+	...tombstoneTriggers("profile_meta", "transfers", (r) => `${r}.id`),
+	// Control state, deleted at commit or abort and never exported.
+	"CREATE TABLE transfer_parts (transfer_id TEXT NOT NULL, n INTEGER NOT NULL, payload TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (transfer_id, n)) WITHOUT ROWID",
+	// 'wipe:<profile>:<wiped_at>' once a wipe removed the row's content; its undo is then refused.
+	"ALTER TABLE activity ADD COLUMN redacted TEXT",
+], [
+	// v5: refresh rows stay under a shadow identity until their bounded atomic publish.
+	"ALTER TABLE import_records ADD COLUMN published_revision INTEGER",
+	"ALTER TABLE import_records ADD COLUMN published_content_hash TEXT",
+	// Old stores derive the anchor from preserved source history, never from a possibly edited hosted node.
+	`UPDATE import_records SET published_revision = (SELECT max(revision) FROM revisions WHERE node_id = record_id AND actor = 'migration'),
+		published_content_hash = (SELECT content_hash FROM revisions WHERE node_id = record_id AND actor = 'migration' ORDER BY revision DESC LIMIT 1)
+		WHERE state = 'published'`,
+	`CREATE TABLE import_refreshes (
+		shadow_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, refresh_no INTEGER NOT NULL,
+		base_record_sha256 TEXT NOT NULL, record_sha256 TEXT NOT NULL, parts INTEGER NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('staging','prepared','published')), node_sha256 TEXT, finalize_sha256 TEXT,
+		published_revision INTEGER, published_content_hash TEXT,
+		staged_at TEXT NOT NULL, published_at TEXT, seq INTEGER NOT NULL,
+		UNIQUE (record_id, refresh_no)
+	) WITHOUT ROWID`,
+	"CREATE INDEX import_refreshes_seq ON import_refreshes (seq, shadow_id)",
+	...tombstoneTriggers("profile_meta", "import_refreshes", (r) => `${r}.shadow_id`),
+	`CREATE TRIGGER nodes_refresh_fence BEFORE INSERT ON nodes
+		WHEN EXISTS (SELECT 1 FROM import_refreshes WHERE shadow_id = NEW.id)
+		BEGIN SELECT RAISE(ABORT, 'import_pending'); END`,
 ]];

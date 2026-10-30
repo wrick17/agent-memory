@@ -7,7 +7,7 @@ import { resetKeyCache } from "../src/auth";
 import { egressFetch } from "../src/egress";
 import { settingsMain } from "../src/settings";
 import wranglerConfig from "../wrangler.jsonc?raw";
-import { deviceToken } from "./helpers";
+import { call, contextFor, deviceToken, outcome, registered } from "./helpers";
 
 let keys: CryptoKeyPair;
 const KID = "test-key-1";
@@ -146,7 +146,7 @@ describe("MCP over /mcp", () => {
 		const token = await jwt({});
 		const list = await rpc(token, "tools/list");
 		expect(list.status).toBe(200);
-		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["append_memory", "capture_memory", "get_memory", "recall_memories", "record_knowledge", "review_candidates", "save_memory"]);
+		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["append_memory", "capture_memory", "explore", "get_memory", "recall_memories", "record_knowledge", "review_candidates", "save_memory", "timeline", "trace", "work_board"]);
 		const saved = await rpc(token, "tools/call", { name: "save_memory", arguments: { name: "Use pnpm in Sequoia repos", type: "feedback", description: "Package manager rule",
 			content: "Run pnpm install and pnpm -w build. npm rewrites pnpm-lock.yaml.", origin: "stated", repo: { remote: "git@github.com:Sequoia-Engineering/web.git" }, request_id: "mcp-e2e-1" } });
 		const s = toolResult(saved.data);
@@ -165,13 +165,13 @@ describe("MCP over /mcp", () => {
 		expect(init.data.result.protocolVersion).toBe("2025-11-25");
 		const list = await rpc(token, "tools/list", {}, "legacy", { "mcp-protocol-version": "2025-11-25" });
 		expect(list.status).toBe(200);
-		expect(list.data.result.tools).toHaveLength(7);
+		expect(list.data.result.tools).toHaveLength(11);
 	});
 
 	it("filters tools by device-token scope and revokes on the next request", async () => {
 		const { id, token } = await deviceToken("reader-box", ["read"], ["personal", "me"], "personal");
 		const list = await rpc(token, "tools/list");
-		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["get_memory", "recall_memories", "review_candidates"]);
+		expect((list.data.result.tools as { name: string }[]).map((t) => t.name).sort()).toEqual(["explore", "get_memory", "recall_memories", "review_candidates", "timeline", "trace", "work_board"]);
 		const { accountStub } = await import("../src/mcp");
 		await accountStub(env, env.OWNER_USER_ID).admin({ op: "revokeDevice", id });
 		expect((await rpc(token, "tools/list")).status).toBe(401);
@@ -201,6 +201,136 @@ describe("MCP over /mcp", () => {
 });
 
 describe("owner API", () => {
+	it("pins, unpins, unflags and forgets a node as the owner, each undoable, and refuses device tokens", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const post = (path: string, token = session) => exports.default.fetch(new Request(`${origin}${path}`, { method: "POST", headers: { authorization: `Bearer ${token}` } }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		const c = await contextFor();
+		const a = await call(c, "save_memory", { name: "Owner pinned preference", type: "user", description: "dark mode", content: "Prefers dark mode.", profile: "personal" });
+		const pinned = await post(`/api/profiles/personal/nodes/${a.memory_id}/pin`);
+		expect(pinned).toMatchObject({ status: 200, body: { action: "pinned", memory_id: a.memory_id } });
+		expect(await call(c, "get_memory", { memory_id: a.memory_id })).toMatchObject({ revision: 2 });
+		expect((await post(`/api/profiles/personal/activity/${String(pinned.body.activity_id)}/undo`)).status).toBe(200);
+		expect((await post(`/api/profiles/personal/nodes/${a.memory_id}/pin`)).body).toMatchObject({ action: "pinned" });
+		expect((await post(`/api/profiles/personal/nodes/${a.memory_id}/unpin`)).body).toMatchObject({ action: "unpinned" });
+		expect((await post(`/api/profiles/personal/nodes/${a.memory_id}/unflag`)).body).toMatchObject({ action: "unflagged" });
+		const forgotten = await post(`/api/profiles/personal/nodes/${a.memory_id}/forget`);
+		expect(forgotten.body).toMatchObject({ action: "forgotten" });
+		expect(await outcome(c, "get_memory", { memory_id: a.memory_id, include_retired: true })).toMatchObject({ ok: false, error: { code: "not_found" } });
+		// Forget archives; its undo brings the memory back whole.
+		expect((await post(`/api/profiles/personal/activity/${String(forgotten.body.activity_id)}/undo`)).status).toBe(200);
+		expect(await call(c, "get_memory", { memory_id: a.memory_id })).toMatchObject({ content: "Prefers dark mode." });
+		const { token } = await deviceToken("owner-actions-device", ["read", "write"], ["personal"], "personal");
+		expect((await post(`/api/profiles/personal/nodes/${a.memory_id}/pin`, token)).status).toBe(403);
+		expect((await post(`/api/profiles/nosuch/nodes/${a.memory_id}/pin`)).status).toBe(404);
+		expect((await post(`/api/profiles/personal/nodes/not-a-node/pin`)).status).toBe(404);
+	});
+
+	it("records an unproven batch's skip from a job token, with no lease, and shows it only to the owner", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const get = (path: string, token = session) => exports.default.fetch(new Request(`${origin}${path}`, { headers: { authorization: `Bearer ${token}` } }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		const job = (await deviceToken(`batch-skip-job-${Date.now()}`, ["ingest", "maintenance"], ["work"])).token;
+		const skip = (args: Record<string, unknown>) => rpc(job, "tools/call", { name: "maintenance_complete", arguments: { profile: "work", status: "batch_skipped", ...args } });
+		expect(toolResult((await skip({ reason: "probe_indeterminate" })).data)).toEqual({ status: "batch_skipped", released: 0 });
+		const shown = await get("/api/profiles/work/batch");
+		expect(shown.status).toBe(200);
+		expect(shown.body).toMatchObject({ last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0 } });
+		// A reason that is not a content-free code, or a park without a lease, is refused before the store.
+		expect((await skip({ reason: "probe failed: /Users/x" })).data.result.isError).toBe(true);
+		expect((await rpc(job, "tools/call", { name: "maintenance_complete", arguments: { profile: "work", status: "stuck", reason: "tool_event" } })).data.result.isError).toBe(true);
+		expect((await get("/api/profiles/work/batch")).body).toMatchObject({ last_status: { reason: "probe_indeterminate" } });
+		// The profile it may not use, a device token on the owner's route, and an unknown profile.
+		expect((await rpc(job, "tools/call", { name: "maintenance_complete", arguments: { profile: "personal", status: "batch_skipped", reason: "probe_allowed" } })).data.result.isError).toBe(true);
+		expect((await get("/api/profiles/work/batch", job)).status).toBe(403);
+		expect((await get("/api/profiles/nosuch/batch")).status).toBe(404);
+	});
+
+	it("pages the owner model through the owner-only route, and its read writes nothing and stops at a closed generation", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const get = (path: string, token = session) => exports.default.fetch(new Request(`${origin}${path}`, { headers: { authorization: `Bearer ${token}` } }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as { items: { id: string; origin: string }[]; next_after: string | null; error?: { code: string } } }));
+		const c = await contextFor();
+		const stated = await call<{ memory_id: string }>(c, "save_memory", { name: `Prefers tabs ${Date.now()}`, type: "user", description: "indentation", origin: "stated", profile: "personal" });
+		const agent = await call<{ memory_id: string }>(c, "save_memory", { name: `Prefers short replies ${Date.now()}`, type: "user", description: "length", profile: "personal" });
+		// Other tests share this profile, so the check walks every page: each id once, stated before agent.
+		const seen: string[] = [];
+		for (let after: string | null = null, pages = 0; pages === 0 || after; pages++) {
+			const page = await get(`/api/profiles/personal/owner-model?limit=1${after ? `&after=${encodeURIComponent(after)}` : ""}`);
+			expect(page.status).toBe(200);
+			seen.push(...page.body.items.map((i) => i.id));
+			after = page.body.next_after;
+		}
+		expect(new Set(seen).size).toBe(seen.length);
+		expect(seen.indexOf(stated.memory_id)).toBeGreaterThanOrEqual(0);
+		expect(seen.indexOf(stated.memory_id)).toBeLessThan(seen.indexOf(agent.memory_id));
+		for (const q of ["after=x", "limit=0", "limit=abc", "limit="]) expect(await get(`/api/profiles/personal/owner-model?${q}`).then((r) => [q, r.status, r.body.error?.code])).toEqual([q, 400, "validation"]);
+		expect((await get("/api/profiles/nosuch/owner-model")).status).toBe(404);
+		expect((await get("/api/profiles/personal/owner-model", (await deviceToken(`owner-model-${Date.now()}`, ["read"], ["personal"], "personal")).token)).status).toBe(403);
+		// A never-written profile reads empty and stays unbound; once its generation closes, the read is refused and writes nothing.
+		const r = await registered("me");
+		const meta = () => runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("SELECT key, value FROM profile_meta ORDER BY key").toArray());
+		const before = await meta();
+		expect(await r.stub.read(r.who, { kind: "owner_model", after: null, limit: 50 })).toEqual({ ok: true, value: { items: [], next_after: null } });
+		expect(await meta()).toEqual(before);
+		await r.account((sql) => sql.exec("UPDATE profiles SET status = 'wiping'"));
+		expect(await r.stub.read(r.who, { kind: "owner_model", after: null, limit: 50 })).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
+		expect(await meta()).toEqual(before);
+	});
+
+	it("ranks recorded tickets through work_board and the owner's board route at a fixed as_of, and refuses bad callers and inputs", async () => {
+		serveJwks();
+		const AS_OF = "2030-01-01T00:00:00.000Z", key = `jira:BRD-${Date.now()}`, closedKey = `${key}0`;
+		const owner = await jwt({});
+		expect(toolResult((await rpc(owner, "tools/call", { name: "record_knowledge", arguments: { profile: "work", nodes: [
+			{ kind: "ticket", key, name: `${key} board flow`, attrs: { state: "open", priority: "High", assignee_is_owner: true } },
+			{ kind: "ticket", key: closedKey, name: `${closedKey} board flow`, attrs: { state: "closed", priority: "Highest" } },
+		] } })).data)).toMatchObject({ nodes: expect.any(Array) });
+		type Board = { as_of: string; read_set?: string[]; items: { key: string; score: number; reasons: { text: string }[] }[] };
+		const board = toolResult((await rpc(owner, "tools/call", { name: "work_board", arguments: { profile: "work", as_of: AS_OF, limit: 200 } })).data) as unknown as Board;
+		expect(board).toMatchObject({ as_of: AS_OF, read_set: ["work", "me"], covers_only_uploaded_data: true });
+		expect(board.items.find((i) => i.key === key)).toMatchObject({ score: 45, reasons: [{ text: "Priority High (+30)." }, { text: "Assigned to the owner (+15)." }] });
+		expect(board.items.some((i) => i.key === closedKey)).toBe(false);
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const get = (path: string, token = session) => exports.default.fetch(new Request(`${origin}${path}`, { headers: { authorization: `Bearer ${token}` } }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Board }));
+		const shown = await get(`/api/profiles/work/board?as_of=${AS_OF}&limit=200`);
+		expect(shown.status).toBe(200);
+		expect(shown.body.items.find((i) => i.key === key)).toMatchObject({ score: 45 });
+		// Inputs, scopes, a foreign dashboard origin and a foreign MCP Origin are refused before any board is read.
+		for (const q of ["as_of=soon", "limit=0", "extra=1"]) expect([q, (await get(`/api/profiles/work/board?${q}`)).status]).toEqual([q, 400]);
+		expect((await get("/api/profiles/nosuch/board")).status).toBe(404);
+		const reader = (await deviceToken(`board-reader-${Date.now()}`, ["read"], ["work"], "work")).token;
+		expect((await get("/api/profiles/work/board", reader)).status).toBe(403);
+		expect((await get("/api/profiles/work/board", await jwt({ aud: undefined, azp: "https://evil.example" }))).status).toBe(401);
+		for (const args of [{ profile: "work", as_of: "soon" }, { profile: "work", extra: 1 }]) {
+			expect((await rpc(owner, "tools/call", { name: "work_board", arguments: args })).data.result.isError).toBe(true);
+		}
+		const writer = (await deviceToken(`board-writer-${Date.now()}`, ["write"], ["work"], "work")).token;
+		const denied = (await rpc(writer, "tools/call", { name: "work_board", arguments: { profile: "work" } })).data;
+		expect(denied.result?.isError ?? Boolean(denied.error)).toBe(true);
+		expect(JSON.stringify(denied)).not.toContain(key);
+		expect((await rpc(owner, "tools/call", { name: "work_board", arguments: { profile: "work" } }, "modern", { origin: "https://evil.example" })).status).toBe(403);
+		// A never-written me reads an empty board and stays unbound; a closed generation is refused and writes nothing.
+		const r = await registered("work", "me"), me = r.of("me");
+		const meta = (stub: typeof me.stub) => runInDurableObject(stub, (_i, s) => s.storage.sql.exec("SELECT key, value FROM profile_meta ORDER BY key").toArray());
+		const q = { kind: "board" as const, asOf: AS_OF, limit: 50, known: ["work", "me"] };
+		const before = await meta(me.stub);
+		expect(await me.stub.read(me.who, q)).toMatchObject({ ok: true, value: { items: [], total: 0 } });
+		expect(await meta(me.stub)).toEqual(before);
+		const closedBefore = await meta(r.stub);
+		await r.account((sql) => sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'work'"));
+		expect(await r.stub.read(r.who, q)).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
+		expect(await meta(r.stub)).toEqual(closedBefore);
+	});
+
 	it("creates and lists device tokens with a dashboard session token, and refuses device tokens", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
@@ -220,6 +350,11 @@ describe("owner API", () => {
 		expect(whoami.claims.aud).toContain(env.RESOURCE_URL);
 		const page = await exports.default.fetch(new Request(`${origin}/settings`));
 		const policy = Object.fromEntries(page.headers.get("content-security-policy")!.split("; ").map((d) => { const [name, ...src] = d.split(" "); return [name!, src]; }));
+		// The dashboard shell and script are public like /settings, under the same policy and no-store; its data stays owner-only.
+		const [app, appJs] = await Promise.all(["/app", "/app.js"].map((p) => exports.default.fetch(new Request(`${origin}${p}`))));
+		expect([app!.status, app!.headers.get("content-security-policy"), app!.headers.get("cache-control"), appJs!.headers.get("content-type"), appJs!.headers.get("cache-control")])
+			.toEqual([200, page.headers.get("content-security-policy"), "no-store", "text/javascript; charset=utf-8", "no-store"]);
+		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`))).status).toBe(401);
 		const fapi = env.CLERK_FRONTEND_API, protect = "https://*.protect.clerk.com";
 		// Clerk's documented sources (script, connect with any port, frame), blob: images from the live page, nothing broader.
 		expect(policy).toEqual({

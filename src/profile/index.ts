@@ -21,7 +21,7 @@ export function checkVectorLimits(w: Who, nodeId: string): void {
 export const embeddingsOn = (env: Env) => env.EMBEDDINGS !== "off" && !!env.AI && !!env.VECTORS;
 
 /** One bounded step. Returns whether more cards are due. Embedding failures never touch committed memory. */
-export async function embedStep(storage: DurableObjectStorage, env: Env, who: Who, meter: (neurons: number) => Promise<boolean>): Promise<boolean> {
+export async function embedStep(storage: DurableObjectStorage, env: Env, who: Who, meter: (neurons: number) => Promise<boolean>, gate: () => Promise<void>): Promise<boolean> {
 	if (!embeddingsOn(env)) return false;
 	const sql = storage.sql;
 	const due = sql.exec<{ id: string; kind: string; name: string; description: string; why: string | null; card_hash: string }>(
@@ -31,15 +31,30 @@ export async function embedStep(storage: DurableObjectStorage, env: Env, who: Wh
 	const cards = due.map((n) => cardText(n, readPrefix(sql, n.id)));
 	// Section 17's estimate: about 4 characters per token, 1,075 neurons per million input tokens.
 	const neurons = cards.reduce((s, c) => s + c.length, 0) / 4 / 1e6 * 1075;
-	if (!(await meter(neurons))) return false;
+	const allowed = await meter(neurons);
+	await gate();
+	if (!allowed) return false;
 	const out = await env.AI!.run(EMBED_MODEL, { text: cards }) as { data?: number[][] };
+	await gate();
 	if (!Array.isArray(out.data) || out.data.length !== cards.length) throw new Error("embedding response did not match the batch");
-	due.forEach((n) => checkVectorLimits(who, n.id));
-	await env.VECTORS!.upsert(due.map((n, i) => ({ id: vectorId(who, n.id), values: out.data![i]!, namespace: namespaceOf(who), metadata: { kind: n.kind, gen: who.generation } })));
+	const eligible = () => {
+		if (sql.exec("SELECT 1 FROM profile_meta WHERE key = 'closed'").toArray().length) return [];
+		return due.filter((n) => sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status = 'active' AND card_hash = ?", n.id, n.card_hash).toArray().length > 0);
+	};
+	const ready = eligible();
+	ready.forEach((n) => checkVectorLimits(who, n.id));
+	if (!ready.length) return false;
+	await env.VECTORS!.upsert(ready.map((n) => ({ id: vectorId(who, n.id), values: out.data![due.indexOf(n)]!, namespace: namespaceOf(who), metadata: { kind: n.kind, gen: who.generation } })));
+	await gate();
+	const keep = eligible();
+	const gone = ready.filter((n) => !keep.includes(n));
+	if (gone.length) await env.VECTORS!.deleteByIds(gone.map((n) => vectorId(who, n.id)));
+	await gate();
+	if (!keep.length) return false;
 	storage.transactionSync(() => {
 		const seq = nextSeq(sql, "profile_meta");
 		// The BothQ rule: record embed_hash only if the card did not change while it was embedding.
-		due.forEach((n) => sql.exec("UPDATE nodes SET embed_hash = card_hash, seq = ? WHERE id = ? AND card_hash = ?", seq, n.id, n.card_hash));
+		keep.forEach((n) => sql.exec("UPDATE nodes SET embed_hash = card_hash, seq = ? WHERE id = ? AND card_hash = ?", seq, n.id, n.card_hash));
 	});
 	return due.length === BATCH;
 }

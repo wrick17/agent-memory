@@ -1,0 +1,354 @@
+// The maintenance queue (sections 7 and 12): deterministic items leased to the confined daily batch, and their results applied
+// through the normal write path with actor maintenance. Each op stays inside its item's subjects, and any op that touches a
+// protected node (stated, pinned, or anything in me) becomes a flag on it instead.
+import { requestHash, sha256, uuid5 } from "../domain/ids";
+import { redactPayload } from "../domain/redact";
+import { Fail, type ErrorCode, type RELATIONS, type WriteCommand, type WriteContext } from "../domain/types";
+import { nextSeq } from "../storage";
+import { BudgetTx } from "./archive";
+import { flagProtected, mayChange } from "./protect";
+import { assertWritable, RESUME_MS } from "./transfer";
+import { assertOpen } from "./wipe";
+import { fenceOf } from "./compact";
+import { captureText, readPrefix, runWrite, type Who } from "./write";
+import { readableNodeIds } from "./graph";
+
+export const MAX_ITEMS = 40;
+export const MAX_LEASE_S = 900;
+export const MAX_OPS = 10;
+const BATCH_GAP_MS = 20 * 3_600_000;
+const MAX_ATTEMPTS = 3;
+export const ALLOWED_OPS = ["save", "compact", "link", "end_link", "supersede", "flag", "dismiss"] as const;
+/** Each item kind's ops: inference reads correction or capture digests; promotion also takes a preference a similarity pair names. */
+export function opsFor(kind: string): string[] {
+	// A dangling link's target is opaque here: the batch may only end the link, flag its source or dismiss the item.
+	if (kind === "dangling_link") return ["end_link", "flag", "dismiss"];
+	const infer = kind === "preference_signal" || kind === "unprocessed_capture";
+	return [...ALLOWED_OPS, ...(infer ? ["infer_preference"] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
+}
+
+type Evidence = { kind: "entry" | "commit" | "pr" | "ticket" | "session" | "file" | "node" | "url" | "corpus"; ref: string; note?: string };
+export type MaintenanceOp =
+	| { op: "save"; memory_id: string; description?: string; content?: string; why?: string; how_to_apply?: string; new_name?: string; retire?: boolean; expected_revision?: number }
+	| { op: "compact"; memory_id: string; through_seq: number; summary: string; expected_revision: number }
+	| { op: "link"; from: string; to: string; rel: (typeof RELATIONS)[number]; other_label?: string; reason: string; evidence: Evidence[] }
+	| { op: "end_link"; edge: number; reason: string; valid_to?: string }
+	| { op: "supersede"; keep: string; retire: string[] }
+	| { op: "flag"; node: string; reason: string }
+	| { op: "dismiss" }
+	| { op: "infer_preference"; name: string; description: string; why?: string; how_to_apply?: string; scope?: string; evidence: Evidence[] }
+	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true };
+export type MaintenanceCmd =
+	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number }
+	| { op: "complete"; lease_id: string; results: { item_id: number; ops: MaintenanceOp[] }[] }
+	| { op: "complete"; lease_id: string; status: "batch_skipped" | "stuck"; reason: string }
+	| { op: "complete"; status: "batch_skipped"; reason: string };
+/**
+ * The job token's device and the Worker's platform label; the actor is always maintenance. `me`: the active me generation,
+ * set only when the Worker found the job token may use both the leased profile and me, which promote_to_me needs.
+ */
+export type JobContext = Pick<WriteContext, "deviceId" | "platform" | "userId"> & { me?: string };
+/**
+ * One finished item's durable intent, content-free (section 12): ids to register for this generation, and the promotions the
+ * profile accepted, each with its transfer id, the me generation and the job device it was authorized for. The alarm settles it.
+ */
+export interface Outbox { created: string[]; promote: { id: string; node: string; me: string; device: string; company_free: true }[] }
+export const OUTBOX = "outbox:";
+/**
+ * Ids and codes only. `created`: the preference an infer op made, registered by the store and named by a later from_op.
+ * `transfer_started`: the profile checked a promotion; the Worker drives its transfer and reports applied, rejected or
+ * `moving` (fenced and resumable).
+ */
+export type OpOutcome = { op: string; status: "applied" | "flagged" | "rejected" | "transfer_started" | "moving"; code?: string; reason?: string; activity_id?: number;
+	created?: string[]; memory_id?: string; transfer_id?: string; company_free?: boolean; me?: string };
+
+/** Queues each item once per fingerprint (kind, subject ids, their card hashes): unchanged items never repeat, changed ones queue again. */
+export function enqueue(storage: DurableObjectStorage, items: { kind: string; subjects: string[]; slot?: string }[]): void {
+	storage.transactionSync(() => {
+		const sql = storage.sql;
+		let tx: BudgetTx | undefined;
+		enqueueIn(sql, () => (tx ??= new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString())), items);
+	});
+}
+
+/** The same inside the caller's transaction; `tx()` is taken only for a new item. Returns how many items were new. */
+export function enqueueIn(sql: SqlStorage, tx: () => BudgetTx, items: { kind: string; subjects: string[]; slot?: string }[]): number {
+	let added = 0;
+	for (const it of items) {
+		const subjects = [...new Set(it.subjects)].sort();
+		const cards = sql.exec<{ card_hash: string }>("SELECT card_hash FROM nodes WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id", JSON.stringify(subjects)).toArray();
+		const fingerprint = sha256(JSON.stringify([it.kind, subjects, cards.map((c) => c.card_hash), ...(it.slot ? [it.slot] : [])]));
+		if (sql.exec("SELECT 1 FROM maintenance WHERE fingerprint = ?", fingerprint).toArray().length) continue;
+		const t = tx();
+		t.run("INSERT OR IGNORE INTO maintenance (kind, subjects, fingerprint, created_at, seq) VALUES (?, ?, ?, ?, ?)",
+			it.kind, JSON.stringify(subjects), fingerprint, t.now, t.seq);
+		added++;
+	}
+	return added;
+}
+
+/**
+ * Leases up to 40 open items for at most 900 s, at most once per profile in 20 hours. Expired leases go back to the queue
+ * first (stuck after 3 attempts). Each item carries its subjects' cards, a passage of up to 1,200 characters and current edges.
+ */
+export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit?: number; lease_seconds?: number }) {
+	const limit = Math.min(q.limit ?? MAX_ITEMS, MAX_ITEMS), lease = Math.min(q.lease_seconds ?? MAX_LEASE_S, MAX_LEASE_S);
+	if (limit < 1 || lease < 1) throw Fail.of("validation", "limit and lease_seconds must be positive");
+	return storage.transactionSync(() => {
+		const sql = storage.sql, now = Date.now(), iso = new Date(now).toISOString();
+		const last = sql.exec<{ last_run_at: string | null }>("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").toArray()[0]?.last_run_at;
+		if (last && now - Date.parse(last) < BATCH_GAP_MS) return { lease_id: null, items: [], next_allowed_at: new Date(Date.parse(last) + BATCH_GAP_MS).toISOString() };
+		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), iso);
+		release(tx);
+		const kinds = q.kinds?.length ? JSON.stringify(q.kinds) : null;
+		const items = sql.exec<{ id: number; kind: string; subjects: string }>(`SELECT id, kind, subjects FROM maintenance WHERE state = 'open'
+			AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, kinds, kinds, limit).toArray();
+		if (!items.length) return { lease_id: null, items: [], next_allowed_at: null };
+		const leaseId = crypto.randomUUID(), until = new Date(now + lease * 1000).toISOString();
+		tx.run("UPDATE maintenance SET state = 'leased', lease_id = ?, lease_until = ?, attempts = attempts + 1, seq = ? WHERE id IN (SELECT value FROM json_each(?))",
+			leaseId, until, tx.seq, JSON.stringify(items.map((i) => i.id)));
+		tx.run(`INSERT INTO cursors (stage, due_at, last_run_at) VALUES ('maintenance_batch', 0, ?)
+			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at`, iso);
+		return {
+			lease_id: leaseId, lease_until: until,
+			items: items.map((i) => ({ item_id: i.id, kind: i.kind, subjects: JSON.parse(i.subjects) as string[], context: context(sql, JSON.parse(i.subjects) as string[], i.kind), allowed_ops: opsFor(i.kind) })),
+		};
+	});
+}
+
+/** Expired leases return to the queue; an item that keeps expiring is parked as stuck. */
+function release(tx: BudgetTx): void {
+	tx.run(`UPDATE maintenance SET state = CASE WHEN attempts >= ? THEN 'stuck' ELSE 'open' END, lease_id = NULL, lease_until = NULL, seq = ?
+		WHERE state = 'leased' AND lease_until < ?`, MAX_ATTEMPTS, tx.seq, tx.now);
+}
+
+function context(sql: SqlStorage, subjects: string[], kind: string) {
+	// Inspect identity/status first. Capture subjects are explicit job input; they never widen weekly or graph visibility.
+	const readable = readableNodeIds(sql, subjects);
+	if (kind === "unprocessed_capture" || kind === "preference_signal") {
+		for (const n of sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'candidate'", JSON.stringify(subjects)).toArray()) readable.add(n.id);
+	}
+	const ids = JSON.stringify([...readable]);
+	const nodes = sql.exec<{ id: string; kind: string; other_label: string | null; memory_type: string | null; scope: string; name: string; description: string; status: string; origin: string; pinned: number; revision: number }>(
+		"SELECT id, kind, other_label, memory_type, scope, name, description, status, origin, pinned, revision FROM nodes WHERE id IN (SELECT value FROM json_each(?))", ids).toArray()
+		.map((n) => ({ ...n, ...(n.kind === "journal" ? journalPrefix(sql, n.id) : {}), passage: n.other_label === "capture" ? captureText(sql, n.id).slice(0, 1200) : readPrefix(sql, n.id) }));
+	const refs = sql.exec<{ id: number; src: string }>("SELECT id, src FROM edges WHERE ended_at IS NULL AND (src IN (SELECT value FROM json_each(?)) OR dst IN (SELECT value FROM json_each(?))) LIMIT 50", ids, ids).toArray();
+	const sources = readableNodeIds(sql, [...new Set(refs.map((e) => e.src))]);
+	// A capture item may read its own candidate subjects, never an unrelated incoming candidate's reason.
+	if (kind === "unprocessed_capture" || kind === "preference_signal") for (const id of readable) sources.add(id);
+	const edges = sql.exec("SELECT id, src, rel, dst, dst_profile, basis, reason FROM edges WHERE id IN (SELECT value FROM json_each(?))",
+		JSON.stringify(refs.filter((e) => sources.has(e.src)).map((e) => e.id))).toArray();
+	return { nodes, edges };
+}
+
+/** Whole entries only; separators count toward the 24k input bound. */
+function journalPrefix(sql: SqlStorage, id: string) {
+	const attrs = sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", id).one().attrs, F = fenceOf(attrs);
+	let text = "", through = F;
+	const rows = sql.exec<{ seq_no: number; chunk: number; body: string; separator: string | null }>("SELECT seq_no, chunk, body, separator FROM texts WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > ? ORDER BY seq_no, chunk", id, F).toArray();
+	const entries = new Map<number, string>();
+	for (const r of rows) entries.set(r.seq_no, (entries.get(r.seq_no) ?? "") + (r.chunk === 0 ? r.separator ?? "" : "") + r.body);
+	for (const [seq, entry] of entries) { if (text.length + entry.length > 24_000) break; text += entry; through = seq; }
+	return { compacted_through: F, through_seq: through, uncompacted_prefix: text, current_summary: sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part = 'summary' AND live = 1 ORDER BY chunk", id).toArray().map((r) => r.body).join("") };
+}
+
+/**
+ * Applies one lease's results. Ops run one by one through runWrite as actor maintenance with request id
+ * "maint:<lease>:<item>:<n>", so a retried call replays; a finished item returns its stored outcome. Outcomes hold op names
+ * and codes only, never content.
+ */
+export function complete(storage: DurableObjectStorage, who: Who, raw: { lease_id: string; results: { item_id: number; ops: MaintenanceOp[] }[] }, job: JobContext) {
+	// Model text is redacted before anything is applied, hashed or flagged, as on every other write path.
+	const c = redactPayload(raw);
+	const sql = storage.sql, now = Date.now();
+	const items = new Map(sql.exec<{ id: number; kind: string; subjects: string; state: string; lease_until: string | null; outcome: string | null }>(
+		"SELECT id, kind, subjects, state, lease_until, outcome FROM maintenance WHERE lease_id = ?", c.lease_id).toArray().map((r) => [r.id, r]));
+	// wiring: ErrorCode gains "lease_expired".
+	const expired = () => Fail.of("lease_expired" as ErrorCode, "this lease expired; its items went back to the queue", { reason: "lease_expired" });
+	if (!items.size) throw expired();
+	if ([...items.values()].some((i) => i.state === "leased" && Date.parse(i.lease_until!) < now)) {
+		storage.transactionSync(() => release(new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date(now).toISOString())));
+		throw expired();
+	}
+	let embedDue = false;
+	const results = c.results.map((r) => {
+		const item = items.get(r.item_id);
+		if (!item) return { item_id: r.item_id, status: "rejected", reason: "not_in_lease" };
+		if (item.state !== "leased") return { item_id: r.item_id, ...(JSON.parse(item.outcome ?? "{}") as object), replayed: true };
+		if (r.ops.length > MAX_OPS) return { item_id: r.item_id, status: "rejected", reason: "too_many_ops" };
+		const subjects = new Set(JSON.parse(item.subjects) as string[]), allowed = opsFor(item.kind);
+		const ops: OpOutcome[] = [];
+		for (const [n, op] of r.ops.entries()) {
+			if (!allowed.includes(op.op)) { ops.push({ op: op.op, status: "rejected", code: "validation", reason: "op_not_allowed" }); continue; }
+			const o = apply(storage, who, op, subjects, job, `maint:${c.lease_id}:${item.id}:${n}`, ops);
+			embedDue ||= o.embedDue;
+			ops.push(o.outcome);
+		}
+		// What this item committed is settled by the alarm even if the caller never sees this result (no client replay needed).
+		const box: Outbox = { created: ops.flatMap((o) => o.created ?? []), promote: ops.flatMap((o) => (o.status === "transfer_started"
+			? [{ id: o.transfer_id!, node: o.memory_id!, me: o.me!, device: job.deviceId!, company_free: true as const }] : [])) };
+		// A same-lease retry adds to an unsettled row: earlier ids and intents stay exactly as accepted, new ones join them.
+		const intend = (tx: BudgetTx) => {
+			const stage = `${OUTBOX}${c.lease_id}:${item.id}`;
+			const prior = sql.exec<{ cursor: string }>("SELECT cursor FROM cursors WHERE stage = ?", stage).toArray()[0];
+			const was: Outbox = prior ? JSON.parse(prior.cursor) as Outbox : { created: [], promote: [] };
+			const all: Outbox = { created: [...new Set([...was.created, ...box.created])], promote: [...was.promote, ...box.promote.filter((p) => !was.promote.some((q) => q.id === p.id))] };
+			if (all.created.length || all.promote.length) tx.run("INSERT INTO cursors (stage, cursor, due_at) VALUES (?, ?, ?) ON CONFLICT (stage) DO UPDATE SET cursor = excluded.cursor, due_at = excluded.due_at",
+				stage, JSON.stringify(all), Date.now() + RESUME_MS);
+		};
+		// A subject in transfer refused an op: the item is not marked done, so it stays queued and returns when its lease expires.
+		if (ops.some((o) => o.code === "moving")) {
+			storage.transactionSync(() => intend(new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString())));
+			return { item_id: r.item_id, status: "rejected", reason: "moving", ops };
+		}
+		const outcome = { status: r.ops.some((o) => o.op === "dismiss") ? "dismissed" : "done", ops };
+		storage.transactionSync(() => {
+			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+			tx.run("UPDATE maintenance SET state = ?, done_at = ?, outcome = ?, seq = ? WHERE id = ?", outcome.status, tx.now, JSON.stringify(outcome), tx.seq, item.id);
+			intend(tx);
+		});
+		return { item_id: r.item_id, ...outcome };
+	});
+	return { results, embedDue };
+}
+
+/** Due outbox rows, oldest first, at most `limit` per alarm. */
+export function dueOutbox(sql: SqlStorage, now: number, limit = 10): { stage: string; box: Outbox }[] {
+	return sql.exec<{ stage: string; cursor: string }>("SELECT stage, cursor FROM cursors WHERE stage LIKE ? AND due_at <= ? ORDER BY due_at LIMIT ?", `${OUTBOX}%`, now, limit)
+		.toArray().map((r) => ({ stage: r.stage, box: JSON.parse(r.cursor) as Outbox }));
+}
+
+/** When the alarm should next settle an outbox row, or null if none. */
+export function nextOutbox(sql: SqlStorage): number | null {
+	return sql.exec<{ at: number | null }>("SELECT min(due_at) AS at FROM cursors WHERE stage LIKE ?", `${OUTBOX}%`).one().at;
+}
+
+/**
+ * Whether a stored promotion may still go ahead: its target is fenced by this very transfer or already moved (the driver then
+ * finishes or refuses it), or it is still an active preference. Otherwise it is aborted. Protection is checked, and flagged,
+ * by the source fence itself.
+ */
+export function promotable(sql: SqlStorage, p: Outbox["promote"][number]): boolean {
+	const n = sql.exec<{ kind: string; status: string; fence: string | null }>("SELECT kind, status, json_extract(attrs, '$.transfer.id') AS fence FROM nodes WHERE id = ?", p.node).toArray()[0];
+	return !!n && (n.fence === p.id || n.status === "moved" || (n.kind === "preference" && n.status === "active"));
+}
+
+/**
+ * A proven job runtime can release its own unfinished lease, or park it after a detected tool event. An unproven one, with no
+ * lease, records only its skip in the batch_status cursor: no item is read or changed and no activity is written. No node is changed.
+ */
+export function finishBatch(storage: DurableObjectStorage, c: { lease_id?: string; status: "batch_skipped" | "stuck"; reason: string }, job: JobContext) {
+	if (!/^[a-z_]{1,64}$/.test(c.reason)) throw Fail.of("validation", "batch reason must be a content-free code");
+	return storage.transactionSync(() => {
+		const sql = storage.sql;
+		if (c.lease_id === undefined) {
+			if (c.status !== "batch_skipped") throw Fail.of("validation", "only batch_skipped may omit lease_id");
+			sql.exec(`INSERT INTO cursors (stage, due_at, last_run_at, last_error, stats) VALUES ('batch_status', 0, ?, ?, ?)
+				ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at, last_error = excluded.last_error, stats = excluded.stats`,
+				new Date().toISOString(), c.reason, JSON.stringify({ status: c.status, items: 0 }));
+			return { status: c.status, released: 0 };
+		}
+		const ids = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE lease_id = ? AND state = 'leased' ORDER BY id LIMIT 40", c.lease_id).toArray().map((r) => r.id);
+		if (!ids.length) return { status: c.status, released: 0 };
+		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+		tx.run("UPDATE maintenance SET state = ?, lease_id = NULL, lease_until = NULL, outcome = ?, seq = ? WHERE id IN (SELECT value FROM json_each(?))",
+			c.status === "stuck" ? "stuck" : "open", JSON.stringify({ status: c.status, reason: c.reason }), tx.seq, JSON.stringify(ids));
+		tx.run("INSERT INTO activity (at, actor, device_id, op, summary, targets, seq) VALUES (?, 'maintenance', ?, ?, ?, '[]', ?)",
+			tx.now, job.deviceId ?? null, c.status, c.reason, tx.seq);
+		tx.run(`INSERT INTO cursors (stage, due_at, last_run_at, last_error, stats) VALUES ('batch_status', 0, ?, ?, ?)
+			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at, last_error = excluded.last_error, stats = excluded.stats`, tx.now, c.reason, JSON.stringify({ status: c.status, items: ids.length }));
+		return { status: c.status, released: ids.length };
+	});
+}
+
+/** The owner's view of the daily batch (section 15): when it last leased, and its last skip or park. Codes and dates only. */
+export function batchStatus(sql: SqlStorage) {
+	const rows = new Map(sql.exec<{ stage: string; last_run_at: string | null; last_error: string | null; stats: string | null }>(
+		"SELECT stage, last_run_at, last_error, stats FROM cursors WHERE stage IN ('maintenance_batch', 'batch_status')").toArray().map((r) => [r.stage, r]));
+	const s = rows.get("batch_status"), stats = s?.stats ? (JSON.parse(s.stats) as { status: string; items: number }) : null;
+	return { last_lease_at: rows.get("maintenance_batch")?.last_run_at ?? null,
+		last_status: s && stats ? { status: stats.status, reason: s.last_error, items: stats.items, at: s.last_run_at } : null };
+}
+
+/** `earlier`: this item's outcomes so far, so a from_op can name only an op before it. */
+function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subjects: Set<string>, job: JobContext, requestId: string, earlier: OpOutcome[]): { outcome: OpOutcome; embedDue: boolean } {
+	const sql = storage.sql;
+	const done = (outcome: Omit<OpOutcome, "op">, embedDue = false) => ({ outcome: { op: op.op, ...outcome }, embedDue });
+	const refuse = (reason: string) => done({ status: "rejected", code: "validation", reason });
+	if (op.op === "dismiss") return done({ status: "applied" });
+	let touched: string[], local = true;
+	if (op.op === "end_link") {
+		const e = sql.exec<{ src: string; dst: string; dst_profile: string }>("SELECT src, dst, dst_profile FROM edges WHERE id = ? AND ended_at IS NULL", op.edge).toArray()[0];
+		if (!e) return done({ status: "rejected", code: "not_found" });
+		// A foreign or absent target is opaque: the item must name it, and only the real local source is checked and changed.
+		const opaque = e.dst_profile !== "" || !sql.exec("SELECT 1 FROM nodes WHERE id = ?", e.dst).toArray().length;
+		if (opaque && !subjects.has(e.dst)) return done({ status: "rejected", code: "outside_subjects" });
+		touched = opaque ? [e.src] : [e.src, e.dst];
+	} else if (op.op === "infer_preference") {
+		// The evidence is the item's own subjects, as local node pointers; the new preference touches nothing else.
+		if (!Array.isArray(op.evidence) || op.evidence.length < 1 || op.evidence.length > 10) return refuse("bad_evidence");
+		if (op.evidence.some((e) => e.kind !== "node" || !subjects.has(e.ref))) return done({ status: "rejected", code: "outside_subjects" });
+		touched = [];
+	} else if (op.op === "promote_to_me") {
+		if (op.company_free !== true) return refuse("company_free_required");
+		if (!job.me || !job.deviceId) return done({ status: "rejected", code: "forbidden" });
+		if (who.profile === "me") return refuse("already_in_me");
+		// One target: a subject, or the preference an earlier infer op of this same item created.
+		const made = op.from_op === undefined ? undefined : earlier[op.from_op];
+		if ((op.from_op === undefined) === (op.memory_id === undefined) || (op.from_op !== undefined && (made?.op !== "infer_preference" || !made.created?.length))) return refuse("bad_target");
+		touched = [made ? made.created![0]! : op.memory_id!];
+		local = !made;
+	} else {
+		touched = (op.op === "save" || op.op === "compact") ? [op.memory_id] : op.op === "link" ? [op.from, op.to] : op.op === "supersede" ? [op.keep, ...op.retire] : [op.node];
+	}
+	if (local && !touched.every((id) => subjects.has(id))) return done({ status: "rejected", code: "outside_subjects" });
+	const nodes = sql.exec<{ id: string; origin: string; pinned: number; kind: string; status: string }>("SELECT id, origin, pinned, kind, status FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(touched)).toArray();
+	if (nodes.length !== new Set(touched).size) return done({ status: "rejected", code: "not_found" });
+	if (op.op === "promote_to_me") {
+		if (nodes[0]!.status === "moving" || nodes[0]!.status === "incoming") return done({ status: "rejected", code: "moving" });
+		if (nodes[0]!.kind !== "preference" || nodes[0]!.status !== "active") return refuse("not_promotable");
+	}
+	const refused = nodes.map((n) => ({ id: n.id, why: mayChange(n, "maintenance", who.profile) })).filter((n) => n.why);
+	if (op.op === "flag" || refused.length) {
+		const flags = op.op === "flag" ? [{ id: op.node, why: op.reason }] : refused;
+		try {
+			const ids = storage.transactionSync(() => {
+				// The shared writer's gates hold for flags too: a flag set on a packed record would be lost when the move publishes.
+				assertOpen(sql);
+				for (const f of flags) assertWritable(sql, f.id);
+				const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+				return flags.map((f) => flagProtected(tx, f.id, f.why!, op.op, "maintenance"));
+			});
+			return done({ status: op.op === "flag" ? "applied" : "flagged", activity_id: ids[ids.length - 1]! });
+		} catch (e) {
+			if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+			throw e;
+		}
+	}
+	// Nothing crosses profiles here: the Worker moves the record through the C3 transfer under this deterministic id.
+	if (op.op === "promote_to_me") return done({ status: "transfer_started", memory_id: touched[0]!, transfer_id: uuid5(requestId.replace(/^maint:/, `${who.userId}:promote:`)), company_free: true, me: job.me! });
+	const cmd: WriteCommand = op.op === "infer_preference" ? { op: "save", args: { name: op.name, type: "user", kind: "preference", description: op.description,
+			...(op.why !== undefined ? { why: op.why } : {}), ...(op.how_to_apply !== undefined ? { how_to_apply: op.how_to_apply } : {}), scope: op.scope ?? "default",
+			origin: "inferred", evidence: op.evidence, request_id: requestId } }
+		: op.op === "save" ? { op: "save", args: { ...withoutOp(op), request_id: requestId } }
+		: op.op === "compact" ? { op: "save", args: { memory_id: op.memory_id, compact: { through_seq: op.through_seq, summary: op.summary }, expected_revision: op.expected_revision, request_id: requestId } }
+		: op.op === "supersede" ? { op: "save", args: { memory_id: op.keep, supersedes: op.retire, request_id: requestId } }
+			: op.op === "link" ? { op: "knowledge", args: { edges: [{ from: { id: op.from }, to: { id: op.to }, rel: op.rel, ...(op.other_label ? { other_label: op.other_label } : {}), reason: op.reason, evidence: op.evidence }], request_id: requestId } }
+				: { op: "knowledge", args: { end: [{ edge: op.edge, valid_to: op.valid_to ?? new Date().toISOString(), reason: op.reason }], request_id: requestId } };
+	try {
+		const out = runWrite(storage, who, cmd, {
+			// wiring: WriteContext.actor gains "keep" | "index" | "maintenance".
+			actor: "maintenance" as WriteContext["actor"], ...(job.deviceId ? { deviceId: job.deviceId } : {}), platform: job.platform,
+			routedBy: "maintenance", payloadHash: requestHash(`maintenance_${op.op}`, cmd.args as unknown as Record<string, unknown>), userId: job.userId,
+		});
+		// A replay reports what the first run did; only a created preference is registered and may be promoted.
+		const action = out.result.action === "replayed" ? (JSON.parse(sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ?", requestId).one().result) as { action: string }).action : out.result.action;
+		return done({ status: action === "flagged" ? "flagged" : "applied", ...(typeof out.result.activity_id === "number" ? { activity_id: out.result.activity_id } : {}),
+			...(op.op === "infer_preference" && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
+	} catch (e) {
+		if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+		throw e;
+	}
+}
+
+const withoutOp = ({ op: _op, ...rest }: Extract<MaintenanceOp, { op: "save" }>) => rest;
