@@ -562,3 +562,28 @@ Only the previously reviewed context gate is ported here. Subject ids and edge-s
 One bounded regression uses the real transfer fence and a synthetic job-token MCP dispatch. It requires an ordinary unlinked item to omit the hidden subject and candidate-owned incoming reason, while its own capture item retains the authorized candidate body/reason. It fails on the frozen f5ee intermediate and passes with the bounded gate. Exact logs and source maps are retained in the additive correction capsule. Independent review of this new core port and Terra combined/server-only eligibility remain separate.
 
 Dependency status: the independent S1/S2 CORE source review reported CLEAR on the pinned shared35/code59 inputs, including payload-SQL gating, instant ordering and budget constraints. Its frozen report and hash are retained as input evidence. That closure does not accept this newly assembled candidate or this common-context port. Dashboard stays deferred; the owner's priority section and current root role instructions remain intact.
+
+## Corpus vertical: locally adopted source, 2026-10-30
+
+This additive source is integrated locally, ported by R0 from the cleared root (126 files, aggregate `91e01937…`) onto CODE719 (root `c4d42da`). Its R1/R2/R3 source and R0 integration seam passed independent review. The sole integrator adopted its exact code, config and tests on current root `6ddd8df`, preserving current README/import facts and reconciling only R0 doc status. Terra's combined local verification passed; hosted and runtime acceptance remain open ([adoption evidence and frozen identity](corpus-implementation.md#r0-source-adoption-2026-10-30)). The revision 2 F1 refresh contract is independently clear and accepted with U8/U9 availability limits; implementation remains pending. AM-14 remains incomplete.
+
+- **New module files:**
+  - `src/corpus/families.ts`, `src/corpus/store.ts`, `src/corpus/query.ts`, `src/corpus-tools.ts`;
+  - `local/corpus-upload.mjs`, `local/corpus-cli.mjs`;
+  - `test/corpus.test.ts`, `local/corpus-upload.test.mjs`.
+
+  Callers outside `src/corpus` import only from `src/corpus/store.ts`, except the pure `chunkHash` used by the test.
+- **Schema:** `CorpusStore` is its own object class with its own migration list (`CORPUS_MIGRATIONS` v1: the five families' original DDL and indexes, the original search table and contentless FTS, `corpus_meta`, `corpus_requests`). It takes no profile or account schema version. The Wrangler migration tag `v2` (`new_sqlite_classes: ["CorpusStore"]`) exists only in `env.test`.
+- **Wiring in shared files:**
+  - `src/worker.ts`: export `CorpusStore`.
+  - `src/mcp.ts`: the `corpus` tool row, with `enabled: corpusOn`. `buildServer` and `callTool` skip a tool whose `enabled(env)` is false.
+  - `src/api.ts`: `corpusOn(env)` routes for `POST /v1/corpus/import` and `GET /v1/corpus/status`. With the module off, both fall through to the unchanged 404.
+  - `src/profile/store.ts`: in `purgeOrigin`, for `close` and `clear`, call `CORPUS_STORE`'s `wipe(who, op)` on the same object name first, whenever the binding exists. Both that refusal and the profile step return through CODE719's row meter (`metered`).
+  - `src/account/store.ts` (guard-term chunk): `addSensitiveTerms` takes optional `profile` and `generation`. With them, it refuses `busy` unless that generation is active and the account is not recovering, checked before its write. Existing callers pass neither, so their behavior is unchanged.
+  - `src/api.ts` (guard-term chunk): the corpus import runs `checkChunk` before anything else. In `work`, it registers `chunkTerms` in pages of 200 with the generation before `importChunk`. `busy` and `unavailable` map to 503.
+  - `wrangler.jsonc`: `CORPUS: "off"` in all three environments. `env.test` binds `CORPUS_STORE` with migration `v2`.
+  - `worker-configuration.d.ts`: regenerated (`CORPUS`, optional `CORPUS_STORE`).
+  - `package.json`: `test:local` adds `local/corpus-upload.test.mjs`.
+- **Completed-load resume:** `local/corpus-upload.mjs` validates the server's `source_sha256` and `as_of` before acknowledging a completed table, including with fresh local state. A mismatch returns `source_changed` without sending rows.
+- **Query response:** `CorpusStore.query(who, q, head = {})` accepts the Worker's routing fields and returns the complete tool JSON value. `src/corpus-tools.ts` passes `profile`, `routed_by` and `action`; it adds no fields afterward. The shared read helper counts at most 1,000,000 UTF-8 bytes for that complete JSON text, including metadata and list separators. It drops whole trailing rows and returns `truncated`; an oversized first row is omitted, metadata over budget is `size_budget`, and omitted paths set `paths_truncated`. The MCP renderer serializes this value without adding JSON fields.
+- **Names for self-host setup:** flag `CORPUS` (`"off"` or `"on"`), binding `CORPUS_STORE`, class `CorpusStore`, object name `userId:profile:generation`.

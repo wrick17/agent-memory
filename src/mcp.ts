@@ -13,6 +13,7 @@ import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } fr
 import { contextProfile, mayUse, readSet, routeWrite, type Route } from "./routing";
 import { explore, exploreSchema, GRAPH_TOOL_TEXT, timeline, timelineSchema, trace, traceSchema } from "./graph-tools";
 import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
+import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT } from "./corpus-tools";
 import { driveTransfer, transferPorts } from "./transfer";
 
 export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string }
@@ -123,6 +124,8 @@ export const TOOLS = [
 	{ name: "trace", scope: "read" as Scope, schema: traceSchema, run: trace, description: GRAPH_TOOL_TEXT.trace },
 	{ name: "timeline", scope: "read" as Scope, schema: timelineSchema, run: timeline, description: GRAPH_TOOL_TEXT.timeline },
 	{ name: "work_board", scope: "read" as Scope, schema: workBoardSchema, run: workBoard, description: BOARD_TOOL_TEXT },
+	// Paid only (section 14): listed and callable only while the corpus module is on.
+	{ name: "corpus", scope: "read" as Scope, schema: corpusSchema, run: corpus, description: CORPUS_TOOL_TEXT, enabled: corpusOn },
 	// Job tools (job-scoped token only, section 7).
 	...MAINTENANCE_TOOLS,
 ] as const;
@@ -406,7 +409,7 @@ function render(outcome: Outcome<unknown>) {
 export function buildServer(c: ToolContext): McpServer {
 	const server = new McpServer({ name: "agent-memory", version: "0.1.0" });
 	for (const tool of TOOLS) {
-		if (!c.caller.scopes.includes(tool.scope)) continue;
+		if (!c.caller.scopes.includes(tool.scope) || ("enabled" in tool && !tool.enabled(c.env))) continue;
 		server.registerTool(tool.name, { description: tool.description, inputSchema: tool.schema },
 			async (args: unknown) => render(await (tool.run as (c: ToolContext, a: unknown) => Promise<Outcome<unknown>>)(c, args)));
 	}
@@ -416,7 +419,7 @@ export function buildServer(c: ToolContext): McpServer {
 /** The same dispatch without the transport, for the REST API and tests. */
 export async function callTool(c: ToolContext, name: string, args: unknown): Promise<Outcome<unknown>> {
 	const tool = TOOLS.find((t) => t.name === name);
-	if (!tool || !c.caller.scopes.includes(tool.scope)) return fail("forbidden", `tool ${name} is not available to this caller`);
+	if (!tool || !c.caller.scopes.includes(tool.scope) || ("enabled" in tool && !tool.enabled(c.env))) return fail("forbidden", `tool ${name} is not available to this caller`);
 	const parsed = tool.schema.safeParse(args);
 	if (!parsed.success) return fail("validation", parsed.error.issues.map((i) => `${i.path.join(".") || "arguments"}: ${i.message}`).join("; "));
 	return (tool.run as (c: ToolContext, a: unknown) => Promise<Outcome<unknown>>)(c, parsed.data);

@@ -6,6 +6,7 @@ import { accountStub, buildServer, type ToolContext } from "./mcp";
 
 export { AccountStore } from "./account/store";
 export { ProfileStore } from "./profile/store";
+export { CorpusStore } from "./corpus/store";
 
 // One handler for the isolate; each request gets a fresh server built from its own authenticated context.
 const handler = createMcpHandler((rc) => buildServer(rc.authInfo!.extra!.tools as ToolContext), { legacy: "stateless", responseMode: "json" });

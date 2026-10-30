@@ -8,7 +8,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run test && npm run test:local",
-    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/migrate.test.mjs local/upload.test.mjs"
+    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/corpus-upload.test.mjs local/migrate.test.mjs local/upload.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

@@ -25,7 +25,8 @@ export type AccountCommand =
 	| { op: "setDeviceDefault"; id: string; defaultProfile: string | null }
 	| { op: "setRules"; rules: Omit<RoutingRule, "id">[] }
 	| { op: "addSensitiveTerm"; term: string }
-	| { op: "addSensitiveTerms"; terms: string[] }
+	/** With profile and generation (corpus chunks), terms land only while that generation is active and the account is not recovering. */
+	| { op: "addSensitiveTerms"; terms: string[]; profile?: string; generation?: string }
 	| { op: "listProfiles" }
 	| { op: "wipeProfile"; profile: string; typed: string };
 
@@ -438,6 +439,9 @@ export class AccountStore extends DurableObject<Env> {
 				// Terms from work record_knowledge writes, in one transaction; existing terms are left as they are.
 				const terms = [...new Set(cmd.terms.map((t) => t.trim()).filter((t) => t.length >= 2 && t.length <= 200))];
 				if (!terms.length) return ok({ terms: 0 });
+				// The upload generation check of bindRequest and recordNodes, with no await before the write, so a wipe or recovery that
+				// began after the caller's context was read stops the registration.
+				if (cmd.generation && (this.meta("recovery_state") || !this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND generation = ? AND status = 'active'", cmd.profile ?? null, cmd.generation).toArray().length)) return fail("busy", "upload generation is closed or recovering");
 				this.write((seq) => { for (const t of terms) this.sql.exec("INSERT OR IGNORE INTO sensitive_terms (term, source, updated_at, seq) VALUES (?, 'work', ?, ?)", t, now(), seq); });
 				const guarded = await this.guardMe(terms, "work");
 				return guarded.ok ? ok({ terms: terms.length }) : guarded;

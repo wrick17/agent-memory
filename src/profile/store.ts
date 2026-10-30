@@ -187,6 +187,12 @@ export class ProfileStore extends DurableObject<Env> {
 	/** One step of a profile wipe (section 9). clear deletes this object's storage, so it skips bind on a repeat. */
 	async purgeOrigin(who: Who, step: WipeStep): Promise<Outcome<WipeOut>> {
 		if (step.op !== "clear") this.bind(who, false, true);
+		// The generation's corpus closes and clears with it, first, whatever the CORPUS flag says now; a replay repeats it harmlessly.
+		if ((step.op === "close" || step.op === "clear") && this.env.CORPUS_STORE) {
+			const corpus = this.env.CORPUS_STORE.get(this.env.CORPUS_STORE.idFromName(`${who.userId}:${who.profile}:${who.generation}`)) as unknown as Pick<import("../corpus/store").CorpusStore, "wipe">;
+			const r = await corpus.wipe(who, step.op);
+			if (!r.ok) return this.metered(r);
+		}
 		return this.metered(await purgeOrigin(this.ctx.storage, this.env, who, step));
 	}
 

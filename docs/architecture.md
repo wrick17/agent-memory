@@ -1425,6 +1425,8 @@ Heal sweeps retire. Their jobs split three ways: deterministic housekeeping and 
 
 The corpus is too big for Free: 3.2 GB, 525k commits, 292k tickets, 135k PRs and 1.7M search documents, against a 1 GB object limit on Free. Its limit is storage, not compute.
 
+**Source status, 2026-10-30:** the reviewed R0 first vertical is integrated locally with scoped local checks only; Terra's combined local verification passed ([adoption evidence](corpus-implementation.md#r0-source-adoption-2026-10-30)). Five Git-history families load under their original DDL through `/v1/corpus/import`. The other source tables are held by name. The search index keeps its original schema, but its rows are rebuilt from approved rows and never uploaded. The flag is `CORPUS`, and the Durable Object binding is `CORPUS_STORE`, since one Env name cannot be both. Chunks are pinned to the profile's generation and keep `request_id = corpus:<table>:<first key>`, where a composite key is hashed. The load is a dated snapshot per table, and refresh is not built. The uploader validates the source hash and `as_of` before skipping a completed table, even with fresh local state. Production and rehearsal remain off and unbound. This is source adoption only; AM-14 and hosted acceptance remain open. The revision 2 F1 refresh contract is independently clear and accepted with its U8/U9 availability limits; implementation remains pending.
+
 ### Storage
 
 One `CorpusStore` object per profile (10 GB object limit on Paid) holds the corpus tables with their original schemas, the FTS5 `corpus_search_documents` index, and two bookkeeping tables: `corpus_meta(table, source, as_of, refresh)` and `markers` per repo. Corpus rows are not graph nodes, because 1.7M commit paths as nodes would bloat every traversal. `explore` and `corpus` look corpus rows up by key (a commit SHA, PR number, ticket key or repo), so "what is connected to X" includes corpus records on Paid.
@@ -1453,7 +1455,7 @@ The local refresh for checkout tables follows the owner's rule: the hook compare
 
 ### Query tools
 
-`corpus` with `search` (FTS5 over search documents, passages), `get` (exact commit, PR, ticket, repo, person or session by key), and `sql` (read-only, 500-row cap, 30 s CPU on Paid). Every response carries the `as_of` of the tables it read.
+`corpus` with `search` (FTS5 over search documents, passages), `get` (exact commit, PR, ticket, repo, person or session by key), and `sql` (read-only, 500-row cap, 30 s CPU on Paid). Every response carries the `as_of` of the tables it read. In the locally adopted first vertical, search, get and SQL share a 1,000,000-byte UTF-8 budget on the complete tool JSON text, including routing fields and provenance. It omits whole trailing rows with `truncated: true`, including a single oversized row, and refuses metadata that cannot fit by itself.
 
 ## 15. Dashboard
 
@@ -1837,7 +1839,7 @@ The repo is a self-host template. Each user deploys it on their own Cloudflare a
 	"durable_objects": { "bindings": [
 		{ "name": "ACCOUNT", "class_name": "AccountStore" },
 		{ "name": "PROFILE", "class_name": "ProfileStore" },
-		{ "name": "CORPUS", "class_name": "CorpusStore" }
+		{ "name": "CORPUS_STORE", "class_name": "CorpusStore" }
 	] },
 	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountStore", "ProfileStore", "CorpusStore"] }],
 	"r2_buckets": [{ "binding": "BACKUPS", "bucket_name": "agent-memory-backups" }],

@@ -4,10 +4,12 @@ import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
 import { redactPayload } from "./domain/redact";
-import { MEMORY_KINDS, MEMORY_TYPES, ok, SCOPES, type OwnerArgs, type ProfileRef, type WriteCommand } from "./domain/types";
+import { Fail, MEMORY_KINDS, MEMORY_TYPES, ok, SCOPES, type OwnerArgs, type ProfileRef, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, profileStub } from "./mcp";
+import { chunkSchema, corpusOn, corpusStub } from "./corpus-tools";
+import { checkChunk, chunkTerms, HELD } from "./corpus/store";
 import { commitArgs, repoNamespace, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
 import { mayUse, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
@@ -288,8 +290,79 @@ async function importAudit(request: Request, env: Env): Promise<Response> {
 	return out.ok ? json({ profile, ...(out.value as Record<string, unknown>) }) : json({ error: out.error }, 400);
 }
 
+/** The owner or an `import` device token; corpus loads and status are never open to read or ingest tokens. */
+async function corpusCaller(request: Request, env: Env): Promise<AccountContext | Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	if (ctx.value.caller.kind !== "owner" && !ctx.value.caller.scopes.includes("import")) return json({ error: { code: "forbidden", message: "this token cannot load the corpus" } }, 403);
+	return ctx.value;
+}
+
+/** An active profile the caller may use, which this deployment takes imports into; never me. */
+function corpusProfile(env: Env, ctx: AccountContext, profile: string): ProfileRef | Response {
+	if (!PROFILE_NAME.test(profile) || profile === "me") return json({ error: { code: "forbidden", message: "the corpus never holds me" } }, 403);
+	if (!(env.IMPORT_PROFILES ?? "").split(",").map((x) => x.trim()).includes(profile)) return json({ error: { code: "forbidden", message: `this deployment does not take imports into '${profile}'`, details: { reason: "import_disabled" } } }, 403);
+	const ref = ctx.profiles.find((p) => p.profile === profile);
+	if (!ref) return json({ error: { code: "not_found", message: `profile '${profile}' is not active` } }, 404);
+	if (!mayUse(ctx.caller, profile)) return json({ error: { code: "forbidden", message: `this caller may not use profile '${profile}'` } }, 403);
+	return ref;
+}
+
+const corpusStatusCode = (code: string) => (code === "forbidden" ? 403 : code === "size_budget" ? 413 : code === "idempotency_mismatch" || code === "profile_wiped" ? 409
+	: code === "busy" || code === "unavailable" ? 503 : 400);
+/** Guard terms per account call: one account and one me transaction each, well inside the 1,000-row write bound. */
+const TERM_PAGE = 200;
+
+/**
+ * POST /v1/corpus/import (section 14): one ordered chunk of one approved family, at most 5,000 rows and 1,000,000 bytes, for
+ * the generation the uploader pinned. Held and unknown tables are refused here by name, before any store sees them.
+ */
+async function corpusImport(request: Request, env: Env): Promise<Response> {
+	const ctx = await corpusCaller(request, env);
+	if (ctx instanceof Response) return ctx;
+	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return json({ error: { code: "validation", message: "send JSON" } }, 400);
+	const raw = await request.text();
+	if (Buffer.byteLength(raw, "utf8") > 1_000_000) return json({ error: { code: "size_budget", message: "a corpus chunk may hold at most 1,000,000 bytes", details: { reason: "chunk_bytes" } } }, 413);
+	let input: z.infer<typeof chunkSchema>;
+	try {
+		const r = chunkSchema.safeParse(JSON.parse(raw));
+		if (!r.success) return json({ error: { code: "validation", message: r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+		input = r.data;
+	} catch { return json({ error: { code: "validation", message: "the body is not JSON" } }, 400); }
+	// Every stateless check first, held and unknown tables by name included, so a refused row never reaches the guard terms.
+	let checked: ReturnType<typeof checkChunk>;
+	try { checked = checkChunk(input); } catch (e) { if (e instanceof Fail) return json({ error: e.failure }, corpusStatusCode(e.failure.code)); throw e; }
+	const ref = corpusProfile(env, ctx, input.profile);
+	if (ref instanceof Response) return ref;
+	if (input.generation !== ref.generation) return json({ error: { code: "profile_wiped", message: "this profile is on another generation; start a fresh upload", details: { reason: "generation_changed" } } }, 409);
+	// The chunk's work repos and people guard me before it is stored, as work writes' terms do: bounded pages through the same
+	// account helper, each bound to this generation. Nothing is stored unless every page is confirmed; a resend replays them all.
+	const terms = ref.profile === "work" ? chunkTerms(checked.f, checked.rows) : [];
+	for (let i = 0; i < terms.length; i += TERM_PAGE) {
+		const added = await accountStub(env, ctx.caller.userId).admin({ op: "addSensitiveTerms", terms: terms.slice(i, i + TERM_PAGE), profile: ref.profile, generation: ref.generation });
+		if (!added.ok) return json({ error: added.error }, corpusStatusCode(added.error.code));
+	}
+	const { profile: _p, generation: _g, ...chunk } = input;
+	const r = await corpusStub(env, ref).importChunk(ref, chunk);
+	return r.ok ? json({ profile: ref.profile, generation: ref.generation, receipt: r.value }) : json({ error: r.error }, corpusStatusCode(r.error.code));
+}
+
+/** GET /v1/corpus/status?profile=: the generation to pin, the accepted families with their hashes, the hold list and each table's progress. */
+async function corpusStatus(request: Request, env: Env): Promise<Response> {
+	const ctx = await corpusCaller(request, env);
+	if (ctx instanceof Response) return ctx;
+	const ref = corpusProfile(env, ctx, new URL(request.url).searchParams.get("profile") ?? "");
+	if (ref instanceof Response) return ref;
+	const r = await corpusStub(env, ref).status(ref);
+	return r.ok ? json({ profile: ref.profile, generation: ref.generation, held: HELD, ...r.value }) : json({ error: r.error }, corpusStatusCode(r.error.code));
+}
+
 export async function api(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
+	if (corpusOn(env) && url.pathname === "/v1/corpus/import" && request.method === "POST") return corpusImport(request, env);
+	if (corpusOn(env) && url.pathname === "/v1/corpus/status" && request.method === "GET") return corpusStatus(request, env);
 	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
 	if (url.pathname === "/v1/import" && request.method === "POST") return importBatch(request, env);
 	if (url.pathname === "/v1/import/audit" && request.method === "GET") return importAudit(request, env);
