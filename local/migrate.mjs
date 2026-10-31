@@ -328,7 +328,7 @@ function applyOwnerWork(items, rows, reviewed) {
 		if (i === undefined) fail("names a source this export does not have");
 		const it = items[i];
 		if ((it.id ?? null) !== r.id || (it.node.scope ?? null) !== r.scope || sha256(canonicalJson(rows[i])) !== r.source_sha256) fail("no longer matches its exported source");
-		if (r.id === null || r.scope === null) continue;
+		if (r.id === null || r.scope === null || it.held) continue;
 		it.route = { profile: "work", rule: "legacy_work_owner", automatic: it.route };
 		it.node.attrs.source.owner_classification = ownerWitness(reviewed, r, it);
 	}
@@ -343,8 +343,48 @@ function applyReviewed(items, rows, reviewed) {
 		if (i === undefined) fail("names a source this export does not have");
 		const it = items[i];
 		if (it.id !== r.id || it.node.scope !== r.scope || sha256(canonicalJson(rows[i])) !== r.source_sha256) fail("no longer matches its exported source");
+		if (it.held) continue;
 		if (it.route) fail("conflicts with an existing routing rule");
 		it.route = { profile: r.profile, rule: "reviewed" };
+	}
+}
+
+const HOLD_REASONS = new Set(["privacy_hold", "unreviewed_new"]);
+/**
+ * The owner's holds (`plan --owner-holds FILE`): exact sources of one export, sorted by source key, each bound to the SHA-256 of
+ * its exported row with a fixed reason. A held source gets no route and no command; it is listed for review. Absent sources
+ * cannot be named, so a hold never deletes or resurrects anything. Refused whole, before any output, when anything differs.
+ */
+export function readOwnerHolds(file, exportDir) {
+	const st = fs.statSync(file), bytes = fs.readFileSync(file);
+	const fail = (why) => { throw new Error(`owner holds refused: ${why}`); };
+	if (st.uid !== process.getuid() || (st.mode & 0o077)) fail("needs a private owner file");
+	const exact = (o, keys) => !!o && typeof o === "object" && !Array.isArray(o) && JSON.stringify(Object.keys(o).sort()) === JSON.stringify([...keys].sort());
+	let doc;
+	try { doc = JSON.parse(bytes.toString("utf8")); } catch { fail("not JSON"); }
+	if (!exact(doc, ["version", "export_manifest_sha256", "holds"]) || doc.version !== 1 || !Array.isArray(doc.holds) || !doc.holds.length) fail("schema");
+	if (doc.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json")))) fail("made for another export");
+	const holds = new Map();
+	doc.holds.forEach((h, i) => {
+		const n = i + 1;
+		if (!exact(h, ["source", "source_sha256", "reason"]) || !nonEmpty(h.source) || !/^[0-9a-f]{64}$/.test(h.source_sha256)) fail(`hold ${n} schema`);
+		if (!HOLD_REASONS.has(h.reason)) fail(`hold ${n} reason`);
+		if (i && !(doc.holds[i - 1].source < h.source)) fail(`hold ${n} is not strictly sorted by source`);
+		holds.set(h.source, { ...h, n });
+	});
+	return { sha256: sha256Bytes(bytes), holds };
+}
+
+/** Runs before every routing override: a held item loses its automatic route, so no later step can stage it. */
+function applyOwnerHolds(items, rows, owner) {
+	const at = new Map(items.map((it, i) => [it.key, i]));
+	for (const h of owner.holds.values()) {
+		const fail = (why) => { throw new Error(`owner holds refused: hold ${h.n} ${why}`); };
+		const i = at.get(h.source);
+		if (i === undefined) fail("names a source this export does not have");
+		if (sha256(canonicalJson(rows[i])) !== h.source_sha256) fail("no longer matches its exported source");
+		Object.assign(items[i], { held: h.reason, route: null });
+		items[i].review.push(`owner_hold:${h.reason}`);
 	}
 }
 
@@ -784,7 +824,7 @@ function refreshCommands(it, base) {
  * commands. Deterministic: the same export and rules give byte-identical commands. A part's id and hash depend only on its
  * record's content, so an unchanged record keeps its parts across plans and the server can replay them.
  */
-export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null } = {}) {
+export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null, ownerHolds = null } = {}) {
 	// A rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
 	if (rehearsal !== null && rehearsal !== "test") throw new Error("a rehearsal goes to the test profile only");
 	if (rehearsal !== null && (routes || sourcePolicy)) throw new Error("a rehearsal ignores routing; reviewed routes apply to a routed plan only");
@@ -795,10 +835,11 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		if (refreshFrom && path.resolve(refreshFrom) === path.resolve(exportDir)) throw new Error("a refresh needs a fresh export directory");
 		const reviewed = routes ? readReviewedRoutes(routes, exportDir) : null;
 		const policy = sourcePolicy ? readSourcePolicy(sourcePolicy, exportDir) : null;
+		const held = ownerHolds ? readOwnerHolds(ownerHolds, exportDir) : null;
 		const base = refreshFrom ? completedBase(refreshFrom, rehearsal) : null;
 		const version = policy || reviewed?.version === 2 || base?.records.some(r=>r.node.attrs.import_review || r.node.attrs.source?.owner_classification) ? POLICY_PLAN_VERSION : PLAN_VERSION;
 		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version, ...(base ? { refresh_base: base.commands_sha256 } : {}),
-			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}), ...(policy ? {source_policy:policy.sha256} : {}) }));
+			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}), ...(policy ? {source_policy:policy.sha256} : {}), ...(held ? { owner_holds: held.sha256 } : {}) }));
 		const out = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan");
 		const statePath = path.join(migrationDir(), "state.json");
 		const state = readJson(statePath, { exports: [], plans: {} });
@@ -809,12 +850,13 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		if (reviewed || policy) remotes.clear();
 		const bothqRows = readJsonl(path.join(exportDir, "bothq", "records.jsonl")), rows = [...bothqRows, ...readJsonl(path.join(exportDir, "markdown", "files.jsonl"))];
 		const items = rows.map((r, i) => (i < bothqRows.length ? bothqItem(r) : markdownItem(r, rules)));
+		if (held) applyOwnerHolds(items, rows, held);
 		if (reviewed) (reviewed.version === 2 ? applyOwnerWork : applyReviewed)(items, rows, reviewed);
 		const review = [], holds = [];
 		const previous = new Map(base?.records.map((r) => [r.key, r]) ?? []), records = new Map(previous);
 		for (const it of items) {
-			if (rehearsal && it.id) it.route = { profile: rehearsal, rule: "rehearsal" };
-			if (!it.route && !it.review.includes("missing_scope")) it.review.push(it.source === "bothq" ? "unrouted_scope" : "unrouted_path");
+			if (rehearsal && it.id && !it.held) it.route = { profile: rehearsal, rule: "rehearsal" };
+			if (!it.route && !it.held && !it.review.includes("missing_scope")) it.review.push(it.source === "bothq" ? "unrouted_scope" : "unrouted_path");
 			// The server's personal-field rule: a node it would strip an attribute from is held, never rewritten.
 			if (stripPersonal(it.node.kind, it.node.attrs).stripped.length) it.review.push("personal_fields");
 			const { changed, derivative } = redactionChanges(it);
@@ -909,6 +951,7 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			version, ...(policy ? {source_policy:{version:1,sha256:policy.sha256,entries:policy.entries.length}} : {}), input_sha256: inputSha, export_dir: tilde(exportDir), rules, rehearsal,
 			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size, ...(reviewed.version === 2 ? { version: 2, effect: "legacy_work_owner",
 				owner_decision_sha256: reviewed.owner_decision_sha256, classified: items.filter((x) => x.route?.rule === "legacy_work_owner").length } : {}) } } : {}),
+			...(held ? { owner_holds: { version: 1, sha256: held.sha256, holds: held.holds.size } } : {}),
 			items: items.length, planned: ready.filter((x) => x.planned).length, review: review.length, holds: holds.length, reasons, records_by_profile: byProfile,
 			commands: commands.length, stage: stages.length, finalize: count((c) => c.op === "finalize"), link: count((c) => c.op === "link"), batches: batches.length,
 			max_part: { rows: Math.max(0, ...stages.map((s) => s.cost.rows)), bytes: Math.max(0, ...stages.map((s) => s.cost.bytes)), json_bytes: Math.max(0, ...stages.map((s) => utf8(JSON.stringify(s)))) },
@@ -1000,10 +1043,10 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process
 	const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 	const run = {
 		export: async () => { const r = await exportAll({ ...DEFAULT_SOURCES, ...(opt("graph-db") ? { graphDb: opt("graph-db") } : {}), ...(opt("python") ? { python: opt("python") } : {}) }); print(r.manifest); },
-		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, sourcePolicy: opt("source-policy"), routes: opt("routes") ?? null }); print({ status: r.status, ...r.manifest }); },
+		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, sourcePolicy: opt("source-policy"), routes: opt("routes") ?? null, ownerHolds: opt("owner-holds") ?? null }); print({ status: r.status, ...r.manifest }); },
 		verify: async () => print(await verify({ exportDir })),
 		"dry-run": async () => print(dryRun({ exportDir, rehearsal: opt("rehearsal") ?? null })),
 	}[cmd];
-	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--source-policy FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
+	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--source-policy FILE] [--owner-holds FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
 	run().catch((e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 }

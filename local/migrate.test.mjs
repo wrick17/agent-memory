@@ -672,6 +672,38 @@ describe("legacy Work owner classification", () => {
 		assert.throws(() => m.dryRun({ exportDir: dir }), /classification command version differs/);
 	});
 
+	it("owner holds stage nothing for an old privacy hold or a new Personal candidate, leave unheld commands unchanged, and refuse a wrong binding", async () => {
+		const oldHold = legacy("old-hold", "bot_hq"), kept = legacy("kept", "bot_hq"), fresh = legacy("fresh", "personal"), other = legacy("other", "personal");
+		const dir = makeExport([oldHold, kept, fresh, other]), id = (r) => m.bothqItem(r).id, routes = ownerFile(dir, [oldHold, kept].map(keyOf));
+		const holdsFile = (holds, edit = (d) => d) => {
+			const file = path.join(fs.mkdtempSync(path.join(tmp, "holds-")), "holds.json");
+			fs.writeFileSync(file, JSON.stringify(edit({ version: 1, export_manifest_sha256: exportSha(dir), holds: holds.map(([r, reason]) => ({ source: keyOf(r), source_sha256: sha256(canonicalJson(r)), reason })) })), { mode: 0o600 });
+			return file;
+		};
+		const before = await m.plan({ exportDir: dir, routes });
+		const all = planned(dir);
+		const p = await m.plan({ exportDir: dir, routes, ownerHolds: holdsFile([[fresh, "unreviewed_new"], [oldHold, "privacy_hold"]].sort((a, b) => (keyOf(a[0]) < keyOf(b[0]) ? -1 : 1))) });
+		const heldIds = [id(oldHold), id(fresh)];
+		assert.deepEqual(planned(dir), all.filter((c) => !heldIds.includes(c.record_id)));
+		assert.deepEqual([p.manifest.version, p.manifest.owner_holds.holds, p.manifest.planned, before.manifest.planned, m.planRecords(p.dir).map((r) => r.id).sort()], [2, 2, 2, 4, [id(kept), id(other)].sort()]);
+		assert.deepEqual(reviewOf(dir).map((r) => [r.key, r.reasons, r.proposed, r.planned]), [[keyOf(fresh), ["owner_hold:unreviewed_new"], undefined, false], [keyOf(oldHold), ["owner_hold:privacy_hold"], undefined, false]]);
+		const one = [[oldHold, "privacy_hold"]];
+		const cases = [
+			[holdsFile(one, (d) => ({ ...d, export_manifest_sha256: "0".repeat(64) })), /made for another export/],
+			[holdsFile([[record({ eid: "not-exported", name: "x" }), "privacy_hold"]]), /names a source this export does not have/],
+			[holdsFile(one, (d) => ({ ...d, holds: [{ ...d.holds[0], source_sha256: "0".repeat(64) }] })), /no longer matches its exported source/],
+			[holdsFile([...one, ...one]), /not strictly sorted/],
+			[holdsFile([[oldHold, "approved"]]), /hold 1 reason/],
+			[holdsFile(one, (d) => ({ ...d, holds: [{ ...d.holds[0], profile: "work" }] })), /hold 1 schema/],
+			[holdsFile([]), /schema/],
+		];
+		const last = fs.readFileSync(path.join(dir, "plan", "manifest.json"), "utf8");
+		for (const [file, error] of cases) await assert.rejects(m.plan({ exportDir: dir, routes, ownerHolds: file }), error);
+		fs.chmodSync(cases[0][0], 0o644);
+		await assert.rejects(m.plan({ exportDir: dir, ownerHolds: cases[0][0] }), /private owner file/);
+		assert.equal(fs.readFileSync(path.join(dir, "plan", "manifest.json"), "utf8"), last, "a refused holds file writes no plan");
+	});
+
 	it("refuses an unknown, stale, retargeted or unsigned owner document before any output", async () => {
 		const mine = legacy("strict", "personal"), dir = makeExport([mine]), key = keyOf(mine);
 		const entry = (over) => (d) => sign({ ...d, roster: [{ ...d.roster[0], ...over }] });

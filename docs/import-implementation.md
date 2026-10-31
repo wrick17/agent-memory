@@ -20,6 +20,7 @@ Author: Opus (`claude-opus-5-5`), 2026-10-29, on `phase2-capture`. This is the [
 node local/migrate.mjs export                    # BothQ (read transactions) + Markdown (read) into export-<UTC>-<rand>/
 node local/migrate.mjs plan                      # routed plan: work and personal, nothing to me
 node local/migrate.mjs plan --routes FILE        # the same, plus the owner's reviewed routes for exact sources of this export
+node local/migrate.mjs plan --owner-holds FILE   # owner-bound exclusions before every route; combine with --routes/--source-policy as needed
 node local/migrate.mjs plan --rehearsal test     # every record with an identity and no hold, to test (rehearsal Worker only)
 node local/migrate.mjs verify                    # a fresh read of the sources compared with the export
 node local/migrate.mjs dry-run [--rehearsal test]   # checks every command, part and batch against the budget; no network
@@ -33,6 +34,12 @@ Upload config, mode 0600, default `~/.agent-memory/migration/upload.json`:
 ```
 
 The token file holds one `import`-scoped device token (mode 0600). It is read only when a request is sent and never written to logs, state or output. The upload state, `plan…/upload-<host>.json` (0600), holds batch numbers and receipts: record ids, operations, statuses and reasons, never memory text.
+
+## Owner hold exclusions, 2026-10-31
+
+`plan --owner-holds FILE` takes an owner-owned private JSON file, kept outside the repository with mode0600. Its closed top-level fields are `version: 1`, `export_manifest_sha256` and a nonempty `holds` array. The export hash must match this export's `manifest.json`. Each hold has exactly `source`, `source_sha256` and `reason`; the row hash is the SHA-256 of that exported row's canonical JSON. Sources must be strictly sorted with no duplicates. Reasons are only `privacy_hold` or `unreviewed_new`. Foreign ownership, group/other access, unknown fields, invalid reasons and mismatched bindings refuse the whole input before plan output.
+
+Holds clear automatic routing and take precedence over reviewed routes, owner454 overrides and rehearsal routing. Held sources remain in review as `owner_hold:<reason>` with no route or commands; other privacy and identity guards remain. Absent sources cannot be named, so exclusions neither delete nor resurrect them. The hold-file hash binds the plan input/manifest; without the flag, prior input hashing and unheld command behavior are unchanged. This is reviewed planner source support only. The current fresh plan remains private and has not been uploaded.
 
 ## Export review fixes, 2026-10-29
 
