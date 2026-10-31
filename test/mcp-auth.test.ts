@@ -447,6 +447,11 @@ describe("owner API", () => {
 		const [app, appJs] = await Promise.all(["/app", "/app.js"].map((p) => exports.default.fetch(new Request(`${origin}${p}`))));
 		expect([app!.status, app!.headers.get("content-security-policy"), app!.headers.get("cache-control"), appJs!.headers.get("content-type"), appJs!.headers.get("cache-control")])
 			.toEqual([200, page.headers.get("content-security-policy"), "no-store", "text/javascript; charset=utf-8", "no-store"]);
+		// The site root serves the same dashboard shell, so https://<host>/ opens it; /app stays as an alias.
+		const root = await exports.default.fetch(new Request(`${origin}/`));
+		expect([root.status, root.headers.get("content-type"), root.headers.get("content-security-policy"), root.headers.get("cache-control"), await root.text()])
+			.toEqual([200, "text/html; charset=utf-8", page.headers.get("content-security-policy"), "no-store", await app!.text()]);
+		expect((await exports.default.fetch(new Request(`${origin}/`, { method: "POST" }))).status).not.toBe(200);
 		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`))).status).toBe(401);
 		const fapi = env.CLERK_FRONTEND_API, protect = "https://*.protect.clerk.com";
 		// Clerk's documented sources (script, connect with any port, frame), blob: images from the live page, nothing broader.

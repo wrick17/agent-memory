@@ -633,8 +633,9 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	if (url.pathname === "/settings.js" && request.method === "GET") {
 		return new Response(SETTINGS_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
 	}
-	// The dashboard shell and script are public, as /settings is; every data route below stays behind owner().
-	if (url.pathname === "/app" && request.method === "GET") {
+	// The dashboard shell and script are public, as /settings is; every data route below stays behind owner(). The site root
+	// serves the same shell, and /app stays as an alias.
+	if ((url.pathname === "/" || url.pathname === "/app") && request.method === "GET") {
 		return new Response(DASHBOARD_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}
 	if (url.pathname === "/app.js" && request.method === "GET") {

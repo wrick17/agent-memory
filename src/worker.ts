@@ -1,4 +1,4 @@
-// fetch(): /mcp, /v1/whoami, /api/*, /settings and protected-resource metadata. Stateless between requests.
+// fetch(): /mcp, /v1/whoami, /api/*, /settings, the dashboard at / (and /app) and protected-resource metadata. Stateless between requests.
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { api, challenge, protectedResource } from "./api";
 import { authenticate } from "./auth";
@@ -35,7 +35,7 @@ export default {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") return protectedResource(env);
 		if (pathname === "/mcp") return mcp(request, env);
-		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js" || pathname === "/app" || pathname === "/app.js") return api(request, env);
+		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js" || pathname === "/" || pathname === "/app" || pathname === "/app.js") return api(request, env);
 		return new Response("not found", { status: 404 });
 	},
 	// The nightly export of every active profile and the account (section 18); a failure is kept as last_export_failed.
