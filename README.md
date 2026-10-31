@@ -35,7 +35,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 - [x] Save a memory and add to a journal (owner trial).
 - [x] Find a memory by searching and read its history (owner trial).
 - [x] Explore a simple connection between two items (owner trial).
-- [ ] Find memories as they were at a chosen point in time.
+- [x] Find memories as they were at a chosen point in time (canonical owner flow). [Evidence](docs/combined-verification-2026-10-30.md#canonical-owner-point-in-time-find-2026-11-01).
 - [ ] Manage a memory's full lifecycle, including renaming, moving, retiring, and restoring it.
 - [x] Review captured suggestions and turn them into memories (canonical owner flow).
 
