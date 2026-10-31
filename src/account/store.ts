@@ -44,9 +44,9 @@ export type AccountCommand =
 	| { op: "beginRestore"; profile: string; export: string }
 	| { op: "beginAccountRestore"; export: string }
 	| { op: "restoreStatus" }
-	| { op: "restoreStep" }
-	| { op: "openRestore" }
-	| { op: "abortRestore" };
+	| { op: "restoreStep"; id?: string }
+	| { op: "openRestore"; id?: string }
+	| { op: "abortRestore"; id?: string };
 
 /**
  * The open recovery, kept in `recovery_state` while the account is closed. `unresolved` keeps the account closed until the
@@ -552,6 +552,10 @@ export class AccountStore extends DurableObject<Env> {
 	private async backup(cmd: Extract<AccountCommand, { op: "export" | "listExports" | "beginRestore" | "beginAccountRestore" | "restoreStatus" | "restoreStep" | "openRestore" | "abortRestore" }>): Promise<Outcome<unknown>> {
 		const userId = this.meta("user_id");
 		if (!userId) return fail("unavailable", "the account is not set up");
+		// Checked before any await, so nothing below runs for a recovery other than the one the caller named.
+		if ((cmd.op === "restoreStep" || cmd.op === "openRestore" || cmd.op === "abortRestore") && cmd.id !== undefined && this.recovery()?.id !== cmd.id) {
+			return fail("busy", "the recovery changed since it was shown; read its status", { reason: "recovery_changed" });
+		}
 		const account = this.accountRecovery();
 		if (account && (cmd.op === "restoreStep" || cmd.op === "openRestore" || cmd.op === "abortRestore")) {
 			try { return await this.accountRestore(cmd.op, userId, account); } catch (e) {

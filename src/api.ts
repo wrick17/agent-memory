@@ -7,7 +7,7 @@ import { redactPayload } from "./domain/redact";
 import { Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
-import { accountStub, profileStub } from "./mcp";
+import { accountStub, callTool, profileStub } from "./mcp";
 import { trace } from "./graph-tools";
 import { chunkSchema, corpusOn, corpusStub, refreshSchema } from "./corpus-tools";
 import { checkChunk, chunkTerms, HELD, refreshTerms, type RefreshCommand } from "./corpus/store";
@@ -369,6 +369,8 @@ const timelineQuery = z.object({ from: z.string().min(1).max(40), to: z.string()
 const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(100).optional(),
 	actor: z.enum(["agent", "owner", "keep", "index", "maintenance", "migration", "transfer"]).optional() }).strict();
 const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
+const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor"];
+const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free"];
 const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
 const decoded = (s: string) => { try { return decodeURIComponent(s); } catch { return null; } };
 const isoOf = (s: string | undefined) => (s ? new Date(s).toISOString() : undefined);
@@ -755,6 +757,28 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
 	}
+	// The dashboard's memory list, search and draft save (section 15): the MCP tools' own dispatch (routing, redaction, request
+	// binding, the me guard), pinned to one active profile. Save takes only the fields the draft form sends, so it never moves,
+	// retires or compacts a record; an edit names a record this profile shows, so a record held elsewhere is refused, not moved.
+	const tool = /^\/api\/profiles\/([^/]+)\/(recall|save)$/.exec(url.pathname);
+	if (tool && request.method === "POST") {
+		const ref = PROFILE_NAME.test(tool[1]!) ? ctx.value.profiles.find((p) => p.profile === tool[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${tool[1]}' is not active` } }, 404);
+		const b = await body(request);
+		const allowed = tool[2] === "recall" ? DASHBOARD_RECALL : DASHBOARD_SAVE;
+		if (!b || Object.keys(b).some((k) => !allowed.includes(k))) return json({ error: { code: "validation", message: `send JSON with only ${allowed.join(", ")}` } }, 400);
+		if (typeof b.memory_id === "string") {
+			const held = await profileStub(env, ref).read(ref, { kind: "shown", ids: [b.memory_id] });
+			if (!held.ok) return json({ error: held.error }, held.error.code === "busy" ? 503 : 400);
+			if (!(held.value as string[]).length) return json({ error: { code: "not_found", message: "no record with this id in this profile" } }, 404);
+		}
+		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" }, tool[2] === "recall" ? "recall_memories" : "save_memory",
+			{ ...b, ...(typeof b.memory_id === "string" ? {} : { profile: ref.profile }) });
+		if (r.ok) return json(r.value);
+		const code = r.error.code;
+		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" ? 409
+			: code === "size_budget" ? 413 : code === "unavailable" ? 503 : 400);
+	}
 	// Owner page reads (section 15), all read-only: a node's entity page by id or key, the map, a path, a timeline, journals and
 	// activity. A link into another profile stays {id, readable: false}: a page reads another profile only when the owner opens it there.
 	const ent = /^\/api\/profiles\/([^/]+)\/nodes\/(by-key\/)?([^/]+)$/.exec(url.pathname);
@@ -834,7 +858,12 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	}
 	if (url.pathname === "/api/recovery" && request.method === "GET") return run({ op: "restoreStatus" });
 	const rc = /^\/api\/recovery\/(step|open|abort)$/.exec(url.pathname);
-	if (rc && request.method === "POST") return run({ op: rc[1] === "step" ? "restoreStep" : rc[1] === "open" ? "openRestore" : "abortRestore" });
+	if (rc && request.method === "POST") {
+		// An optional id binds the call to the recovery the caller saw; the account refuses it if another is open now.
+		const b = await body(request);
+		if (b && b.id !== undefined && typeof b.id !== "string") return json({ error: { code: "validation", message: "id must be the recovery id" } }, 400);
+		return run({ op: rc[1] === "step" ? "restoreStep" : rc[1] === "open" ? "openRestore" : "abortRestore", ...(typeof b?.id === "string" ? { id: b.id } : {}) });
+	}
 	if (m && request.method === "POST" && m[2] === "default") {
 		const b = await body(request);
 		return run({ op: "setDeviceDefault", id: m[1]!, defaultProfile: typeof b?.default_profile === "string" ? b.default_profile : null });

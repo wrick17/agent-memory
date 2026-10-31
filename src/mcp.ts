@@ -7,7 +7,7 @@ import { requestHash } from "./domain/ids";
 import { legacyRequestHash } from "./domain/legacy";
 import { redactPayload } from "./domain/redact";
 import { statedFirst } from "./domain/rank";
-import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, RELATIONS, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand } from "./domain/types";
+import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, RELATIONS, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand, type WriteContext } from "./domain/types";
 import { ANSWER_BYTES } from "./corpus/query";
 import { MAINTENANCE_TOOLS } from "./maintenance-tools";
 import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
@@ -17,7 +17,8 @@ import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
 import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT } from "./corpus-tools";
 import { driveTransfer, transferPorts } from "./transfer";
 
-export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string }
+/** `actor` is set only by trusted server code (the owner-authenticated dashboard route), never from request input; MCP calls write as agent. */
+export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner"> }
 
 const RRF_K = 60;
 
@@ -253,7 +254,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	const cmd = ({ save_memory: { op: "save", args: rest }, append_memory: { op: "append", args: rest }, capture_memory: { op: "capture", args: rest },
 		review_candidates: { op: "candidate", args: rest }, record_knowledge: { op: "knowledge", args: rest } })[op] as WriteCommand;
 	const res = await profileStub(c.env, ref).write(ref, cmd, {
-		actor: "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
+		actor: c.actor ?? "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
 		platform: c.platform, routedBy, payloadHash, ...(legacyHash ? { legacyHash } : {}), userId: c.caller.userId,
 		// The profile runs the me guard inside its transaction, after checking for a committed replay.
 		...(target === "me" ? { meGuard: { explicit: explicit === "me", context: contextProfile(c.caller, c.account.rules, repo), companyFree: companyFree === true, sensitiveTerms: c.account.sensitiveTerms } } : {}),

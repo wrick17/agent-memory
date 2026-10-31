@@ -4,12 +4,12 @@ import { describe, expect, it } from "vitest";
 import { DASHBOARD_HTML, DASHBOARD_JS, dashboardMain } from "../src/dashboard";
 import { call, contextFor } from "./helpers";
 
-type El = { tag: string; textContent: string; value: string; hidden: boolean; disabled: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
+type El = { tag: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
 	on: Record<string, (event?: { preventDefault(): void }) => unknown>; appendChild(c: El): void; replaceChildren(): void; setAttribute(k: string, v: string): void; focus(): void;
 	addEventListener(type: string, f: () => unknown): void };
 let active: El | undefined; // the stand-in document.activeElement
 const make = (tag: string, hidden = false): El => {
-	const e: El = { tag, textContent: "", value: "", hidden, disabled: false, children: [], attrs: {}, on: {},
+	const e: El = { tag, textContent: "", value: "", hidden, disabled: false, checked: false, children: [], attrs: {}, on: {},
 		appendChild(c) { e.children.push(c); }, replaceChildren() { e.children = []; }, setAttribute(k, v) { e.attrs[k] = v; },
 		focus() { e.focused = true; active = e; }, addEventListener(type, f) { e.on[type] = f; } };
 	return e;
@@ -25,11 +25,11 @@ const DEVICES = [
 ];
 const BATCH = { last_lease_at: null, last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0, at: "2026-10-29T07:00:00Z" } };
 
-type Api = (path: string, method: string) => Response | undefined | Promise<Response | undefined>;
+type Api = (path: string, method: string, body?: unknown) => Response | undefined | Promise<Response | undefined>;
 function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles?: unknown[]; api?: Api } = {}) {
 	const els: Record<string, El> = {};
 	const listeners: Record<string, () => void> = {};
-	const seen: { fetched: string[]; auth: string[]; posted: string[]; mounted?: unknown } = { fetched: [], auth: [], posted: [] };
+	const seen: { fetched: string[]; auth: string[]; posted: string[]; bodies: unknown[]; mounted?: unknown } = { fetched: [], auth: [], posted: [], bodies: [] };
 	const clerk = {
 		user: o.signedIn ? { id: env.OWNER_USER_ID } : null,
 		session: { getToken: async () => "session-token" },
@@ -40,12 +40,13 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag) },
 		location: { hash: o.hash ?? "" },
 		addEventListener(type: string, f: () => void) { listeners[type] = f; },
-		fetch: async (path: string, init: { method?: string; headers: Record<string, string> }) => {
+		fetch: async (path: string, init: { method?: string; headers: Record<string, string>; body?: string }) => {
 			seen.fetched.push(path);
 			seen.auth.push(init.headers.authorization!);
-			if (init.method === "POST") seen.posted.push(path);
+			const body = init.body === undefined ? undefined : JSON.parse(init.body) as unknown;
+			if (init.method === "POST") { seen.posted.push(path); seen.bodies.push(body); }
 			if (o.fail) return Response.json({ error: "forbidden" }, { status: o.fail });
-			const r = await o.api?.(path, init.method ?? "GET");
+			const r = await o.api?.(path, init.method ?? "GET", body);
 			if (r) return r;
 			if (path === "/api/profiles" && o.profiles) return Response.json(o.profiles);
 			if (path === "/api/profiles/personal/batch") return Response.json({ error: { code: "unavailable", message: "profile store unreachable" } }, { status: 503 });
@@ -104,7 +105,7 @@ describe("dashboard", () => {
 		// work: laptop is active and defaults to it; old-box is revoked, so it does not count as active.
 		expect(text(cards[1]!)).toContain("Active devices 1 Default for 1 device(s) Last use by its devices 2026-10-29");
 		expect(text(cards[1]!)).toContain("Not available yet");
-		expect(text(cards[1]!)).toContain("Backups are not built yet");
+		expect(text(cards[1]!)).toContain("See Backups");
 		// The daily batch row shows the server's batch_status as text; a failed read marks only its own card.
 		expect(text(cards[1]!)).toContain("Daily batch Last lease never; last skipped 2026-10-29 (probe_indeterminate)");
 		expect(text(cards[0]!)).toContain("Daily batch Unavailable: profile store unreachable");
@@ -360,8 +361,8 @@ describe("dashboard About you", () => {
 		// Reachable from the shell and the profile page, focus moves on navigation, and the served script carries the page.
 		b.go("#/profiles/work");
 		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
-		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a><a href="/settings">Settings</a>');
-		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The map, entity pages, path finder, timeline, journals, activity with undo, archive and review pages/);
+		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
+		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The path finder, timeline, journals, transfers, wipe and review pages/);
 		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
 	});
 
@@ -490,5 +491,176 @@ describe("dashboard About you", () => {
 		await settle();
 		expect(noMe.seen.fetched.filter((p) => p.includes("owner-model"))).toEqual(Array(2).fill("/api/profiles/personal/owner-model?limit=50"));
 		expect(b.seen.fetched.some((p) => p.includes("owner-model"))).toBe(false);
+	});
+});
+
+// The newer pages: fixtures shaped like the owner reads and writes they call.
+const typeIn = (e: El, value: string) => { e.value = value; e.on.input?.(); };
+const submit = (root: El, i = 0) => find(root, "form")[i]!.on.submit!({ preventDefault() {} });
+const byId = (root: El, id: string) => find(root, "input").concat(find(root, "textarea"), find(root, "select")).find((e) => e.attrs.id === id)!;
+const HOSTILE = "<img src=x onerror=alert(1)>";
+const entity = (extra: Record<string, unknown> = {}) => ({ id: "m1", as_of: null,
+	node: { id: "m1", kind: "decision", memory_type: "project", scope: null, name: HOSTILE, status: "active", origin: "stated", revision: 3, created_at: "2026-10-01T00:00:00Z",
+		updated_at: "2026-10-30T00:00:00Z", pinned: false, flagged: null, source_profile: null, description: "Why we chose it", truncated: [] },
+	content: { text: "Line one\nLine two", chars: 18, complete: true }, evidence: { items: [{ kind: "url", ref: "https://example.test", note: null }], truncated: false },
+	links: [{ id: 1, rel: "relates_to", direction: "out", reason: "same area", other: { id: "x9", readable: false } }], budget: { exhausted: false },
+	history: { items: [{ revision: 3, op: "updated", at: "2026-10-30T00:00:00Z", actor: "agent" }], next_before: 3 }, ...extra });
+
+describe("dashboard memories and drafts", () => {
+	it("lists with the server's cursor, opens a record as text with history, and pins it with Undo", async () => {
+		const b = browser({ signedIn: true, hash: "#/memories", api: (path, method, body) => {
+			if (path === "/api/profiles/work/recall") return Response.json((body as { cursor?: string }).cursor
+				? { results: [], next_cursor: null, truncated: false } : { results: [{ memory_id: "m1", profile: "work", name: HOSTILE, type: "project", passage: "p" }], next_cursor: "c1", truncated: true });
+			if (path === "/api/profiles/work/nodes/m1") return Response.json(entity());
+			if (path === "/api/profiles/work/nodes/m1?before=3") return Response.json({ history: { items: [{ revision: 2, op: "created", at: "2026-10-01T00:00:00Z", actor: "owner" }], next_before: null } });
+			if (path === "/api/profiles/work/nodes/m1/pin" && method === "POST") return Response.json({ action: "pinned", activity_id: 41 });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: work"); // work is the default over the first active profile
+		expect(b.seen.bodies[0]).toEqual({ limit: 25 });
+		expect(find(b.view(), "a").find((a) => a.textContent === HOSTILE)!.attrs.href).toBe("#/memory/work/m1");
+		expect(find(b.view(), "img")).toEqual([]);
+		click(button(b.view(), "Load more"));
+		await settle();
+		expect(b.seen.bodies[1]).toEqual({ limit: 25, cursor: "c1" });
+		b.go("#/memory/work/m1");
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe(`Memory: ${HOSTILE}`);
+		expect(text(b.view())).toContain("Line one\nLine two");
+		expect(text(b.view())).toContain("a record not readable in this profile");
+		click(button(b.view(), "Older revisions"));
+		await settle();
+		expect(find(b.view(), "tr").slice(1).map(text)).toEqual(["3 updated 2026-10-30T00:00:00Z agent", "2 created 2026-10-01T00:00:00Z owner"]);
+		click(button(b.view(), "Pin"));
+		await settle();
+		expect(status(b).textContent).toContain(`Done: pinned “${HOSTILE}”.`);
+		expect(button(b.view(), "Undo last change")).toBeDefined();
+		expect(b.seen.posted).toEqual(["/api/profiles/work/recall", "/api/profiles/work/recall", "/api/profiles/work/nodes/m1/pin"]);
+	});
+
+	it("saves a draft only after a preview and an explicit Save, invalidates the preview on change, and keeps a refusal visible", async () => {
+		let answer: Response = Response.json({ error: { code: "validation", message: "synthetic refusal" } }, { status: 400 });
+		const b = browser({ signedIn: true, hash: "#/draft/work", api: (path) => path === "/api/profiles/work/save" ? answer : undefined });
+		await dashboardMain(b.win);
+		expect(button(b.view(), "Save").disabled).toBe(true);
+		typeIn(byId(b.view(), "draft-name"), "Use SQLite");
+		submit(b.view());
+		expect(status(b).textContent).toBe("Write a short description.");
+		typeIn(byId(b.view(), "draft-desc"), "Storage choice");
+		typeIn(byId(b.view(), "draft-content"), "Because it is local.");
+		submit(b.view());
+		expect(text(b.view())).toContain("Preview (not saved)");
+		expect(b.seen.posted).toEqual([]);
+		typeIn(byId(b.view(), "draft-content"), "Because it is local and fast.");
+		expect(button(b.view(), "Save").disabled).toBe(true);
+		submit(b.view());
+		click(button(b.view(), "Save"));
+		await settle();
+		expect(status(b).textContent).toContain("Could not save “Use SQLite”: synthetic refusal (validation).");
+		const sent = b.seen.bodies[0] as Record<string, unknown>;
+		expect(sent).toMatchObject({ name: "Use SQLite", type: "project", origin: "stated", description: "Storage choice", content: "Because it is local and fast." });
+		expect(String(sent.request_id)).toMatch(/^dashboard:/);
+		answer = Response.json({ ok: true, action: "created", memory_id: "m2", name: "Use SQLite", revision: 1 });
+		submit(b.view());
+		click(button(b.view(), "Save"));
+		await settle();
+		expect(status(b).textContent).toContain("Saved: created “Use SQLite”, revision 1.");
+		expect(byId(b.view(), "draft-name").value).toBe("");
+		expect(b.seen.posted).toEqual(["/api/profiles/work/save", "/api/profiles/work/save"]);
+	});
+
+	it("keeps the previewed payload and request id through a lost response, so an unchanged retry replays instead of writing twice", async () => {
+		const saved = new Map<string, unknown>();
+		const b = browser({ signedIn: true, hash: "#/draft/work", api: (path, _method, body) => {
+			if (path !== "/api/profiles/work/save") return;
+			const { request_id: id, name } = body as { request_id: string; name: string };
+			if (saved.has(id)) return Response.json(saved.get(id));
+			if (saved.size) return Response.json({ error: { code: "already_exists", message: "memory already exists" } }, { status: 400 });
+			saved.set(id, { action: "created", name, memory_id: "m1", revision: 1 });
+			throw new Error("response lost after commit");
+		} });
+		await dashboardMain(b.win);
+		typeIn(byId(b.view(), "draft-name"), "Retry control");
+		typeIn(byId(b.view(), "draft-desc"), "Description");
+		submit(b.view());
+		click(button(b.view(), "Save"));
+		await settle();
+		expect(status(b).textContent).toContain("response lost after commit");
+		expect(byId(b.view(), "draft-name").value).toBe("Retry control");
+		expect(button(b.view(), "Save").disabled).toBe(false); // the same preview stays ready; nothing was retried by itself
+		expect(b.seen.posted).toHaveLength(1);
+		submit(b.view()); // previewing the unchanged body again keeps its request id
+		click(button(b.view(), "Save"));
+		await settle();
+		const [first, second] = b.seen.bodies as Record<string, unknown>[];
+		expect(second).toEqual(first);
+		expect(status(b).textContent).toContain("Saved: created “Retry control”, revision 1.");
+		expect(byId(b.view(), "draft-name").value).toBe("");
+	});
+
+	it("draws the map's readable records as buttons, states partial and opaque coverage, and keeps what-if items local until a draft is saved", async () => {
+		const map = { center: null, starts: ["p1"], depth: 1, nodes: [{ id: "p1", kind: "project", name: "Agent Memory", status: "active" }, { id: "c1", kind: "component", name: HOSTILE, status: "active" }],
+			links: [{ id: 1, rel: "part_of", reason: "lives in it", from: { id: "c1", readable: true }, to: { id: "p1", readable: true } }, { id: 2, rel: "relates_to", from: { id: "p1", readable: true }, to: { id: "zz", readable: false } }],
+			truncated: true, limits: { nodes: 300 } };
+		const b = browser({ signedIn: true, hash: "#/map/work", api: (path) => path.startsWith("/api/profiles/work/map?") ? Response.json(map) : undefined });
+		await dashboardMain(b.win);
+		await settle();
+		expect(b.seen.fetched).toContain("/api/profiles/work/map?depth=1");
+		expect(text(b.view())).toContain("Partial map");
+		expect(text(b.view())).toContain("1 link leads to records not readable in this profile");
+		const nodes = find(b.view(), "button").filter((e) => e.attrs.class === "node");
+		expect(nodes.map((n) => n.attrs["aria-label"])).toEqual(["project: Agent Memory", `component: ${HOSTILE}`]);
+		click(nodes[0]!);
+		expect(nodes[0]!.attrs["aria-pressed"]).toBe("true");
+		expect(text(b.view())).toContain(`From ${HOSTILE} — part_of: lives in it`);
+		typeIn(byId(b.view(), "whatif-name"), "Try Postgres");
+		submit(b.view(), 1);
+		await settle();
+		expect(text(b.view())).toContain("What-if: Try Postgres");
+		expect(b.seen.posted).toEqual([]);
+		click(button(b.view(), "Make a draft"));
+		b.go("#/draft/work");
+		expect(byId(b.view(), "draft-name").value).toBe("Try Postgres");
+		expect(text(b.view())).toContain("Adds a “relates to” link to “Agent Memory”");
+		expect(b.seen.posted).toEqual([]);
+	});
+
+	it("shows an open recovery with its consequences, and steps, aborts or begins a restore only after typed confirmation", async () => {
+		let open = true;
+		const b = browser({ signedIn: true, hash: "#/backups", api: (path, method) => {
+			if (path === "/api/recovery") return Response.json(open ? { recovery: { id: "rA", profile: "work", export: "e2", at: "2026-10-31T00:00:00Z", state: "restoring", unresolved: [], unresolved_count: 0 }, last_export: null }
+				: { recovery: null, last_export: { at: "2026-10-30T00:00:00Z", results: { work: { id: "e2", rows: 9 }, personal: "empty" } } });
+			if (path === "/api/recovery/step" && method === "POST") return Response.json({ state: "checking" });
+			if (path === "/api/recovery/abort" && method === "POST") { open = false; return Response.json({ state: "aborted" }); }
+			if (path === "/api/profiles/work/exports") return Response.json(["e1", "e2"]);
+			if (path === "/api/profiles/work/restore" && method === "POST") return Response.json({ state: "restoring" });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(text(b.view())).toContain("Every profile and device is refused until this restore of “work” is opened or aborted.");
+		expect(text(b.view())).not.toContain("Export everything");
+		click(button(b.view(), "Run the next step"));
+		await settle();
+		expect(status(b).textContent).toContain("Recovery is now checking.");
+		const abort = button(b.view(), "Abort");
+		expect(abort.disabled).toBe(true);
+		typeIn(byId(b.view(), "confirm-abort"), "abort");
+		click(button(b.view(), "Abort"));
+		await settle();
+		expect(text(b.view())).toContain("No recovery is open");
+		expect(text(b.view())).toContain("work: saved (e2), 9 rows");
+		byId(b.view(), "restore-profile").value = "work";
+		click(button(b.view(), "List this profile's exports"));
+		await settle();
+		expect(byId(b.view(), "exp-restore-a-profile").value).toBe("e2");
+		const begin = button(b.view(), "Begin restore of profile work");
+		expect(begin.disabled).toBe(true);
+		typeIn(find(b.view(), "input").find((e) => e.attrs.id?.startsWith("confirm-begin-restore-of-profile"))!, "work");
+		click(begin);
+		await settle();
+		expect(b.seen.posted).toEqual(["/api/recovery/step", "/api/recovery/abort", "/api/profiles/work/restore"]);
+		expect(b.seen.bodies).toEqual([{ id: "rA" }, { id: "rA" }, { export: "e2" }]); // each recovery action names the recovery shown
+		expect(JSON.stringify(b.seen)).not.toMatch(/BACKUP_KEY/);
 	});
 });

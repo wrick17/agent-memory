@@ -293,6 +293,34 @@ describe("owner API", () => {
 		expect((await post(`/api/profiles/personal/nodes/not-a-node/pin`)).status).toBe(404);
 	});
 
+	it("saves, edits and recalls through the dashboard's owner route without moving records or taking extra fields", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const post = (path: string, body: unknown, token = session) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}${path}`,
+			{ method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		const draft = { name: `Dashboard draft ${Date.now()}`, type: "project", origin: "stated", description: "A dashboard draft", content: "Chosen from the dashboard.", request_id: `dash-${Date.now()}` };
+		const made = await post("/api/profiles/personal/save", draft);
+		expect(made).toMatchObject({ status: 200, body: { action: "created", revision: 1 } });
+		expect((await post("/api/profiles/personal/save", draft)).body.memory_id).toBe(made.body.memory_id);
+		const found = await post("/api/profiles/personal/recall", { keyword: "Chosen from the dashboard" });
+		expect((found.body.results as { memory_id: string }[]).map((r) => r.memory_id)).toContain(made.body.memory_id);
+		expect(await post("/api/profiles/personal/save", { memory_id: made.body.memory_id, expected_revision: 1, content: "Edited." })).toMatchObject({ status: 200, body: { revision: 2 } });
+		expect((await post("/api/profiles/personal/save", { memory_id: made.body.memory_id, expected_revision: 1, content: "Stale." })).status).toBe(409);
+		const c = await contextFor();
+		const other = await call(c, "save_memory", { name: `Work record ${Date.now()}`, type: "project", description: "work", content: "Stays in work.", profile: "work" });
+		expect((await post("/api/profiles/personal/save", { memory_id: other.memory_id, content: "Moved?" })).status).toBe(404);
+		expect(await call(c, "get_memory", { memory_id: other.memory_id })).toMatchObject({ profile: "work", content: "Stays in work.", revision: 1 });
+		for (const extra of [{ profile: "work" }, { retire: true }, { repo: { remote: "github.com/a/b" } }]) expect((await post("/api/profiles/personal/save", { ...draft, ...extra })).status).toBe(400);
+		// The dashboard writes as the owner; the same tool over MCP keeps writing as agent.
+		const log = async (p: string) => (await (await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/api/profiles/${p}/activity?limit=1`,
+			{ headers: { authorization: `Bearer ${session}` } }))).json() as { items: { actor: string; targets: string[] }[] }).items[0]!;
+		expect(await log("personal")).toMatchObject({ actor: "owner", targets: [made.body.memory_id] });
+		expect(await log("work")).toMatchObject({ actor: "agent", targets: [other.memory_id] });
+		const { token } = await deviceToken("dashboard-save-device", ["read", "write"], ["personal"], "personal");
+		expect((await post("/api/profiles/personal/save", draft, token)).status).toBe(403);
+	});
+
 	it("records an unproven batch's skip from a job token, with no lease, and shows it only to the owner", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });

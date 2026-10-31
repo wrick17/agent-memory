@@ -109,6 +109,26 @@ describe("export and restore", () => {
 			.toBe(`${OWNER}:personal:${begun.to}`);
 	});
 
+	it("refuses a step, open or abort that names a recovery other than the open one, leaving the open one unchanged", async () => {
+		const c = await contextFor();
+		await call(c, "save_memory", { name: "Bound work", type: "reference", description: "w", content: "work body", profile: "work" });
+		await call(c, "save_memory", { name: "Bound personal", type: "reference", description: "p", content: "personal body", profile: "personal" });
+		const work = (await value<Record<string, { id: string }>>(admin({ op: "export", profile: "work" }))).work!.id;
+		const mine = (await value<Record<string, { id: string }>>(admin({ op: "export", profile: "personal" }))).personal!.id;
+		const a = await value<Recovery>(admin({ op: "beginRestore", profile: "work", export: work }));
+		expect(await value(admin({ op: "abortRestore", id: a.id }))).toMatchObject({ state: "aborted" });
+		const b = await value<Recovery>(admin({ op: "beginRestore", profile: "personal", export: mine }));
+		let shown = b;
+		for (let i = 0; i < 20 && shown.state !== "ready"; i++) shown = await value<Recovery>(admin({ op: "restoreStep", id: b.id }));
+		expect(shown.state).toBe("ready");
+		const before = await value(admin({ op: "restoreStatus" }));
+		for (const op of ["restoreStep", "openRestore", "abortRestore"] as const) {
+			expect(await admin({ op, id: a.id })).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "recovery_changed" } } });
+		}
+		expect(await value(admin({ op: "restoreStatus" }))).toEqual(before);
+		expect(await value(admin({ op: "openRestore", id: b.id }))).toMatchObject({ id: b.id, profile: "personal", state: "opened" });
+	});
+
 	it("keeps the account closed on a corrupt chunk or a wiped record until the owner aborts", async () => {
 		const c = await contextFor();
 		const keep = await call(c, "save_memory", { name: "Kept rule", type: "feedback", description: "kept", content: "kept body", profile: "personal" });

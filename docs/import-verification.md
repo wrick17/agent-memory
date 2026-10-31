@@ -301,6 +301,16 @@ The later Personal acquisition check used synthetic inventory against a local Wo
 
 ## Fresh Work import and profile recovery, 2026-10-31
 
-A later fresh Work library passed a local import and profile backup/restore rehearsal: the import audit matched all 1,297 records with no drift. The earlier 1,370-record plan above remains a historical planning checkpoint. The new hosted target has only synthetic Personal data; no Work upload, hosted backup key or ordinary client switch has occurred. [Results and limits](combined-verification-2026-10-30.md#fresh-work-import-and-profile-recovery-local-rehearsal-2026-10-31); [import receipt](/private/tmp/am-local-work-rehearsal-hTc3nLSK/receipt.json); [restore receipt](/private/tmp/am-local-restore-joW22Wg2/fixed-receipt.json).
+A later fresh Work library passed a local import and profile backup/restore rehearsal: the import audit matched all 1,297 records with no drift. The earlier 1,370-record plan above remains a historical planning checkpoint. At this local checkpoint, the new hosted target contained only synthetic Personal data. [Results and limits](combined-verification-2026-10-30.md#fresh-work-import-and-profile-recovery-local-rehearsal-2026-10-31); [import receipt](/private/tmp/am-local-work-rehearsal-hTc3nLSK/receipt.json); [restore receipt](/private/tmp/am-local-restore-joW22Wg2/fixed-receipt.json).
 
 An account restore on a clone of that local library preserved the newer Work generation and rebuilt all 1,301 node and 4,121 request bindings. The 1,297-record audit and retained journal reads and replay passed; a corrupt chunk was refused and abort restored the checkpoint, indexes and device revocation. [Account receipt](/private/tmp/am-account-dataset-yvAO1dPf/account-receipt.json). This remains local evidence with synthetic authentication and a local test key.
+
+## Hosted Work import and recovery, 2026-10-31
+
+The owner service imported 1,374 approved Work records in 66 batches and audited them with zero mismatches or drift. Hosted Work profile and Account restores each passed a subsequent 1,374-record audit and the checked journal, search and replay flows. [Import receipt](/private/tmp/am-uploader-prepared-ZVvXCXfd/hosted-import-receipt.json); [recovery receipt](/private/tmp/am-hosted-recovery-gr6kjole/SUMMARY.json). The final refresh below followed this recovery; the ordinary caller handoff remains open.
+
+## Guarded final Work refresh, 2026-10-31
+
+The accepted anchored refresh processed 2,748 commands in 55 batches. Its audit matched all 1,374 approved records, 5,699 revisions and 4,173 requests with zero mismatches or drift. The imported journal's revision 682, acknowledgement, history and literal recall passed; the canary replay and Personal comparison passed. Of 119 held records, 29 are privacy-held and 92 have null identity or scope, with overlap; one new item was quarantined. Another 178 absent sources remain accounted for. [Final receipt](/private/tmp/am-final-refresh-ready-GL4s8apH/final-receipt.json).
+
+The source export was per-record consistent, not a global point-in-time cut. This was a guarded final refresh, not ongoing automatic BothQ synchronization. BothQ remains running and readable with the old bridge fenced; global instructions and fresh T3 handoff remain pending.

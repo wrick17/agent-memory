@@ -2,7 +2,7 @@ import { enqueue, next, complete } from "../src/profile/maintenance";
 import { reviewedMarkdown } from "./fixtures/source-policy";
 // The staged BothQ import through the real /v1/import endpoint, Workers SQLite Durable Objects and AccountStore
 // (docs/import-implementation.md). Synthetic records only; the part shapes are the real largest parts' lengths, no text.
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, newMemoryId, sha256 } from "../src/domain/ids";
@@ -546,6 +546,15 @@ describe("import audit", () => {
 		const [ej, el] = [expected(jc, j.rows), expected(lc, lrows)];
 		const state = async () => [await profileSql("test", (sql) => [...["nodes", "texts", "revisions", "requests", "import_records", "import_parts", "activity"].map((t) => sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
 			sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value]), await accountSql((sql) => sql.exec("SELECT count(*) AS n, sum(pending) AS p FROM request_index").one())];
+		// The import arms the profile's alarm for its follow-up background work, which writes on its own schedule (it re-arms at most a
+		// second ahead while work remains). Drive it until none is due, so the no-write window below measures only the audit.
+		const ref = c.account.profiles.find((p) => p.profile === "test")!, stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`));
+		for (let i = 0; ; i++) {
+			if (i === 20) throw new Error("the profile's background work did not settle in 20 alarms");
+			await runDurableObjectAlarm(stub);
+			const at = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm());
+			if (at === null || at > Date.now() + 10_000) break;
+		}
 		const before = await state();
 
 		expect((await auditGet(token, { profile: "test", limit: 1 })).data.totals).toEqual({ records: { staging: base.records.staging! + 1, prepared: base.records.prepared, published: base.records.published! + 2 },
