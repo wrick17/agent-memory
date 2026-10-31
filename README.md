@@ -6,7 +6,7 @@ Give your coding agents a shared place to remember what matters. Agent Memory is
 
 Your everyday agents still use BothQ. Agent Memory has a private owner trial where basic saving, searching, history, and connection exploration work, and an older copy of your memories has been imported and checked. Your latest memory library has not been migrated to production, and your agents have not switched over.
 
-The current source groups, including the daily server, authenticated scope and observed-commit counts, have passed local combined and self-host package checks; this does not establish everyday readiness. [Verification](docs/combined-verification-2026-10-30.md#counter-and-backend-local-verification-2026-10-31).
+Earlier source groups passed local combined and self-host package checks; this does not establish everyday readiness. Core memory, authenticated clients, safe migration and recovery come first. [Verification](docs/combined-verification-2026-10-30.md#counter-and-backend-local-verification-2026-10-31).
 
 A private Work migration planning checkpoint has been accepted; reconciliation and migration are still pending. [Scope](docs/module-contracts.md#current-private-work-planning-checkpoint-2026-10-31).
 
@@ -14,8 +14,8 @@ Automatic capture is not running. The dashboard, work and project corpus, self-h
 
 ## Completed development milestones
 
-- [x] Lifecycle, daily server and observed-count source delivered with local verification.
-- [x] Personal acquisition, exact retry and durable acknowledgements verified with synthetic data against a local Worker. The client is unwired and uninstalled.
+- [x] Lifecycle, daily server and observed-count source delivered with local verification; feed collection is no longer a product goal.
+- [x] Earlier Personal acquisition, exact retry and durable acknowledgements verified with synthetic data against a local Worker. That client remains unwired and uninstalled.
 - [x] Private plan for 1,370 Work records accepted. Migration has not run.
 
 ## Feature acceptance
@@ -47,7 +47,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 
 ### Work and project context
 
-- [ ] Keep project, commit, pull request, and Jira context current as work happens. Pull request and Jira collection is not live.
+- [ ] Remember project, commit, pull request and Jira references encountered during work, including IDs, URLs and useful context, so they can be found later. Do not read or manage PR or Jira feeds.
 - [ ] Search and explore the project corpus; it is not available yet.
 - [ ] Provide current work boards and regular project reviews.
 

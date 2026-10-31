@@ -1399,6 +1399,8 @@ Implementation seam (D2/D3, source-cleared and in the private [integration candi
 
 ## 13. Work graph
 
+**Owner scope, 2026-10-31:** Remember PR and Jira references encountered during ordinary work, including their IDs, URLs and relevant context. The [encounter-only contract](module-contracts.md#owner-scope-encounter-only-prjira-2026-10-31) supersedes proactive PR/Jira collection, feed management and daily inventory plans below. Existing collector code is dormant historical work, not a prerequisite for replacing BothQ.
+
 **PR/Jira source status, 2026-10-30:** The reviewed PR/Jira snapshot writers and injected local collectors are adopted locally over the current R0/self-host/F1 source. Same-source-revision completion retains field-hash and owner-Undo fences; reciprocal Jira evidence preserves source order and exact replay. More than 100 positive incoming listing rows explicitly refuses the entire item and leaves the local request pending; durable paging is not implemented. Product J5/J6 closure and the PM's bounded-purge fixture correction are source/local evidence only. Current integration glue and the final local combined check passed. Live acquisition, Jira-only tool fencing, capture/native wiring, daily refresh, board/review acceptance and full AM-12 completion remain open ([contract and evidence](module-contracts.md#prjira-locally-adopted-source-2026-10-30)).
 
 Cloudflare never talks to GitHub or Jira and holds none of their credentials. All repos and Jira projects are private, and work data enters memory only from the owner's machines while work happens:

@@ -1,5 +1,13 @@
 # Module contracts for parallel work
 
+## Owner scope: encounter-only PR/Jira, 2026-10-31
+
+> "I don't want this project to read or manage PR or Jira feeds. Just remember them as we come across them when we work so that if we need reference to it later, we know where to look."
+
+Remember encountered IDs, URLs and relevant context through ordinary memory/digest capture. Proactive GitHub/Jira querying, polling/feed management, daily inventory, Office readers and new feed account bindings are removed from active product scope, not deferred. Existing acquisition/daily collector source is historical/dormant UNWIRED/UNINSTALLED; its provider, collector-caller and installation gates are not feature goals or pending completion. This owner decision overrides older feed-collection plans, including architecture section13 and the dated contracts below. Existing implemented server, counter, archive and graph behavior and sealed source/local evidence remain valid and unchanged.
+
+Core memory/MCP, authenticated clients, safe fresh migration, recovery and the ordinary caller transition come first, with BothQ running/readable. No Office provider is a blocker on that path. Ordinary encountered-context/digest capture retains its own access-control, privacy and recovery gates; no proactive collector or capture activation is authorized here.
+
 2026-10-29, architect: Opus (`claude-opus-5-5`). This page allocates files, interfaces, store methods and schema versions so that the C2 to C5 authors can code in parallel without touching the same file. It implements the approved [architecture v3.2](architecture.md) and changes no decision there; the architecture's sections stay authoritative for behaviour and checks.
 
 ## Core MCP source adoption, 2026-10-30
@@ -607,6 +615,8 @@ The three future merge seams are src/api.ts routes, src/corpus-tools.ts command/
 
 ## PR/Jira locally adopted source, 2026-10-30
 
+Historical collector/source evidence only. Proactive acquisition and feed-management completion plans in this section are superseded by the [owner scope correction](#owner-scope-encounter-only-prjira-2026-10-31).
+
 The owner-authorized integration adopts the reviewed PR/Jira snapshot source over HEAD b238096a8a0a25da90d029bb852f54a056cb44c8 plus the frozen, unstaged F1 adoption. It preserves current corpus refresh, self-host source and owner facts. This is local source adoption only. Current integration glue review and the final local combined check passed; no deployed, runtime or full AM-12 acceptance follows.
 
 - [PR collector](../local/pr-upload.mjs) and [Jira collector](../local/jira-upload.mjs) take injected account-bound readers and the existing ingest transport. They retain incomplete identities and exact redacted pending bodies across retries. Jira is work-only, uses account ids rather than contact fields, and reads at most 20 requested keys at a time. Both files and their local tests match the reviewed candidate exactly. The source test script adds those two tests to the existing corpus/setup list. The self-host package and stage allowlists are unchanged, and no production executor or general command is added.
@@ -736,6 +746,8 @@ The integrator performed mechanical reconstruction/inverse, code/doc hash/mode, 
 
 ### Daily refresh source adoption with terminal cleanup, 2026-10-31
 
+The daily feed-collection contracts below are historical/dormant, not an active or deferred feature goal. Existing server lifecycle/backstop source remains valid; no reader, Office provider or collector caller/install work is required for core cutover. See the [owner decision](#owner-scope-encounter-only-prjira-2026-10-31).
+
 Daily77ee glue and backstopccae each have parent-accepted independent SOURCE-only clearance. The parent accepted final daily glue CLEAR at source162 `6aa1505e5941bc58722aac9508ad29293e9213e1326aeae6605740f9bab5ef04` and authorized this ROOT source adoption. The adopted union retains the two current main test corrections, all four original Undo bodies/assertions and its settling helper. All 82 src/local paths are exact ccae; the three backstop runtime files have no new synthesis. Schema7/account5, the seven prior daily shared guards/import resolutions, policy/owner454/date/witness/pre-reservation, weekly stable receipts/OPS gates, graph5559 and ARC fences remain. Terminal cleanup makes one existing cleanupStep transaction, never closes the account or releases its day, and preserves original bytes and changed-byte refusal. The retained-history selector is an explicit read-cost limit. [Accepted final daily glue](/private/tmp/am-final-daily-glue-review-sol-8_bwtvkd/sealed/REVIEW.md) and [exact ROOT adoption evidence](/private/tmp/am-daily-root-adoption-sol-ezugwh58/capsule/HANDOFF.md).
 
 SOURCE ADOPTED only; Terra daily affected local combined verification passed. Account v5/profile v7 are the first unreleased migrations; deployment before the first live PR/ticket remains gated. The delivered main588 bundle retains its 385 Worker/type/lint and 117 local plus 1 intentional skip/package proof. They do not prove this daily successor. Counterv8, nativef302 and native client source remain private and EXCLUDED. Native client/acquisition/discovery, hosted/wipe/actual-UTC/runtime availability, model and full-feature gates remain open. No default collection, configuration or capture activation changes. All six Responses are spent/STOPPED; the pending ONE-budget question is unanswered and grants no new request. Capture OFF, BothQ live/readable. Current main delivery facts and historical failures remain. Meter causality and baseline recall/teardown diagnostics are unresolved. The integrator stops all ROOT source/canonical writes at its frozen handoff; the parent assesses that receipt and Terra results before any separately authorized delivery.
@@ -760,6 +772,8 @@ Declared account/owner data does not prove real authentication, default inventor
 
 
 ### Inventory backend source adoption, 2026-10-31
+
+Historical/dormant acquisition and local collector proof. Earlier forward-looking provider/caller/Office/install gates in this checkpoint are removed from product scope, not pending completion. Backend/source evidence is preserved. See the [current encounter-only contract](#owner-scope-encounter-only-prjira-2026-10-31).
 
 The [independent source review](/Users/pratyush.poddar/.t3/worktrees/memory/t3-ae041494/.private-inventory-source-review-srhcom4k/capsule/REPORT.md) clears exactly routing.ts, account/store.ts, api.ts and test/work-upload.test.ts. The parent accepted the exact disjoint composition and authorized SOURCE ADOPTION of the unchanged four-path patch on current b00, with no code reconciliation. [Exact private maps and gates](/private/tmp/am-inventory-backend-private-union-sol-0uz4u725/capsule/HANDOFF.md). Backend projection source is now SOURCE ADOPTED only; local combined verification passed at exact86ff runtime/test pins, as recorded in the [counter checkpoint](#observed-commit-counter-source-adoption-2026-10-31). The exact reviewed local-default union is now SOURCE ADOPTED as described below; focused local/actual Worker synthetic interoperability passed at exact28d runtime/local-test pins; runtime acceptance and deployment remain pending. [Actual ROOT adoption evidence](/private/tmp/am-inventory-backend-root-adoption-sol-gf7gdbyw/capsule/HANDOFF.md). No availability or feature completion follows.
 
