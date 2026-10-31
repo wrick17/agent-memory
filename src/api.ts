@@ -362,6 +362,7 @@ const journalsQuery = z.object({ after: z.string().min(1).max(512).optional(), l
 	entries_after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional() }).strict()
 	.refine((v) => (v.id === undefined ? v.entries_after === undefined : v.after === undefined && (v.limit ?? 1) <= 25));
 const mapQuery = z.object({ center: id.optional(), center_key: z.string().min(1).max(256).optional(), depth: z.coerce.number().int().min(1).max(2).optional(), as_of: asOfParam }).strict().refine((q) => !(q.center && q.center_key), "pass center or center_key");
+const graphQuery = z.object({ part: z.enum(["nodes", "edges"]), after: z.string().min(1).max(1024).optional(), limit: z.coerce.number().int().min(1).max(2000).optional() }).strict();
 const pathQuery = z.object({ from: id, to: id, max_depth: z.coerce.number().int().min(2).max(4).optional(), as_of: asOfParam }).strict();
 const timelineQuery = z.object({ from: z.string().min(1).max(40), to: z.string().min(1).max(40), node: id.optional(),
 	kinds: z.string().max(400).transform((v) => v.split(",")).pipe(z.array(z.enum(NODE_KINDS)).min(1).max(NODE_KINDS.length)).optional(),
@@ -783,7 +784,7 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	// Owner page reads (section 15), all read-only: a node's entity page by id or key, the map, a path, a timeline, journals and
 	// activity. A link into another profile stays {id, readable: false}: a page reads another profile only when the owner opens it there.
 	const ent = /^\/api\/profiles\/([^/]+)\/nodes\/(by-key\/)?([^/]+)$/.exec(url.pathname);
-	const page = /^\/api\/profiles\/([^/]+)\/(journals|map|path|timeline|activity|archive)$/.exec(url.pathname);
+	const page = /^\/api\/profiles\/([^/]+)\/(journals|map|graph|path|timeline|activity|archive)$/.exec(url.pathname);
 	if ((ent || page) && request.method === "GET") {
 		const name = (ent ?? page)![1]!;
 		const ref = PROFILE_NAME.test(name) ? ctx.value.profiles.find((p) => p.profile === name) : undefined;
@@ -805,6 +806,11 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			const p = mapQuery.safeParse(params);
 			if (!p.success) return bad("center a node id or center_key a key; depth 1 or 2; as_of an ISO date");
 			q = { kind: "map", ...(p.data.center ? { center: { id: p.data.center } } : p.data.center_key ? { center: { key: p.data.center_key } } : {}), depth: p.data.depth ?? 1, ...(p.data.as_of ? { asOf: isoOf(p.data.as_of)! } : {}), known };
+		} else if (page![2] === "graph") {
+			// The whole graph as metadata, nodes or current links paged by keyset; a selected record's detail stays the entity read.
+			const p = graphQuery.safeParse(params);
+			if (!p.success) return bad("part nodes or edges; after the previous page's next_after; limit 1 to 2000");
+			q = { kind: "graph", part: p.data.part, after: p.data.after ?? null, limit: p.data.limit ?? (p.data.part === "nodes" ? 1000 : 2000) };
 		} else if (page![2] === "timeline") {
 			const p = timelineQuery.safeParse(params);
 			const from = p.success ? Date.parse(p.data.from) : NaN, to = p.success ? Date.parse(p.data.to) : NaN;

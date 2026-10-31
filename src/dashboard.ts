@@ -1,4 +1,4 @@
-// The owner dashboard (section 15): Home, profile pages, Work, About you, memories with detail and history, the map with unsaved
+// The owner dashboard (section 15): the knowledge graph at the root, profile pages, Work, About you, memories with detail and history, the map with unsaved
 // what-if items, drafts saved only on an explicit click, activity with undo and the archive, and backups with recovery. Every page
 // reads and writes through the owner API that exists. Same shape as settings.ts: a server-rendered shell and one browser function
 // served as /app.js. Pages not built are listed as such.
@@ -7,7 +7,7 @@ const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 export const DASHBOARD_HTML = (env: Env) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Memory</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1280px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
 nav a{margin-right:1rem;display:inline-block}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #d0d7de;padding:.4rem;text-align:left}
 .cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}.card{border:1px solid #d0d7de;border-radius:8px;padding:0 1rem}
 dl{display:grid;grid-template-columns:auto 1fr;gap:.2rem 1rem}dt{color:#57606a}dd{margin:0}.na{color:#57606a;font-style:italic}
@@ -18,13 +18,19 @@ a[aria-current]{font-weight:600}.prefs{list-style:none;padding:0}.prefs>li{borde
 .mapwrap{overflow:auto;border:1px solid #d0d7de;border-radius:8px;max-width:100%}.map{position:relative;width:640px;height:640px}
 .map .node{position:absolute;transform:translate(-50%,-50%);margin:0;padding:.1rem .35rem;font-size:12px;max-width:9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid #57606a;border-radius:10px;background:#fff;color:#1b1f24}
 .map .node[aria-pressed=true]{background:#0969da;color:#fff}.map .node.whatif{border-style:dashed;background:#fff8c5}
-.map .edge{position:absolute;height:1px;background:#8c959f;transform-origin:0 0}.map .edge.whatif{background:none;border-top:1px dashed #9a6700}</style></head>
-<body><nav aria-label="Dashboard"><a href="#/">Overview</a><a href="#/memories">Memories</a><a href="#/map">Map</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/backups">Backups</a><a href="/settings">Settings</a></nav>
+.map .edge{position:absolute;height:1px;background:#8c959f;transform-origin:0 0}.map .edge.whatif{background:none;border-top:1px dashed #9a6700}
+.graph{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:1.25rem;align-items:start}@media (max-width:900px){.graph{grid-template-columns:1fr}}
+.graph-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem 1.5rem}.graph-head h2{margin:.25rem 0}.graph-tools{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem}
+.graph canvas{display:block;width:100%;height:min(70vh,680px);border:1px solid #d0d7de;border-radius:10px;background:#fbfcfd;touch-action:none;cursor:grab}
+.legend{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.25rem 1rem;font-size:13px}.dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;vertical-align:-.05rem}
+.graph aside{position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow:auto}.matches{list-style:none;padding:0;margin:0}.matches button{width:100%;text-align:left;margin:0 0 .25rem}
+#signin:empty{display:none}</style></head>
+<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="/settings">Settings</a></nav>
 <main><h1>Agent Memory</h1>
 <p id="status" role="status">Loading sign-in…</p><div id="signin"></div>
 <div id="view" hidden></div>
 <section id="planned" hidden aria-labelledby="planned-h"><h2 id="planned-h">Not built yet</h2>
-<p>The path finder, timeline, journals, transfers, wipe and review pages are not built here. Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
+<p>The transfers, wipe and review pages are not built here. Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
 <script defer crossorigin="anonymous" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
 <script defer crossorigin="anonymous" data-clerk-publishable-key="${esc(env.CLERK_PUBLISHABLE_KEY)}" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
 <script defer src="/app.js"></script></body></html>`;
@@ -70,7 +76,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		}
 		return body;
 	};
-	type Profile = { name: string; status: string; created_at: string };
+	type Profile = { name: string; status: string; created_at: string; generation?: string };
 	type Device = { name: string; kind: string; scopes: string[]; profiles: string[]; default_profile: string | null; enabled: boolean;
 		expires_at: string | null; last_used_at: string | null; revoked_at: string | null };
 	type Batch = { last_lease_at: string | null; last_status: { status: string; reason: string | null; at: string | null } | null };
@@ -151,8 +157,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		link(more, "/settings", "Add or revoke devices in Settings");
 		if (p.status === "active") link(el("p", view), `#/about/${encodeURIComponent(p.name)}`, "About you in this profile");
 		if (p.status === "active") link(el("p", view), `#/work/${encodeURIComponent(p.name)}`, "Work in this profile");
-		if (p.status === "active") for (const [r, t] of [["memories", "Memories"], ["map", "Map"], ["activity", "Activity and archive"], ["draft", "Write a memory"]]) link(el("p", view), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
-		el("p", view, "Timeline and journals for this profile are not built yet.").setAttribute("class", "na");
+		if (p.status === "active") for (const [r, t] of [["memories", "Memories"], ["map", "Map"], ["activity", "Activity and archive"], ["timeline", "Timeline"], ["journals", "Journals"], ["path", "Path finder"], ["draft", "Write a memory"]]) link(el("p", view), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
 		return h;
 	};
 
@@ -542,7 +547,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			const n = r.node, name = String(n.name ?? "(no name)"), cut: string[] = Array.isArray(n.truncated) ? n.truncated : [];
 			h.textContent = `Memory: ${name}`;
 			say("");
-			facts(body, [["Kind", recorded(n.kind)], ["Type", recorded(n.memory_type)], ["Scope", recorded(n.scope)], ["Status", recorded(n.status)], ["Origin", recorded(n.origin)],
+			facts(body, [["Id", id], ["Kind", recorded(n.kind)], ["Type", recorded(n.memory_type)], ["Scope", recorded(n.scope)], ["Status", recorded(n.status)], ["Origin", recorded(n.origin)],
 				["Revision", recorded(n.revision)], ["Created", recorded(n.created_at)], ["Updated", recorded(n.updated_at)], ["Pinned", n.pinned ? "yes" : "no"],
 				["Flagged", n.flagged ? String(n.flagged) : "no"], ["Source profile", n.source_profile ? String(n.source_profile) : "this profile"]]);
 			if (n.description) { el("h3", body, "Description"); textBlock(body, String(n.description)); if (cut.includes("description")) note(body, "The description is longer than shown."); }
@@ -586,6 +591,9 @@ export async function dashboardMain(win: any): Promise<void> {
 			});
 			else note(body, "Editing here needs an active, non-procedural, non-journal memory with its whole text shown.");
 			link(el("p", body), `#/map/${enc(p.name)}/${enc(id)}`, "Center the map here");
+			link(el("p", body), `#/path/${enc(p.name)}/${enc(id)}`, "Find a path from here");
+			link(el("p", body), `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline of this record");
+			if (n.kind === "journal") link(el("p", body), `#/journals/${enc(p.name)}/${enc(id)}`, "Read as a journal");
 			el("h3", body, "Evidence");
 			const ev: J[] = r.evidence?.items ?? [];
 			if (ev.length) { const ul = el("ul", body); for (const e of ev) el("li", ul, `${String(e.kind)}: ${String(e.ref)}${e.note ? ` (${String(e.note)})` : ""}`); } else note(body, "No evidence pointers.");
@@ -1043,6 +1051,686 @@ export async function dashboardMain(win: any): Promise<void> {
 		return h;
 	};
 
+	// Timeline, journals and the path finder (section 15): read-only views over the owner page reads, nothing written.
+	const DAY_MS = 86_400_000, TIMELINE_DAYS = 90;
+	/** One timeline event as text: its date, what happened, and a link to the record when the server named it. */
+	const eventItem = (parent: Node, p: Profile, e: J) => {
+		const li = el("li", parent), kind = String(e.event ?? ""), [cls, op] = kind.split(":");
+		el("strong", li, recorded(e.at));
+		el("span", li, ` · ${cls === "activity" ? `Change: ${op} by ${recorded(e.actor)}` : cls === "revision" ? `Revision ${recorded(e.revision)}: ${op} by ${recorded(e.actor)}`
+			: kind === "entry" ? `Journal entry ${recorded(e.entry_seq)} by ${recorded(e.actor)}` : kind === "link_recorded" || kind === "link_ended"
+			? `Link ${recorded(e.rel)} ${kind === "link_ended" ? "ended" : "recorded"}` : kind || "Event"}`);
+		if (e.redacted) note(li, "Its summary was removed by a wipe.");
+		else if (e.summary) el("p", li, String(e.summary));
+		if (e.node_id && e.name) link(el("p", li), `#/memory/${enc(p.name)}/${enc(String(e.node_id))}`, `${recorded(e.kind)}: ${String(e.name)}`);
+		if (kind.startsWith("link_")) note(li, `From ${recorded(e.src)} to ${recorded(e.dst)}`);
+		if (Array.isArray(e.targets) && e.targets.length) note(li, `${e.targets.length} record(s) changed`);
+	};
+
+	// Timeline: one explicit window of at most 90 days, the profile's changes or one record's, oldest first. The server has no
+	// cursor: a cut window says so, and only a narrower window or the 500-event limit shows more.
+	const timelinePage = (view: Node, p: Profile, nodeId?: string) => {
+		const version = pageVersion, h = el("h2", view, `Timeline: ${p.name}`);
+		switcher(view, "timeline", p.name);
+		if (nodeId) {
+			el("p", view, "Showing one record's revisions, entries and links.");
+			link(el("p", view), `#/memory/${enc(p.name)}/${enc(nodeId)}`, "Open the record");
+			link(el("p", view), `#/timeline/${enc(p.name)}`, "Show the whole profile instead");
+		}
+		note(view, `A window of at most ${TIMELINE_DAYS} days, ISO dates with Z or an offset; a date alone means midnight UTC. To is not included.`);
+		const form = el("form", view), now = Date.now();
+		const from = input(form, "tl-from", "From");
+		from.value = new Date(now - 7 * DAY_MS).toISOString();
+		const to = input(form, "tl-to", "To");
+		to.value = new Date(now).toISOString();
+		el("button", el("p", form), "Show timeline").setAttribute("type", "submit");
+		const { msg, say } = pageStatus(view);
+		const out = el("section", view);
+		out.setAttribute("aria-label", "Timeline events");
+		const more = btn(view, "Show up to 500 events", () => load(500, true));
+		more.hidden = true;
+		let request = 0;
+		const invalidate = () => { request++; out.replaceChildren(); more.hidden = true; };
+		for (const f of [from, to]) f.addEventListener("input", () => { invalidate(); say("Window changed. Choose Show timeline to load it."); });
+		const load = async (limit = 100, moveFocus = false) => {
+			invalidate();
+			const id = request, f = from.value.trim(), t = to.value.trim(), a = Date.parse(f), b = Date.parse(t);
+			if (Number.isNaN(a) || Number.isNaN(b) || a >= b || b - a > TIMELINE_DAYS * DAY_MS) { say(`Choose From before To, at most ${TIMELINE_DAYS} days apart, as ISO dates.`); msg.focus(); return; }
+			say("Loading the timeline…");
+			let r: J;
+			try {
+				r = await call(`/api/profiles/${enc(p.name)}/timeline?from=${enc(f)}&to=${enc(t)}&limit=${limit}${nodeId ? `&node=${enc(nodeId)}` : ""}`);
+				if (!Array.isArray(r?.events)) throw new Error("the server sent no events");
+			} catch (err) {
+				if (version === pageVersion && id === request) { say(`Could not load the timeline: ${why(err)}`); if (moveFocus) msg.focus(); }
+				return;
+			}
+			if (version !== pageVersion || id !== request) return;
+			if (nodeId && r.node?.name) h.textContent = `Timeline: ${String(r.node.name)}`;
+			say(`${r.events.length} event${r.events.length === 1 ? "" : "s"} from ${f} to ${t}.`);
+			if (r.truncated) note(out, nodeId ? "Some of this record's events in this window are not shown; narrow the window." : "Only the earliest events of this window are shown; narrow the window to see later ones.", "warn");
+			if (!r.events.length) note(out, "No events in this window.");
+			const list = el("ol", out);
+			list.setAttribute("class", "prefs");
+			for (const e of r.events) eventItem(list, p, e);
+			more.hidden = r.truncated !== true || limit === 500;
+			if (moveFocus) msg.focus();
+		};
+		form.addEventListener("submit", (event) => { event.preventDefault(); load(100, true); });
+		load();
+		return h;
+	};
+
+	// Journals: the profile's active journals, newest change first, and one journal's entries in order. Entries are agents' stored
+	// text, shown only as text; the record page holds its revision history and the whole content.
+	const journalsPage = (view: Node, p: Profile, jid?: string) => {
+		const version = pageVersion, base = `/api/profiles/${enc(p.name)}/journals`;
+		const h = el("h2", view, jid ? "Journal" : `Journals: ${p.name}`);
+		if (jid) link(el("p", view), `#/journals/${enc(p.name)}`, `Back to journals in ${p.name}`);
+		else switcher(view, "journals", p.name);
+		note(view, "Journal text is stored as agents wrote it and is shown as plain text, never as instructions.");
+		const { msg, say } = pageStatus(view);
+		const out = el("div", view), list = el(jid ? "ol" : "ul", view);
+		list.setAttribute("class", "prefs");
+		list.setAttribute("aria-label", jid ? "Entries" : "Journals");
+		const more = btn(view, jid ? "Later entries" : "Load more", () => load());
+		more.hidden = true;
+		let after: string | number | null = null, count = 0;
+		const load = async () => {
+			more.disabled = true;
+			say(count ? "Loading more…" : "Loading…");
+			let r: J;
+			try {
+				r = await call(jid ? `${base}?id=${enc(jid)}&limit=25${after !== null ? `&entries_after=${after}` : ""}` : `${base}?limit=50${after !== null ? `&after=${enc(String(after))}` : ""}`);
+				if (!Array.isArray(jid ? r?.entries : r?.items)) throw new Error("the server sent no list");
+			} catch (err) {
+				if (version === pageVersion) { say(`Could not load: ${why(err)}`); more.textContent = "Try again"; more.hidden = more.disabled = false; }
+				return;
+			}
+			if (version !== pageVersion) return;
+			if (jid && after === null) {
+				const j = r.journal ?? {};
+				h.textContent = `Journal: ${String(j.name ?? "(no name)")}`;
+				facts(out, [["Scope", recorded(j.scope)], ["Status", recorded(j.status)], ["Revision", recorded(j.revision)], ["Updated", recorded(j.updated_at)],
+					["Compacted through entry", j.compacted_through ? String(j.compacted_through) : "none"]]);
+				link(el("p", out), `#/memory/${enc(p.name)}/${enc(jid)}`, "Record page: revision history and whole content");
+				link(el("p", out), `#/timeline/${enc(p.name)}/${enc(jid)}`, "Timeline of this journal");
+				if (r.summary) {
+					el("h3", out, "Summary of compacted entries");
+					textBlock(out, String(r.summary.body ?? ""));
+					if (r.summary.complete === false) note(out, "Only the summary's first part is shown; the record page has the whole text.");
+				}
+				if (Array.isArray(r.compactions) && r.compactions.length) {
+					el("h3", out, "Compactions");
+					const ul = el("ul", out);
+					for (const c of r.compactions) el("li", ul, `Revision ${recorded(c.revision)} at ${recorded(c.at)} by ${recorded(c.actor)}: entries ${recorded(c.from_seq)} to ${recorded(c.through_seq)}`);
+					if (r.compactions_more) note(out, "Older compactions are not listed.");
+				}
+				el("h3", out, "Entries");
+			}
+			for (const it of jid ? r.entries : r.items) {
+				const li = el("li", list);
+				if (jid) {
+					el("strong", li, `Entry ${recorded(it.entry_seq)}`);
+					el("span", li, ` · ${recorded(it.created_at)} · ${recorded(it.actor)}`);
+					textBlock(li, String(it.body ?? ""));
+					if (it.current === false) note(li, "Compacted into the summary.");
+					if (it.complete === false) note(li, "Only this entry's first part is shown; the record page has the whole text.");
+				} else {
+					link(el("h3", li), `#/journals/${enc(p.name)}/${enc(String(it.id))}`, String(it.name ?? "(no name)"));
+					facts(li, [["Scope", recorded(it.scope)], ["Updated", recorded(it.updated_at)], ["Latest entry", recorded(it.latest_entry_seq)],
+						["Compacted through entry", it.compacted_through ? String(it.compacted_through) : "none"], ["Pinned", it.pinned ? "yes" : "no"]]);
+					if (it.description) el("p", li, String(it.description));
+				}
+			}
+			count += (jid ? r.entries : r.items).length;
+			after = jid ? (typeof r.next_after === "number" ? r.next_after : null) : (typeof r.next_after === "string" ? r.next_after : null);
+			more.textContent = jid ? "Later entries" : "Load more";
+			more.hidden = after === null;
+			more.disabled = false;
+			const noun = jid ? (count === 1 ? "entry" : "entries") : count === 1 ? "journal" : "journals";
+			say(count ? `Showing ${count} ${noun}${after !== null ? "; more are available" : ""}.` : jid ? "This journal has no entries." : "No active journals in this profile.");
+			if (more.hidden && count > (jid ? r.entries : r.items).length) msg.focus();
+		};
+		load();
+		return h;
+	};
+
+	// Path finder: up to 3 paths of at most 4 links between two records this profile shows, as the server searched them. Names
+	// come only from its answer: a record in another profile shows as such, never looked up here.
+	const endpointText = (e: J) => e?.name ? `${recorded(e.kind)}: ${String(e.name)}` : e?.readable === false ? "a record not readable here" : "a record in another profile, not read";
+	const endpointView = (parent: Node, p: Profile, e: J) => {
+		if (e?.name && (e.profile === undefined || e.profile === p.name)) link(parent, `#/memory/${enc(p.name)}/${enc(String(e.id))}`, endpointText(e));
+		else el("span", parent, endpointText(e));
+	};
+	const pathPage = (view: Node, p: Profile, fromId?: string) => {
+		const version = pageVersion, h = el("h2", view, `Path finder: ${p.name}`);
+		switcher(view, "path", p.name);
+		note(view, "Both records must be shown in this profile. Copy a record's id from its page, or open a record and choose “Find a path from here”.");
+		const form = el("form", view);
+		const from = input(form, "path-from", "From record id");
+		from.setAttribute("maxlength", "128");
+		from.value = fromId ?? "";
+		const to = input(form, "path-to", "To record id");
+		to.setAttribute("maxlength", "128");
+		const depth = choose(form, "path-depth", "Longest path", [["4", "4 links"], ["3", "3 links"], ["2", "2 links"]]);
+		el("button", el("p", form), "Find paths").setAttribute("type", "submit");
+		const { msg, say } = pageStatus(view);
+		const out = el("section", view);
+		out.setAttribute("aria-label", "Paths found");
+		let request = 0;
+		const invalidate = () => { request++; out.replaceChildren(); };
+		for (const f of [from, to, depth]) f.addEventListener("input", invalidate);
+		form.addEventListener("submit", async (event) => {
+			event.preventDefault();
+			invalidate();
+			const id = request, a = from.value.trim(), b = to.value.trim();
+			if (!a || !b) { say("Enter both record ids."); msg.focus(); return; }
+			say("Searching…");
+			let r: J;
+			try {
+				r = await call(`/api/profiles/${enc(p.name)}/path?from=${enc(a)}&to=${enc(b)}&max_depth=${depth.value}`);
+				if (!Array.isArray(r?.paths)) throw new Error("the server sent no paths");
+			} catch (err) {
+				if (version === pageVersion && id === request) { say(`Could not find paths: ${why(err)}`); msg.focus(); }
+				return;
+			}
+			if (version !== pageVersion || id !== request) return;
+			const ends = el("p", out);
+			el("span", ends, "From ");
+			endpointView(ends, p, r.from);
+			el("span", ends, " to ");
+			endpointView(ends, p, r.to);
+			if (r.budget?.exhausted) note(out, "The search stopped at its read budget; a longer or unread path may exist.", "warn");
+			if (!r.paths.length) say(`No path of at most ${recorded(r.max_depth ?? depth.value)} links was found.`);
+			else say(`${r.paths.length} path${r.paths.length === 1 ? "" : "s"} found.`);
+			r.paths.forEach((path: J, i: number) => {
+				el("h3", out, `Path ${i + 1}: ${recorded(path.length)} link${path.length === 1 ? "" : "s"}`);
+				const ol = el("ol", out);
+				for (const e of path.edges ?? []) {
+					const li = el("li", ol);
+					endpointView(li, p, e.from);
+					el("span", li, ` — ${recorded(e.rel)}${e.other_label ? ` (${String(e.other_label)})` : ""} → `);
+					endpointView(li, p, e.to);
+					if (e.reason) el("p", li, String(e.reason));
+				}
+			});
+			msg.focus();
+		});
+		return h;
+	};
+
+	// The knowledge graph (section 15), the dashboard's home: every record and link of one profile, drawn on one canvas from the
+	// owner whole-graph read (metadata only, paged), so loaded and total counts are the server's. A selected record's detail is read
+	// only when it is selected. Cached per profile generation; nothing here writes, and no link is drawn that the server did not send.
+	type GNode = { id: string; name: string; kind: string; label: string | null; type: string | null; scope: string | null; status: string; updated: string | null;
+		group: string; seq: number; x: number; y: number; deg: number; opaque: number };
+	type GEdge = { id: string; a: string; b: string; rel: string };
+	type Phase = { next: string | null; total: number | null; done: boolean; error: string | null };
+	type Graph = { nodes: Map<string, GNode>; edges: Map<string, GEdge>; groups: Map<string, string[]>; pending: Map<string, GEdge[]>; opaque: number;
+		parts: { nodes: Phase; edges: Phase }; loading: boolean; missing: boolean; changed: boolean; dirty: boolean; listener?: () => void };
+	const graphs = new Map<string, Graph>();
+	const GROUPS: [string, string][] = [["m:project", "Project memories"], ["m:feedback", "Feedback"], ["m:reference", "References"], ["m:user", "About the owner"],
+		["m:procedural", "Procedures"], ["e:project", "Projects"], ["e:component", "Components"], ["e:person", "People"], ["e:ticket", "Tickets"], ["e:bug", "Bugs"],
+		["e:feature", "Features"], ["e:pr", "Pull requests"], ["e:commit", "Commits"], ["e:release", "Releases"], ["e:decision", "Decisions"], ["e:other", "Other"]];
+	const GROUP_NAME = new Map(GROUPS);
+	// Three categorical hues (they stay apart for every pair, including colour-blind readers); each group's place and label name it too.
+	const hueOf = (g: string) => g.startsWith("m:") ? "#2a78d6" : g === "e:person" ? "#1baf7a" : "#eb6834";
+	const groupOf = (type: string | null, kind: string) => type ? (GROUP_NAME.has(`m:${type}`) ? `m:${type}` : "e:other") : GROUP_NAME.has(`e:${kind}`) ? `e:${kind}` : "e:other";
+	const SPACING = 14, GOLDEN = Math.PI * (3 - Math.sqrt(5));
+	const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+	const blankGraph = (): Graph => ({ nodes: new Map(), edges: new Map(), groups: new Map(), pending: new Map(), opaque: 0, loading: false, missing: false, changed: false, dirty: true,
+		parts: { nodes: { next: null, total: null, done: false, error: null }, edges: { next: null, total: null, done: false, error: null } } });
+	const graphOf = (p: Profile) => {
+		const key = `${p.name}:${p.generation ?? ""}`;
+		let g = graphs.get(key);
+		if (!g) graphs.set(key, g = blankGraph());
+		return g;
+	};
+	const addNode = (g: Graph, it: J) => {
+		const id = str(it?.id);
+		if (!id || g.nodes.has(id)) return;
+		const kind = str(it.kind) ?? "other", type = str(it.type), group = groupOf(type, kind), list = g.groups.get(group) ?? [];
+		g.nodes.set(id, { id, name: str(it.name) ?? "(no name)", kind, label: str(it.other_label), type, scope: str(it.scope), status: str(it.status) ?? "active",
+			updated: str(it.updated_at), group, seq: list.length, x: 0, y: 0, deg: 0, opaque: 0 });
+		list.push(id);
+		g.groups.set(group, list);
+		g.dirty = true;
+		for (const e of g.pending.get(id) ?? []) link2(g, e);
+		g.pending.delete(id);
+	};
+	/** A link joins the drawing once both ends are loaded records; until then it waits, so no end is invented. */
+	const link2 = (g: Graph, e: GEdge) => {
+		if (g.edges.has(e.id)) return;
+		const missing = [e.a, e.b].find((x) => !g.nodes.has(x));
+		if (missing) { g.pending.set(missing, [...(g.pending.get(missing) ?? []), e]); return; }
+		g.edges.set(e.id, e);
+		g.nodes.get(e.a)!.deg++;
+		g.nodes.get(e.b)!.deg++;
+		g.dirty = true;
+	};
+	const addEdge = (g: Graph, it: J) => {
+		const id = str(String(it?.id ?? "")), a = str(it?.src), b = str(it?.dst?.id);
+		if (!id || !a || !b) return;
+		// A far end that is not a record shown here (another profile, a moved record, a capture) is counted on its record, never drawn.
+		if (it.dst.readable !== true) {
+			if (!g.edges.has(`x:${id}`)) { g.edges.set(`x:${id}`, { id: `x:${id}`, a, b: "", rel: str(it.rel) ?? "" }); g.opaque++; const n = g.nodes.get(a); if (n) n.opaque++; }
+			return;
+		}
+		link2(g, { id, a, b, rel: str(it.rel) ?? "relates_to" });
+	};
+	/** Walks the nodes and edges parts in parallel with the server's cursors, at its default page sizes; edges join nodes on id. */
+	const pump = async (p: Profile, g: Graph) => {
+		if (g.loading) return;
+		g.loading = true;
+		await Promise.all((["nodes", "edges"] as const).map(async (part) => {
+			const ph = g.parts[part];
+			while (!ph.done && !ph.error && !g.missing) {
+				try {
+					const first = !ph.next, r: J = await call(`/api/profiles/${enc(p.name)}/graph?part=${part}${ph.next ? `&after=${enc(ph.next)}` : ""}`);
+					if (!Array.isArray(r?.items) || graphs.get(`${p.name}:${p.generation ?? ""}`) !== g) return; // a reload replaced this walk
+					for (const it of r.items) (part === "nodes" ? addNode : addEdge)(g, it);
+					if (first && part === "nodes") ph.total = typeof r.total === "number" ? r.total : null;
+					ph.next = str(r.next_after);
+					ph.done = r.done === true || !ph.next;
+					if (r.changed === true) g.changed = true;
+				} catch (err) {
+					const e = err as Failure;
+					if (e.status === 404 && !g.nodes.size && part === "nodes") g.missing = true;
+					else ph.error = why(err);
+				}
+				g.listener?.();
+				await new Promise((r) => setTimeout(r, 0)); // yield between pages so the canvas stays responsive
+			}
+		}));
+		g.loading = false;
+		g.listener?.();
+	};
+	/** Groups as discs in a fixed order, wrapped in rows; records spiral out from their disc's centre in load order. O(records). */
+	const layout = (g: Graph, shown: (n: GNode) => boolean) => {
+		const discs: { group: string; ids: string[]; r: number; x: number; y: number }[] = [];
+		for (const [group] of GROUPS) {
+			const ids = (g.groups.get(group) ?? []).filter((id) => shown(g.nodes.get(id)!));
+			if (ids.length) discs.push({ group, ids, r: Math.max(80, SPACING * Math.sqrt(ids.length) + SPACING * 2), x: 0, y: 0 });
+		}
+		const width = Math.max(600, Math.sqrt(discs.reduce((s, d) => s + (2 * d.r + 60) ** 2, 0)) * 1.6);
+		let x = 0, y = 0, row = 0;
+		for (const d of discs) {
+			if (x > 0 && x + 2 * d.r > width) { x = 0; y += row + 60; row = 0; }
+			d.x = x + d.r; d.y = y + d.r; x += 2 * d.r + 60; row = Math.max(row, 2 * d.r);
+			d.ids.forEach((id, i) => {
+				const n = g.nodes.get(id)!, r = SPACING * Math.sqrt(i + 0.5), a = i * GOLDEN;
+				n.x = d.x + r * Math.cos(a); n.y = d.y + r * Math.sin(a);
+			});
+		}
+		return discs;
+	};
+
+	const graphPage = (view: Node, p: Profile, selectId?: string) => {
+		const version = pageVersion, g = graphOf(p);
+		const wrap = el("div", view);
+		wrap.setAttribute("class", "graph");
+		const stage = el("section", wrap), side = el("aside", wrap);
+		stage.setAttribute("aria-label", "Knowledge graph");
+		side.setAttribute("aria-label", "Find and inspect records");
+		const head = el("div", stage);
+		head.setAttribute("class", "graph-head");
+		const h = el("h2", head, `Knowledge graph: ${p.name}`);
+		switcher(head, "graph", p.name);
+		const statusLine = live(stage);
+		const tools = el("div", stage);
+		tools.setAttribute("class", "graph-tools");
+		const canvas: J = el("canvas", stage);
+		canvas.setAttribute("tabindex", "0");
+		canvas.setAttribute("role", "img");
+		canvas.setAttribute("aria-label", "Graph of this profile's records. Arrow keys pan, plus and minus zoom, 0 fits, Enter selects the first match. Use the search beside it to find records.");
+		const legend = el("ul", stage);
+		legend.setAttribute("class", "legend");
+		legend.setAttribute("aria-label", "Groups; uncheck to hide");
+		el("p", stage, "Dot size grows with links. A ring marks a record with links into another profile. Records with no links are drawn without lines; that is what the server holds.").setAttribute("class", "na");
+		// Side panel: search and the selected record.
+		const search = input(side, "graph-q", "Find records by name, type or scope");
+		search.setAttribute("type", "search");
+		const linkedOnly = el("label", side);
+		linkedOnly.setAttribute("class", "field");
+		const linkedBox = el("input", linkedOnly);
+		linkedBox.setAttribute("type", "checkbox");
+		el("span", linkedOnly, " Only records with links");
+		const pastLabel = el("label", side);
+		pastLabel.setAttribute("class", "field");
+		const pastBox = el("input", pastLabel);
+		pastBox.setAttribute("type", "checkbox");
+		const pastText = el("span", pastLabel, " Include retired and superseded records");
+		const matchNote = el("p", side);
+		const matches = el("ul", side);
+		matches.setAttribute("class", "matches");
+		matches.setAttribute("aria-label", "Matching records");
+		const detail = el("section", side);
+		detail.setAttribute("aria-label", "Selected record");
+
+		const hidden = new Set<string>();
+		let query = "", selected: string | null = selectId ?? null, hover: string | null = null, matched: GNode[] = [], matchSet = new Set<string>();
+		let discs: ReturnType<typeof layout> = [], grid = new Map<string, GNode[]>(), cam = { x: 0, y: 0, k: 1 }, fitted = false, moved = false, frame = false, detailRequest = 0;
+		// Per-layout state, so a frame reads no DOM and filters nothing: the drawable records, their ids, and each record's linked ids.
+		let vis: GNode[] = [], visIds = new Set<string>(), adj = new Map<string, string[]>(), showPast = false, onlyLinked = false;
+		const ctx = canvas.getContext?.("2d") ?? null;
+		// The canvas size is read only when it may have changed (resize), never per frame or per pointer move.
+		let cw = 800, ch = 560, dpr = 1;
+		const measure = () => {
+			const w = canvas.clientWidth || 800, hh = canvas.clientHeight || 560, d = win.devicePixelRatio || 1;
+			if (w === cw && hh === ch && d === dpr) return false;
+			cw = w; ch = hh; dpr = d;
+			if (!moved) fitted = false; // an untouched view refits; a moved one keeps its centre and scale
+			return true;
+		};
+		measure();
+		const shown = (n: GNode) => !hidden.has(n.group) && (n.status === "active" || showPast) && (!onlyLinked || n.deg > 0 || n.opaque > 0);
+		const relayout = () => {
+			discs = layout(g, shown);
+			vis = []; visIds = new Set(); grid = new Map(); adj = new Map();
+			for (const n of g.nodes.values()) {
+				if (!shown(n)) continue;
+				vis.push(n); visIds.add(n.id);
+				const k = `${Math.floor(n.x / 32)},${Math.floor(n.y / 32)}`, cell = grid.get(k);
+				if (cell) cell.push(n); else grid.set(k, [n]);
+			}
+			for (const e of g.edges.values()) if (e.b) for (const [x, y] of [[e.a, e.b], [e.b, e.a]] as const) { const l = adj.get(x); if (l) l.push(y); else adj.set(x, [y]); }
+			layoutVersion++;
+			g.dirty = false;
+		};
+		const fit = () => {
+			if (!discs.length) return;
+			const x0 = Math.min(...discs.map((d) => d.x - d.r)), x1 = Math.max(...discs.map((d) => d.x + d.r)), y0 = Math.min(...discs.map((d) => d.y - d.r)), y1 = Math.max(...discs.map((d) => d.y + d.r));
+			cam = { x: (x0 + x1) / 2, y: (y0 + y1) / 2, k: Math.min(4, Math.max(0.05, Math.min(cw / (x1 - x0 + 80), (ch - 24) / (y1 - y0 + 80)))) };
+			fitted = true;
+		};
+		const toWorld = (sx: number, sy: number) => ({ x: (sx - cw / 2) / cam.k + cam.x, y: (sy - ch / 2) / cam.k + cam.y });
+		const radius = (n: GNode) => 3 + Math.min(5, Math.sqrt(n.deg));
+		const pick = (sx: number, sy: number) => {
+			const w = toWorld(sx, sy), reach = Math.max(8 / cam.k, 6);
+			let best: string | null = null, bestD = Infinity;
+			for (let gx = Math.floor((w.x - reach) / 32); gx <= Math.floor((w.x + reach) / 32); gx++) for (let gy = Math.floor((w.y - reach) / 32); gy <= Math.floor((w.y + reach) / 32); gy++) {
+				for (const n of grid.get(`${gx},${gy}`) ?? []) { const d = Math.hypot(n.x - w.x, n.y - w.y); if (d < reach + radius(n) && d < bestD) { best = n.id; bestD = d; } }
+			}
+			return best;
+		};
+		// Dots are drawn as one native path per colour (three fills for the whole library), into a cached layer: a frame stamps that one
+		// bitmap (a pan moves it, a wheel zoom in progress scales it) and the dots are drawn again only when the zoom settles, the layout
+		// changes or the pixel ratio does. Zoomed in past the layer's size cap, the dots in view are drawn directly, the same way.
+		const HUES = ["#2a78d6", "#eb6834", "#1baf7a"], LAYER_PIXELS = 16_000_000, PAD = 12;
+		const dots = (c: J, k: number, ox: number, oy: number, keep: (n: GNode) => boolean) => {
+			let n = 0;
+			const scale = Math.min(1.6, Math.max(0.6, Math.sqrt(k)));
+			for (const hue of HUES) {
+				c.fillStyle = hue;
+				c.beginPath();
+				for (const d of vis) {
+					if (hueOf(d.group) !== hue || !keep(d)) continue;
+					const x = d.x * k + ox, y = d.y * k + oy, r = radius(d) * scale;
+					c.moveTo(x + r, y); c.arc(x, y, r, 0, 2 * Math.PI);
+					n++;
+				}
+				c.fill();
+			}
+			return n;
+		};
+		let layer: J = null, layerKey = "", layerAt = { x: 0, y: 0, k: 1, n: 0 }, layoutVersion = 0, zooming = 0, settleTimer: ReturnType<typeof setTimeout> | undefined;
+		/** Draws every drawable dot at zoom k into the layer; leaves no layer when that would pass the size cap. */
+		const buildLayer = (k: number, key: string) => {
+			layerKey = key;
+			if (!discs.length) { layer = null; return; }
+			const x0 = Math.min(...discs.map((d) => d.x - d.r)), x1 = Math.max(...discs.map((d) => d.x + d.r)), y0 = Math.min(...discs.map((d) => d.y - d.r)), y1 = Math.max(...discs.map((d) => d.y + d.r));
+			const w = Math.ceil(((x1 - x0) * k + 2 * PAD) * dpr), hh = Math.ceil(((y1 - y0) * k + 2 * PAD) * dpr);
+			if (w * hh > LAYER_PIXELS || w > 8192 || hh > 8192) { layer = null; return; }
+			const c = layer ?? doc.createElement("canvas");
+			if (c.width !== w) c.width = w;
+			if (c.height !== hh) c.height = hh;
+			const lc = c.getContext?.("2d");
+			if (!lc) { layer = null; return; }
+			lc.setTransform(dpr, 0, 0, dpr, 0, 0);
+			lc.clearRect(0, 0, w, hh);
+			layerAt = { x: x0 - PAD / k, y: y0 - PAD / k, k, n: dots(lc, k, PAD - x0 * k, PAD - y0 * k, () => true) };
+			layer = c;
+		};
+		const widths = new Map<string, number>(); // measured text widths, per font and text
+		const widthOf = (font: string, t: string): number => {
+			const k = `${font}|${t}`, known = widths.get(k);
+			if (known !== undefined) return known;
+			ctx.font = font;
+			const w = Number(ctx.measureText(t).width) || t.length * 7;
+			widths.set(k, w);
+			return w;
+		};
+		let drawn = -1; // records drawn in the last frame, kept on the canvas for measurement
+		const GROUP_FONT = "600 13px system-ui, sans-serif", NAME_FONT = "12px system-ui, sans-serif";
+		const draw = () => {
+			frame = false;
+			if (version !== pageVersion) return;
+			if (g.dirty) { relayout(); if (!moved) fitted = false; } // the view follows the loading graph until the owner pans or zooms
+			if (!fitted) fit();
+			if (!ctx) return;
+			// Width and height are checked apart, so a height-only change resizes the backing store too.
+			const bw = Math.round(cw * dpr), bh = Math.round(ch * dpr);
+			if (canvas.width !== bw) canvas.width = bw;
+			if (canvas.height !== bh) canvas.height = bh;
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			ctx.clearRect(0, 0, cw, ch);
+			const k = cam.k, ox = cw / 2 - cam.x * k, oy = ch / 2 - cam.y * k, scale = Math.min(1.6, Math.max(0.6, Math.sqrt(k)));
+			const x0 = (-20 - ox) / k, x1 = (cw + 20 - ox) / k, y0 = (-20 - oy) / k, y1 = (ch + 20 - oy) / k;
+			const inView = (n: GNode) => n.x > x0 && n.x < x1 && n.y > y0 && n.y < y1;
+			// Text is placed only where it fits: inside the canvas and clear of text already placed (a screen grid of 8 px cells).
+			const taken = new Set<number>();
+			const place = (x: number, y: number, w: number, hgt: number) => {
+				if (x < 2 || y - hgt < 2 || x + w > cw - 2 || y + 2 > ch) return false;
+				const c0 = Math.floor(x / 8), c1 = Math.floor((x + w) / 8), r0 = Math.floor((y - hgt) / 8), r1 = Math.floor((y + 2) / 8);
+				for (let cx = c0; cx <= c1; cx++) for (let cy = r0; cy <= r1; cy++) if (taken.has(cy * 4096 + cx)) return false;
+				for (let cx = c0; cx <= c1; cx++) for (let cy = r0; cy <= r1; cy++) taken.add(cy * 4096 + cx);
+				return true;
+			};
+			ctx.lineWidth = 1;
+			ctx.strokeStyle = "rgba(87,96,106,0.35)";
+			ctx.beginPath();
+			for (const e of g.edges.values()) {
+				if (!e.b || !visIds.has(e.a) || !visIds.has(e.b)) continue;
+				const a = g.nodes.get(e.a)!, b = g.nodes.get(e.b)!;
+				if (!inView(a) && !inView(b)) continue;
+				ctx.moveTo(a.x * k + ox, a.y * k + oy); ctx.lineTo(b.x * k + ox, b.y * k + oy);
+			}
+			ctx.stroke();
+			const focus = selected ? new Set([selected, ...(adj.get(selected) ?? [])]) : null;
+			let count = 0;
+			ctx.globalAlpha = focus || matchSet.size ? 0.35 : 1;
+			const key = `${layoutVersion}:${k}:${dpr}`, settled = Date.now() - zooming > 150;
+			if (layerKey !== key && (settled || !layer)) buildLayer(k, key);
+			if (layer && (layerAt.k === k || !settled)) {
+				const s = k / layerAt.k;
+				ctx.drawImage(layer, layerAt.x * k + ox, layerAt.y * k + oy, (layer.width / dpr) * s, (layer.height / dpr) * s);
+				count = layerAt.n;
+				// A scaled layer is a placeholder: draw it sharp once the wheel has been still for a moment.
+				if (layerAt.k !== k) { clearTimeout(settleTimer); settleTimer = setTimeout(schedule, 160); }
+			} else count = dots(ctx, k, ox, oy, inView);
+			ctx.globalAlpha = 1;
+			const emphasise = (n: GNode, ring: string) => {
+				const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale;
+				ctx.fillStyle = hueOf(n.group); ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
+				ctx.strokeStyle = ring; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, r + 2, 0, 2 * Math.PI); ctx.stroke();
+			};
+			if (k > 0.6) { ctx.strokeStyle = "#57606a"; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
+			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, "#9a6700"); }
+			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? "#1b1f24" : "#ffffff"); }
+			// Record names first, most important first, then group headings where room is left; the legend always names every group.
+			ctx.font = NAME_FONT;
+			ctx.fillStyle = "#1b1f24";
+			const label = (n: GNode) => {
+				const t = n.name.length > 40 ? `${n.name.slice(0, 39)}…` : n.name, w = widthOf(NAME_FONT, t), x = n.x * k + ox, y = n.y * k + oy + 4, r = radius(n) * scale + 4;
+				// Right of the dot, or left of it near the right edge.
+				for (const lx of [x + r, x - r - w]) if (place(lx, y, w, 12)) { ctx.fillText(t, lx, y); return; }
+			};
+			const important = [...new Set([...(selected ? [selected] : []), ...(hover ? [hover] : []), ...(focus ?? []), ...[...matchSet].slice(0, 50)])];
+			for (const id of important) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) label(n); }
+			if (k >= 1.4) { let shownLabels = 0; for (const n of vis) { if (shownLabels >= 150) break; if (inView(n)) { label(n); shownLabels++; } } }
+			ctx.font = GROUP_FONT;
+			ctx.fillStyle = "#57606a";
+			for (const d of [...discs].sort((a, b) => b.ids.length - a.ids.length)) {
+				const full = `${GROUP_NAME.get(d.group)} (${d.ids.length})`, w = widthOf(GROUP_FONT, full), cx = d.x * k + ox;
+				// Centred over the disc, kept inside the canvas; below it if the top is taken; left out if neither fits.
+				const lx = Math.min(Math.max(cx - w / 2, 4), cw - 4 - w);
+				for (const y of [(d.y - d.r) * k + oy - 6, (d.y + d.r) * k + oy + 16]) if (place(lx, y, w, 14)) { ctx.fillText(full, lx, y); break; }
+			}
+			if (count !== drawn) { drawn = count; canvas.setAttribute("data-drawn", String(count)); }
+		};
+		const schedule = () => {
+			if (frame) return;
+			frame = true;
+			if (win.requestAnimationFrame) win.requestAnimationFrame(draw); else setTimeout(draw, 0);
+		};
+		const resized = () => { if (version === pageVersion && measure()) schedule(); };
+		win.addEventListener("resize", resized);
+		if (win.ResizeObserver) { const ro = new win.ResizeObserver(() => { if (version !== pageVersion) ro.disconnect(); else resized(); }); ro.observe(canvas); }
+
+		const count = (n: number | null) => (n === null ? "?" : n.toLocaleString("en"));
+		const refresh = () => {
+			if (version !== pageVersion) return;
+			const nodes = g.parts.nodes, edges = g.parts.edges, links = [...g.edges.values()].filter((e) => e.b).length;
+			const past = [...g.nodes.values()].filter((n) => n.status !== "active").length, waiting = [...g.pending.values()].reduce((s, l) => s + l.length, 0);
+			const parts = g.missing ? ["This server does not offer the whole-graph read yet, so the graph cannot be drawn. Browse records in Memories meanwhile."]
+				: [nodes.total === null ? `${count(g.nodes.size)} records loaded${nodes.done ? " (all)" : nodes.error ? "; loading stopped" : "; loading…"}`
+					: `${count(g.nodes.size)} of ${count(nodes.total)} records loaded${nodes.done ? "" : nodes.error ? "; loading stopped" : "; loading…"}`,
+					`${count(links)} links${edges.done ? "" : edges.error ? "; loading stopped" : " so far; loading…"}`,
+					...(g.opaque ? [`${count(g.opaque)} links lead to records not readable in this profile`] : []),
+					...(nodes.done && edges.done && waiting ? [`${count(waiting)} links wait for records that were not listed`] : []),
+					...(g.changed ? ["The profile changed while loading; reload for a fresh graph"] : []),
+					...(nodes.error || edges.error ? [`Could not load everything: ${nodes.error ?? edges.error}`] : [])];
+			statusLine.textContent = `${parts.join(" · ")}.`;
+			retry.hidden = !(nodes.error || edges.error);
+			reload.hidden = !g.changed;
+			pastText.textContent = ` Include retired and superseded records (${past.toLocaleString("en")})`;
+			if (!g.missing && nodes.done && !g.nodes.size) statusLine.textContent = "This profile holds no records yet.";
+			legend.replaceChildren();
+			for (const [group, name] of GROUPS) {
+				const n = g.groups.get(group)?.length ?? 0;
+				if (!n) continue;
+				const li = el("li", legend), l = el("label", li), box = el("input", l), dot = el("span", l);
+				box.setAttribute("type", "checkbox");
+				box.checked = !hidden.has(group);
+				box.addEventListener("change", () => { if (box.checked) hidden.delete(group); else hidden.add(group); g.dirty = true; fitted = false; runSearch(false); schedule(); });
+				dot.setAttribute("class", "dot");
+				dot.setAttribute("style", `background:${hueOf(group)}`);
+				el("span", l, ` ${name} (${n.toLocaleString("en")})`);
+			}
+			runSearch(false);
+			schedule();
+		};
+		const retry = btn(tools, "Retry loading", () => { for (const ph of Object.values(g.parts)) ph.error = null; pump(p, g); refresh(); });
+		retry.hidden = true;
+		// A fresh walk replaces the cached graph; the old walk's late pages are dropped.
+		const reload = btn(tools, "Reload graph", () => { graphs.delete(`${p.name}:${p.generation ?? ""}`); render(false); });
+		reload.hidden = true;
+		btn(tools, "Zoom in", () => { moved = true; cam.k = Math.min(8, cam.k * 1.4); schedule(); });
+		btn(tools, "Zoom out", () => { moved = true; cam.k = Math.max(0.03, cam.k / 1.4); schedule(); });
+		btn(tools, "Fit", () => { moved = false; fit(); schedule(); });
+		link(tools, `#/memories/${enc(p.name)}`, "List view");
+
+		const runSearch = (announce: boolean) => {
+			const q = query.trim().toLowerCase();
+			matched = q ? [...g.nodes.values()].filter((n) => shown(n) && `${n.name} ${n.type ?? n.kind} ${n.scope ?? ""}`.toLowerCase().includes(q)) : [];
+			matchSet = new Set(matched.map((n) => n.id));
+			matches.replaceChildren();
+			for (const n of matched.slice(0, 50)) btn(el("li", matches), n.name, () => select(n.id, true), `${n.name}, ${GROUP_NAME.get(n.group)}`);
+			matchNote.textContent = !q ? "" : matched.length ? `${matched.length.toLocaleString("en")} match${matched.length === 1 ? "" : "es"}${matched.length > 50 ? "; the first 50 are listed" : ""}${g.parts.nodes.done ? "" : " among the records loaded so far"}.` : "No loaded record matches.";
+			if (announce) schedule();
+		};
+		search.addEventListener("input", () => { query = search.value; runSearch(true); });
+		search.addEventListener("keydown", (event: J) => { if (event.key === "Enter" && matched[0]) { event.preventDefault(); select(matched[0].id, true); } });
+		linkedBox.addEventListener("change", () => { onlyLinked = linkedBox.checked; g.dirty = true; fitted = false; refresh(); });
+		pastBox.addEventListener("change", () => { showPast = pastBox.checked; g.dirty = true; fitted = false; refresh(); });
+
+		/** Selects a record without moving the graph, unless asked to bring it into view; its detail is read now, once per selection. */
+		const select = (id: string | null, reveal = false) => {
+			selected = id;
+			const req = ++detailRequest;
+			detail.replaceChildren();
+			schedule();
+			if (!id) return;
+			const n = g.nodes.get(id);
+			if (n && reveal) { moved = true; if (g.dirty) relayout(); cam.x = n.x; cam.y = n.y; cam.k = Math.max(cam.k, 1.4); }
+			const title = el("h3", detail, n?.name ?? "Record");
+			if (n) facts(detail, [["Group", GROUP_NAME.get(n.group) ?? n.kind], ["Kind", `${n.kind}${n.label ? ` (${n.label})` : ""}`], ["Scope", recorded(n.scope)], ["Status", n.status], ["Updated", recorded(n.updated)],
+				["Links", `${n.deg}${n.opaque ? ` here, ${n.opaque} to other profiles` : ""}`]]);
+			const neighbours = [...g.edges.values()].filter((e) => e.b && (e.a === id || e.b === id));
+			if (neighbours.length) {
+				const ul = el("ul", detail);
+				ul.setAttribute("aria-label", "Linked records");
+				for (const e of neighbours.slice(0, 30)) {
+					const other = g.nodes.get(e.a === id ? e.b : e.a)!, li = el("li", ul);
+					el("span", li, `${e.a === id ? "to" : "from"} · ${e.rel} · `);
+					btn(li, other.name, () => select(other.id, true), `Select ${other.name}`);
+				}
+				if (neighbours.length > 30) note(detail, `${neighbours.length - 30} more links; open the record for all of them.`);
+			} else if (n && g.parts.edges.done) note(detail, n.opaque ? "Its only links go to other profiles." : "No links: this record stands alone.");
+			else if (n) note(detail, "Links are still loading.");
+			const actions = el("p", detail);
+			link(actions, `#/memory/${enc(p.name)}/${enc(id)}`, "Open the record");
+			el("span", actions, " · ");
+			link(actions, `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline");
+			el("span", actions, " · ");
+			link(actions, `#/path/${enc(p.name)}/${enc(id)}`, "Find a path");
+			const more = el("div", detail);
+			note(more, "Loading details…");
+			(async () => {
+				let r: J;
+				try { r = await call(`/api/profiles/${enc(p.name)}/nodes/${enc(id)}`); } catch (err) { if (version === pageVersion && req === detailRequest) { more.replaceChildren(); note(more, `Could not load details: ${why(err)}`); } return; }
+				if (version !== pageVersion || req !== detailRequest) return;
+				more.replaceChildren();
+				if (!n && r?.node?.name) title.textContent = String(r.node.name);
+				if (r?.node?.description) { el("h4", more, "Description"); textBlock(more, String(r.node.description)); }
+				const hist = Array.isArray(r?.history?.items) ? r.history.items : [];
+				el("h4", more, "Recent history");
+				if (hist.length) { const ul = el("ul", more); for (const v of hist.slice(0, 8)) el("li", ul, `Revision ${recorded(v.revision)} · ${recorded(v.op)} · ${recorded(v.at)} · ${recorded(v.actor)}`); }
+				else note(more, "No history recorded.");
+			})();
+		};
+
+		// Pan with a drag, zoom with the wheel around the pointer, select with a click; nothing animates, so reduced motion holds.
+		let drag: { x: number; y: number; cx: number; cy: number; moved: boolean } | null = null;
+		const at = (event: J) => { const r = canvas.getBoundingClientRect?.() ?? { left: 0, top: 0 }; return { x: event.clientX - r.left, y: event.clientY - r.top }; };
+		canvas.addEventListener("pointerdown", (event: J) => { const q = at(event); drag = { x: q.x, y: q.y, cx: cam.x, cy: cam.y, moved: false }; canvas.setPointerCapture?.(event.pointerId); });
+		canvas.addEventListener("pointermove", (event: J) => {
+			const q = at(event);
+			if (drag) {
+				if (Math.hypot(q.x - drag.x, q.y - drag.y) > 3) drag.moved = true;
+				if (drag.moved) { moved = true; cam.x = drag.cx - (q.x - drag.x) / cam.k; cam.y = drag.cy - (q.y - drag.y) / cam.k; schedule(); }
+				return;
+			}
+			const id = pick(q.x, q.y);
+			if (id !== hover) { hover = id; canvas.setAttribute("title", id ? g.nodes.get(id)!.name : ""); schedule(); }
+		});
+		canvas.addEventListener("pointerup", (event: J) => { const q = at(event), was = drag; drag = null; if (was && !was.moved) select(pick(q.x, q.y)); });
+		canvas.addEventListener("wheel", (event: J) => {
+			event.preventDefault();
+			moved = true;
+			zooming = Date.now();
+			const q = at(event), before = toWorld(q.x, q.y);
+			cam.k = Math.min(8, Math.max(0.03, cam.k * Math.exp(-event.deltaY * 0.0015)));
+			const after = toWorld(q.x, q.y);
+			cam.x += before.x - after.x; cam.y += before.y - after.y;
+			schedule();
+		});
+		canvas.addEventListener("keydown", (event: J) => {
+			const step = 80 / cam.k, keys: Record<string, () => void> = {
+				ArrowLeft: () => { cam.x -= step; }, ArrowRight: () => { cam.x += step; }, ArrowUp: () => { cam.y -= step; }, ArrowDown: () => { cam.y += step; },
+				"+": () => { cam.k = Math.min(8, cam.k * 1.4); }, "=": () => { cam.k = Math.min(8, cam.k * 1.4); }, "-": () => { cam.k = Math.max(0.03, cam.k / 1.4); },
+				"0": fit, Escape: () => select(null), Enter: () => { if (matched[0]) select(matched[0].id, true); } };
+			const f = keys[event.key];
+			if (f) { event.preventDefault(); moved = event.key !== "0"; f(); schedule(); }
+		});
+		g.listener = refresh;
+		refresh();
+		if (selected) select(selected, true);
+		pump(p, g);
+		return h;
+	};
+
 	const render = (moveFocus: boolean) => {
 		pageVersion++;
 		pageButtons = [];
@@ -1056,7 +1744,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		try { name = m ? decodeURIComponent(m[2]!) : undefined; } catch { name = m?.[2]; }
 		let h: Node;
 		// The newer pages: the named active profile, or active work when none is named (asked for if work is not active); for a record, its id.
-		const pg = /^#\/(memories|memory|map|draft|activity)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
+		const pg = /^#\/(graph|memories|memory|map|draft|activity|timeline|journals|path)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
 		const dec = (s?: string) => { if (s === undefined) return undefined; try { return decodeURIComponent(s); } catch { return s; } };
 		if (pg) {
 			const named = dec(pg[2]), id = dec(pg[3]), ok = active();
@@ -1068,8 +1756,12 @@ export async function dashboardMain(win: any): Promise<void> {
 			}
 			else if (pg[1] === "memory") h = id === undefined ? memoriesPage(view, p) : memoryPage(view, p, id);
 			else if (pg[1] === "memories") h = memoriesPage(view, p);
+			else if (pg[1] === "graph") h = graphPage(view, p, id);
 			else if (pg[1] === "map") h = mapPage(view, p, id);
 			else if (pg[1] === "draft") h = draftPage(view, p);
+			else if (pg[1] === "timeline") h = timelinePage(view, p, id);
+			else if (pg[1] === "journals") h = journalsPage(view, p, id);
+			else if (pg[1] === "path") h = pathPage(view, p, id);
 			else h = activityPage(view, p);
 		} else if (hash === "#/backups") h = backupsPage(view);
 		else if (hash === "#/work" || m?.[1] === "work") {
@@ -1086,10 +1778,13 @@ export async function dashboardMain(win: any): Promise<void> {
 			if (p) h = aboutPage(view, p);
 			else { h = el("h2", view, name === undefined ? "No active profile yet" : `No active profile named ${name}`); link(el("p", view), "#/", "Back to the overview"); }
 		} else {
-			const p = name === undefined ? undefined : profiles.find((x) => x.name === name);
-			if (name === undefined) h = home(view);
+			// The site root opens active work's graph (or asks for a profile); the profile cards are their own page.
+			const p = name === undefined ? undefined : profiles.find((x) => x.name === name), work = active().find((x) => x.name === "work");
+			if (name === undefined && hash === "#/profiles") h = home(view);
+			else if (name === undefined && work) h = graphPage(view, work);
+			else if (name === undefined) { h = el("h2", view, "Choose an active profile"); for (const q of active()) link(el("p", view), `#/graph/${enc(q.name)}`, q.name); link(el("p", view), "#/profiles", "Profiles"); }
 			else if (p) h = profilePage(view, p);
-			else { h = el("h2", view, `No profile named ${name}`); link(el("p", view), "#/", "Back to the overview"); }
+			else { h = el("h2", view, `No profile named ${name}`); link(el("p", view), "#/profiles", "Back to the profiles"); }
 		}
 		if (moveFocus) { h.setAttribute("tabindex", "-1"); h.focus(); }
 	};

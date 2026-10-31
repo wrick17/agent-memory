@@ -203,6 +203,7 @@ export type ReadQuery =
 	| { kind: "page_timeline"; from: string; to: string; node?: { id: string } | { key: string }; kinds?: NodeKind[]; limit: number; known: string[] }
 	| { kind: "activity"; before: number | null; limit: number; actor?: string }
 	| { kind: "shown"; ids: string[] }
+	| { kind: "graph"; part: "nodes" | "edges"; after: string | null; limit: number }
 	| { kind: "archive"; before: number | null; limit: number }
 	// GET /v1/markers (section 7): `repo` is the GitHub namespace, or null for another remote.
 	| { kind: "markers"; repo: string | null; session?: { client: "claude-code" | "codex"; id: string } };

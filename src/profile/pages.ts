@@ -232,6 +232,79 @@ export function map(sql: SqlStorage, q: MapQuery) {
 	};
 }
 
+/** The whole graph as metadata (section 15): `part` pages every shown node, or every current link, by keyset; `after` is the last page's `next_after`. */
+export interface GraphQuery { kind: "graph"; part: "nodes" | "edges"; after: string | null; limit: number }
+export const GRAPH_LIMITS = { nodes: 1_000, edges: 2_000 }, GRAPH_BYTES = 512 * 1024;
+const COUNT_ROWS = 50_000;
+type GraphCursor = { p: string; a: string | number; n: string; g: string; w: string };
+
+/**
+ * One page of the whole graph, metadata only: nodes by id (every node shown here, linked or not) or current links by edge id. A page
+ * reads at most `limit` raw rows and its whole JSON response stays within GRAPH_BYTES (UTF-8), so it can hold fewer items than asked with
+ * more to come; a row that does not fit is left for the next page. `done` says the walk is over. Readability applies again on every page: a link's src is a shown node, a dst that is not one stays
+ * {id, readable: false} as on the map, and a link touching a record still landing or moving is left out. No bodies, reasons or
+ * evidence. The cursor carries the profile, generation and the write_seq the walk began at; `changed` says the profile was written
+ * since. That is a signal, not a point-in-time view.
+ */
+export function graph(sql: SqlStorage, q: GraphQuery) {
+	if (!Number.isInteger(q.limit) || q.limit < 1) throw Fail.of("validation", "limit must be a whole number of at least 1");
+	const meta = Object.fromEntries(sql.exec<{ key: string; value: string }>("SELECT key, value FROM profile_meta WHERE key IN ('profile','generation','write_seq')").toArray().map((r) => [r.key, r.value]));
+	const here = { n: meta.profile ?? "", g: meta.generation ?? "", w: meta.write_seq ?? "0" };
+	let at: GraphCursor | null = null;
+	if (q.after !== null) {
+		try { at = q.after.length <= 1024 ? JSON.parse(Buffer.from(q.after, "base64url").toString("utf8")) as GraphCursor : null; } catch { at = null; }
+		if (!at || typeof at !== "object" || at.p !== q.part || at.n !== here.n || at.g !== here.g || typeof at.w !== "string"
+			|| (q.part === "nodes" ? typeof at.a !== "string" : !Number.isSafeInteger(at.a))) throw Fail.of("validation", "graph cursor is not valid for this part and profile; start again without after");
+	}
+	const limit = Math.min(q.limit, GRAPH_LIMITS[q.part]), began = at?.w ?? here.w, changed = began !== here.w, items: unknown[] = [];
+	let total: number | null | undefined;
+	if (q.part === "nodes" && q.after === null) {
+		// Exact under COUNT_ROWS raw rows, else null: the count never scans past that cap.
+		const c = sql.exec<{ raw: number; shown: number | null }>(`SELECT count(*) AS raw, sum(${SHOWN}) AS shown FROM (SELECT status, kind, other_label FROM nodes LIMIT ?)`, COUNT_ROWS).one();
+		total = c.raw < COUNT_ROWS ? c.shown ?? 0 : null;
+	}
+	const envelope = (next_after: string | null) => ({ part: q.part, next_after, done: next_after === null, changed, ...(total !== undefined ? { total } : {}), limits: { items: limit, bytes: GRAPH_BYTES } });
+	const cursor = (a: string | number) => Buffer.from(JSON.stringify({ p: q.part, a, n: here.n, g: here.g, w: began } satisfies GraphCursor), "utf8").toString("base64url");
+	// The response with no items and an empty cursor; the cursor is ASCII, and the last page's null cursor and done:true are smaller.
+	const fixed = Buffer.byteLength(JSON.stringify({ ...envelope(""), items: [] }), "utf8");
+	let bytes = 0, read = 0, rows = 0, last: string | number | null = null;
+	/** Consumes one raw row, its item (if shown) included, only if the whole response would still fit with this row's cursor. */
+	const fits = (id: string | number, item: unknown) => {
+		const size = item === null ? 0 : Buffer.byteLength(JSON.stringify(item), "utf8") + (items.length ? 1 : 0);
+		if (fixed + cursor(id).length + bytes + size > GRAPH_BYTES) {
+			if (read === 0) throw Fail.of("size_budget", "one graph record does not fit a page");
+			return false;
+		}
+		bytes += size; read++; last = id;
+		if (item !== null) items.push(item);
+		return true;
+	};
+	if (q.part === "nodes") {
+		// Raw rows in id order, filtered here: tombstones and captures cost their own row, never a longer scan.
+		const page = sql.exec<{ id: string; kind: string; other_label: string | null; key: string | null; name: string; type: string | null; scope: string; status: string; origin: string; pinned: number; flagged: string | null; created_at: string; updated_at: string }>(
+			`SELECT id, kind, substr(other_label, 1, 80) AS other_label, substr(key, 1, 256) AS key, substr(name, 1, 200) AS name, memory_type AS type, substr(scope, 1, 200) AS scope,
+				status, origin, pinned, flagged, created_at, updated_at FROM nodes WHERE id > ? ORDER BY id LIMIT ?`, (at?.a as string | undefined) ?? "", limit).toArray();
+		rows = page.length;
+		for (const n of page) if (!fits(n.id, isShown(n) ? { ...n, pinned: n.pinned !== 0, flagged: n.flagged !== null } : null)) break;
+	} else {
+		const page = sql.exec<{ id: number; src: string; dst: string; rel: keyof typeof REL_CLASS; other_label: string | null; basis: string; score: number | null; weight: number; valid_from: string | null; valid_to: string | null; recorded_at: string; ended_at: string | null }>(
+			`SELECT id, src, dst, rel, substr(other_label, 1, 80) AS other_label, basis, score, weight, valid_from, valid_to, recorded_at, ended_at FROM edges WHERE id > ? ORDER BY id LIMIT ?`,
+			(at?.a as number | undefined) ?? 0, limit).toArray();
+		rows = page.length;
+		// Ends resolve locally by id whatever profile the link was written toward, as the map's walk does; at most 2 x limit ids.
+		const ends = new Map(sql.exec<{ id: string; status: string; kind: string; other_label: string | null }>("SELECT id, status, kind, other_label FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+			JSON.stringify([...new Set(page.filter((e) => e.ended_at === null).flatMap((e) => [e.src, e.dst]))])).toArray().map((n) => [n.id, n]));
+		for (const e of page) {
+			const far = ends.get(e.dst);
+			if (!fits(e.id, e.ended_at !== null || !isShown(ends.get(e.src)) || far?.status === "incoming" || far?.status === "moving" ? null : { id: e.id, rel: e.rel, other_label: e.other_label, class: REL_CLASS[e.rel], basis: e.basis, score: e.score, weight: e.weight,
+				src: e.src, dst: { id: e.dst, readable: isShown(far) }, valid_from: e.valid_from, valid_to: e.valid_to, recorded_at: e.recorded_at })) break;
+		}
+	}
+	// Only a short raw page read to its end is the last; a full page or a byte stop may have more after it.
+	const next_after = read === rows && rows < limit ? null : cursor(last!);
+	return { ...envelope(next_after), items };
+}
+
 /** A node's timeline (shown nodes only) or the profile's, through the graph's own read. */
 export function pageTimeline(sql: SqlStorage, q: PageTimelineQuery) {
 	const { node, kind: _k, ...rest } = q;

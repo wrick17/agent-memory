@@ -555,6 +555,8 @@ describe("owner page reads", () => {
 	it("reads only for the owner, refuses records not shown here, keeps foreign ends opaque and writes nothing", async () => {
 		const c = await contextFor(), tag = Date.now().toString(36);
 		const far = await call<{ nodes: { id: string }[] }>(c, "record_knowledge", { profile: "work", nodes: [{ kind: "component", name: `Foreign secret ${tag}` }] });
+		// A disconnected non-project memory: the whole-graph read lists it although no walk from a project reaches it.
+		const lone = await call<{ memory_id: string }>(c, "save_memory", { name: `Lone ${tag}`, type: "reference", description: `lone description ${tag}`, content: `lone body ${tag}`, profile: "personal" });
 		const made = await call<{ nodes: { id: string }[] }>(c, "record_knowledge", { profile: "personal", nodes: [
 			{ kind: "project", key: `github:acme/shown-${tag}`, name: `Shown ${tag}` }, { kind: "component", key: `github:acme/moving-${tag}`, name: `Moving ${tag}` },
 			{ kind: "component", name: `Landing ${tag}` }, { kind: "component", name: `Moved ${tag}` },
@@ -594,6 +596,36 @@ describe("owner page reads", () => {
 			["depends_on", "out", { id: moved, readable: false }], ["relates_to", "out", { id: cap.capture_id, readable: false }], ["relates_to", "out", { id: foreign, readable: false }]]));
 		expect(map.body.nodes.map((n: { id: string }) => n.id)).toEqual([shown]);
 		expect(map.body.links.map((l: { to: unknown }) => l.to)).toEqual(expect.arrayContaining([{ id: moved, readable: false }, { id: foreign, readable: false }]));
+		// The whole graph pages every shown node and every current link by cursor, metadata only, with the map's opaque far ends.
+		const walk = async (part: "nodes" | "edges", limit: number, b = base) => {
+			const items: any[] = [], pages: any[] = [];
+			for (let after: string | null = null; pages.length === 0 || after;) {
+				const r = await get(`${b}/graph?part=${part}&limit=${limit}${after ? `&after=${encodeURIComponent(after)}` : ""}`);
+				expect([part, r.status]).toEqual([part, 200]);
+				pages.push(r.body); items.push(...r.body.items); after = r.body.next_after;
+			}
+			return { items, pages };
+		};
+		const gn = await walk("nodes", 2), ge = await walk("edges", 2);
+		expect(gn.pages.length).toBeGreaterThan(2);
+		expect([gn.pages[0].total, gn.pages.slice(1).some((x) => "total" in x), gn.pages.at(-1).done, gn.pages.some((x) => x.changed)]).toEqual([gn.items.length, false, true, false]);
+		const nodeIds = gn.items.map((n: { id: string }) => n.id);
+		expect(new Set(nodeIds).size).toBe(nodeIds.length);
+		expect(nodeIds).toEqual(expect.arrayContaining([shown, lone.memory_id]));
+		for (const id of [moving, landing, moved, cap.capture_id]) expect([id, nodeIds.includes(id)]).toEqual([id, false]);
+		expect(gn.items.find((n: { id: string }) => n.id === lone.memory_id)).toEqual({ id: lone.memory_id, kind: "document", other_label: null, key: null, name: `Lone ${tag}`, type: "reference",
+			scope: expect.any(String), status: "active", origin: expect.any(String), pinned: false, flagged: false, created_at: expect.any(String), updated_at: expect.any(String) });
+		const edgeEnds: [string, { id: string }][] = ge.items.map((e: { src: string; dst: { id: string } }) => [e.src, e.dst]);
+		expect(edgeEnds).toEqual(expect.arrayContaining([[shown, { id: moved, readable: false }], [shown, { id: foreign, readable: false }], [shown, { id: cap.capture_id, readable: false }]]));
+		for (const id of [moving, landing]) expect([id, edgeEnds.some(([a, b]) => a === id || b.id === id)]).toEqual([id, false]);
+		const readableEnds = ge.items.filter((e: { dst: { readable: boolean } }) => e.dst.readable).flatMap((e: { src: string; dst: { id: string } }) => [e.src, e.dst.id]);
+		expect(readableEnds.every((id: string) => nodeIds.includes(id))).toBe(true);
+		const rawGraph = JSON.stringify([gn.pages, ge.pages]);
+		for (const hidden of [`moving reason ${tag}`, `landing reason ${tag}`, `moving-evidence-${tag}`, `landing-evidence-${tag}`, `Moving ${tag}`, `Landing ${tag}`, `Moved ${tag}`, `Foreign secret ${tag}`,
+			`Capture ${tag}`, `capture secret ${tag}`, `lone description ${tag}`, `lone body ${tag}`, "depends on the one that moved", '"reason"', '"evidence"', '"description"', '"dst_profile"']) {
+			expect([hidden, rawGraph.includes(hidden)]).toEqual([hidden, false]);
+		}
+		const nodeCursor = gn.pages[0].next_after as string, edgeCursor = ge.pages[0].next_after as string;
 		const now = new Date(), day = (d: number) => new Date(now.getTime() + d * 86_400_000).toISOString();
 		const timeline = await get(`${base}/timeline?from=${day(-1)}&to=${day(1)}&node=${encodeURIComponent(shown)}`);
 		expect(timeline.status).toBe(200);
@@ -610,31 +642,73 @@ describe("owner page reads", () => {
 		expect((await get(`${base}/map?center=${shown}&center_key=some-key`)).status).toBe(400);
 		expect((await get(`${base}/activity?limit=2`)).body.items.map((i: { op: string; targets: string[] }) => [i.op, i.targets[0]])).toEqual([["capture", cap.capture_id], ["knowledge", shown]]);
 		expect(await state(c, "personal")).toEqual(before); // reads stamp, bind, log and schedule nothing
+		// A cursor names its part, profile and generation; a write after a walk began is reported, never hidden.
+		for (const path of [`/graph?part=edges&after=${encodeURIComponent(nodeCursor)}`, `/graph?part=nodes&after=${encodeURIComponent(edgeCursor)}`]) expect((await get(`${base}${path}`)).status).toBe(400);
+		expect((await get(`/api/profiles/work/graph?part=nodes&after=${encodeURIComponent(nodeCursor)}`)).body.error?.code).toBe("validation");
+		await call(c, "save_memory", { name: `Later ${tag}`, type: "reference", description: "written mid-walk", content: "later", profile: "personal" });
+		expect((await get(`${base}/graph?part=nodes&limit=2&after=${encodeURIComponent(nodeCursor)}`)).body.changed).toBe(true);
+		expect((await get(`${base}/graph?part=nodes&limit=2`)).body.changed).toBe(false);
 		for (const path of ["/nodes/x?as_of=soon", "/nodes/x?before=0", "/nodes/x?extra=1", "/nodes/x?cursor=abc", "/nodes/%E0%A4%A", `/nodes/${"a".repeat(129)}`, `/nodes/by-key/${"k".repeat(257)}`,
 			"/journals?after=x", "/journals?entries_after=1", "/journals?id=x&limit=26", "/map?depth=3", "/map?center=", "/path?from=a", "/path?from=a&to=b&max_depth=5",
 			`/timeline?from=${day(-91)}&to=${day(0)}`, `/timeline?from=${day(1)}&to=${day(0)}`, `/timeline?from=${day(-1)}&to=${day(0)}&kinds=planet`, `/timeline?from=${day(-1)}&to=${day(0)}&limit=501`,
-			"/activity?before=0", "/activity?limit=101", "/activity?actor=robot"]) {
+			"/activity?before=0", "/activity?limit=101", "/activity?actor=robot", "/graph", "/graph?part=links", "/graph?part=nodes&limit=2001", "/graph?part=nodes&after=x", "/graph?part=edges&after=e30"]) {
 			const r = await get(`${base}${path}`);
 			expect([path, r.status, r.body.error?.code]).toEqual([path, 400, "validation"]);
 		}
 		expect((await get("/api/profiles/nosuch/map")).status).toBe(404);
 		const reader = (await deviceToken(`pages-reader-${tag}`, ["read"], ["personal"], "personal")).token;
-		for (const r of ["/journals", "/map", "/activity", `/nodes/${encodeURIComponent(shown)}`]) expect([r, (await get(`${base}${r}`, reader)).status]).toEqual([r, 403]);
+		for (const r of ["/journals", "/map", "/graph?part=nodes", "/activity", `/nodes/${encodeURIComponent(shown)}`]) expect([r, (await get(`${base}${r}`, reader)).status]).toEqual([r, 403]);
 		expect((await (await owner({ azp: "https://evil.example" }))(`${base}/nodes/${encodeURIComponent(shown)}`)).status).toBe(401);
 		// A never-written profile reads nothing and stays unbound; a recovering account and a closed generation are refused, writing nothing.
 		const r = await registered("me");
 		const meta = () => runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("SELECT key, value FROM profile_meta ORDER BY key").toArray());
 		const virgin = await meta();
 		const queries = [{ kind: "entity" as const, node: { id: "x" }, known: ["me"] }, { kind: "journals" as const, after: null, limit: 50 }, { kind: "map" as const, depth: 1, known: ["me"] },
-			{ kind: "activity" as const, before: null, limit: 10 }, { kind: "shown" as const, ids: ["x"] }];
+			{ kind: "activity" as const, before: null, limit: 10 }, { kind: "shown" as const, ids: ["x"] }, { kind: "graph" as const, part: "nodes" as const, after: null, limit: 10 }];
 		expect(await r.stub.read(r.who, queries[0]!)).toMatchObject({ ok: false, error: { code: "not_found" } });
 		expect(await r.stub.read(r.who, queries[3]!)).toEqual({ ok: true, value: { items: [], next_before: null } });
+		expect(await r.stub.read(r.who, queries[5]!)).toMatchObject({ ok: true, value: { items: [], next_after: null, done: true, total: 0 } });
 		expect(await meta()).toEqual(virgin);
 		await r.account((sql) => sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'restoring')"));
 		for (const q of queries) expect(await r.stub.read(r.who, q)).toMatchObject({ ok: false, error: { code: "busy" } });
 		await r.account((sql) => { sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'"); sql.exec("UPDATE profiles SET status = 'wiping'"); });
 		for (const q of queries) expect(await r.stub.read(r.who, q)).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
 		expect(await meta()).toEqual(virgin);
+	});
+
+	it("walks a 1,400-record graph to every record and current link in a few bounded pages", async () => {
+		const { stub, who } = await registered("work"), at = new Date().toISOString(), docs = 1_374, projects = 26;
+		await runInDurableObject(stub, (_i, s) => s.storage.transactionSync(() => {
+			const sql = s.storage.sql;
+			for (let i = 0; i < docs + projects; i++) {
+				// Long names and scopes fill the node pages to their byte limit before their row limit.
+				const doc = i < docs, name = `${doc ? "doc" : "project"} ${i} ${"N".repeat(190)}`;
+				sql.exec("INSERT INTO nodes (id, kind, memory_type, scope, name, norm_name, status, origin, content_hash, card_hash, recorded_at, created_at, updated_at, seq) VALUES (?, ?, ?, ?, ?, ?, 'active', 'import', 'h', 'h', ?, ?, ?, 1)",
+					`n-${String(i).padStart(4, "0")}`, doc ? "document" : "project", doc ? "reference" : null, "S".repeat(128), name, name, at, at, at);
+			}
+			// 3,000 current links and 500 ended ones; most documents stay unlinked or lightly linked.
+			for (let i = 0; i < 3_500; i++) sql.exec("INSERT INTO edges (src, rel, dst, dst_profile, basis, recorded_at, ended_at, actor, seq) VALUES (?, 'relates_to', ?, '', 'identifier', ?, ?, 'test', 1)",
+				`n-${String(i % docs).padStart(4, "0")}`, `n-${String(docs + (i % projects)).padStart(4, "0")}`, at, i < 3_000 ? null : at);
+		}));
+		const pages = { nodes: 0, edges: 0 }, seen = { nodes: new Set<string>(), edges: new Set<number>() }, sizes: number[] = [];
+		let total: number | undefined, maxBytes = 0;
+		const began = Date.now();
+		for (const part of ["nodes", "edges"] as const) {
+			for (let after: string | null = null; pages[part] === 0 || after; pages[part]++) {
+				const out = await stub.read(who, { kind: "graph", part, after, limit: 2_000 }) as { ok: true; value: { items: { id: string & number }[]; next_after: string | null; total?: number } };
+				expect(out.ok).toBe(true);
+				maxBytes = Math.max(maxBytes, Buffer.byteLength(JSON.stringify(out.value), "utf8"));
+				if (part === "nodes") sizes.push(out.value.items.length);
+				total ??= out.value.total;
+				for (const it of out.value.items) (seen[part] as Set<unknown>).add(it.id);
+				after = out.value.next_after;
+			}
+		}
+		const ms = Date.now() - began;
+		console.log(`graph walk: ${seen.nodes.size} nodes in ${pages.nodes} pages, ${seen.edges.size} links in ${pages.edges} pages, largest page ${maxBytes} bytes, ${ms} ms in the test runtime`);
+		expect([total, seen.nodes.size, seen.edges.size, pages.edges]).toEqual([1_400, 1_400, 3_000, 2]);
+		// The first node page stops at the byte limit, not its 1,000 rows; the record that did not fit opens the next page.
+		expect([sizes[0]! < 1_000, maxBytes <= 524_288]).toEqual([true, true]);
 	});
 
 	it("shows a node's stored state at as_of, pages its content and history by revision, and refuses a node recorded later", async () => {

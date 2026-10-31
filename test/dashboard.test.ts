@@ -8,10 +8,23 @@ type El = { tag: string; textContent: string; value: string; hidden: boolean; di
 	on: Record<string, (event?: { preventDefault(): void }) => unknown>; appendChild(c: El): void; replaceChildren(): void; setAttribute(k: string, v: string): void; focus(): void;
 	addEventListener(type: string, f: () => unknown): void };
 let active: El | undefined; // the stand-in document.activeElement
+// A 2D context that draws nothing and records text: its font, place and width (7 px a character, as measureText reports here).
+type Ctx = Record<string, unknown> & { arcs: number; fills: number; images: number; font: string; texts: { font: string; t: string; x: number; y: number; w: number }[] };
+const context = (): Ctx => {
+	const c: Ctx = { arcs: 0, fills: 0, images: 0, font: "", texts: [] };
+	for (const f of ["setTransform", "clearRect", "beginPath", "moveTo", "lineTo", "stroke", "scale"]) c[f] = () => {};
+	c.arc = () => { c.arcs++; };
+	c.fill = () => { c.fills++; };
+	c.drawImage = () => { c.images++; };
+	c.measureText = (t: string) => ({ width: t.length * 7 });
+	c.fillText = (t: string, x: number, y: number) => { c.texts.push({ font: c.font, t, x, y, w: t.length * 7 }); };
+	return c;
+};
 const make = (tag: string, hidden = false): El => {
 	const e: El = { tag, textContent: "", value: "", hidden, disabled: false, checked: false, children: [], attrs: {}, on: {},
 		appendChild(c) { e.children.push(c); }, replaceChildren() { e.children = []; }, setAttribute(k, v) { e.attrs[k] = v; },
 		focus() { e.focused = true; active = e; }, addEventListener(type, f) { e.on[type] = f; } };
+	if (tag === "canvas") Object.assign(e, { clientWidth: 800, clientHeight: 560, ctx: context(), getContext(this: { ctx: Ctx }) { return this.ctx; } });
 	return e;
 };
 const text = (e: El): string => [e.textContent, ...e.children.map(text)].filter(Boolean).join(" ");
@@ -94,7 +107,7 @@ describe("dashboard", () => {
 	});
 
 	it("shows one card per profile from the real endpoints, and says which figures do not exist yet", async () => {
-		const b = browser({ signedIn: true });
+		const b = browser({ signedIn: true, hash: "#/profiles" });
 		await dashboardMain(b.win);
 		expect(b.seen.fetched.sort()).toEqual(["/api/devices", "/api/profiles", "/api/profiles/personal/batch", "/api/profiles/work/batch"]);
 		expect(b.seen.auth).toEqual(Array(4).fill("Bearer session-token"));
@@ -362,7 +375,7 @@ describe("dashboard About you", () => {
 		b.go("#/profiles/work");
 		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
 		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
-		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The path finder, timeline, journals, transfers, wipe and review pages/);
+		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The transfers, wipe and review pages/);
 		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
 	});
 
@@ -662,5 +675,258 @@ describe("dashboard memories and drafts", () => {
 		expect(b.seen.posted).toEqual(["/api/recovery/step", "/api/recovery/abort", "/api/profiles/work/restore"]);
 		expect(b.seen.bodies).toEqual([{ id: "rA" }, { id: "rA" }, { export: "e2" }]); // each recovery action names the recovery shown
 		expect(JSON.stringify(b.seen)).not.toMatch(/BACKUP_KEY/);
+	});
+});
+
+describe("dashboard timeline, journals and paths", () => {
+	it("reads an explicit timeline window for active work, links named records, states a cut window, and drops a stale answer", async () => {
+		const late = gate();
+		let calls = 0;
+		const b = browser({ signedIn: true, hash: "#/timeline", api: async (path) => {
+			if (!path.startsWith("/api/profiles/work/timeline?")) return;
+			if (++calls === 3) { await late.wait; return Response.json({ node: null, events: [{ at: "2026-10-30T00:00:00Z", event: "activity:save", summary: "stale answer" }], truncated: false }); }
+			return Response.json({ node: null, truncated: true, events: [
+				{ at: "2026-10-29T00:00:00Z", event: "activity:save", node_id: null, actor: "agent", summary: HOSTILE, targets: ["m1"] },
+				{ at: "2026-10-30T00:00:00Z", event: "revision:legacy_snapshot", node_id: "n1", revision: 1, kind: "document", name: "Imported note", actor: "migration" }] });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Timeline: work");
+		const first = b.seen.fetched.find((x) => x.includes("/timeline?"))!;
+		const q = new URL(first, "https://x").searchParams;
+		expect([q.get("limit"), Date.parse(q.get("to")!) - Date.parse(q.get("from")!)]).toEqual(["100", 7 * 86_400_000]);
+		expect(text(b.view())).toContain(`Change: save by agent ${HOSTILE}`);
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(find(b.view(), "a").find((a) => a.textContent === "document: Imported note")!.attrs.href).toBe("#/memory/work/n1");
+		expect(text(b.view())).toContain("Only the earliest events of this window are shown");
+		click(button(b.view(), "Show up to 500 events"));
+		await settle();
+		expect(b.seen.fetched.filter((x) => x.includes("/timeline?")).at(-1)).toContain("limit=100".replace("100", "500"));
+		submit(b.view());
+		typeIn(byId(b.view(), "tl-from"), "2026-10-01T00:00:00Z");
+		late.open();
+		await settle();
+		expect(text(b.view())).not.toContain("stale answer");
+		expect(status(b).textContent).toBe("Window changed. Choose Show timeline to load it.");
+	});
+
+	it("pages journals, reads one journal's entries as text with compaction and part markers, and pages its entries", async () => {
+		const b = browser({ signedIn: true, hash: "#/journals", api: (path) => {
+			if (path === "/api/profiles/work/journals?limit=50") return Response.json({ items: [{ id: "j1", name: HOSTILE, scope: "repo", updated_at: "2026-10-30T00:00:00Z", latest_entry_seq: 3, compacted_through: 1, pinned: false }], next_after: null });
+			if (path === "/api/profiles/work/journals?id=j1&limit=25") return Response.json({ journal: { id: "j1", name: "Build log", scope: "repo", status: "active", revision: 4, compacted_through: 1 },
+				summary: { body: "Summary <b>text</b>", complete: true }, compactions: [{ revision: 3, at: "2026-10-29T00:00:00Z", actor: "agent", from_seq: 1, through_seq: 1 }], compactions_more: false,
+				entries: [{ entry_seq: 1, body: HOSTILE, created_at: "2026-10-28T00:00:00Z", actor: "agent", current: false, complete: true }, { entry_seq: 2, body: "two", created_at: "2026-10-29T00:00:00Z", actor: "agent", current: true, complete: false }], next_after: 2 });
+			if (path === "/api/profiles/work/journals?id=j1&limit=25&entries_after=2") return Response.json({ journal: {}, entries: [{ entry_seq: 3, body: "three", created_at: "2026-10-30T00:00:00Z", actor: "agent", current: true, complete: true }], next_after: null });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(find(b.view(), "a").find((a) => a.textContent === HOSTILE)!.attrs.href).toBe("#/journals/work/j1");
+		expect(status(b).textContent).toBe("Showing 1 journal.");
+		b.go("#/journals/work/j1");
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Journal: Build log");
+		expect(text(b.view())).toContain("Summary <b>text</b>");
+		expect(text(b.view())).toContain(`· 2026-10-28T00:00:00Z · agent ${HOSTILE} Compacted into the summary.`);
+		expect(text(b.view())).toContain("Only this entry's first part is shown");
+		expect(find(b.view(), "img").concat(find(b.view(), "b"))).toEqual([]);
+		click(button(b.view(), "Later entries"));
+		await settle();
+		expect(text(b.view())).toContain("Entry 3");
+		expect(status(b).textContent).toBe("Showing 3 entries.");
+		expect(button(b.view(), "Later entries").hidden).toBe(true);
+		expect(b.seen.posted).toEqual([]);
+	});
+
+	it("finds paths from the server's answer only, shows unreadable ends truthfully, and ignores an answer after the profile changed", async () => {
+		const late = gate();
+		const answer = { mode: "path", max_depth: 4, from: { id: "a1", kind: "project", name: "Start", profile: "work" }, to: { id: "b2", kind: "decision", name: "Goal", profile: "work" },
+			paths: [{ length: 2, edges: [{ rel: "depends_on", reason: "needs it", from: { id: "a1", kind: "project", name: "Start", profile: "work" }, to: { id: "x9", readable: false } },
+				{ rel: "relates_to", from: { id: "x9", readable: false }, to: { id: "b2", profile: "me", readable: true } }] }], budget: { exhausted: true } };
+		let calls = 0;
+		const b = browser({ signedIn: true, hash: "#/path/work/a1", api: async (path) => {
+			if (!path.startsWith("/api/profiles/work/path?")) return;
+			if (++calls === 2) await late.wait;
+			return Response.json(answer);
+		} });
+		await dashboardMain(b.win);
+		expect(byId(b.view(), "path-from").value).toBe("a1");
+		typeIn(byId(b.view(), "path-to"), "b2");
+		submit(b.view());
+		await settle();
+		// Only the path read: no extra lookups of names or ends.
+		expect(b.seen.fetched.filter((x) => x.startsWith("/api/profiles/") && !x.endsWith("/batch"))).toEqual(["/api/profiles/work/path?from=a1&to=b2&max_depth=4"]);
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("From project: Start to decision: Goal");
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("project: Start — depends_on → a record not readable here needs it");
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("a record not readable here — relates_to → a record in another profile, not read");
+		expect(text(b.view())).toContain("The search stopped at its read budget");
+		expect(find(b.view(), "a").find((a) => a.textContent === "decision: Goal")!.attrs.href).toBe("#/memory/work/b2");
+		submit(b.view());
+		b.go("#/path/personal");
+		const focused = active;
+		late.open();
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Path finder: personal");
+		expect(text(b.view())).not.toContain("Start");
+		expect(active).toBe(focused);
+	});
+});
+
+describe("dashboard knowledge graph", () => {
+	// A realistic metadata-only library: 1,374 memories of every type, two entities, and links of every kind the read can send.
+	const TYPES = ["project", "feedback", "reference", "user", "procedural"];
+	const nodes = [...Array.from({ length: 1374 }, (_, i) => ({ id: `r${i}`, kind: i % 7 ? "document" : "decision", type: TYPES[i % 5], scope: i % 3 ? "repo-a" : null,
+		name: i === 1000 ? HOSTILE : `Record ${i}`, status: "active", updated_at: "2026-10-30T00:00:00Z" })),
+		{ id: "p1", kind: "project", type: null, name: "Agent Memory", status: "active" }, { id: "u1", kind: "person", type: null, name: "Owner", status: "active" },
+		{ id: "old", kind: "document", type: "reference", name: "Retired note", status: "retired" }];
+	const at = (src: string, dst: string, readable = true) => ({ src, dst: { id: dst, readable } });
+	const edges = [{ id: 1, rel: "part_of", ...at("r1", "p1") }, { id: 2, rel: "authored", ...at("u1", "r1") }, { id: 3, rel: "relates_to", ...at("r2", "far", false) },
+		{ id: 4, rel: "relates_to", ...at("r3", "never-sent") }];
+	// The whole-graph read: server page sizes (1,000 nodes, 2,000 edges), an opaque next_after, total only on a first nodes page.
+	const pageOf = (part: "nodes" | "edges", items: unknown[], path: string, changed = false) => {
+		const start = Number(new URL(path, "https://x").searchParams.get("after") ?? 0), size = part === "nodes" ? 1000 : 2000, next = start + size < items.length ? String(start + size) : null;
+		return Response.json({ part, items: items.slice(start, start + size), next_after: next, done: !next, changed, ...(part === "nodes" && !start ? { total: items.length } : {}), limits: { items: size, bytes: 524288 } });
+	};
+	const graphApi = (extra?: Api): Api => async (path, method, body) => {
+		const r = await extra?.(path, method, body);
+		if (r) return r;
+		if (path.startsWith("/api/profiles/work/graph?part=nodes")) return pageOf("nodes", nodes, path);
+		if (path.startsWith("/api/profiles/work/graph?part=edges")) return pageOf("edges", edges, path);
+	};
+	const loaded = async (b: ReturnType<typeof browser>) => {
+		for (let i = 0; i < 40; i++) { await settle(); const t = status(b)?.textContent ?? ""; if (t.includes("records") && !t.includes("loading…")) return; }
+		throw new Error("the graph did not finish loading");
+	};
+
+	it("opens active work's whole graph at the root, pages metadata to the server's totals, draws every record and only real links", async () => {
+		const b = browser({ signedIn: true, api: graphApi() });
+		const started = performance.now();
+		await dashboardMain(b.win);
+		await loaded(b);
+		const elapsed = performance.now() - started;
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Knowledge graph: work");
+		expect(b.seen.fetched.filter((x) => x.includes("/graph?")).sort()).toEqual(["/api/profiles/work/graph?part=edges", "/api/profiles/work/graph?part=nodes",
+			"/api/profiles/work/graph?part=nodes&after=1000"]);
+		// A link to a record the server never listed waits instead of inventing an end; the opaque one is counted, not drawn.
+		expect(status(b).textContent).toBe("1,377 of 1,377 records loaded · 2 links · 1 links lead to records not readable in this profile · 1 links wait for records that were not listed.");
+		expect(b.seen.fetched.some((x) => x.includes("/recall") || x.includes("/map?"))).toBe(false);
+		await settle();
+		const canvas = find(b.view(), "canvas")[0]!;
+		expect(Number(canvas.attrs["data-drawn"])).toBe(1376); // fitted: every active record is in view; the retired one waits for its toggle
+		expect(text(b.view())).toContain("Include retired and superseded records (1)");
+		expect(text(find(b.view(), "ul").find((u) => u.attrs.class === "legend")!)).toContain("Project memories (275)");
+		expect(elapsed).toBeLessThan(3000);
+		// Search finds records among all loaded ones, lists at most 50 as buttons, and a hostile name stays text.
+		typeIn(byId(b.view(), "graph-q"), "record 1");
+		expect(text(b.view())).toContain("matches; the first 50 are listed.");
+		expect(find(find(b.view(), "ul").find((u) => u.attrs.class === "matches")!, "button")).toHaveLength(50);
+		typeIn(byId(b.view(), "graph-q"), "onerror");
+		expect(button(b.view(), HOSTILE)).toBeDefined();
+		expect(find(b.view(), "img")).toEqual([]);
+		// Hiding a group removes it from the drawing.
+		const box = find(b.view(), "input").find((e) => e.attrs.type === "checkbox" && text(find(b.view(), "label").find((l) => l.children.includes(e))!).includes("Feedback"))!;
+		box.checked = false;
+		box.on.change!();
+		await settle();
+		expect(Number(canvas.attrs["data-drawn"])).toBe(1376 - 275);
+	});
+
+	it("reads a selected record's detail only on selection, shows its real links, and drops a slower earlier selection", async () => {
+		const slow = gate();
+		const b = browser({ signedIn: true, api: graphApi(async (path) => {
+			if (path === "/api/profiles/work/nodes/r1") { await slow.wait; return Response.json({ node: { name: "Record 1", description: "late detail" }, history: { items: [] } }); }
+			if (path === "/api/profiles/work/nodes/u1") return Response.json({ node: { name: "Owner", description: "The owner" }, history: { items: [{ revision: 1, op: "saved", at: "2026-10-01T00:00:00Z", actor: "agent" }] } });
+		}) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		expect(b.seen.fetched.some((x) => x.includes("/nodes/"))).toBe(false);
+		typeIn(byId(b.view(), "graph-q"), "Record 1");
+		click(button(b.view(), "Record 1"));
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("to · part_of · Agent Memory");
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("from · authored · Owner");
+		click(button(b.view(), "Owner"));
+		await settle();
+		slow.open();
+		await settle();
+		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Owner");
+		expect(text(b.view())).toContain("The owner");
+		expect(text(b.view())).not.toContain("late detail");
+		typeIn(byId(b.view(), "graph-q"), "Record 13");
+		click(button(b.view(), "Record 13"));
+		await settle();
+		expect(text(b.view())).toContain("No links: this record stands alone.");
+		expect(b.seen.posted).toEqual([]);
+	});
+
+	it("says plainly when the server has no whole-graph read, without a fallback read", async () => {
+		const b = browser({ signedIn: true, api: (path) => path.includes("/graph?") ? Response.json({ error: "not_found" }, { status: 404 }) : undefined });
+		await dashboardMain(b.win);
+		await settle();
+		expect(status(b).textContent).toContain("This server does not offer the whole-graph read yet");
+		expect(b.seen.fetched.filter((x) => x.startsWith("/api/profiles/work/")).sort()).toEqual(["/api/profiles/work/batch", "/api/profiles/work/graph?part=edges", "/api/profiles/work/graph?part=nodes"]);
+		expect(b.seen.fetched.some((x) => x.includes("/recall") || x.includes("/map?"))).toBe(false);
+	});
+
+	it("offers a fresh walk when the profile changed during loading, and replaces the cached graph", async () => {
+		let changed = true;
+		const b = browser({ signedIn: true, api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", edges, path, changed) : undefined) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		expect(status(b).textContent).toContain("The profile changed while loading; reload for a fresh graph.");
+		changed = false;
+		click(button(b.view(), "Reload graph"));
+		await loaded(b);
+		expect(status(b).textContent).not.toContain("changed while loading");
+		expect(b.seen.fetched.filter((x) => x === "/api/profiles/work/graph?part=nodes")).toHaveLength(2);
+	});
+
+	it("resizes the backing canvas on a height-only change and keeps headings and the selected label inside a narrow canvas without overlap", async () => {
+		const b = browser({ signedIn: true, api: graphApi() });
+		await dashboardMain(b.win);
+		await loaded(b);
+		await settle();
+		const canvas = find(b.view(), "canvas")[0]! as El & { width: number; height: number; clientWidth: number; clientHeight: number; ctx: Ctx };
+		expect([canvas.width, canvas.height]).toEqual([800, 560]);
+		canvas.clientHeight = 420;
+		b.listeners.resize!();
+		await settle();
+		expect([canvas.width, canvas.height]).toEqual([800, 420]);
+		canvas.clientWidth = 390;
+		b.listeners.resize!();
+		typeIn(byId(b.view(), "graph-q"), "Record 1");
+		click(button(b.view(), "Record 1"));
+		canvas.ctx.texts = [];
+		click(button(b.view(), "Zoom out"));
+		await settle();
+		const texts = canvas.ctx.texts, inside = (t: Ctx["texts"][number]) => t.x >= 0 && t.x + t.w <= 390 && t.y >= 0 && t.y <= 420;
+		const headings = texts.filter((t) => t.font.startsWith("600"));
+		expect(headings.length).toBeGreaterThan(0);
+		expect(texts.every(inside)).toBe(true);
+		for (const [i, a] of texts.entries()) for (const c of texts.slice(i + 1)) expect(a.x + a.w <= c.x || c.x + c.w <= a.x || a.y <= c.y - 14 || c.y <= a.y - 14).toBe(true);
+		expect(texts.some((t) => t.t === "Record 1")).toBe(true);
+	});
+
+	it("draws every record into one cached dot layer as a path per colour, so a pan stamps one bitmap and a zoom redraws the layer once", async () => {
+		const b = browser({ signedIn: true, api: graphApi() });
+		const made: (El & { ctx: Ctx })[] = [], create = b.win.document.createElement;
+		b.win.document.createElement = (tag: string) => { const e = create(tag) as El & { ctx: Ctx }; if (tag === "canvas") made.push(e); return e; };
+		await dashboardMain(b.win);
+		await loaded(b);
+		await settle();
+		const [screen, dotLayer] = made;
+		expect(made).toHaveLength(2); // the visible canvas and its one dot layer, reused
+		const stamped = screen!.ctx.images;
+		// The last layer drawing held every active record (1,376 arcs) in three fills, one per colour.
+		dotLayer!.ctx.arcs = 0; dotLayer!.ctx.fills = 0;
+		click(button(b.view(), "Fit"));
+		click(button(b.view(), "Zoom in"));
+		await settle();
+		expect([dotLayer!.ctx.arcs, dotLayer!.ctx.fills]).toEqual([1376, 3]);
+		expect(screen!.attrs["data-drawn"]).toBe("1376");
+		// A pan stamps the layer once and draws no record on the visible canvas, nor redraws the layer.
+		const before = { layer: dotLayer!.ctx.arcs, screen: screen!.ctx.arcs, images: screen!.ctx.images };
+		screen!.on.keydown!({ key: "ArrowLeft", preventDefault() {} } as never);
+		await settle();
+		expect([dotLayer!.ctx.arcs - before.layer, screen!.ctx.arcs - before.screen, screen!.ctx.images - before.images]).toEqual([0, 0, 1]);
+		expect(stamped).toBeGreaterThan(0);
 	});
 });
