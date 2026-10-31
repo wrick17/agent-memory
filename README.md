@@ -8,15 +8,15 @@ Your everyday agents still use BothQ. Agent Memory has a private owner trial whe
 
 Earlier source groups passed local combined and self-host package checks; this does not establish everyday readiness. Core memory, authenticated clients, safe migration and recovery come first. [Verification](docs/combined-verification-2026-10-30.md#counter-and-backend-local-verification-2026-10-31).
 
-A private Work migration planning checkpoint has been accepted; reconciliation and migration are still pending. [Scope](docs/module-contracts.md#current-private-work-planning-checkpoint-2026-10-31).
+A fresh Work library passed local import and profile and account recovery rehearsals. Hosted migration and reconciliation remain pending. [Evidence](docs/combined-verification-2026-10-30.md#fresh-work-import-and-profile-recovery-local-rehearsal-2026-10-31).
 
-Automatic capture is not running. The dashboard, work and project corpus, self-host setup, backups, and multi-machine use are not ready. BothQ will remain running and readable after the eventual caller transition.
+Automatic capture is not running. The dashboard, work and project corpus, self-host setup, hosted backup configuration, and multi-machine use are not ready. BothQ will remain running and readable after the eventual caller transition.
 
 ## Completed development milestones
 
 - [x] Lifecycle, daily server and observed-count source delivered with local verification; feed collection is no longer a product goal.
 - [x] Earlier Personal acquisition, exact retry and durable acknowledgements verified with synthetic data against a local Worker. That client remains unwired and uninstalled.
-- [x] Private plan for 1,370 Work records accepted. Migration has not run.
+- [x] A fresh 1,297-record Work import and profile and account backup/restore passed locally. An earlier 1,370-record plan remains historical; hosted migration has not run.
 
 ## Feature acceptance
 
@@ -61,7 +61,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 
 - [x] Sign in to the private memory service with an isolated client (owner trial).
 - [ ] Set up and run your own independent deployment. A separate test deployment passed sign-in and selected memory checks; everyday setup remains unfinished.
-- [ ] Back up and restore memories; backups have not been built yet.
+- [ ] Back up and restore memories in everyday use. Profile and account recovery passed local library rehearsals; hosted key custody and recovery remain open.
 - [ ] Use and verify the same memories across multiple machines.
 - [ ] Switch everyday Claude, Codex, and headless agents to Agent Memory after migration and acceptance checks.
 

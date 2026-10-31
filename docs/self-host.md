@@ -2,7 +2,7 @@
 
 Agent Memory runs on your own Cloudflare account and signs you in through your own Clerk application. Each deployment serves one owner. It is not a shared service.
 
-**Status:** Reviewed self-host source is integrated with the locally adopted corpus source. Combined package, normal-install and configuration verification is pending. Setup tests use an injected Wrangler and Cloudflare API, not a real account. Nobody has run this package end to end on a separate Cloudflare and Clerk account yet, and setup is not proven for everyday use. Setup does not read or check the Clerk settings below. Backups do not exist yet. See [Backups come last](#backups-come-last).
+**Status:** Reviewed self-host source is integrated with the locally adopted corpus source. Local package, normal-install and configuration checks have passed on retained source snapshots. Setup tests use an injected Wrangler and Cloudflare API, not a real account. Nobody has run this package end to end on a separate Cloudflare and Clerk account yet, and setup is not proven for everyday use. Setup does not read or check the Clerk settings below. Backup exports and profile/account restore are implemented in source, but require the manual configuration in [Profile backups and restore](#profile-backups-and-restore).
 
 ## Unpack and install
 
@@ -96,7 +96,7 @@ Setup writes and creates only what the plan says:
 
 - `wrangler.jsonc`, the Worker config. It holds no secrets.
 - `agent-memory.setup-receipts.json`, local creation receipts keyed by account, resource kind and name. Keep it with this source directory; it holds no owner id or secret and is excluded from the package.
-- The R2 bucket `<worker>-ledger` under the `BACKUPS` binding. Despite the binding name, it is not a backup. It is the permanent ledger of profile generation ids that keeps identities unique.
+- The R2 bucket `<worker>-ledger` under the `BACKUPS` binding. Initially it holds the permanent ledger of profile generation ids. After backup configuration, it also holds encrypted exports. Never delete or recreate it as a setup retry.
 - With embeddings on, the Vectorize index `<worker>-cards` (1,024 dimensions, cosine) and its string metadata index on `kind`.
 - The Worker secret `OWNER_USER_ID`. If the Worker does not exist yet, Wrangler creates it as an empty draft with the secret. Deploy uploads the code.
 
@@ -161,9 +161,21 @@ For headless use, create a scoped device token on `<public_url>/settings` after 
 - **Capture client:** still under separate verification and excluded from this archive. Setup does not install capture or change client settings. Connect to the MCP explicitly with the commands above.
 - **Daily maintenance batch:** the local runner is excluded with capture. This package does not install, activate or downgrade a model runtime.
 
-## Backups come last
+## Profile backups and restore
 
-Backups, restore, and recovery are built in the final stage of the project, after every other feature. No backup key, nightly export, backup bucket, or restore command exists yet. Setup creates none of them. Until that stage ships, your deployment has no Agent Memory backup or restore.
+Encrypted exports of profiles and account state keep up to two complete exports per store. Restore into a fresh profile generation is implemented through the owner-only backup and recovery HTTP API. Account-state restore is also implemented in source. List account exports with owner-authenticated `GET /api/account/exports`, then begin with `POST /api/account/restore` and `{"export":"<export id>"}` or `{"export":"latest"}`. Use `GET /api/recovery` for status and `POST /api/recovery/step`, `/api/recovery/open` or `/api/recovery/abort` to advance, reopen or roll back. The permanent R2 generation ledger and wipe refusals remain authoritative; unresolved recovery stays closed until abort reapplies the pre-restore checkpoint. A successful account restore disables every device token, so the owner must reissue needed tokens. Full current combined and actual-dataset account restore checks remain pending. Point-in-time restore, corpus recovery and the recovery dashboard are not implemented yet.
+
+Setup does not generate a backup key or enable a schedule. Before using backups, generate a unique random key of at least 32 characters and retain an offline copy in your password manager. After deploying your Worker, set it through Wrangler's interactive secret prompt:
+
+```sh
+npx wrangler secret put BACKUP_KEY
+```
+
+Keep the key out of settings, Wrangler variables, command-line arguments and Git. Losing it makes encrypted exports unreadable.
+
+After the secret is configured, enable nightly exports by adding `"triggers": { "crons": ["17 3 * * *"] }` to your generated `wrangler.jsonc`, keeping its other fields, and deploy again. This runs at 03:17 UTC. The shipped example and setup-generated configuration leave the schedule off until you configure the key.
+
+Without a key, exports fail closed. Restores require the same schema version and keep the account closed until reconciliation succeeds; unresolved transfers require owner intervention. The current export pauses writes for at most 30 seconds, so larger stores may need the planned cursor-based export. These local checks do not establish complete disaster-recovery readiness.
 
 ## Packaging from the source repository
 

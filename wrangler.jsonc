@@ -11,6 +11,8 @@
 	// observed here. The live 503 was egress.ts using redirect: "error", which Workers rejects.
 	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"observability": { "enabled": true },
+	// Nightly encrypted export to BACKUPS; needs the BACKUP_KEY secret (section 18).
+	"triggers": { "crons": ["17 3 * * *"] },
 	"durable_objects": {
 		"bindings": [
 			{ "name": "ACCOUNT", "class_name": "AccountStore" },

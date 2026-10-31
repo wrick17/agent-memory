@@ -1,6 +1,6 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { Fail, fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
@@ -25,6 +25,7 @@ import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
 import { commitKey, naturalRequest, putMarker, uploadKey } from "./work-upload";
 import { ackPart, assertRefreshOpen, installMirror, markRegistered, partCheck, progress, receiptSeq, sealPlan, terminal, type Binding, type PartMeta, type PartReply, type Parts, type Payload, type Terminal, type TerminalReply } from "./daily-proof";
 import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
+import { applyRows, exportStore, exportTables, readChunk, readManifest } from "../backup";
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
@@ -47,8 +48,18 @@ import { foldDue, foldStep } from "./compact";
 import { danglingPage, enqueueDangling } from "./dangling";
 import { ackRows, countRows, flushRows, nextUtcDay, pendingRows } from "./meter";
 export { ROW_PAUSE } from "./meter";
+export { BudgetTx } from "./archive";
 
 const RETRY_MS = 60_000;
+/** Control state, never exported: every stage arms again after a restore, and unfinished transfers settle by reconciliation. */
+const PROFILE_CONTROL = ["cursors", "transfer_parts"];
+/** A restored generation keeps its own identity and schema version. */
+const RESTORE_SKIP = new Set(["user_id", "profile", "generation", "schema_version", "closed"]);
+export interface RestoredPage {
+	nodes: { id: string; status: string }[];
+	requests: { request_id: string; op: string; payload_hash: string; at: string; legacy_op: string | null; legacy_hash: string | null }[];
+	open_transfers: number;
+}
 /** The account or the local closed marker refused this generation during an alarm; `retry` when it was an account recovery. */
 class Stopped { constructor(readonly retry: boolean) {} }
 
@@ -99,6 +110,116 @@ export class ProfileStore extends DurableObject<Env> {
 	private who(): Who | undefined {
 		const meta = Object.fromEntries(this.ctx.storage.sql.exec<{ key: string; value: string }>("SELECT key, value FROM profile_meta WHERE key IN ('user_id','profile','generation')").toArray().map((r) => [r.key, r.value]));
 		return meta.user_id ? { userId: meta.user_id, profile: meta.profile!, generation: meta.generation! } : undefined;
+	}
+
+	private same(who: Who): boolean {
+		const me = this.who();
+		return !!me && me.userId === who.userId && me.profile === who.profile && me.generation === who.generation;
+	}
+
+	/** Internal RPC from AccountStore: this generation's encrypted export (section 18), under the bounded write pause. */
+	async exportNow(who: Who): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+		if (!this.same(who)) return fail("not_found", "this generation holds nothing to export");
+		const sql = this.ctx.storage.sql;
+		if (sql.exec("SELECT 1 FROM profile_meta WHERE key = 'closed'").toArray().length) return fail("profile_wiped", "this profile generation is closed");
+		if (sql.exec("SELECT 1 FROM profile_meta WHERE key = 'restore_id'").toArray().length && !sql.exec("SELECT 1 FROM profile_meta WHERE key = 'restore_done'").toArray().length) return fail("busy", "this generation is being restored");
+		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env,
+			{ store: `profile-${who.profile}`, userId: who.userId, metaTable: "profile_meta", control: PROFILE_CONTROL, first: ["nodes"], profile: who.profile, generation: who.generation }));
+	}
+
+	/**
+	 * Internal RPC from AccountStore's open restore: applies the export's verified chunks, in order, to this fresh generation,
+	 * for at most about ten seconds per call. Each transaction stays within 1,000 physical rows and 1 MB (BudgetTx) and moves the
+	 * durable (chunk, row) progress with its rows. A row that cannot fit alone fails the restore for good. The last call checks
+	 * every table's row count.
+	 */
+	async restoreStep(who: Who, r: { id: string; exportId: string }): Promise<Outcome<{ applied: number; chunks: number; done: boolean }>> {
+		try {
+			const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "restoreAuthority">;
+			const auth = await account.restoreAuthority(who, r.id);
+			if (!auth.ok) return auth;
+			this.bind(who);
+			const sql = this.ctx.storage.sql;
+			const meta = (k: string) => sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", k).toArray()[0]?.value;
+			const m = await readManifest(this.env, `profile-${who.profile}`, r.exportId, who.userId);
+			if (!m.ok) return m;
+			const manifest = m.value;
+			if (manifest.profile !== who.profile || manifest.schema_version !== PROFILE_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+			if (!meta("restore_id")) {
+				if (exportTables(sql, { control: PROFILE_CONTROL }).some((t) => t !== "profile_meta" && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a restore needs a fresh generation");
+				sql.exec("INSERT INTO profile_meta (key, value) VALUES ('restore_id', ?), ('restore_next', '0')", r.id);
+			} else if (meta("restore_id") !== r.id) return fail("validation", "this generation belongs to another restore");
+			const failed = meta("restore_failed");
+			if (failed) return fail("validation", failed);
+			// The identity and the restore's own keys stay this generation's; every card embeds again under this generation's ids.
+			const adjust = (table: string, cols: string[], row: unknown[]) => {
+				if (table === "profile_meta") return RESTORE_SKIP.has(row[cols.indexOf("key")] as string) || String(row[cols.indexOf("key")]).startsWith("restore_") ? null : row;
+				if (table === "nodes") { const out = [...row]; out[cols.indexOf("embed_hash")] = null; return out; }
+				return row;
+			};
+			const started = Date.now();
+			let next = Number(meta("restore_next"));
+			const position = () => [Number(meta("restore_next")), Number(meta("restore_row") ?? 0)] as const;
+			while (next < manifest.chunks.length && Date.now() - started < 10_000) {
+				const c = await readChunk(this.env, manifest, next), at = next;
+				let [chunk, from] = position(), max = c.rows.length;
+				while (chunk === at && Date.now() - started < 10_000) {
+					const done = { n: 0 };
+					try {
+						this.ctx.storage.transactionSync(() => {
+							const [k, f] = position();
+							if (k !== at || f !== from) return; // a concurrent step moved it
+							const tx = new BudgetTx(sql, 0, "");
+							const end = from + applyRows(tx, c, from, max, adjust, done, c.table === "profile_meta");
+							tx.run("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('restore_next', ?), ('restore_row', ?)",
+								String(end === c.rows.length ? at + 1 : at), String(end === c.rows.length ? 0 : end));
+						});
+						max = c.rows.length;
+					} catch (e) {
+						if (!(e instanceof Fail) || e.failure.code !== "size_budget") throw e;
+						// Rolled back. Retry with strictly fewer rows; a row that overflows on its own can never apply.
+						max = Math.min(max - 1, done.n);
+						if (max < 1) {
+							const why = `export row ${from} of ${c.table} does not fit one bounded transaction: ${e.failure.message}`;
+							sql.exec("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('restore_failed', ?)", why);
+							return fail("validation", why);
+						}
+					}
+					[chunk, from] = position();
+				}
+				next = position()[0];
+			}
+			const done = next === manifest.chunks.length;
+			if (done && !meta("restore_done")) {
+				for (const [t, n] of Object.entries(manifest.counts)) {
+					if (t !== "profile_meta" && sql.exec<{ n: number }>(`SELECT count(*) AS n FROM "${t}"`).one().n !== n) return fail("validation", `restored ${t} does not match the manifest row count`);
+				}
+				sql.exec("INSERT INTO profile_meta (key, value) VALUES ('restore_done', ?)", manifest.id);
+				await this.ctx.storage.setAlarm(Date.now() + 1_000); // every stage arms again from scratch; the gate waits for the reopen
+			}
+			return ok({ applied: next, chunks: manifest.chunks.length, done });
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** Internal RPC: one page of the restored generation's ownership, for the account's reconciliation. */
+	async restoredPage(who: Who, after: { node: string; request: string }): Promise<Outcome<RestoredPage>> {
+		const sql = this.ctx.storage.sql;
+		// A live generation pages too, for an account restore; an unbound one holds nothing. Only another identity or an unfinished restore is refused.
+		if (!this.who()) return ok({ nodes: [], requests: [], open_transfers: 0 });
+		const has = (k: string) => sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", k).toArray().length > 0;
+		if (!this.same(who) || (has("restore_id") && !has("restore_done"))) return fail("validation", "this generation holds no finished restore");
+		return ok({
+			nodes: sql.exec<{ id: string; status: string }>("SELECT id, status FROM nodes WHERE id > ? ORDER BY id LIMIT 200", after.node).toArray(),
+			requests: sql.exec<RestoredPage["requests"][number]>("SELECT request_id, op, payload_hash, at, legacy_op, legacy_hash FROM requests WHERE request_id > ? ORDER BY request_id LIMIT 200", after.request).toArray(),
+			open_transfers: sql.exec<{ n: number }>("SELECT count(*) AS n FROM transfers WHERE state NOT IN ('committed','aborted')").one().n,
+		});
+	}
+
+	/** Internal RPC from an aborted restore, after the account retired this generation: clears what the restore wrote. */
+	async discardRestore(who: Who, id: string): Promise<void> {
+		if (!this.same(who) || this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = 'restore_id'").toArray()[0]?.value !== id) return;
+		await this.ctx.storage.deleteAlarm();
+		await this.ctx.storage.deleteAll();
 	}
 
 	/**

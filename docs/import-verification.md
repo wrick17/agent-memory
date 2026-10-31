@@ -298,3 +298,9 @@ The accepted private checkpoint plans 1,370 Work records from 1,489 present sour
 The later combined source check includes a selected populated profile v7-to-v8 upgrade through repeat and reopen; it does not prove the held live fixture or complete migration. [Evidence and limits](combined-verification-2026-10-30.md#counter-and-backend-local-verification-2026-10-31).
 
 The later Personal acquisition check used synthetic inventory against a local Worker; it did not execute the Work plan or verify the live fixture. [Evidence and limits](combined-verification-2026-10-30.md#personal-inventory-local-verification-2026-10-31).
+
+## Fresh Work import and profile recovery, 2026-10-31
+
+A later fresh Work library passed a local import and profile backup/restore rehearsal: the import audit matched all 1,297 records with no drift. The earlier 1,370-record plan above remains a historical planning checkpoint. The new hosted target has only synthetic Personal data; no Work upload, hosted backup key or ordinary client switch has occurred. [Results and limits](combined-verification-2026-10-30.md#fresh-work-import-and-profile-recovery-local-rehearsal-2026-10-31); [import receipt](/private/tmp/am-local-work-rehearsal-hTc3nLSK/receipt.json); [restore receipt](/private/tmp/am-local-restore-joW22Wg2/fixed-receipt.json).
+
+An account restore on a clone of that local library preserved the newer Work generation and rebuilt all 1,301 node and 4,121 request bindings. The 1,297-record audit and retained journal reads and replay passed; a corrupt chunk was refused and abort restored the checkpoint, indexes and device revocation. [Account receipt](/private/tmp/am-account-dataset-yvAO1dPf/account-receipt.json). This remains local evidence with synthetic authentication and a local test key.

@@ -38,4 +38,8 @@ export default {
 		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js" || pathname === "/app" || pathname === "/app.js") return api(request, env);
 		return new Response("not found", { status: 404 });
 	},
+	// The nightly export of every active profile and the account (section 18); a failure is kept as last_export_failed.
+	async scheduled(_event, env, ctx): Promise<void> {
+		if (env.OWNER_USER_ID) ctx.waitUntil(accountStub(env, env.OWNER_USER_ID).admin({ op: "export" }));
+	},
 } satisfies ExportedHandler<Env>;

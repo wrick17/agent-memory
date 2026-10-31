@@ -76,6 +76,9 @@ it("an alarm whose generation closes or recovers during a similarity or cleanup 
 		await runInDurableObject(r.stub, async (instance, state) => {
 			const storage = state.storage, sql = storage.sql, original = Reflect.get(instance, "env");
 			const ids: string[] = [];
+			// With embeddings on, a save arms an immediate alarm that can start before deleteAlarm and then run alongside the alarm
+			// called below; with them off it arms only the delayed one deleteAlarm removes. The cards are marked embedded below anyway.
+			Reflect.set(instance, "env", { ...env, EMBEDDINGS: "off" });
 			for (const name of ["late a", "late b"]) {
 				const out = await instance.write(r.who, { op: "save", args: { name, type: "reference", description: "synthetic" } },
 					{ actor: "owner", platform: "test", routedBy: "explicit", userId: r.who.userId, payloadHash: name });

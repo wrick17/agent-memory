@@ -815,6 +815,26 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		const b = await body(request);
 		return run({ op: "wipeProfile", profile: w[1]!, typed: typeof b?.typed === "string" ? b.typed : "" });
 	}
+	// Backups and restore from an export (section 18). One recovery at a time; it closes the account until open or abort.
+	if (url.pathname === "/api/backups/export" && request.method === "POST") {
+		const b = await body(request);
+		return run({ op: "export", ...(typeof b?.profile === "string" ? { profile: b.profile } : {}) });
+	}
+	const ex = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/(exports|restore)$/.exec(url.pathname);
+	if (ex && ex[2] === "exports" && request.method === "GET") return run({ op: "listExports", profile: ex[1]! });
+	if (ex && ex[2] === "restore" && request.method === "POST") {
+		const b = await body(request);
+		return run({ op: "beginRestore", profile: ex[1]!, export: typeof b?.export === "string" ? b.export : "latest" });
+	}
+	// The account's own restore (section 18): it closes the account, disables every device token and opens only when reconciled.
+	if (url.pathname === "/api/account/exports" && request.method === "GET") return run({ op: "listExports" });
+	if (url.pathname === "/api/account/restore" && request.method === "POST") {
+		const b = await body(request);
+		return run({ op: "beginAccountRestore", export: typeof b?.export === "string" ? b.export : "latest" });
+	}
+	if (url.pathname === "/api/recovery" && request.method === "GET") return run({ op: "restoreStatus" });
+	const rc = /^\/api\/recovery\/(step|open|abort)$/.exec(url.pathname);
+	if (rc && request.method === "POST") return run({ op: rc[1] === "step" ? "restoreStep" : rc[1] === "open" ? "openRestore" : "abortRestore" });
 	if (m && request.method === "POST" && m[2] === "default") {
 		const b = await body(request);
 		return run({ op: "setDeviceDefault", id: m[1]!, defaultProfile: typeof b?.default_profile === "string" ? b.default_profile : null });

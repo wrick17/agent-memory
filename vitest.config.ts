@@ -11,6 +11,7 @@ export default defineConfig({
 			miniflare: {
 				workers: [{ name: "fakes", modules: true, scriptPath: "./test/fakes.js", compatibilityDate: "2026-10-20" }],
 				serviceBindings: { AI: { name: "fakes", entrypoint: "FakeAI" }, VECTORS: { name: "fakes", entrypoint: "FakeVectors" } },
+				bindings: { BACKUP_KEY: "synthetic-test-backup-key-0000000000000000" },
 			},
 		}),
 	],

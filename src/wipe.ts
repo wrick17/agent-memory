@@ -1,7 +1,8 @@
 import { resumeTransfer, transferPorts } from "./transfer";
 // Owner-only wipe of one profile (section 9, steps 1 to 6). The account closes the profile and records the wipe; the plan and
 // every id page go to permanent R2 objects before anything is deleted; then copies elsewhere are purged, the profile's own
-// generations cleared, and its indexes fenced. A retry replays the same plan. Backup replacement waits for the final stage.
+// generations cleared, and its indexes fenced. A retry replays the same plan. Last, before done, the wiped profile's exports
+// are deleted and every other store's are replaced by a clean one (section 18); a failure there leaves the wipe unfinished.
 import { Fail, ok, PROFILE_NAME, type Caller, type Outcome, type ProfileRef } from "./domain/types";
 import { nextSeq } from "./storage";
 import type { Page, PurgeResult, WipeOut, WipeStep } from "./profile/store";
@@ -99,6 +100,8 @@ export interface WipePorts {
 	resumeCountTransfer?(id:string,terms:string[]):Promise<Outcome<unknown>>;
 	account(cmd: WipeAccountCommand): Promise<Outcome<WipeAccountResult>>;
 	profile(ref: ProfileRef, step: WipeStep): Promise<Outcome<WipeOut>>;
+	/** AccountStore's export replacement. Without it, a wipe finishes only when R2 holds no export at all. */
+	backups?(profile: string): Promise<Outcome<unknown>>;
 }
 
 /** Inside AccountStore: its own wipe commands directly, and the integrator's ProfileStore.purgeOrigin(who, step) by stub. */
@@ -120,6 +123,7 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 		if (JSON.parse(r.report).state === "done") return ok(r);
 		const bucket = env.BACKUPS;
 		if (!bucket) throw Fail.of("unavailable", "wipe requires the permanent R2 tombstone bucket");
+		if (JSON.parse(r.report).state === "backups") return ok(await backupsDone(env, ports, profile, r));
 		// The root object fixes generations and profile refs across a crash, before any profile content is purged.
 		const old = await bucket.get(r.marker_key);
 		const plan: WipePlan = old ? await old.json<WipePlan>() : { record: r, refs: begun.refs! };
@@ -231,17 +235,29 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 				} while (after);
 			}
 		}
-		// Digest migration objects only. Backup/export replacement is deliberately left for the final backup stage.
+		// Digest migration objects; exports follow in backupsDone.
 		let migrationCursor: string | undefined;
 		do {
 			const page = await bucket.list({ prefix: `migration/${profile}/`, limit: 100, ...(migrationCursor ? { cursor: migrationCursor } : {}) });
 			if (page.objects.length) await bucket.delete(page.objects.map((o) => o.key));
 			migrationCursor = page.truncated ? page.cursor : undefined;
 		} while (migrationCursor);
-		const report = JSON.stringify({ state: "done", marker: r.marker_key, handwritten: `${r.marker_key}/handwritten/`, purged: counts.purged, redacted: counts.redacted,
-			preserved: [...counts.preserved], backups: "deferred_final_stage" });
+		// The account's indexes are final first, so a replacement account export is clean; the record stays short of done until exports are.
+		const report = JSON.stringify({ state: "backups", marker: r.marker_key, handwritten: `${r.marker_key}/handwritten/`, purged: counts.purged, redacted: counts.redacted,
+			preserved: [...counts.preserved] });
 		let done: WipeAccountResult;
 		do { done = value(await ports.account({ op: "finish", profile, at: r.wiped_at, report })); } while (done.after);
-		return ok(done.record!);
+		return ok(await backupsDone(env, ports, profile, done.record!));
 	} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+}
+
+/** Export replacement, then done. Never deletes the generation ledger or the tombstones: only `exports/` prefixes. */
+async function backupsDone(env: Env, ports: WipePorts, profile: string, r: WipeRecord): Promise<WipeRecord> {
+	let backups: unknown = "none";
+	if (ports.backups) backups = value(await ports.backups(profile));
+	else if ((await env.BACKUPS.list({ prefix: "exports/", limit: 1 })).objects.length) throw Fail.of("unavailable", "exports exist that this wipe cannot replace");
+	const report = JSON.stringify({ ...JSON.parse(r.report) as Record<string, unknown>, state: "done", backups });
+	let done: WipeAccountResult;
+	do { done = value(await ports.account({ op: "finish", profile, at: r.wiped_at, report })); } while (done.after);
+	return done.record!;
 }
