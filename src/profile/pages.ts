@@ -9,6 +9,8 @@ import { fenceOf, VISIBLE } from "./compact";
 import { EDGE_ROWS, explore, newBudget, READABLE_NODE, REL_CLASS, summaries, timeline, walk, type GraphLink, type NodeSummary } from "./graph";
 import { contentPage, pastOf } from "./read";
 import { readContent, readPrefix } from "./write";
+import { handwrittenPage, originPage, survives } from "./wipe";
+import { nodeOperationAfter } from "./archive-operations";
 
 /**
  * `before` asks for one more page of revision history only; `content` pages the whole content, bound to its revision (and as_of).
@@ -328,4 +330,29 @@ export function activity(sql: SqlStorage, q: ActivityQuery) {
 
 export function shownIds(sql: SqlStorage, q: ShownQuery): string[] {
 	return sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND ${SHOWN}`, JSON.stringify(q.ids)).toArray().map((r) => r.id);
+}
+
+/**
+ * The owner's wipe preview in one other profile (section 9), read only: the wipe engine's own pages, never its fence or purge.
+ * `purge` lists the ids `originPage` selects here, each with the verdict `held` reaches: outside me always purged; in me a
+ * company-free preference that `survives` is kept, unless it has a staged archive operation, whose full image is read only
+ * during the wipe, so it is decided then. `handwritten` lists `handwrittenPage`'s records: kept, and listed for review.
+ * Metadata only (kind, name cut to 200, status, where the row is); no bodies, history, evidence or archive payloads.
+ */
+export function wipePreview(sql: SqlStorage, who: { userId: string; profile: string; generation: string }, q: { profile: string; terms: string[]; part: "purge" | "handwritten"; after: string }) {
+	if (q.profile === who.profile) throw Fail.of("validation", "the preview reads only the other profiles");
+	const page = q.part === "purge" ? originPage(sql, who, q.profile, q.after) : handwrittenPage(sql, q.profile, q.terms, q.after);
+	const items = page.ids.map((id) => {
+		const live = sql.exec<{ kind: string; other_label: string | null; name: string; status: string }>("SELECT kind, other_label, substr(name, 1, 200) AS name, status FROM nodes WHERE id = ?", id).toArray()[0];
+		const kept = live ? undefined : sql.exec<{ kind: string | null; name: string | null; status: string | null }>(
+			"SELECT json_extract(payload, '$.kind') AS kind, substr(json_extract(payload, '$.name'), 1, 200) AS name, json_extract(payload, '$.status') AS status FROM archive WHERE source = 'nodes' AND json_extract(payload, '$.id') = ? LIMIT 1", id).toArray()[0];
+		const meta = live ? { kind: live.kind, other_label: live.other_label, name: live.name, status: live.status, where: live.status === "moved" ? "tombstone" : "live" }
+			: kept ? { kind: kept.kind, other_label: null, name: kept.name, status: kept.status, where: "archive" } : { kind: null, other_label: null, name: null, status: null, where: "staged" };
+		if (q.part === "handwritten") return { id, ...meta, verdict: "kept_listed" };
+		const marked = sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", `wiped:${id}`).toArray().length > 0;
+		// Like held: an id with no row here (a staged operation between its steps) is left to the wipe itself.
+		const present = !!live || marked || sql.exec(`SELECT 1 FROM archive WHERE coalesce(json_extract(payload, '$.node_id'), json_extract(payload, '$.src'), json_extract(payload, '$.id')) = ? LIMIT 1`, id).toArray().length > 0;
+		return { id, ...meta, verdict: !present ? "decided_at_wipe" : marked || !survives(sql, who, id, q.terms) ? "purge" : nodeOperationAfter(sql, id, "") ? "decided_at_wipe" : "survive" };
+	});
+	return { items, after: page.after };
 }

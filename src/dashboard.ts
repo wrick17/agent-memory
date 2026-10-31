@@ -25,12 +25,12 @@ a[aria-current]{font-weight:600}.prefs{list-style:none;padding:0}.prefs>li{borde
 .legend{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.25rem 1rem;font-size:13px}.dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;vertical-align:-.05rem}
 .graph aside{position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow:auto}.matches{list-style:none;padding:0;margin:0}.matches button{width:100%;text-align:left;margin:0 0 .25rem}
 #signin:empty{display:none}</style></head>
-<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="/settings">Settings</a></nav>
+<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="#/move">Moves</a><a href="#/wipe">Wipe</a><a href="/settings">Settings</a></nav>
 <main><h1>Agent Memory</h1>
 <p id="status" role="status">Loading sign-in…</p><div id="signin"></div>
 <div id="view" hidden></div>
 <section id="planned" hidden aria-labelledby="planned-h"><h2 id="planned-h">Not built yet</h2>
-<p>The transfers and wipe pages are not built here. Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
+<p>Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
 <script defer crossorigin="anonymous" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
 <script defer crossorigin="anonymous" data-clerk-publishable-key="${esc(env.CLERK_PUBLISHABLE_KEY)}" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
 <script defer src="/app.js"></script></body></html>`;
@@ -592,6 +592,8 @@ export async function dashboardMain(win: any): Promise<void> {
 			else note(body, "Editing here needs an active, non-procedural, non-journal memory with its whole text shown.");
 			link(el("p", body), `#/map/${enc(p.name)}/${enc(id)}`, "Center the map here");
 			link(el("p", body), `#/path/${enc(p.name)}/${enc(id)}`, "Find a path from here");
+			link(el("p", body), `#/move/${enc(p.name)}/${enc(id)}`, "Move to another profile");
+			link(el("p", body), `#/copy/${enc(p.name)}/${enc(id)}`, "Save a copy in another profile");
 			link(el("p", body), `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline of this record");
 			if (n.kind === "journal") link(el("p", body), `#/journals/${enc(p.name)}/${enc(id)}`, "Read as a journal");
 			el("h3", body, "Evidence");
@@ -638,7 +640,7 @@ export async function dashboardMain(win: any): Promise<void> {
 	// and kept in this page only; nothing about them reaches the server until a draft is saved.
 	// `preview` is the exact payload (with its request id) a Save sends; `sent` is the last one Save sent, kept until the server confirms it.
 	type Draft = { memory_id?: string; expected_revision?: number; name: string; type: string; scope: string; description: string; content: string; target: string; targetName: string; reason: string;
-		companyFree?: boolean; preview?: Record<string, unknown>; sent?: Record<string, unknown> };
+		companyFree?: boolean; preview?: Record<string, unknown>; sent?: Record<string, unknown>; copyOf?: { profile: string; id: string; name: string; kind: string; back?: string } };
 	const drafts = new Map<string, Draft>();
 	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>();
 	const pendingOps = new Map<string, { id: string; cursor: string; label: string }>(); // staged archive restores not finished
@@ -781,6 +783,9 @@ export async function dashboardMain(win: any): Promise<void> {
 		if (editing) {
 			el("p", view, `Editing “${d.name}” at revision ${d.expected_revision}. Saving makes a new revision; the earlier one stays in its history. A change by someone else since then is refused, not overwritten.`);
 			link(el("p", view), `#/memory/${enc(p.name)}/${enc(d.memory_id!)}`, "Back to the record");
+		} else if (d.copyOf) {
+			el("p", view, `A copy of “${d.copyOf.name}” from ${d.copyOf.profile}, saved as a new record in ${p.name}. Only what is shown below is saved; the original keeps its history, requests and links, and the copy has no tie to ${d.copyOf.profile}, so a wipe of ${d.copyOf.profile} leaves it.`);
+			link(el("p", view), `#/memory/${enc(d.copyOf.profile)}/${enc(d.copyOf.id)}`, "Back to the original");
 		} else el("p", view, "A new memory you state yourself. Nothing is saved until you preview it and choose Save.");
 		const form = el("form", view);
 		const name = input(form, "draft-name", "Name");
@@ -789,7 +794,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		if (editing) name.disabled = true;
 		const type = choose(form, "draft-type", "Type", [["project", "Project"], ["feedback", "Feedback"], ["reference", "Reference"], ["user", "User"]]);
 		type.value = d.type;
-		if (editing) type.disabled = true;
+		if (editing || d.copyOf) type.disabled = true; // a copy keeps its record's type (and kind) as they are
 		const scope = input(form, "draft-scope", "Scope (optional)");
 		scope.setAttribute("maxlength", "128");
 		scope.value = d.scope;
@@ -831,8 +836,9 @@ export async function dashboardMain(win: any): Promise<void> {
 		const show = (x: Record<string, unknown>) => {
 			el("h3", preview, "Preview (not saved)");
 			const link0 = (x.links as { reason: string }[] | undefined)?.[0];
-			facts(preview, [["Profile", p.name], ["Change", editing ? `New revision of “${d.name}” (now ${d.expected_revision})` : "A new memory"],
-				...(editing ? [] : [["Name", String(x.name)], ["Type", String(x.type)], ["Scope", x.scope ? String(x.scope) : "none"], ["Origin", "Stated by you"]] as [string, string][]),
+			facts(preview, [["Profile", p.name], ["Change", editing ? `New revision of “${d.name}” (now ${d.expected_revision})` : d.copyOf ? `A new record, copied from “${d.copyOf.name}” in ${d.copyOf.profile}` : "A new memory"],
+				...(editing ? [] : [["Name", String(x.name)], ["Type", String(x.type)], ...(d.copyOf ? [["Kind", String(x.kind)], ["Text", `${String(x.content ?? "").length.toLocaleString("en")} characters`]] : []),
+					["Scope", x.scope ? String(x.scope) : "none"], ["Origin", d.copyOf ? `New in ${p.name}; no history, requests or links come along` : "Stated by you"]] as [string, string][]),
 				["Link", link0 ? `relates to “${d.targetName || d.target}”` : "none"]]);
 			el("h4", preview, "Description");
 			textBlock(preview, String(x.description ?? "") || "(none)");
@@ -847,10 +853,13 @@ export async function dashboardMain(win: any): Promise<void> {
 			stale();
 			const n = name.value.trim(), r = reason?.value.trim() ?? "";
 			const problem = !editing && !n ? "Give the memory a name." : !desc.value.trim() ? "Write a short description."
+				: d.copyOf && !content.value.trim() ? "A copy needs the record's text." : d.copyOf && content.value.length > COPY_MAX ? "A copy's text must fit one record."
 				: d.target && (r.length < 8 || r.length > 600) ? "Say why they relate in 8 to 600 characters." : free && !free.checked ? "Saving to me needs the no-company-details confirmation." : "";
 			if (problem) { say(problem); msg.focus(); return; }
 			const next: Record<string, unknown> = {
+				// A copy is a plain creation: no record id, revision, origin or source of any kind; creation derives them afresh.
 				...(editing ? { memory_id: d.memory_id, expected_revision: d.expected_revision, description: desc.value, content: content.value }
+					: d.copyOf ? { name: n, type: d.type, kind: d.copyOf.kind, description: desc.value, ...(scope.value.trim() ? { scope: scope.value.trim() } : {}), content: content.value }
 					: { name: n, type: type.value, origin: "stated", description: desc.value, ...(scope.value.trim() ? { scope: scope.value.trim() } : {}), ...(content.value.trim() ? { content: content.value } : {}) }),
 				...(d.target ? { links: [{ rel: "relates_to", to: { id: d.target }, reason: r, evidence: [{ kind: "node", ref: d.target }] }] } : {}),
 				...(free ? { company_free: true } : {}),
@@ -868,7 +877,12 @@ export async function dashboardMain(win: any): Promise<void> {
 			keep({ sent });
 			act(`/api/profiles/${enc(p.name)}/save`, editing ? `save “${d.name}”` : `save “${String(sent.name)}”`, sent, (r) => {
 				drafts.delete(p.name);
-				return { text: `Saved: ${String(r.action ?? "saved")} “${String(r.name ?? d.name)}”, revision ${recorded(r.revision)}. Open it from Memories.` };
+				const text = `Saved: ${String(r.action ?? "saved")} “${String(r.name ?? d.name)}”, revision ${recorded(r.revision)}. Open it from Memories.`;
+				// A copy asked for from a wipe page goes back there; that page reads its preview afresh. Nothing is typed or confirmed.
+				const back = d.copyOf?.back;
+				// The hash change renders that page once; retiring this page's version keeps this action from rendering it a second time.
+				if (back) { outcomes.set(`#/wipe/${enc(back)}`, { text: `${text} The preview below is read again.` }); pageVersion++; win.location.hash = `#/wipe/${enc(back)}`; }
+				return { text };
 			});
 		};
 		return h;
@@ -1874,6 +1888,314 @@ export async function dashboardMain(win: any): Promise<void> {
 		return h;
 	};
 
+	// The wipe preview (section 9) for an active profile: every other profile the wipe reads, both parts, page by page from the
+	// server's read-only preview, before the confirmation is offered. A failed page stops the walk; reading again is explicit and
+	// resumes from the last page read (or starts over if a profile changed). Names are text; it is not a snapshot.
+	const PREVIEW_HEAD: Record<string, string> = { purge: "Removed from", survive: "Survives in", decided_at_wipe: "Decided when the wipe runs, in", kept_listed: "Stays, but mentions this profile's work terms, in" };
+	const wipePreviewView = (parent: Node, name: string, version: number, done: () => void) => {
+		const sec = el("section", parent);
+		sec.setAttribute("aria-label", "Preview of the wipe outside this profile");
+		el("h3", sec, `Before you confirm: what happens outside ${name}`);
+		note(sec, "Read now, page by page; it is not a snapshot. Records written, moved or archived after this preview are decided by the same rules when the wipe runs.");
+		note(sec, "A preference that survives in me is one you accepted as free of company details. One marked as decided when the wipe runs has archived history the wipe checks only then. Records that stay but mention this profile's terms are listed for you to review; the wipe does not change them.");
+		const line = live(sec), out = el("div", sec);
+		const retry = btn(sec, "Read the preview again", () => { retry.hidden = true; walk(); });
+		retry.hidden = true;
+		const counts: { [verdict: string]: number; purge: number; survive: number; decided_at_wipe: number; kept_listed: number } = { purge: 0, survive: 0, decided_at_wipe: 0, kept_listed: 0 };
+		let targets: string[] | null = null, ti = 0, part: "purge" | "handwritten" = "purge", after: string | null = null, restart = false;
+		const lists = new Map<string, Node>();
+		const listFor = (target: string, verdict: string) => {
+			const key = `${target}:${verdict}`;
+			let ul = lists.get(key);
+			if (!ul) { el("h4", out, `${PREVIEW_HEAD[verdict] ?? verdict} ${target}`); ul = el("ul", out); lists.set(key, ul); }
+			return ul;
+		};
+		const reset = () => { targets = null; ti = 0; part = "purge"; after = null; out.replaceChildren(); lists.clear(); for (const k of Object.keys(counts)) counts[k] = 0; };
+		const walk = async () => {
+			if (restart) { reset(); restart = false; }
+			try {
+				if (!targets) { const r: J = await call(`/api/profiles/${enc(name)}/wipe/preview`); if (!Array.isArray(r?.targets)) throw new Error("the server sent no profiles"); targets = r.targets.map(String); }
+				while (ti < targets!.length) {
+					if (version !== pageVersion) return;
+					const t = targets![ti]!;
+					line.textContent = `Reading ${t}… ${counts.purge} to remove so far.`;
+					const r: J = await call(`/api/profiles/${enc(name)}/wipe/preview?target=${enc(t)}&part=${part}${after ? `&after=${enc(after)}` : ""}`);
+					if (version !== pageVersion) return;
+					if (!Array.isArray(r?.items)) throw new Error("the server sent no page");
+					for (const it of r.items) {
+						const verdict = String(it.verdict);
+						counts[verdict] = (counts[verdict] ?? 0) + 1;
+						const li = el("li", listFor(t, verdict)), label = `${recorded(it.kind)}${it.other_label ? ` (${String(it.other_label)})` : ""}: ${it.name ? String(it.name) : "name not readable before the wipe"}`;
+						if (it.where === "live" && it.status === "active") link(li, `#/memory/${enc(t)}/${enc(String(it.id))}`, label); else el("span", li, label);
+						el("span", li, ` · ${it.where === "tombstone" ? "moved-away marker" : it.where === "archive" ? "archived" : it.where === "staged" ? "being archived" : recorded(it.status)}`);
+						// A record that will be removed can be re-saved first; one not readable now cannot be copied from here.
+						if (verdict === "purge" && it.where === "live" && it.status === "active") btn(li, "Save a copy", () => { copyBack.set(`${t}:${String(it.id)}`, name); win.location.hash = `#/copy/${enc(t)}/${enc(String(it.id))}`; }, `Save a copy of ${String(it.name ?? it.id)}`);
+						else if (verdict === "purge") el("span", li, " · cannot be copied before the wipe (not readable now; restore it from the archive first if it is archived)");
+					}
+					after = typeof r.next === "string" ? r.next : null;
+					if (!after) { if (part === "purge") part = "handwritten"; else { part = "purge"; ti++; } }
+					await new Promise((x) => setTimeout(x, 0)); // let the page breathe between requests
+				}
+			} catch (err) {
+				if (version !== pageVersion) return;
+				restart = (err as Failure).reason === "stale_cursor";
+				line.textContent = `The preview stopped: ${why(err)}. The confirmation stays off until the preview is complete.`;
+				retry.hidden = false;
+				return;
+			}
+			if (version !== pageVersion) return;
+			const total = counts.purge + counts.survive + counts.decided_at_wipe + counts.kept_listed;
+			line.textContent = total ? `Preview complete: ${counts.purge} records will be removed from other profiles, ${counts.survive} survive in me, ${counts.decided_at_wipe} are decided when the wipe runs, and ${counts.kept_listed} that mention this profile's terms stay for your review.`
+				: `Preview complete: nothing outside ${name} is removed, kept or flagged.`;
+			done();
+		};
+		walk();
+	};
+
+	// Wipe (section 9): one profile chosen explicitly, its consequences stated before anything is typed, the exact name typed, then
+	// one click. Every request names the profile version this page shows, so a stale page cannot wipe a profile restored since.
+	// The engine's own begin resumes an unfinished wipe and never starts a second one, so Continue is the same request.
+	const wipePage = (view: Node, name: string | undefined) => {
+		const version = pageVersion;
+		if (name === undefined) {
+			const h = el("h2", view, "Wipe a profile");
+			el("p", view, "Choose the profile to wipe. Nothing happens until you confirm on its page.");
+			const ul = el("ul", view);
+			for (const q of profiles) link(el("li", ul), `#/wipe/${enc(q.name)}`, `${q.name} (${q.status})`);
+			return h;
+		}
+		const base = `/api/profiles/${enc(name)}/wipe`, h = el("h2", view, `Wipe profile: ${name}`);
+		link(el("p", view), "#/wipe", "Choose another profile");
+		const { msg, say } = pageStatus(view);
+		const body = el("div", view);
+		say("Reading the profile's state…");
+		(async () => {
+			let s: J;
+			try { s = await call(base); if (typeof s?.status !== "string") throw new Error("the server sent no state"); } catch (err) {
+				if (version === pageVersion) { say(`Could not read the profile's state: ${why(err)}`); btn(body, "Read the state again", () => render(false)); }
+				return;
+			}
+			if (version !== pageVersion) return;
+			say("");
+			const known = profiles.find((q) => q.name === name);
+			if (known) known.status = s.status; // keep the other pages' profile lists honest after a wipe
+			const w = s.wipe;
+			const unfinished = s.status === "wiping" || Boolean(w && w.state !== "done");
+			facts(body, [["State", unfinished ? "Wipe unfinished" : s.status === "active" ? "Active" : s.status === "wiped" ? "Wiped" : String(s.status)],
+				["Profile version", String(s.generation)], ...(w ? [["Wipe started", recorded(w.started_at)], ["Wipe step", w.state === "done" ? "Finished" : w.state === "backups" ? "Replacing backups" : "Removing content"],
+					...(typeof w.purged === "number" ? [["Records removed", String(w.purged)]] : []), ...(typeof w.redacted === "number" ? [["Activity entries cleared", String(w.redacted)]] : [])] as [string, string][] : [])]);
+			btn(el("p", body), "Read the state again", () => render(false));
+			if (s.status === "wiped" && w?.state === "done") { el("p", body, "This profile is wiped. Nothing more can be done here."); return; }
+			const warn = el("div", body);
+			warn.setAttribute("class", "danger");
+			el("h3", warn, unfinished ? "This wipe has not finished" : "What wiping does");
+			const ul = el("ul", warn);
+			for (const t of [
+				`Everything ${name} holds is removed from the service: its memories, their history, journals, links and work records, in every stored version of the profile.`,
+				"Copies of its records in other profiles are removed, except accepted company-free preferences in me. Links to removed copies stay only as unreadable references.",
+				"Other profiles' own hand-written references remain and need manual review.",
+				"Devices lose access to it, and its routing rules stop sending anything to it.",
+				`Its backups are deleted and every other profile's backup is replaced with a clean one, so no backup can bring ${name} back.`,
+				"Request ids it used stay refused, and only a content-free record that the wipe happened is kept.",
+				"It cannot be undone.",
+			]) el("li", ul, t);
+			if (unfinished) el("p", warn, "A wipe of this profile started and did not finish, so the profile is already closed. Continue runs the same wipe from where it stopped; it never starts a second one.");
+			else if (s.status !== "active") { el("p", warn, "This profile cannot be wiped in its current state."); return; }
+			// An active profile's confirmation waits for the whole preview; an unfinished wipe continues without one.
+			let previewed = unfinished;
+			if (!unfinished) wipePreviewView(body, name, version, () => { previewed = true; gate(); });
+			const form = el("form", body);
+			const typed = input(form, "wipe-typed", `Type ${name} to confirm`);
+			typed.setAttribute("autocomplete", "off");
+			typed.setAttribute("spellcheck", "false");
+			const go = el("button", el("p", form), unfinished ? `Continue wiping ${name}` : `Wipe ${name}`);
+			go.setAttribute("type", "submit");
+			go.disabled = true;
+			pageButtons.push(go);
+			const wait = el("p", form, "The confirmation opens once the preview above is complete.");
+			wait.setAttribute("class", "na");
+			wait.hidden = previewed;
+			const gate = () => { go.disabled = typed.value !== name || !previewed; wait.hidden = previewed; };
+			typed.addEventListener("input", gate);
+			form.addEventListener("submit", (event) => {
+				event.preventDefault();
+				if (typed.value !== name || !previewed) return;
+				say(`Wiping ${name}. This can take a while; keep this page open.`);
+				msg.focus();
+				act(base, `wipe ${name}`, { typed: name, generation: String(s.generation) }, (r) => ({
+					text: JSON.parse(String(r?.report ?? "{}")).state === "done" ? `${name} is wiped.` : `The wipe of ${name} stopped before finishing; read its state and choose Continue.` }));
+			});
+		})();
+		return h;
+	};
+
+	// Moves (sections 9 and 15): one record to another active profile through save_memory's transfer. Each move's exact request,
+	// request id included, is kept for this session, so it can be sent again after a lost answer even once the record has left
+	// its source; the server replays a finished move instead of moving it twice. Nothing is sent by itself.
+	type Move = { source: string; id: string; name: string; to: string; body: Record<string, unknown>; state: "sent" | "unknown" | "done" | "aborted" | "refused" | "progress"; text: string };
+	const moves = new Map<string, Move>(); // `${source}:${id}` -> the last move asked for
+	const moveState = (m: Move) => ({ sent: "Sending…", unknown: "Result unconfirmed: the move may or may not have happened. Send the same move again to find out; it cannot move twice.",
+		done: `Moved to ${m.to}.`, aborted: "The move was stopped and nothing was published; the record stays where it was.", refused: m.text,
+		progress: "The move has started but not finished; the record is fenced until it does. Send the same move again to continue it; the server also retries a stalled move by itself after about five minutes." })[m.state];
+	const sendMove = (m: Move) => {
+		m.state = "sent";
+		// A temporary failure can follow a committed intent, so only a terminal refusal drops the exact retry.
+		act(() => call(`/api/profiles/${enc(m.source)}/move`, "POST", m.body).catch((e: Failure) => {
+			const retryable = !e.status || e.status >= 500 || e.status === 408 || e.status === 429 || ["unavailable", "moving", "busy"].includes(e.code ?? "");
+			Object.assign(m, retryable ? { state: "unknown" } : { state: "refused", text: `Refused: ${why(e)}` });
+			throw e;
+		}), `move “${m.name}” to ${m.to}`, undefined, (r) => {
+			m.state = r?.state === "committed" ? "done" : r?.state === "aborted" ? "aborted" : "progress";
+			return { text: moveState(m) };
+		});
+	};
+	const moveView = (parent: Node, m: Move) => {
+		const box = el("div", parent);
+		box.setAttribute("class", m.state === "done" ? "na" : "warn");
+		el("p", box, `Move of “${m.name}” from ${m.source} to ${m.to}: ${moveState(m)}`);
+		if (m.state === "done") link(el("p", box), `#/memory/${enc(m.to)}/${enc(m.id)}`, `Open it in ${m.to}`);
+		if (m.state === "unknown" || m.state === "progress") btn(el("p", box), "Send the same move again", () => sendMove(m), `Send the same move of ${m.name} again`);
+	};
+	const movePage = (view: Node, p: Profile, id: string | undefined) => {
+		const version = pageVersion;
+		if (id === undefined) {
+			const h = el("h2", view, "Moves");
+			pageStatus(view);
+			el("p", view, "Moves asked for in this browser tab. Open a record and choose “Move to another profile” to start one.");
+			const list = [...moves.values()];
+			for (const m of list) moveView(view, m);
+			if (!list.length) note(view, "No moves yet in this tab.");
+			return h;
+		}
+		const key = `${p.name}:${id}`, prior = moves.get(key);
+		const h = el("h2", view, "Move a record");
+		link(el("p", view), "#/move", "All moves in this tab");
+		const { msg, say } = pageStatus(view);
+		if (prior) moveView(view, prior);
+		const body = el("div", view);
+		say("Reading the record…");
+		(async () => {
+			let r: J;
+			try { r = await call(`/api/profiles/${enc(p.name)}/nodes/${enc(id)}`); if (!r?.node) throw new Error("the server sent no record"); } catch (err) {
+				if (version === pageVersion) say(prior ? "" : `Could not read the record in ${p.name}: ${why(err)}`);
+				return;
+			}
+			if (version !== pageVersion) return;
+			say("");
+			const name = String(r.node.name ?? "(no name)");
+			h.textContent = `Move “${name}”`;
+			facts(body, [["Record", name], ["Kind", recorded(r.node.kind)], ["Now in", p.name], ["Status", recorded(r.node.status)]]);
+			if (r.node.status !== "active") { note(body, "Only an active record can be moved."); return; }
+			const warn = el("div", body);
+			warn.setAttribute("class", "warn");
+			el("h3", warn, "What a move does");
+			const ul = el("ul", warn);
+			for (const t of [`The record leaves ${p.name} and is held by the profile you choose, with the same id, its whole revision history and its request records.`,
+				`${p.name} keeps a tombstone in its place; links to it keep pointing at it. Devices that can read only ${p.name} stop seeing it.`,
+				"Only the move happens: no other change rides along. Search by meaning may take a while to catch up.",
+				"Moving into me needs your statement that it holds no company or work details; the server also checks its text and refuses a move it cannot accept."]) el("li", ul, t);
+			const form = el("form", body);
+			const to = choose(form, "move-to", "Move to", [["", "Choose a profile"], ...active().filter((q) => q.name !== p.name).map((q) => [q.name, q.name] as [string, string])]);
+			const freeLabel = el("label", form);
+			freeLabel.setAttribute("class", "field");
+			const free = el("input", freeLabel);
+			free.setAttribute("type", "checkbox");
+			el("span", freeLabel, " This record holds no company or work details (required for me)");
+			freeLabel.hidden = true;
+			const row = el("p", form);
+			el("button", row, "Preview").setAttribute("type", "submit");
+			const go = btn(row, "Move", () => {
+				if (!pending) return;
+				const same = prior && prior.state !== "done" && prior.to === pending.to && JSON.stringify(prior.body.company_free ?? false) === JSON.stringify(pending.company_free ?? false);
+				const m: Move = same ? prior! : { source: p.name, id, name, to: String(pending.to), state: "sent", text: "",
+					body: { memory_id: id, to: pending.to, ...(pending.company_free ? { company_free: true } : {}), ...(p.generation ? { generation: p.generation } : {}), request_id: `dashboard:${crypto.randomUUID()}` } };
+				moves.set(key, m);
+				sendMove(m);
+			}, `Move ${name}`);
+			go.disabled = true;
+			const preview = el("p", body);
+			let pending: Record<string, unknown> | undefined;
+			const stale = () => { pending = undefined; go.disabled = true; preview.textContent = ""; freeLabel.hidden = to.value !== "me"; };
+			to.addEventListener("input", stale);
+			to.addEventListener("change", stale);
+			free.addEventListener("change", stale);
+			form.addEventListener("submit", (event) => {
+				event.preventDefault();
+				stale();
+				if (!to.value) { say("Choose the profile to move it to."); msg.focus(); return; }
+				if (to.value === "me" && !free.checked) { say("Moving into me needs the no-company-details statement."); msg.focus(); return; }
+				pending = { to: to.value, ...(to.value === "me" ? { company_free: true } : {}) };
+				preview.textContent = `Preview: move “${name}” from ${p.name} to ${to.value}. Nothing moves until you choose Move.`;
+				go.disabled = false;
+				go.focus();
+			});
+		})();
+		return h;
+	};
+
+	// Save a copy (section 9): before a wipe, the owner may re-save a record as a new record of another profile. The copy holds
+	// only the name, description and full current text the owner reviews; the original keeps its history, requests and links, and
+	// creation gives the copy its own identity and origin. Only records Write can recreate exactly are offered; nothing is converted.
+	const copyBack = new Map<string, string>(); // `${profile}:${id}` -> the profile whose wipe page asked for the copy
+	const COPY_KIND: Record<string, string> = { feedback: "rule", user: "preference", reference: "document", project: "journal" };
+	const COPY_MAX = 64_000; // the save tool's content limit
+	const copyPage = (view: Node, p: Profile, id: string | undefined) => {
+		const version = pageVersion, h = el("h2", view, "Save a copy");
+		if (id === undefined) { el("p", view, "Open a record and choose “Save a copy in another profile”."); return h; }
+		const base = `/api/profiles/${enc(p.name)}/nodes/${enc(id)}`, back = copyBack.get(`${p.name}:${id}`);
+		if (back) link(el("p", view), `#/wipe/${enc(back)}`, `Back to the wipe of ${back}`);
+		const { msg, say } = pageStatus(view);
+		const body = el("div", view);
+		say("Reading the record…");
+		(async () => {
+			let r: J;
+			try { r = await call(base); if (!r?.node) throw new Error("the server sent no record"); } catch (err) { if (version === pageVersion) say(`This record cannot be read here: ${why(err)}`); return; }
+			if (version !== pageVersion) return;
+			say("");
+			const n = r.node, name = String(n.name ?? ""), type = n.memory_type ? String(n.memory_type) : null, kind = String(n.kind ?? "");
+			h.textContent = `Save a copy of “${name}”`;
+			facts(body, [["Record", name], ["Now in", p.name], ["Type", recorded(type)], ["Kind", kind], ["Status", recorded(n.status)]]);
+			const cut: string[] = Array.isArray(n.truncated) ? n.truncated : [];
+			const unavailable = !type ? "it is a work item, not a memory; Write saves memories only."
+				: type === "procedural" ? "a procedure keeps ordered steps, which Write does not carry."
+				: kind === "decision" ? "a decision needs its reasoning and evidence, which Write does not carry."
+				: COPY_KIND[type] !== kind ? "its type and kind do not match a record Write can create."
+				: n.status !== "active" ? "only an active record can be copied."
+				: cut.includes("description") ? "its description is longer than this page can read in full."
+				: name.length < 1 || name.length > 512 ? "its name cannot be saved as given." : "";
+			if (unavailable) { note(body, `This record cannot be copied: ${unavailable}`, "warn"); return; }
+			el("p", body, `The copy is a new record in the profile you choose, holding this record's name, description and full current text, which you review before saving. Its history, requests and links stay with the original in ${p.name}.`);
+			const form = el("form", body);
+			const to = choose(form, "copy-to", "Copy into", [["", "Choose a profile"], ...active().filter((q) => q.name !== p.name).map((q) => [q.name, q.name] as [string, string])]);
+			const go = el("button", el("p", form), "Read the full text and prepare the copy");
+			go.setAttribute("type", "submit");
+			form.addEventListener("submit", async (event) => {
+				event.preventDefault();
+				if (!to.value) { say("Choose the profile to copy it into."); msg.focus(); return; }
+				if (drafts.has(to.value)) { say(`There is an unsaved draft in ${to.value}; save or discard it first.`); msg.focus(); return; }
+				go.disabled = true;
+				say("Reading the full text…");
+				// The whole content in the entity read's own pages, bound to the revision shown; only this record is read.
+				let text = "", cursor: string | null = null, pages = 0;
+				try {
+					do {
+						const page: J = await call(`${base}?content=all${cursor ? `&cursor=${enc(cursor)}` : ""}`);
+						if (typeof page?.content?.content !== "string") throw new Error("the server sent no text");
+						text += page.content.content;
+						cursor = typeof page.content.cursor === "string" ? page.content.cursor : null;
+					} while (cursor && ++pages < 3 && text.length <= COPY_MAX);
+				} catch (err) { if (version === pageVersion) { say(`Could not read the text: ${why(err)}`); go.disabled = false; } return; }
+				if (version !== pageVersion) return;
+				if (cursor || text.length > COPY_MAX) { say(`This record cannot be copied: its text is longer than one record can hold (${COPY_MAX.toLocaleString("en")} characters).`); return; }
+				if (!text.trim()) { say("This record cannot be copied: it has no text."); return; }
+				drafts.set(to.value, { name, type: type!, scope: n.scope ? String(n.scope) : "", description: String(n.description ?? ""), content: text, target: "", targetName: "", reason: "",
+					copyOf: { profile: p.name, id, name, kind, ...(back ? { back } : {}) } });
+				win.location.hash = `#/draft/${enc(to.value)}`;
+			});
+		})();
+		return h;
+	};
+
 	const render = (moveFocus: boolean) => {
 		pageVersion++;
 		pageButtons = [];
@@ -1887,7 +2209,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		try { name = m ? decodeURIComponent(m[2]!) : undefined; } catch { name = m?.[2]; }
 		let h: Node;
 		// The newer pages: the named active profile, or active work when none is named (asked for if work is not active); for a record, its id.
-		const pg = /^#\/(graph|memories|memory|map|draft|activity|timeline|journals|path|review)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
+		const pg = /^#\/(graph|memories|memory|map|draft|activity|timeline|journals|path|review|move|copy)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
 		const dec = (s?: string) => { if (s === undefined) return undefined; try { return decodeURIComponent(s); } catch { return s; } };
 		if (pg) {
 			const named = dec(pg[2]), id = dec(pg[3]), ok = active();
@@ -1906,8 +2228,11 @@ export async function dashboardMain(win: any): Promise<void> {
 			else if (pg[1] === "journals") h = journalsPage(view, p, id);
 			else if (pg[1] === "path") h = pathPage(view, p, id);
 			else if (pg[1] === "review") h = reviewPage(view, p);
+			else if (pg[1] === "move") h = movePage(view, p, id);
+			else if (pg[1] === "copy") h = copyPage(view, p, id);
 			else h = activityPage(view, p);
 		} else if (hash === "#/backups") h = backupsPage(view);
+		else if (hash === "#/wipe" || hash.startsWith("#/wipe/")) h = wipePage(view, hash === "#/wipe" ? undefined : dec(hash.slice(7)));
 		else if (hash === "#/work" || m?.[1] === "work") {
 			const ok = active(), p = name === undefined ? ok.find((x) => x.name === "work") : ok.find((x) => x.name === name);
 			if (p) h = workPage(view, p);

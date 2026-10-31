@@ -206,7 +206,8 @@ export type ReadQuery =
 	| { kind: "graph"; part: "nodes" | "edges"; after: string | null; limit: number }
 	| { kind: "archive"; before: number | null; limit: number }
 	// GET /v1/markers (section 7): `repo` is the GitHub namespace, or null for another remote.
-	| { kind: "markers"; repo: string | null; session?: { client: "claude-code" | "codex"; id: string } };
+	| { kind: "markers"; repo: string | null; session?: { client: "claude-code" | "codex"; id: string } }
+	| { kind: "wipe_preview"; profile: string; terms: string[]; part: "purge" | "handwritten"; after: string };
 
 // Graph reads (section 7), defined here so domain/ imports nothing from a store; src/profile/graph.ts takes the same shapes.
 type GraphRef = { id: string } | { key: string } | { name: string; kind?: NodeKind; scope?: string };

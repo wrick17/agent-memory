@@ -7,7 +7,7 @@ import { redactPayload } from "./domain/redact";
 import { Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
-import { accountStub, callTool, profileStub } from "./mcp";
+import { accountStub, callTool, ownerOf, profileStub } from "./mcp";
 import { trace } from "./graph-tools";
 import { chunkSchema, corpusOn, corpusStub, refreshSchema } from "./corpus-tools";
 import { checkChunk, chunkTerms, HELD, refreshTerms, type RefreshCommand } from "./corpus/store";
@@ -784,6 +784,32 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" ? 409
 			: code === "size_budget" ? 413 : code === "unavailable" ? 503 : 400);
 	}
+	// The dashboard's move of one record to another active profile (sections 9 and 15): save_memory's own transfer, run as the owner,
+	// with its request id required so a retry after a lost answer replays the stored result. The record must be held by the source
+	// shown here (a new or unfinished move) or already by the destination (a replay); held anywhere else, it moved since it was shown.
+	const mv = /^\/api\/profiles\/([^/]+)\/move$/.exec(url.pathname);
+	if (mv && request.method === "POST") {
+		const ref = PROFILE_NAME.test(mv[1]!) ? ctx.value.profiles.find((p) => p.profile === mv[1]) : undefined;
+		if (!ref) return json({ error: { code: "not_found", message: `profile '${mv[1]}' is not active` } }, 404);
+		const b = await body(request);
+		const m = z.object({ memory_id: z.string().min(1).max(128), to: z.string().regex(PROFILE_NAME), company_free: z.boolean().optional(), request_id: z.string().min(1).max(256),
+			generation: z.string().min(1).max(64).optional() }).strict().safeParse(b);
+		if (!m.success || m.data.to === ref.profile) return json({ error: { code: "validation", message: "send JSON with memory_id, to (another profile), request_id and optional company_free and generation" } }, 400);
+		// The source version the page showed, when sent, must still be the source's; the intent then binds it.
+		if (m.data.generation !== undefined && m.data.generation !== ref.generation) return json({ error: { code: "busy", message: "the source profile changed since it was shown; read it again", details: { reason: "generation_changed" } } }, 409);
+		const c = { env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" as const, moveFrom: { profile: ref.profile, generation: ref.generation } };
+		const owner = await ownerOf(c, m.data.memory_id);
+		if (!owner) return json({ error: { code: "not_found", message: "no record with this id" } }, 404);
+		if (owner !== ref.profile && owner !== m.data.to) return json({ error: { code: "validation", message: "this record is now held by another profile; read it again", details: { reason: "record_elsewhere" } } }, 409);
+		const r = await callTool(c, "save_memory", { memory_id: m.data.memory_id, profile: m.data.to, request_id: m.data.request_id, ...(m.data.company_free ? { company_free: true } : {}) });
+		if (r.ok) return json(r.value);
+		const code = r.error.code;
+		if (["record_elsewhere", "wrong_profile", "already_there"].includes((r.error.details as { reason?: string } | undefined)?.reason ?? "")) return json({ error: r.error }, 409);
+		// Already in the destination under a request id that never moved it: nothing was written.
+		if ((r.error.details as { reason?: string } | undefined)?.reason === "no_changes") return json({ error: { code: "validation", message: "this record is already in that profile", details: { reason: "already_there" } } }, 409);
+		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" || code === "idempotency_mismatch" ? 409
+			: code === "size_budget" ? 413 : code === "unavailable" ? 503 : 400);
+	}
 	// Owner page reads (section 15), all read-only: a node's entity page by id or key, the map, a path, a timeline, journals and
 	// activity. A link into another profile stays {id, readable: false}: a page reads another profile only when the owner opens it there.
 	const ent = /^\/api\/profiles\/([^/]+)\/nodes\/(by-key\/)?([^/]+)$/.exec(url.pathname);
@@ -847,7 +873,41 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	const w = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/wipe$/.exec(url.pathname);
 	if (w && request.method === "POST") {
 		const b = await body(request);
-		return run({ op: "wipeProfile", profile: w[1]!, typed: typeof b?.typed === "string" ? b.typed : "" });
+		// An optional generation binds the wipe to the profile the caller showed; the dashboard always sends it.
+		if (b && b.generation !== undefined && typeof b.generation !== "string") return json({ error: { code: "validation", message: "generation must be the profile generation shown" } }, 400);
+		return run({ op: "wipeProfile", profile: w[1]!, typed: typeof b?.typed === "string" ? b.typed : "", ...(typeof b?.generation === "string" ? { generation: b.generation } : {}) });
+	}
+	if (w && request.method === "GET") return run({ op: "wipeStatus", profile: w[1]! });
+	// The owner's wipe preview (section 9), read only: the other profiles the wipe reads, then one page of one part of one of
+	// them. The wiped profile's terms stay in the Worker. A cursor binds both profiles' generations and the part, and must match
+	// the plan read now, so a restored or replaced profile restarts the preview instead of mixing two states.
+	const wp = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/wipe\/preview$/.exec(url.pathname);
+	if (wp && request.method === "GET") {
+		const q = z.object({ target: z.string().regex(PROFILE_NAME).optional(), part: z.enum(["purge", "handwritten"]).optional(), after: z.string().min(1).max(2048).optional() })
+			.strict().safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success || !q.data.target !== !q.data.part || (q.data.after && !q.data.target)) return json({ error: { code: "validation", message: "send no parameters, or target with part and the previous page's after" } }, 400);
+		const plan = await account.admin({ op: "wipePlan", profile: wp[1]! });
+		if (!plan.ok) return json({ error: plan.error }, plan.error.code === "not_found" ? 404 : plan.error.code === "busy" ? 409 : 400);
+		const v = plan.value as { generation: string; status: string; targets: ProfileRef[]; terms: string[] };
+		if (v.status !== "active") return json({ error: { code: "validation", message: "the preview is for an active profile", details: { reason: "not_active" } } }, 409);
+		if (!q.data.target) return json({ profile: wp[1], generation: v.generation, targets: v.targets.map((t) => t.profile) });
+		const target = v.targets.find((t) => t.profile === q.data.target);
+		if (!target) return json({ error: { code: "validation", message: "this wipe does not read that profile" } }, 400);
+		const bind = { s: wp[1]!, sg: v.generation, t: target.profile, tg: target.generation, p: q.data.part! };
+		let after = "";
+		if (q.data.after) {
+			let c: Record<string, unknown> | null = null;
+			try { c = JSON.parse(Buffer.from(q.data.after, "base64url").toString("utf8")) as Record<string, unknown>; } catch { c = null; }
+			if (!c || c.s !== bind.s || c.sg !== bind.sg || c.t !== bind.t || c.tg !== bind.tg || c.p !== bind.p || typeof c.a !== "string" || !c.a) {
+				return json({ error: { code: "validation", message: "this preview page no longer matches; start the preview again", details: { reason: "stale_cursor" } } }, 400);
+			}
+			after = c.a;
+		}
+		const r = await profileStub(env, target).read(target, { kind: "wipe_preview", profile: wp[1]!, terms: v.terms, part: bind.p, after });
+		if (!r.ok) return json({ error: r.error }, r.error.code === "not_found" ? 404 : r.error.code === "busy" ? 503 : 400);
+		const page = r.value as { items: unknown[]; after: string | null };
+		return json({ profile: wp[1], generation: v.generation, target: target.profile, target_generation: target.generation, part: bind.p, items: page.items,
+			next: page.after === null ? null : Buffer.from(JSON.stringify({ ...bind, a: page.after }), "utf8").toString("base64url") });
 	}
 	// Backups and restore from an export (section 18). One recovery at a time; it closes the account until open or abort.
 	if (url.pathname === "/api/backups/export" && request.method === "POST") {

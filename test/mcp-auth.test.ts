@@ -293,6 +293,166 @@ describe("owner API", () => {
 		expect((await post(`/api/profiles/personal/nodes/not-a-node/pin`)).status).toBe(404);
 	});
 
+	it("moves a record between disposable profiles once, replays a lost answer, and refuses a stale source, a repeat into its holder, bad input and devices", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const move = (source: string, body: unknown, token = session) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/api/profiles/${source}/move`,
+			{ method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		await contextFor();
+		const now = new Date().toISOString(), tag = Date.now().toString(36).slice(-6), [a, b, third] = [`ma${tag}`, `mb${tag}`, `mc${tag}`];
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(account, (_i, state) => {
+			for (const p of [a, b, third]) {
+				const g = crypto.randomUUID().slice(0, 8);
+				state.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", p, `${env.OWNER_USER_ID}:${p}:${g}`, g, now);
+				state.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, p, now);
+			}
+		});
+		const c = await contextFor();
+		const saved = await call(c, "save_memory", { name: `Movable ${tag}`, type: "reference", description: "disposable", content: "moves once", profile: a });
+		const id = String(saved.memory_id), body = { memory_id: id, to: b, request_id: `dash-move-${tag}` };
+		const transfers = () => runInDurableObject(account, (_i, state) => state.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM transfers WHERE node_id = ?", id).one().n);
+		for (const bad of [{ ...body, content: "x" }, { ...body, to: a }, { memory_id: id, to: b }, { ...body, company_free: "yes" }]) expect((await move(a, bad)).status).toBe(400);
+		const { token } = await deviceToken(`move-device-${tag}`, ["read", "write"], [a, b], a);
+		expect((await move(a, body, token)).status).toBe(403);
+		// A page showing an older version of the source is refused before any intent is recorded.
+		expect(await move(a, { ...body, generation: "stale000" })).toMatchObject({ status: 409, body: { error: { details: { reason: "generation_changed" } } } });
+		expect(await transfers()).toBe(0);
+		const moved = await move(a, body);
+		expect(moved).toMatchObject({ status: 200, body: { action: "transfer_started", memory_id: id, state: "committed", profile: b } });
+		expect(await call(await contextFor(), "get_memory", { memory_id: id })).toMatchObject({ profile: b, content: "moves once" });
+		// The identical request again (its first answer lost) returns the stored result; nothing moves twice.
+		const replay = await move(a, body);
+		expect([replay.status, replay.body.transfer_id, replay.body.state]).toEqual([200, moved.body.transfer_id, "committed"]);
+		expect(await transfers()).toBe(1);
+		// The same request sent through another profile's route does not replay a move from a source that page did not show.
+		expect(await move(third, body)).toMatchObject({ status: 409, body: { error: { code: "idempotency_mismatch", details: { reason: "source_mismatch" } } } });
+		// A stale tab still showing the record in its old profile cannot start a move from where it now is.
+		expect(await move(a, { memory_id: id, to: third, request_id: `dash-move-stale-${tag}` })).toMatchObject({ status: 409, body: { error: { details: { reason: "record_elsewhere" } } } });
+		const revision = (await call(await contextFor(), "get_memory", { memory_id: id })).revision;
+		expect(await move(a, { memory_id: id, to: b, request_id: `dash-move-again-${tag}` })).toMatchObject({ status: 409, body: { error: { details: { reason: "already_there" } } } });
+		expect(await call(await contextFor(), "get_memory", { memory_id: id })).toMatchObject({ profile: b, revision });
+		expect(await transfers()).toBe(1);
+	});
+
+	it("previews a wipe outside the profile read only, and the wipe then plans, keeps and flags exactly what it showed", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const send = (method: string, path: string, body?: unknown, token = session) => exports.default.fetch(new Request(`${origin}${path}`,
+			{ method, headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> & { error?: { details?: { reason?: string } } } }));
+		await contextFor();
+		const now = new Date().toISOString(), tag = Date.now().toString(36).slice(-6), w = `v${tag}`, org = `Acme${tag}`, gen = crypto.randomUUID().slice(0, 8);
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(account, (_i, state) => {
+			state.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", w, `${env.OWNER_USER_ID}:${w}:${gen}`, gen, now);
+			state.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", gen, w, now);
+			state.storage.sql.exec("INSERT INTO routing_rules (id, priority, match, pattern, profile, enabled, seq) VALUES (?, 5, 'remote', ?, ?, 1, 1)", `rule-${tag}`, `github.com/${org}/*`, w);
+		});
+		let c = await contextFor();
+		// Records born in the profile; their copies elsewhere keep it as their origin.
+		const keep = await call(c, "save_memory", { name: `Tabs ${tag}`, type: "user", description: "prefers tabs", content: "tabs over spaces", profile: w });
+		const copy = await call(c, "save_memory", { name: `Copy ${tag}`, type: "reference", description: "copied", content: "plain copy", profile: w });
+		const gone = await call(c, "save_memory", { name: `Archived ${tag}`, type: "reference", description: "archived", content: "archived later", profile: w });
+		await call(c, "save_memory", { memory_id: keep.memory_id, profile: "me", company_free: true });
+		for (const r of [copy, gone]) await call(c, "save_memory", { memory_id: r.memory_id, profile: "personal" });
+		expect((await send("POST", `/api/profiles/personal/nodes/${gone.memory_id}/forget`)).status).toBe(200);
+		const note = await call(c, "save_memory", { name: `Trip ${tag}`, type: "reference", description: "notes", content: `met the ${org} team`, profile: "personal" });
+		c = await contextFor();
+		const listed = await send("GET", `/api/profiles/${w}/wipe/preview`);
+		expect(listed.status).toBe(200);
+		const targets = listed.body.targets as string[];
+		expect(targets).toEqual(expect.arrayContaining(["me", "personal"]));
+		expect(targets).not.toContain(w);
+		// Everything the preview could touch, before and after the walk: write sequence, row counts, wipe-image cursors, alarms.
+		const refs = c.account.profiles.filter((p) => targets.includes(p.profile));
+		const snapshot = async () => [await runInDurableObject(account, async (_i, st) => [st.storage.sql.exec("SELECT value FROM account_meta WHERE key = 'write_seq'").toArray()[0]?.value,
+			...["transfers", "request_index", "profiles", "wipes"].map((t) => st.storage.sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n), await st.storage.getAlarm()]),
+			...await Promise.all(refs.map((r) => runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${r.userId}:${r.profile}:${r.generation}`)), async (_i, st) => [r.profile,
+				st.storage.sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").toArray()[0]?.value ?? null,
+				...["nodes", "texts", "revisions", "archive", "activity", "requests"].map((t) => st.storage.sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
+				st.storage.sql.exec("SELECT count(*) AS n FROM profile_meta WHERE key LIKE 'wipe-image:%'").one().n, await st.storage.getAlarm()])))];
+		const before = await snapshot();
+		const seen: Record<string, { purge: { id: string; verdict: string; where: string }[]; handwritten: { id: string }[] }> = {};
+		for (const t of targets) {
+			seen[t] = { purge: [], handwritten: [] };
+			for (const part of ["purge", "handwritten"] as const) {
+				for (let after: string | null = null, i = 0; i < 50; i++) {
+					const r = await send("GET", `/api/profiles/${w}/wipe/preview?target=${t}&part=${part}${after ? `&after=${encodeURIComponent(after)}` : ""}`);
+					expect(r.status).toBe(200);
+					expect(Object.keys(r.body)).not.toContain("terms");
+					seen[t]![part].push(...(r.body.items as { id: string; verdict: string; where: string }[]));
+					if (!(after = r.body.next as string | null)) break;
+				}
+			}
+		}
+		expect(await snapshot()).toEqual(before);
+		expect(seen.me!.purge).toContainEqual(expect.objectContaining({ id: keep.memory_id, verdict: "survive" }));
+		expect(seen.personal!.purge).toEqual(expect.arrayContaining([expect.objectContaining({ id: copy.memory_id, verdict: "purge", where: "live" }),
+			expect.objectContaining({ id: gone.memory_id, verdict: "purge", where: "archive" })]));
+		expect(seen.personal!.handwritten).toContainEqual(expect.objectContaining({ id: note.memory_id }));
+		// Owner only, strict parameters, and cursors bound to both profiles' generations and the part.
+		const { token } = await deviceToken(`preview-device-${tag}`, ["read", "write"], ["personal"], "personal");
+		expect((await send("GET", `/api/profiles/${w}/wipe/preview`, undefined, token)).status).toBe(403);
+		for (const q of ["?target=personal", "?part=purge", `?target=${w}&part=purge`, "?target=nosuch&part=purge", "?x=1", "?target=personal&part=other"]) expect((await send("GET", `/api/profiles/${w}/wipe/preview${q}`)).status).toBe(400);
+		const forged = Buffer.from(JSON.stringify({ s: w, sg: gen, t: "personal", tg: "older000", p: "purge", a: "x" })).toString("base64url");
+		for (const after of [forged, "!!!"]) expect(await send("GET", `/api/profiles/${w}/wipe/preview?target=personal&part=purge&after=${after}`)).toMatchObject({ status: 400, body: { error: { details: { reason: "stale_cursor" } } } });
+		// The wipe itself: its planned ids, survivors and flagged records equal the preview's.
+		const wiped = await send("POST", `/api/profiles/${w}/wipe`, { typed: w, generation: gen });
+		expect(wiped.status).toBe(200);
+		const report = JSON.parse(String(wiped.body.report)) as { state: string; preserved: string[] };
+		expect(report.state).toBe("done");
+		const marker = String(wiped.body.marker_key);
+		const r2ids = async (prefix: string) => (await Promise.all((await env.BACKUPS.list({ prefix })).objects.map(async (o) => ({ key: o.key, ids: await (await env.BACKUPS.get(o.key))!.json<string[]>() }))));
+		const planned = await r2ids(`${marker}/ids/`), flagged = await r2ids(`${marker}/handwritten/`);
+		for (const r of refs) {
+			expect(planned.filter((o) => o.key.startsWith(`${marker}/ids/${r.profile}-${r.generation}-`)).flatMap((o) => o.ids).sort()).toEqual(seen[r.profile]!.purge.map((x) => x.id).sort());
+			expect(flagged.filter((o) => o.key.startsWith(`${marker}/handwritten/${r.generation}-`)).flatMap((o) => o.ids).sort()).toEqual(seen[r.profile]!.handwritten.map((x) => x.id).sort());
+		}
+		expect(report.preserved.sort()).toEqual(Object.values(seen).flatMap((x) => x.purge.filter((i) => i.verdict === "survive").map((i) => i.id)).sort());
+		expect((await send("GET", `/api/profiles/${w}/wipe/preview`)).body).toMatchObject({ error: { details: { reason: "not_active" } } });
+	});
+
+	it("wipes a disposable profile only for the generation shown and after its typed name, and resumes an unfinished wipe without starting another", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const send = (method: string, path: string, body?: unknown, token = session) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}${path}`,
+			{ method, headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> & { error?: unknown } }));
+		await contextFor();
+		const now = new Date().toISOString(), tag = Date.now().toString(36).slice(-6), name = `w${tag}`, unfinished = `u${tag}`, gen = crypto.randomUUID().slice(0, 8), gen2 = crypto.randomUUID().slice(0, 8);
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, state) => {
+			const sql = state.storage.sql;
+			for (const [p, g, status] of [[name, gen, "active"], [unfinished, gen2, "wiping"]] as const) {
+				sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, ?, ?, 1)", p, `${env.OWNER_USER_ID}:${p}:${g}`, g, status, now);
+				sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, p, now);
+			}
+			// A wipe that began and stopped: the profile is closed and its durable record is still planning.
+			sql.exec("INSERT INTO wipes (profile, generations, wiped_at, node_count, marker_key, report, seq) VALUES (?, ?, ?, 0, ?, ?, 1)", unfinished, JSON.stringify([gen2]), now, `tombstones/${unfinished}-${now}.json`, JSON.stringify({ state: "planning" }));
+		});
+		const status = (p: string) => send("GET", `/api/profiles/${p}/wipe`);
+		expect(await status(name)).toMatchObject({ status: 200, body: { status: "active", generation: gen, wipe: null } });
+		// A stale page's generation is refused before anything changes; so are a wrong name, a malformed field and a device token.
+		expect(await send("POST", `/api/profiles/${name}/wipe`, { typed: name, generation: "stale000" })).toMatchObject({ status: 400, body: { error: { code: "busy", details: { reason: "generation_changed" } } } });
+		expect((await send("POST", `/api/profiles/${name}/wipe`, { typed: "wrong", generation: gen })).status).toBe(400);
+		expect((await send("POST", `/api/profiles/${name}/wipe`, { typed: name, generation: 7 })).status).toBe(400);
+		const { token } = await deviceToken(`wipe-device-${tag}`, ["read", "write"], ["personal"], "personal");
+		expect((await send("POST", `/api/profiles/${name}/wipe`, { typed: name, generation: gen }, token)).status).toBe(403);
+		expect((await status(name)).body).toMatchObject({ status: "active", generation: gen, wipe: null });
+		const wiped = await send("POST", `/api/profiles/${name}/wipe`, { typed: name, generation: gen });
+		expect(wiped.status).toBe(200);
+		expect(JSON.parse(String(wiped.body.report)).state).toBe("done");
+		expect((await status(name)).body).toMatchObject({ status: "wiped", wipe: { state: "done", started_at: wiped.body.wiped_at } });
+		// Sending it again returns the same finished wipe; none starts.
+		expect((await send("POST", `/api/profiles/${name}/wipe`, { typed: name, generation: gen })).body.wiped_at).toBe(wiped.body.wiped_at);
+		// The unfinished wipe continues under its own identity.
+		const resumed = await send("POST", `/api/profiles/${unfinished}/wipe`, { typed: unfinished, generation: gen2 });
+		expect([resumed.status, resumed.body.wiped_at, JSON.parse(String(resumed.body.report)).state]).toEqual([200, now, "done"]);
+		expect((await status(unfinished)).body).toMatchObject({ status: "wiped", wipe: { started_at: now, state: "done" } });
+	});
+
 	it("reviews captured suggestions through the dashboard's owner route: lists, refuses another profile, promotes once with replay, dismisses with a reason", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });

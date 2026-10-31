@@ -13,7 +13,7 @@ import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
 import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
-import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds } from "./pages";
+import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
 import { archiveCursor, archiveOperation, archiveStatus, deferArchive, nextArchiveAlarm, nextArchiveOperation, runArchive, stagedArchiveActivity, stagedUndo, type ArchiveCommand } from "./archive-operations";
@@ -528,7 +528,7 @@ export class ProfileStore extends DurableObject<Env> {
 	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
 		try {
 			await this.access(who);
-			this.bind(who, ["import_audit", "batch_status", "owner_model", "board", "entity", "journals", "journal", "map", "graph", "page_timeline", "activity", "shown", "archive", "markers"].includes(q.kind));
+			this.bind(who, ["import_audit", "batch_status", "owner_model", "board", "entity", "journals", "journal", "map", "graph", "page_timeline", "activity", "shown", "archive", "markers", "wipe_preview"].includes(q.kind));
 			const sql = this.ctx.storage.sql;
 			switch (q.kind) {
 				case "get":
@@ -556,6 +556,8 @@ export class ProfileStore extends DurableObject<Env> {
 					return ok(batchStatus(sql));
 				case "owner_model":
 					return ok(ownerModel(sql, q));
+				case "wipe_preview":
+					return ok(wipePreview(sql, who, q));
 				case "entity":
 					return ok(entity(sql, q));
 				case "journals":

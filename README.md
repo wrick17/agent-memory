@@ -10,9 +10,11 @@ The [dashboard](https://memory.wrick17.com/) opens the Work graph with 1,379 rec
 
 In [Review](https://memory.wrick17.com/#/review/work), the owner can review captured suggestions and promote or dismiss them. Migration review queues remain open.
 
+Move and wipe preview, and copying selected current text to another profile, have reviewed source and local checks. Browser acceptance remains open. Copy creates a new memory without history or links and excludes unsupported, inactive, archived, unreadable or oversized items. [Evidence](docs/combined-verification-2026-10-30.md#move-wipe-preview-and-copy-source-verification-2026-10-31).
+
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-Automatic capture source is adopted, but capture is off and not installed; runtime acceptance remains blocked. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
+Automatic capture source is adopted, but capture is off and not installed; runtime acceptance remains blocked. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
 
 ## Completed development milestones
 

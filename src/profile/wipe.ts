@@ -36,7 +36,7 @@ const PAGE = 100;
 const marker = (w: OriginWipe) => `wipe:${w.profile}:${w.at}`;
 
 /** Ids to purge here: every node, archived node and tombstone whose first origin is the wiped profile (all of them in the profile itself). */
-function originPage(sql: SqlStorage, who: Who, profile: string, after: string): Page {
+export function originPage(sql: SqlStorage, who: Who, profile: string, after: string): Page {
 	const all = who.profile === profile ? 1 : 0;
 	const ids = sql.exec<{ id: string }>(`SELECT id FROM (
 		SELECT id FROM nodes WHERE source_profile = ? OR (? AND source_profile IS NULL)
@@ -50,7 +50,7 @@ function originPage(sql: SqlStorage, who: Who, profile: string, after: string): 
  * The one exception (section 9, step 5): a preference in me that landed with a company_free attestation survives, and only
  * while it still passes the me guard against the wiped profile's terms.
  */
-function survives(sql: SqlStorage, who: Who, id: string, terms: string[]): boolean {
+export function survives(sql: SqlStorage, who: Who, id: string, terms: string[]): boolean {
 	if (who.profile !== "me") return false;
 	const n = sql.exec<Row>("SELECT * FROM nodes WHERE id = ? AND kind = 'preference' AND status IN ('active','retired','superseded','moving') AND json_extract(attrs, '$.company_free') = 1", id).toArray()[0];
 	if (!n) return false;
@@ -199,7 +199,7 @@ function requestPage(sql: SqlStorage, who: Who, w: OriginWipe, after: string): P
 }
 
 /** Surviving records whose text names a term of the wiped profile: listed for the owner, never changed (section 9, step 6). */
-function handwrittenPage(sql: SqlStorage, origin: string, terms: string[], after: string): Page {
+export function handwrittenPage(sql: SqlStorage, origin: string, terms: string[], after: string): Page {
 	const rows = sql.exec<Row>(`SELECT * FROM nodes WHERE id > ? AND status <> 'moved' AND (source_profile IS NULL OR source_profile <> ?) ORDER BY id LIMIT 40`, after, origin).toArray();
 	// meGuard's word-boundary match; a contact field alone is not a work reference.
 	const ids = rows.filter((n) => {

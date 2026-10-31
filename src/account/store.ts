@@ -12,7 +12,7 @@ import { mayUse, refreshSelectors, type RefreshSelector } from "../routing";
 import { BudgetTx, ROW_PAUSE, type ProfileStore, type RestoredPage } from "../profile/store";
 import { PROFILE_MIGRATIONS } from "../profile/schema";
 import { applyRows, dropExportId, dropExports, exportStore, exportTables, hasExports, listExports, readChunk, readManifest, type Manifest } from "../backup";
-import { wipePorts, wipeProfile } from "../wipe";
+import { wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wipe";
 
 export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
@@ -37,7 +37,10 @@ export type AccountCommand =
 	/** With profile and generation (corpus chunks), terms land only while that generation is active and the account is not recovering. */
 	| { op: "addSensitiveTerms"; terms: string[]; profile?: string; generation?: string }
 	| { op: "listProfiles" }
-	| { op: "wipeProfile"; profile: string; typed: string }
+	| { op: "wipeProfile"; profile: string; typed: string; generation?: string }
+	| { op: "wipeStatus"; profile: string }
+	/** Internal to the owner preview route: the targets and terms come back to the Worker, which never returns the terms. */
+	| { op: "wipePlan"; profile: string }
 	// Backups and restore from an export (section 18): owner only, one recovery at a time.
 	| { op: "export"; profile?: string }
 	| { op: "listExports"; profile?: string }
@@ -976,10 +979,33 @@ export class AccountStore extends DurableObject<Env> {
 				const userId = this.meta("user_id");
 				if (!userId) return fail("unavailable", "the account is not set up");
 				if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+				// The caller's generation, when sent, binds the wipe to the profile it showed; checked before any await or change.
+				if (cmd.generation !== undefined && this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ?", cmd.profile).toArray()[0]?.generation !== cmd.generation) {
+					return fail("busy", "the profile changed since it was shown; read its status", { reason: "generation_changed" });
+				}
 				return wipeProfile(this.env, { ...wipePorts(this.env, this.ctx.storage), backups: (p) => this.replaceExports(p) }, { userId, kind: "owner", scopes: ["read", "write"], profiles: "*" }, cmd.profile, cmd.typed);
 			}
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
+			case "wipePlan": {
+				// Read only, through the wipe engine's own target and term rules; its own profile is left out, as the preview is of the rest.
+				const userId = this.meta("user_id");
+				if (!userId) return fail("unavailable", "the account is not set up");
+				if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
+				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
+				return ok({ profile: cmd.profile, generation: p.generation, status: p.status, targets: wipeRefs(this.sql, cmd.profile, userId).filter((r) => r.profile !== cmd.profile),
+					terms: wipeTerms(this.sql, cmd.profile) });
+			}
+			case "wipeStatus": {
+				// Read only: the profile's state and its latest wipe record, if any, as the wipe engine stored them.
+				const p = this.sql.exec<{ name: string; generation: string; status: string }>("SELECT name, generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
+				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
+				const w = this.sql.exec<{ wiped_at: string; generations: string; report: string }>("SELECT wiped_at, generations, report FROM wipes WHERE profile = ? ORDER BY wiped_at DESC LIMIT 1", cmd.profile).toArray()[0];
+				const report = w ? JSON.parse(w.report) as Record<string, unknown> : null;
+				return ok({ profile: p.name, generation: p.generation, status: p.status, wipe: w ? { started_at: w.wiped_at, generations: (JSON.parse(w.generations) as string[]).length,
+					state: report?.state ?? null, purged: report?.purged ?? null, redacted: report?.redacted ?? null } : null });
+			}
 			case "listDevices":
 				return ok(this.sql.exec<DeviceRow>("SELECT * FROM devices ORDER BY created_at").toArray().map(({ token_hash, ...d }) => ({
 					...d, kind: token_hash ? "token" : "oauth", scopes: JSON.parse(d.scopes), profiles: JSON.parse(d.profiles), enabled: d.enabled === 1,

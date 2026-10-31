@@ -20,6 +20,19 @@ const record = (sql: SqlStorage, profile: string) => {
 	return r ? { ...r, generations: JSON.parse(r.generations) as string[] } : undefined;
 };
 
+/** Every generation of the wiped profile is cleared; every other profile is purged in its active generation. Shared by begin and the owner preview. */
+export function wipeRefs(sql: SqlStorage, profile: string, userId: string): ProfileRef[] {
+	return sql.exec<{ profile: string; generation: string }>(`SELECT profile, id AS generation FROM generations
+		WHERE (profile = ? AND state <> 'wiped') OR (profile <> ? AND state = 'active' AND profile IN (SELECT name FROM profiles WHERE status = 'active'))
+		ORDER BY profile, id`, profile, profile).toArray().map((g) => ({ ...g, userId }));
+}
+/** The wiped profile's terms, taken before its rules go: registered terms plus the org names of its remote rules. Shared by begin and the owner preview. */
+export function wipeTerms(sql: SqlStorage, profile: string): string[] {
+	const org = sql.exec<{ pattern: string }>("SELECT pattern FROM routing_rules WHERE profile = ? AND match = 'remote'", profile).toArray()
+		.map((r) => r.pattern.split("/")[1] ?? "").filter((o) => o && !o.includes("*"));
+	return [...new Set([...org, ...sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((t) => t.term)])];
+}
+
 /** Wired as internal AccountStore.wipe; begin is the sole user entry and verifies owner plus exact typed name. */
 export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountCommand): Outcome<WipeAccountResult> {
 	try {
@@ -45,15 +58,7 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 						tx.run("INSERT INTO wipes (profile, generations, wiped_at, node_count, marker_key, report, seq) VALUES (?, ?, ?, 0, ?, ?, ?)", cmd.profile, JSON.stringify(generations), tx.now, r.marker_key, r.report, tx.seq);
 					} else if (p.status !== "wiping" && p.status !== "wiped") throw Fail.of("validation", "profile is not available for a wipe");
 					if (!r) throw Fail.of("validation", "closed profile has no durable wipe intent");
-					// Every generation of the wiped profile is cleared; every other profile is purged in its active generation.
-					const refs = sql.exec<{ profile: string; generation: string }>(`SELECT profile, id AS generation FROM generations
-						WHERE (profile = ? AND state <> 'wiped') OR (profile <> ? AND state = 'active' AND profile IN (SELECT name FROM profiles WHERE status = 'active'))
-						ORDER BY profile, id`, cmd.profile, cmd.profile).toArray().map((g) => ({ ...g, userId }));
-					// The wiped profile's terms, taken before its rules go: registered terms plus the org names of its remote rules.
-					const org = sql.exec<{ pattern: string }>("SELECT pattern FROM routing_rules WHERE profile = ? AND match = 'remote'", cmd.profile).toArray()
-						.map((r) => r.pattern.split("/")[1] ?? "").filter((o) => o && !o.includes("*"));
-					const terms = [...new Set([...org, ...sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((t) => t.term)])];
-					return { record: r, refs, terms };
+					return { record: r, refs: wipeRefs(sql, cmd.profile, userId), terms: wipeTerms(sql, cmd.profile) };
 				}
 				case "grants": {
 					const rows = sql.exec<{ id: string; profiles: string; default_profile: string | null }>("SELECT id, profiles, default_profile FROM devices WHERE id > ? ORDER BY id LIMIT 30", cmd.after).toArray();

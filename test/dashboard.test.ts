@@ -376,7 +376,7 @@ describe("dashboard About you", () => {
 		b.go("#/profiles/work");
 		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
 		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
-		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The transfers and wipe pages/);
+		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>Recovery covers restore from an export only/);
 		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
 	});
 
@@ -1000,5 +1000,194 @@ describe("dashboard review", () => {
 		expect(sent[0]).toMatchObject({ action: "promote", candidate_id: "c1", into: { name: "Careful", type: "project" } });
 		expect(status(b).textContent).toContain("Promoted into memory “Careful”.");
 		expect(button(b.view(), "Undo last change")).toBeDefined();
+	});
+});
+
+describe("dashboard wipe", () => {
+	it("asks for the profile, states the consequences first, sends only the typed name and shown version, and offers only a manual Continue after a lost answer", async () => {
+		const states = [{ status: "active", generation: "bbbb", wipe: null },
+			{ status: "wiped", generation: "bbbb", wipe: { started_at: "2026-10-31T10:00:00Z", generations: 1, state: "backups", purged: 12, redacted: 3 } },
+			{ status: "wiped", generation: "bbbb", wipe: { started_at: "2026-10-31T10:00:00Z", generations: 1, state: "done", purged: 12, redacted: 3 } }];
+		let reads = 0, posts = 0;
+		const b = browser({ signedIn: true, hash: "#/wipe", api: (path, method) => {
+			if (path === "/api/profiles/work/wipe/preview") return Response.json({ profile: "work", generation: "bbbb", targets: [] });
+			if (path !== "/api/profiles/work/wipe") return;
+			if (method === "GET") return Response.json(states[Math.min(reads++, 2)]);
+			if (++posts === 1) throw new Error("connection lost");
+			return Response.json({ profile: "work", generations: ["bbbb"], wiped_at: "2026-10-31T10:00:00Z", marker_key: "m", report: JSON.stringify({ state: "done" }) });
+		} });
+		await dashboardMain(b.win);
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Wipe a profile");
+		expect(b.seen.fetched.some((x) => x.includes("/wipe"))).toBe(false); // nothing is read or chosen until the owner picks a profile
+		expect(find(b.view(), "a").map((a) => a.attrs.href)).toEqual(expect.arrayContaining(["#/wipe/personal", "#/wipe/work"]));
+		b.go("#/wipe/work");
+		await settle();
+		expect(text(b.view())).toContain("no backup can bring work back");
+		expect(text(b.view())).toContain("It cannot be undone.");
+		expect(text(b.view())).toContain("except accepted company-free preferences in me");
+		expect(text(b.view())).toContain("hand-written references remain and need manual review");
+		const go = () => button(b.view(), "Wipe work") ?? button(b.view(), "Continue wiping work");
+		expect(go().disabled).toBe(true);
+		typeIn(byId(b.view(), "wipe-typed"), "Work");
+		expect(go().disabled).toBe(true);
+		typeIn(byId(b.view(), "wipe-typed"), "work");
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(b.seen.bodies).toEqual([{ typed: "work", generation: "bbbb" }]);
+		expect(status(b).textContent).toContain("Could not wipe work: connection lost.");
+		// The state is read again; the unfinished wipe offers Continue, and nothing was sent again by itself.
+		expect(text(b.view())).toContain("Continue runs the same wipe from where it stopped; it never starts a second one.");
+		expect(button(b.view(), "Continue wiping work").disabled).toBe(true);
+		expect(posts).toBe(1);
+		typeIn(byId(b.view(), "wipe-typed"), "work");
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(b.seen.bodies).toEqual([{ typed: "work", generation: "bbbb" }, { typed: "work", generation: "bbbb" }]);
+		expect(status(b).textContent).toContain("work is wiped.");
+		expect(text(b.view())).toContain("This profile is wiped. Nothing more can be done here.");
+		expect(text(b.view())).toContain("Records removed 12");
+		expect(find(b.view(), "button").some((x) => x.textContent === "Undo last change")).toBe(false);
+		// Only the active profile was previewed; the unfinished wipe continued without a new preview.
+		expect(b.seen.fetched.filter((x) => x.includes("/wipe/preview"))).toEqual(["/api/profiles/work/wipe/preview"]);
+	});
+
+	it("keeps the confirmation off until every preview page is read, resumes a failed page only when asked, and shows undecided survivors as such", async () => {
+		let failed = false;
+		const item = (id: string, verdict: string, extra: Record<string, unknown> = {}) => ({ id, kind: "preference", other_label: null, name: `Pref ${id}`, status: "active", where: "live", verdict, ...extra });
+		const b = browser({ signedIn: true, hash: "#/wipe/work", api: (path) => {
+			if (path === "/api/profiles/work/wipe") return Response.json({ status: "active", generation: "bbbb", wipe: null });
+			if (path === "/api/profiles/work/wipe/preview") return Response.json({ profile: "work", generation: "bbbb", targets: ["me", "personal"] });
+			const q = new URL(path, "https://x").searchParams;
+			if (!path.startsWith("/api/profiles/work/wipe/preview?")) return;
+			const key = `${q.get("target")}:${q.get("part")}:${q.get("after") ?? ""}`;
+			if (key === "me:purge:") return Response.json({ items: [item("s1", "survive"), item("d1", "decided_at_wipe")], next: "c1" });
+			if (key === "me:purge:c1") return Response.json({ items: [item("p1", "purge", { name: HOSTILE })], next: null });
+			if (key === "me:handwritten:") return Response.json({ items: [], next: null });
+			if (key === "personal:purge:") { if (!failed) { failed = true; return Response.json({ error: { code: "busy", message: "profile busy" } }, { status: 503 }); } return Response.json({ items: [item("a1", "purge", { kind: "document", where: "archive", status: "active" })], next: null }); }
+			if (key === "personal:handwritten:") return Response.json({ items: [item("h1", "kept_listed", { kind: "document", name: "Trip notes" })], next: null });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(text(b.view())).toContain("The preview stopped: profile busy (busy).");
+		typeIn(byId(b.view(), "wipe-typed"), "work");
+		expect(button(b.view(), "Wipe work").disabled).toBe(true);
+		expect(text(b.view())).toContain("The confirmation opens once the preview above is complete.");
+		const before = b.seen.fetched.filter((x) => x.includes("personal")).length;
+		await settle();
+		expect(b.seen.fetched.filter((x) => x.includes("personal")).length).toBe(before); // nothing is read again by itself
+		click(button(b.view(), "Read the preview again"));
+		for (let i = 0; i < 20 && !text(b.view()).includes("Preview complete"); i++) await settle();
+		expect(text(b.view())).toContain("Preview complete: 2 records will be removed from other profiles, 1 survive in me, 1 are decided when the wipe runs, and 1 that mention this profile's terms stay for your review.");
+		expect(text(b.view())).toContain("Decided when the wipe runs, in me");
+		expect(text(b.view())).toContain(`preference: ${HOSTILE}`);
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("document: Pref a1 · archived");
+		expect(b.seen.fetched).toContain("/api/profiles/work/wipe/preview?target=me&part=purge&after=c1");
+		typeIn(byId(b.view(), "wipe-typed"), "work");
+		expect(button(b.view(), "Wipe work").disabled).toBe(false);
+		expect(b.seen.posted).toEqual([]);
+	});
+});
+
+describe("dashboard save a copy", () => {
+	it("re-saves a record due for removal as a new record in an explicitly chosen profile, from its complete text, then returns to a fresh preview", async () => {
+		const PROFILES4 = [...PROFILES, { name: "keep", generation: "kkkk", status: "active", created_at: "2026-10-28T12:00:00Z" }];
+		let previews = 0, saves = 0;
+		const b = browser({ signedIn: true, hash: "#/wipe/work", profiles: PROFILES4, api: (path, method) => {
+			if (path === "/api/profiles/work/wipe") return Response.json({ status: "active", generation: "bbbb", wipe: null });
+			if (path === "/api/profiles/work/wipe/preview") { previews++; return Response.json({ profile: "work", generation: "bbbb", targets: ["personal"] }); }
+			if (path === "/api/profiles/work/wipe/preview?target=personal&part=purge") return Response.json({ items: [{ id: "m7", kind: "document", other_label: null, name: "Keep me", status: "active", where: "live", verdict: "purge" }], next: null });
+			if (path === "/api/profiles/work/wipe/preview?target=personal&part=handwritten") return Response.json({ items: [], next: null });
+			if (path === "/api/profiles/personal/nodes/m7") return Response.json({ node: { id: "m7", name: "Keep me", kind: "document", memory_type: "reference", status: "active", scope: "trips", description: "why it matters", truncated: [] }, content: { text: "part one ", chars: 17, complete: false } });
+			if (path === "/api/profiles/personal/nodes/m7?content=all") return Response.json({ id: "m7", content: { content: "part one ", complete: false, cursor: "k1" } });
+			if (path === "/api/profiles/personal/nodes/m7?content=all&cursor=k1") return Response.json({ id: "m7", content: { content: "part two", complete: true, cursor: null } });
+			if (path === "/api/profiles/keep/save" && method === "POST") { if (++saves === 1) throw new Error("connection lost"); return Response.json({ ok: true, action: "created", memory_id: "n1", name: "Keep me", revision: 1 }); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 20 && !text(b.view()).includes("Preview complete"); i++) await settle();
+		click(button(b.view(), "Save a copy"));
+		expect(b.win.location.hash).toBe("#/copy/personal/m7");
+		b.go("#/copy/personal/m7");
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Save a copy of “Keep me”");
+		expect(byId(b.view(), "copy-to").value).toBe("");
+		expect(find(byId(b.view(), "copy-to"), "option").map((o) => o.attrs.value)).toEqual(["", "work", "keep"]); // never the record's own profile
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(status(b).textContent).toContain("Choose the profile to copy it into.");
+		byId(b.view(), "copy-to").value = "keep";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(b.win.location.hash).toBe("#/draft/keep");
+		b.go("#/draft/keep");
+		expect(text(b.view())).toContain("the original keeps its history, requests and links");
+		expect(byId(b.view(), "draft-content").value).toBe("part one part two"); // both pages of the text, nothing cut
+		expect(byId(b.view(), "draft-type").disabled).toBe(true);
+		expect(b.seen.posted).toEqual([]); // nothing is saved by opening a copy
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(text(b.view()).replace(/\s+/g, " ")).toContain("Change A new record, copied from “Keep me” in personal");
+		click(button(b.view(), "Save"));
+		await settle();
+		expect(status(b).textContent).toContain("Could not save “Keep me”: connection lost.");
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		click(button(b.view(), "Save"));
+		await settle();
+		const [first, second] = b.seen.bodies as Record<string, unknown>[];
+		expect(second).toEqual(first);
+		const { request_id: rid, ...fields } = first!;
+		expect(fields).toEqual({ name: "Keep me", type: "reference", kind: "document", description: "why it matters", scope: "trips", content: "part one part two" });
+		expect(String(rid)).toMatch(/^dashboard:/);
+		expect(b.win.location.hash).toBe("#/wipe/work");
+		b.go("#/wipe/work");
+		for (let i = 0; i < 20 && !text(b.view()).includes("Preview complete"); i++) await settle();
+		expect(previews).toBe(2); // the preview is read afresh
+		expect(status(b).textContent).toContain("Saved: created “Keep me”");
+		expect(button(b.view(), "Wipe work").disabled).toBe(true); // nothing typed or confirmed by itself
+		expect(b.seen.posted).toEqual(["/api/profiles/keep/save", "/api/profiles/keep/save"]);
+	});
+});
+
+describe("dashboard moves", () => {
+	it("moves only to a chosen profile after a preview, and keeps the same request reachable after a lost answer once the record has left", async () => {
+		let reads = 0, posts = 0;
+		const b = browser({ signedIn: true, hash: "#/move/work/m1", api: (path, method) => {
+			if (path === "/api/profiles/work/nodes/m1") return reads++ === 0 ? Response.json({ node: { id: "m1", name: HOSTILE, kind: "document", status: "active" } })
+				: Response.json({ error: { code: "not_found", message: "no node matches 'm1' in this profile" } }, { status: 404 });
+			if (path !== "/api/profiles/work/move" || method !== "POST") return;
+			if (++posts === 1) return Response.json({ error: { code: "unavailable", message: "temporarily unavailable after binding" } }, { status: 503 });
+			return Response.json({ ok: true, action: "transfer_started", memory_id: "m1", transfer_id: "t1", state: "committed", profile: "personal", routed_by: "explicit" });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe(`Move “${HOSTILE}”`);
+		expect(text(b.view())).toContain("Now in work");
+		expect(text(b.view())).toContain("work keeps a tombstone in its place");
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(byId(b.view(), "move-to").value).toBe(""); // no destination until the owner chooses one
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(status(b).textContent).toContain("Choose the profile to move it to.");
+		expect(button(b.view(), "Move").disabled).toBe(true);
+		const to = byId(b.view(), "move-to");
+		to.value = "personal";
+		to.on.change!();
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(text(b.view())).toContain("Preview: move");
+		click(button(b.view(), "Move"));
+		await settle();
+		expect(posts).toBe(1);
+		expect(text(b.view())).toContain("Result unconfirmed: the move may or may not have happened.");
+		// The record is no longer readable here, yet the same move stays one click away, and nothing was resent by itself.
+		const again = button(b.view(), "Send the same move again");
+		expect(again).toBeDefined();
+		click(again);
+		await settle();
+		expect(posts).toBe(2);
+		const [first, second] = b.seen.bodies as Record<string, unknown>[];
+		expect(second).toEqual(first);
+		expect(first).toMatchObject({ memory_id: "m1", to: "personal" });
+		expect(String(first!.request_id)).toMatch(/^dashboard:/);
+		expect(text(b.view())).toContain("Moved to personal.");
+		expect(find(b.view(), "a").find((x) => x.textContent === "Open it in personal")!.attrs.href).toBe("#/memory/personal/m1");
+		b.go("#/move");
+		expect(text(b.view())).toContain("Moved to personal.");
 	});
 });

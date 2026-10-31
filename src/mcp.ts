@@ -17,8 +17,12 @@ import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
 import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT } from "./corpus-tools";
 import { driveTransfer, transferPorts } from "./transfer";
 
-/** `actor` is set only by trusted server code (the owner-authenticated dashboard route), never from request input; MCP calls write as agent. */
-export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner"> }
+/**
+ * `actor` and `moveFrom` are set only by trusted server code (the owner-authenticated dashboard routes), never from request input;
+ * MCP calls write as agent and move from wherever the record is. `moveFrom` is the source profile and generation a dashboard move
+ * showed: the durable transfer intent binds them, so the account refuses the move if the record left that source meanwhile.
+ */
+export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner">; moveFrom?: { profile: string; generation: string } }
 
 const RRF_K = 60;
 
@@ -201,8 +205,9 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 					return fail("validation", `a move to another profile takes no other changes (${changes.join(", ")}); save them before or after the move`, { reason: "move_with_changes", fields: changes });
 				}
 			}
-			transfer = { nodeId: targetId, from: owner, to: explicit, companyFree: companyFree === true, context: contextProfile(c.caller, c.account.rules, repo),
-				expect: { from: c.account.profiles.find((p) => p.profile === owner)?.generation ?? "", to: c.account.profiles.find((p) => p.profile === explicit)?.generation ?? "" } };
+			if (c.moveFrom && owner !== c.moveFrom.profile) return fail("validation", `record '${targetId}' is held by another profile`, { reason: "record_elsewhere" });
+			transfer = { nodeId: targetId, from: c.moveFrom?.profile ?? owner, to: explicit, companyFree: companyFree === true, context: contextProfile(c.caller, c.account.rules, repo),
+				expect: { from: c.moveFrom?.generation ?? c.account.profiles.find((p) => p.profile === owner)?.generation ?? "", to: c.account.profiles.find((p) => p.profile === explicit)?.generation ?? "" } };
 			route = ok({ profile: explicit, routedBy: "explicit", context: transfer.context });
 		}
 		else if (!mayUse(c.caller, owner)) route = fail("forbidden", `this caller may not use profile '${owner}'`);
@@ -214,6 +219,12 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	if (args.request_id) {
 		const bound = priorBinding ?? await account.bindRequest({ requestId: args.request_id, profile: route.ok ? route.value.profile : null, op, payloadHash, ...(legacyHash ? { legacyHash } : {}), ...(transfer ? { transfer } : {}) });
 		if (!bound.ok) return bound;
+		// A dashboard move replays only its own transfer from the source it showed; it never turns into a generic save.
+		if (c.moveFrom && bound.value.profile && bound.value.transfer?.input.from !== c.moveFrom.profile) {
+			if (!bound.value.existing) await account.releaseRequest(args.request_id, payloadHash);
+			return bound.value.transfer ? fail("idempotency_mismatch", "this request moved the record from another profile", { reason: "source_mismatch" })
+				: fail("validation", "this record is already in that profile", { reason: "already_there" });
+		}
 		if (!bound.value.profile) return route;
 		if (bound.value.transfer) {
 			const held = bound.value.transfer;
