@@ -8,9 +8,11 @@ Agent Memory has imported and refreshed 1,374 approved Work records: 1,014 from 
 
 The [dashboard](https://memory.wrick17.com/) opens the Work graph with 1,379 records and 174 links. Dark canvas text contrast and fresh owner Google sign-in passed selected live checks. [Verification](docs/combined-verification-2026-10-30.md#live-whole-graph-2026-10-31).
 
+In [Review](https://memory.wrick17.com/#/review/work), the owner can review captured suggestions and promote or dismiss them. Migration review queues remain open.
+
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-Automatic capture is off and not installed; a private capture patch remains under review. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
+Automatic capture source is adopted, but capture is off and not installed; runtime acceptance remains blocked. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
 
 ## Completed development milestones
 
@@ -31,7 +33,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 - [x] Explore a simple connection between two items (owner trial).
 - [ ] Find memories as they were at a chosen point in time.
 - [ ] Manage a memory's full lifecycle, including renaming, moving, retiring, and restoring it.
-- [ ] Review captured suggestions and turn them into memories.
+- [x] Review captured suggestions and turn them into memories (canonical owner flow).
 
 ### Bring existing memory
 

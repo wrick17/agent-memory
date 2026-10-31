@@ -1097,6 +1097,8 @@ The owner may wipe a profile, mainly `work` on leaving the company. The wipe is 
 
 ## 10. Capture and the local run
 
+Source-only checkpoint, 2026-10-31: caller v3 adopts a resumable `SessionStart` sweep of at most 64 known-state files per start, without an age cutoff for retained transcripts, and a separate claimable `.start` intent. Equal-size epoch skips require the existing checked prefix to match. States without retained source hints need their own trigger. Name-listing growth, the at-most-4-KB prefix limit and install-source details are in the [caller contract](module-contracts.md#capture-caller-v3-source-adoption-2026-10-31). The separate seven-day pending-source rule is unchanged. Capture remains OFF, UNINSTALLED and RUNTIME-UNACCEPTED.
+
 ### Triggers (verified in `research/04-hook-test.md`, 2026-10-28)
 
 | Client | Event | Role | What the test showed |

@@ -371,6 +371,7 @@ const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Numb
 	actor: z.enum(["agent", "owner", "keep", "index", "maintenance", "migration", "transfer"]).optional() }).strict();
 const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
 const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor"];
+const DASHBOARD_REVIEW = ["action", "status", "limit", "candidate_id", "into", "reason", "request_id"];
 const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free"];
 const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
 const decoded = (s: string) => { try { return decodeURIComponent(s); } catch { return null; } };
@@ -762,20 +763,22 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	// The dashboard's memory list, search and draft save (section 15): the MCP tools' own dispatch (routing, redaction, request
 	// binding, the me guard), pinned to one active profile. Save takes only the fields the draft form sends, so it never moves,
 	// retires or compacts a record; an edit names a record this profile shows, so a record held elsewhere is refused, not moved.
-	const tool = /^\/api\/profiles\/([^/]+)\/(recall|save)$/.exec(url.pathname);
+	// Review lists, promotes or dismisses this profile's captured candidates; the profile is always named, so the tool refuses a
+	// candidate held in another profile before anything is bound or written, and captures never reach me.
+	const tool = /^\/api\/profiles\/([^/]+)\/(recall|save|review)$/.exec(url.pathname);
 	if (tool && request.method === "POST") {
 		const ref = PROFILE_NAME.test(tool[1]!) ? ctx.value.profiles.find((p) => p.profile === tool[1]) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${tool[1]}' is not active` } }, 404);
 		const b = await body(request);
-		const allowed = tool[2] === "recall" ? DASHBOARD_RECALL : DASHBOARD_SAVE;
+		const allowed = tool[2] === "recall" ? DASHBOARD_RECALL : tool[2] === "review" ? DASHBOARD_REVIEW : DASHBOARD_SAVE;
 		if (!b || Object.keys(b).some((k) => !allowed.includes(k))) return json({ error: { code: "validation", message: `send JSON with only ${allowed.join(", ")}` } }, 400);
-		if (typeof b.memory_id === "string") {
+		if (tool[2] === "save" && typeof b.memory_id === "string") {
 			const held = await profileStub(env, ref).read(ref, { kind: "shown", ids: [b.memory_id] });
 			if (!held.ok) return json({ error: held.error }, held.error.code === "busy" ? 503 : 400);
 			if (!(held.value as string[]).length) return json({ error: { code: "not_found", message: "no record with this id in this profile" } }, 404);
 		}
-		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" }, tool[2] === "recall" ? "recall_memories" : "save_memory",
-			{ ...b, ...(typeof b.memory_id === "string" ? {} : { profile: ref.profile }) });
+		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
+			{ ...b, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) });
 		if (r.ok) return json(r.value);
 		const code = r.error.code;
 		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" ? 409

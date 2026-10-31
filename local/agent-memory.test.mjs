@@ -505,6 +505,125 @@ describe("review regressions", () => {
 	});
 });
 
+describe("recovery and install", () => {
+	const enqueue = (session, f, event) => am.hook("claude-code", JSON.stringify({ session_id: session, transcript_path: f, cwd: tmp, hook_event_name: event }), { spawnRun: false });
+
+	it("another session's start recovers a seen session's tail that no Stop queued, once and in exact tiling parts", async () => {
+		const a = transcript("sweep-a", [claudeLine("user", "Never squash release commits.")]);
+		const server = fakeServer(), runner = keepAllRunner();
+		enqueue("sess-a", a, "Stop");
+		await am.run({ server, runner, debounceMs: 0 });
+		const first = fs.statSync(a).size;
+		fs.appendFileSync(a, claudeLine("user", "Use the other timeout."));
+		const b = transcript("sweep-b", [claudeLine("user", "Keep the staging bucket.")]);
+		// A Stop of the starting session before the run still keeps its start.
+		enqueue("sess-b", b, "SessionStart");
+		enqueue("sess-b", b, "Stop");
+		const r = await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(r.results["claude-code-sess-a.json"].consolidated_to, fs.statSync(a).size);
+		assert.ok(server.storedText().includes("Use the other timeout."));
+		assert.deepEqual([...server.manifests.keys()].filter((k) => k.includes(":sess-a:")).map((k) => k.split(":").at(-1)).sort(), [`0-${first}`, `${first}-${fs.statSync(a).size}`]);
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "queue")), []);
+		// Nothing is behind now: another start uploads nothing for either session.
+		const uploads = server.log.length;
+		enqueue("sess-c", transcript("sweep-c", []), "SessionStart");
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(server.log.length, uploads);
+		const keys = server.log.flatMap((x) => x.digests.map((d) => `${d.range_id}|${d.part_id}`).concat(x.manifests.map((m) => `${m.range_id}|manifest`)));
+		assert.equal(new Set(keys).size, keys.length, "no part or manifest was uploaded twice");
+	});
+
+	it("reaches a known session idle for 9 days behind a full sweep of newer states, on the next start", async () => {
+		const old = transcript("sweep-old", [claudeLine("user", "Never squash release commits.")]);
+		const server = fakeServer(), runner = keepAllRunner();
+		enqueue("zzz-old", old, "Stop");
+		await am.run({ server, runner, debounceMs: 0 });
+		fs.appendFileSync(old, claudeLine("user", "Use the old timeout."));
+		const nine = new Date(Date.now() - 9 * 86_400_000);
+		for (const f of [old, path.join(am.home(), "state", "claude-code", "zzz-old.json")]) fs.utimesSync(f, nine, nine);
+		// Newer seen states that sort first fill one whole sweep.
+		for (let i = 0; i < am.LIMITS.sweep; i++) am.writePrivate(path.join(am.home(), "state", "claude-code", `aaa-${i}.json`), "{}");
+		enqueue("sess-new", transcript("sweep-new", []), "SessionStart");
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.ok(!server.storedText().includes("Use the old timeout."), "the first sweep spent its bound on the newer states");
+		enqueue("sess-new2", transcript("sweep-new2", []), "SessionStart");
+		const r = await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(r.results["claude-code-zzz-old.json"].consolidated_to, fs.statSync(old).size);
+		assert.ok(server.storedText().includes("Use the old timeout."));
+	});
+
+	// Review of 16a (am-capture-review-sol-qsp62r0c): an older Stop published over a SessionStart, and an equal-size rewrite.
+	it("keeps a SessionStart's sweep when an older Stop of that session publishes after it", async () => {
+		const a = transcript("overlap-a", [claudeLine("user", "Never use alpha.")]);
+		const server = fakeServer(), runner = keepAllRunner();
+		await am.processSession(trigger("claude-code", "overlap-a", a), { server, runner });
+		fs.appendFileSync(a, claudeLine("user", "Use the other timeout."));
+		const b = transcript("overlap-b", []), q = path.join(am.home(), "queue", "claude-code-overlap-b.json");
+		const write = fs.writeFileSync;
+		let fired = false;
+		fs.writeFileSync = function (f, ...args) {
+			if (!fired && String(f).startsWith(`${q}.`)) { fired = true; enqueue("overlap-b", b, "SessionStart"); }
+			return write.call(this, f, ...args);
+		};
+		try { enqueue("overlap-b", b, "Stop"); } finally { fs.writeFileSync = write; }
+		assert.ok(fired);
+		assert.equal(JSON.parse(fs.readFileSync(q, "utf8")).event, "Stop", "the older Stop's trigger replaced the start's");
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.ok(server.storedText().includes("Use the other timeout."));
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "queue")), []);
+	});
+
+	it("queues an equal-size rewrite whose checked prefix changed, and skips an unchanged one", async () => {
+		const a = transcript("rewrite-a", [claudeLine("user", "Never use alpha.")]);
+		const server = fakeServer(), runner = keepAllRunner();
+		await am.processSession(trigger("claude-code", "rewrite-a", a), { server, runner });
+		const uploads = server.log.length;
+		enqueue("rewrite-b", transcript("rewrite-b", []), "SessionStart");
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(server.log.length, uploads, "an unchanged transcript is not swept");
+		const size = fs.statSync(a).size;
+		fs.writeFileSync(a, claudeLine("user", "Never use bravo."));
+		assert.equal(fs.statSync(a).size, size);
+		enqueue("rewrite-c", transcript("rewrite-c", []), "SessionStart");
+		const r = await am.run({ server, runner, debounceMs: 0 });
+		assert.ok(server.log.length > uploads && server.storedText().includes("Never use bravo."));
+		assert.equal(r.results["claude-code-rewrite-a.json"].consolidated_to, size);
+		assert.equal(new Set([...server.manifests.keys()].filter((k) => k.includes(":rewrite-a:")).map((k) => k.split(":")[2])).size, 2, "a new epoch");
+	});
+
+	it("installs one canonical CLI with a symlinked command, private files, and the existing config kept", async () => {
+		const bin = path.join(am.home(), "bin", "agent-memory"), cfg = path.join(am.home(), "config.json");
+		am.writePrivate(bin, "old regular copy");
+		am.writePrivate(cfg, "{\"server\":\"https://kept.example\"}");
+		const r = am.install();
+		assert.equal(r.bin, bin);
+		assert.equal(fs.readlinkSync(bin), "agent-memory.mjs");
+		assert.equal(fs.statSync(`${bin}.mjs`).mode & 0o777, 0o700);
+		assert.equal(fs.statSync(path.join(am.home(), "bin", "batch.mjs")).mode & 0o777, 0o600);
+		for (const d of [am.home(), path.dirname(bin)]) assert.equal(fs.statSync(d).mode & 0o777, 0o700);
+		assert.equal(fs.readFileSync(cfg, "utf8"), "{\"server\":\"https://kept.example\"}");
+		assert.equal(fs.readFileSync(`${bin}.mjs`, "utf8"), fs.readFileSync(new URL("./agent-memory.mjs", import.meta.url), "utf8"));
+		// One module instance through the command, the .mjs name and batch.mjs, so the lock owner is shared.
+		const { pathToFileURL } = await import("node:url");
+		const cmd = await import(pathToFileURL(bin).href), mjs = await import(pathToFileURL(`${bin}.mjs`).href);
+		assert.equal(cmd, mjs);
+		await import(pathToFileURL(path.join(path.dirname(bin), "batch.mjs")).href);
+		assert.ok(cmd.takeLock());
+		try { mjs.assertMachineLock(); } finally { cmd.dropLock(); }
+		const usage = spawnSync(bin, [], { encoding: "utf8", env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
+		assert.equal(usage.status, 2, usage.stderr);
+		assert.match(usage.stderr, /^usage: agent-memory/);
+		fs.rmSync(path.dirname(bin), { recursive: true });
+		fs.symlinkSync(tmp, path.dirname(bin));
+		assert.throws(() => am.install(), /install_refused/);
+		// A symlinked home is refused before anything is created through it.
+		const outside = fs.mkdtempSync(path.join(tmp, "outside-"));
+		process.env.AGENT_MEMORY_HOME = path.join(tmp, `linked-home-${n}`);
+		fs.symlinkSync(outside, am.home());
+		assert.throws(() => am.install(), /install_refused/);
+		assert.deepEqual(fs.readdirSync(outside), []);
+	});
+});
 
 describe("general confined executor", () => {
 	it("uses the proved config and environment for each requested schema and discards notices, tools, rejected calls and config drift", async () => {

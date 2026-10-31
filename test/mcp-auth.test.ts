@@ -293,6 +293,35 @@ describe("owner API", () => {
 		expect((await post(`/api/profiles/personal/nodes/not-a-node/pin`)).status).toBe(404);
 	});
 
+	it("reviews captured suggestions through the dashboard's owner route: lists, refuses another profile, promotes once with replay, dismisses with a reason", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const post = (path: string, body: unknown, token = session) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}${path}`,
+			{ method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		const c = await contextFor(), tag = Date.now();
+		const one = await call(c, "capture_memory", { content: `Prefer small diffs ${tag}`, name: `Small diffs ${tag}`, profile: "personal" });
+		const two = await call(c, "capture_memory", { content: `Noise ${tag}`, profile: "personal" });
+		const listed = await post("/api/profiles/personal/review", { action: "list", status: "pending", limit: 100 });
+		expect(listed.status).toBe(200);
+		expect((listed.body.candidates as { capture_id: string; content: string }[]).find((x) => x.capture_id === one.capture_id)).toMatchObject({ content: `Prefer small diffs ${tag}`, status: "pending" });
+		const promote = { action: "promote", candidate_id: one.capture_id, into: { name: `Small diffs ${tag}`, type: "feedback" }, request_id: `dash-review-${tag}` };
+		// The route always names its profile, so a candidate held in another profile is refused before anything is written.
+		expect((await post("/api/profiles/work/review", promote)).status).toBe(400);
+		const made = await post("/api/profiles/personal/review", promote);
+		expect(made).toMatchObject({ status: 200, body: { action: "promoted", capture_id: one.capture_id } });
+		const again = await post("/api/profiles/personal/review", promote);
+		expect([again.status, again.body.memory_id]).toEqual([200, made.body.memory_id]);
+		expect(await call(c, "get_memory", { memory_id: made.body.memory_id })).toMatchObject({ content: `Prefer small diffs ${tag}`, profile: "personal" });
+		expect((await post("/api/profiles/personal/review", { action: "dismiss", candidate_id: two.capture_id })).status).toBe(400);
+		expect(await post("/api/profiles/personal/review", { action: "dismiss", candidate_id: two.capture_id, reason: "noise" })).toMatchObject({ status: 200, body: { action: "dismissed" } });
+		for (const extra of [{ profile: "work" }, { repo: { remote: "github.com/a/b" } }, { as_of: "2026-01-01" }]) expect((await post("/api/profiles/personal/review", { action: "list", ...extra })).status).toBe(400);
+		const log = await (await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/api/profiles/personal/activity?limit=1`, { headers: { authorization: `Bearer ${session}` } }))).json() as { items: { actor: string }[] };
+		expect(log.items[0]!.actor).toBe("owner");
+		const { token } = await deviceToken("dashboard-review-device", ["read", "write"], ["personal"], "personal");
+		expect((await post("/api/profiles/personal/review", { action: "list" }, token)).status).toBe(403);
+	});
+
 	it("saves, edits and recalls through the dashboard's owner route without moving records or taking extra fields", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });

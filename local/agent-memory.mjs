@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024 };
+export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024, sweep: 64 };
 const DEBOUNCE_MS = 45_000, DEBOUNCE_MAX_MS = 600_000, PENDING_SOURCE_DAYS = 7, EPOCH_BYTES = 4096;
 const CLIENTS = new Set(["claude-code", "codex"]);
 
@@ -17,10 +17,10 @@ const sha = (s) => createHash("sha256").update(s).digest("hex");
 const bytes = (s) => Buffer.byteLength(s, "utf8");
 
 /** Private files: mode 600, written atomically so a crash never leaves half a file. */
-export function writePrivate(file, data) {
+export function writePrivate(file, data, mode = 0o600) {
 	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
 	const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-	fs.writeFileSync(tmp, data, { mode: 0o600 });
+	fs.writeFileSync(tmp, data, { mode });
 	fs.renameSync(tmp, file);
 }
 const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
@@ -57,6 +57,8 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	const file = path.join(home(), "queue", name);
 	const prior = readJson(file, null), claimed = readJson(path.join(home(), "claimed", name), null);
 	// Each trigger is a new generation. A run that is handling an older one (now under claimed/) handles this one after it.
+	// A SessionStart's sweep request is its own file, so no trigger written for the session, even an older one, can erase it.
+	if (h.hook_event_name === "SessionStart") writePrivate(file.replace(/\.json$/, ".start"), "");
 	// last_assistant_message is never stored: it cannot stand in for a range.
 	writePrivate(file, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event: h.hook_event_name ?? null,
 		transcript_path: h.transcript_path ?? prior?.transcript_path ?? claimed?.transcript_path ?? null, cwd: h.cwd ?? prior?.cwd ?? claimed?.cwd ?? null,
@@ -493,6 +495,8 @@ export async function processSession(t, { server, runner, env = process.env, now
 		save();
 	} else {
 		st.pending_source_since = null;
+		// What a SessionStart sweep needs to queue this session again: the found transcript and the hook's routing input.
+		st.source = { client: t.client, session: t.session, transcript_path: src, cwd: t.cwd ?? null };
 		checkEpoch(st, src);
 		const epoch = st.epoch;
 		const { end, lines } = readLines(src, st.digested_to);
@@ -572,11 +576,42 @@ export function loadConfig() {
 const claimDir = () => path.join(home(), "claimed");
 const genOf = (t) => t.gen ?? String(t.at);
 const queued = (qdir) => (fs.existsSync(qdir) ? fs.readdirSync(qdir).filter((f) => f.endsWith(".json")) : []);
+const starts = (qdir) => (fs.existsSync(qdir) ? fs.readdirSync(qdir).filter((f) => f.endsWith(".start")) : []);
 
 /** Returns a claimed trigger to the queue, unless a newer one for the session is already there: that one supersedes it. */
 function unclaim(claimed, queuedFile) {
 	try { fs.linkSync(claimed, queuedFile); } catch { /* a newer trigger is queued */ }
 	fs.rmSync(claimed, { force: true });
+}
+
+/**
+ * The SessionStart sweep: queue each session this machine has seen whose cursor is behind its retained transcript and that
+ * has no trigger of its own, so the drain recovers a tail whose Stop never fired. Each sweep reads at most LIMITS.sweep state
+ * files, in name order from where the last sweep stopped (sweep.json), so every seen session is reached whatever its age.
+ */
+function sweep(now, debounceMs) {
+	const qdir = path.join(home(), "queue"), cursor = path.join(home(), "sweep.json");
+	const all = [...CLIENTS].flatMap((c) => { const dir = path.join(home(), "state", c); return fs.existsSync(dir) ? fs.readdirSync(dir).filter((x) => x.endsWith(".json")).map((f) => `${c}/${f}`) : []; }).sort();
+	const after = readJson(cursor, {})?.after, at = all.findIndex((k) => typeof after !== "string" || k > after);
+	const turn = at < 0 ? all : all.slice(at).concat(all.slice(0, at));
+	for (const key of turn.slice(0, LIMITS.sweep)) {
+		const [client, f] = key.split("/"), name = `${client}-${f}`;
+		if (fs.existsSync(path.join(qdir, name)) || fs.existsSync(path.join(claimDir(), name))) continue;
+		const st = readJson(path.join(home(), "state", client, f), null), s = st?.source;
+		// A state written before sources were kept has none; that session is recovered only by its own next trigger.
+		if (s?.client !== client || typeof s.session !== "string" || typeof s.transcript_path !== "string") continue;
+		let size;
+		try { size = fs.statSync(s.transcript_path).size; } catch { continue; }
+		// Same size and same checked prefix is current; a changed prefix is queued so processSession starts the new epoch.
+		if (size === st.digested_to && Number.isInteger(st.prefix_len) && prefixHash(s.transcript_path, st.prefix_len) === st.prefix_hash) continue;
+		// Linked, never renamed, into place: a trigger a hook wrote meanwhile is kept.
+		const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
+		writePrivate(tmp, JSON.stringify({ client, session: s.session, gen: randomBytes(6).toString("hex"), event: "sweep", transcript_path: s.transcript_path,
+			cwd: s.cwd, turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
+		try { fs.linkSync(tmp, path.join(qdir, name)); } catch { /* a newer trigger is queued */ }
+		fs.rmSync(tmp, { force: true });
+	}
+	if (turn.length) writePrivate(cursor, JSON.stringify({ after: turn[Math.min(LIMITS.sweep, turn.length) - 1] }));
 }
 
 /**
@@ -597,6 +632,12 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 		for (const f of fs.readdirSync(claimDir())) unclaim(path.join(claimDir(), f), path.join(qdir, f));
 		for (;;) {
 			let wait = Infinity, progressed = false;
+			// Every SessionStart request claimed by now is served by one bounded sweep; the swept sessions join this scan.
+			const claimedStarts = starts(qdir).filter((f) => { try { fs.renameSync(path.join(qdir, f), path.join(claimDir(), f)); return true; } catch { return false; } });
+			if (claimedStarts.length) {
+				try { sweep(clock(), debounceMs); } catch { /* best effort: queued sessions are still handled */ }
+				for (const f of claimedStarts) fs.rmSync(path.join(claimDir(), f), { force: true });
+			}
 			for (const f of queued(qdir)) {
 				const t = readJson(path.join(qdir, f), null);
 				if (!t || handled.get(f) === genOf(t)) continue;
@@ -636,7 +677,7 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 		try { last = await drain({ server, runner, clock, sleep, debounceMs }, results); } finally { dropLock(); }
 		// A trigger written after the last scan saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");
-		if (!queued(qdir).some((f) => { const t = readJson(path.join(qdir, f), null); return t && last.handled.get(f) !== genOf(t); })) break;
+		if (!starts(qdir).length && !queued(qdir).some((f) => { const t = readJson(path.join(qdir, f), null); return t && last.handled.get(f) !== genOf(t); })) break;
 	}
 	if (!last) return { status: "locked" };
 	return { status: "ran", results, runtime: last.runtime, reason: last.reason };
@@ -808,15 +849,25 @@ export function parseEvents(stdout) {
 
 // ---------- install ----------
 
-/** Writes this CLI, a private config and the probe directory under the Agent Memory home. Never edits client settings. */
+/**
+ * Writes this CLI, a private config and the probe directory under the Agent Memory home. Never edits client settings.
+ * bin/agent-memory.mjs is the one CLI copy; the hook command bin/agent-memory is a relative symlink to it, so the entry and
+ * batch.mjs's `./agent-memory.mjs` import load one module instance and one lock owner. Each file is replaced atomically.
+ */
 export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
-	fs.mkdirSync(path.dirname(bin), { recursive: true, mode: 0o700 });
-	fs.copyFileSync(fileURLToPath(import.meta.url), bin);
-	fs.chmodSync(bin, 0o700);
-	// batch.mjs imports the CLI by its module name; the command alias keeps the existing hook path.
-	fs.copyFileSync(fileURLToPath(import.meta.url), `${bin}.mjs`);
-	fs.copyFileSync(new URL("./batch.mjs", import.meta.url), path.join(path.dirname(bin), "batch.mjs"));
+	// Home and bin are checked before anything is created inside them: a symlink or a foreign directory is refused.
+	for (const [dir, recursive] of [[home(), true], [path.dirname(bin), false]]) {
+		try { fs.lstatSync(dir); } catch (e) { if (e.code !== "ENOENT") throw e; fs.mkdirSync(dir, { recursive, mode: 0o700 }); }
+		const st = fs.lstatSync(dir);
+		if (!st.isDirectory() || st.uid !== process.getuid()) throw new Error(`install_refused:${dir}`);
+		fs.chmodSync(dir, 0o700);
+	}
+	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
+	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
+	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	fs.symlinkSync("agent-memory.mjs", link);
+	fs.renameSync(link, bin);
 	const cfg = path.join(home(), "config.json");
 	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna", batch_profiles: [], batch_luna_model: "gpt-6-luna", batch_terra_model: "gpt-6.1-terra" }, null, 2));
 	fs.mkdirSync(path.join(home(), "probe"), { recursive: true, mode: 0o700 });

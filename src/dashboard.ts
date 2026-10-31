@@ -25,12 +25,12 @@ a[aria-current]{font-weight:600}.prefs{list-style:none;padding:0}.prefs>li{borde
 .legend{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.25rem 1rem;font-size:13px}.dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;vertical-align:-.05rem}
 .graph aside{position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow:auto}.matches{list-style:none;padding:0;margin:0}.matches button{width:100%;text-align:left;margin:0 0 .25rem}
 #signin:empty{display:none}</style></head>
-<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="/settings">Settings</a></nav>
+<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="/settings">Settings</a></nav>
 <main><h1>Agent Memory</h1>
 <p id="status" role="status">Loading sign-in…</p><div id="signin"></div>
 <div id="view" hidden></div>
 <section id="planned" hidden aria-labelledby="planned-h"><h2 id="planned-h">Not built yet</h2>
-<p>The transfers, wipe and review pages are not built here. Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
+<p>The transfers and wipe pages are not built here. Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
 <script defer crossorigin="anonymous" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
 <script defer crossorigin="anonymous" data-clerk-publishable-key="${esc(env.CLERK_PUBLISHABLE_KEY)}" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
 <script defer src="/app.js"></script></body></html>`;
@@ -157,7 +157,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		link(more, "/settings", "Add or revoke devices in Settings");
 		if (p.status === "active") link(el("p", view), `#/about/${encodeURIComponent(p.name)}`, "About you in this profile");
 		if (p.status === "active") link(el("p", view), `#/work/${encodeURIComponent(p.name)}`, "Work in this profile");
-		if (p.status === "active") for (const [r, t] of [["memories", "Memories"], ["map", "Map"], ["activity", "Activity and archive"], ["timeline", "Timeline"], ["journals", "Journals"], ["path", "Path finder"], ["draft", "Write a memory"]]) link(el("p", view), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
+		if (p.status === "active") for (const [r, t] of [["memories", "Memories"], ["map", "Map"], ["activity", "Activity and archive"], ["timeline", "Timeline"], ["journals", "Journals"], ["path", "Path finder"], ["review", "Review captured suggestions"], ["draft", "Write a memory"]]) link(el("p", view), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
 		return h;
 	};
 
@@ -1768,6 +1768,112 @@ export async function dashboardMain(win: any): Promise<void> {
 		return h;
 	};
 
+	// Review (section 15): this profile's captured suggestions through review_candidates, list then an explicit promote or dismiss.
+	// Captures are untrusted evidence, shown only as text. Each action's exact request (with its request id) is kept until the server
+	// confirms it, so retrying an unchanged action after a lost answer replays instead of acting twice; a changed one gets a new id.
+	const reviewSent = new Map<string, Record<string, unknown>>(); // `${profile}:${capture}:${action}` -> last request sent
+	const reviewPage = (view: Node, p: Profile) => {
+		const version = pageVersion, base = `/api/profiles/${enc(p.name)}/review`, h = el("h2", view, `Review: ${p.name}`);
+		switcher(view, "review", p.name);
+		note(view, "Captured suggestions are untrusted evidence from agents and capture hooks. Nothing is promoted unless you choose Promote; captures never go to me.");
+		const unresolved = [...reviewSent].filter(([key]) => key.startsWith(`${p.name}:`));
+		if (unresolved.length) {
+			const receipts = el("section", view);
+			el("h3", receipts, "Unconfirmed reviews");
+			note(receipts, "Retry sends the original request and request ID, even if the suggestion has left this list.");
+			for (const [key, sent] of unresolved) {
+				const receipt = el("p", receipts, `Suggestion ${String(sent.candidate_id)}: `);
+				btn(receipt, `Retry ${String(sent.action)}`, () => act(base, `retry ${String(sent.action)}`, sent, (r) => {
+					reviewSent.delete(key);
+					return { text: sent.action === "promote" ? `Promoted into memory “${String(r.name ?? r.memory_id)}”.` : "Dismissed captured suggestion.", undo: undoOf(p.name, r) };
+				}), `Retry ${String(sent.action)} for captured suggestion ${String(sent.candidate_id)}`);
+			}
+		}
+		const form = el("form", view);
+		const status = choose(form, "review-status", "Status", [["pending", "Pending"], ["promoted", "Promoted"], ["dismissed", "Dismissed"], ["all", "All"]]);
+		const limit = choose(form, "review-limit", "Show at most", [["20", "20"], ["50", "50"], ["100", "100"]]);
+		el("button", el("p", form), "Show").setAttribute("type", "submit");
+		const { msg, say } = pageStatus(view);
+		const list = el("ul", view);
+		list.setAttribute("class", "prefs");
+		list.setAttribute("aria-label", "Captured suggestions");
+		let request = 0;
+		const send = (key: string, body: Record<string, unknown>) => {
+			const prior = reviewSent.get(key), strip = (x?: Record<string, unknown>) => { if (!x) return ""; const { request_id: _id, ...rest } = x; return JSON.stringify(rest); };
+			const sent = { ...body, request_id: strip(prior) === JSON.stringify(body) ? prior!.request_id : `dashboard:${crypto.randomUUID()}` };
+			reviewSent.set(key, sent);
+			return sent;
+		};
+		const item = (c: J) => {
+			const li = el("li", list), id = String(c.capture_id), name = String(c.name ?? "(no name)");
+			el("h3", li, name);
+			facts(li, [["Kind", recorded(c.kind)], ["Status", recorded(c.status)], ["Captured", recorded(c.created_at)],
+				...Object.entries(c.source && typeof c.source === "object" ? c.source : {}).map(([k, v]) => [`Source ${k}`, String(v)] as [string, string])]);
+			textBlock(li, String(c.content ?? "") || "(no text)");
+			if (c.promoted_to) { const row = el("p", li, "Promoted to "); link(row, `#/memory/${enc(p.name)}/${enc(String(c.promoted_to))}`, String(c.promoted_to)); }
+			if (c.reason) el("p", li, `Reason: ${String(c.reason)}`);
+			if (c.status !== "pending") return;
+			const key = (action: string) => `${p.name}:${id}:${action}`;
+			const promote = el("form", li);
+			el("h4", promote, "Promote into a memory");
+			const pname = input(promote, `promote-name-${id}`, "Name");
+			pname.setAttribute("maxlength", "512");
+			pname.value = name.slice(0, 512);
+			const ptype = choose(promote, `promote-type-${id}`, "Type", [["project", "Project"], ["feedback", "Feedback"], ["reference", "Reference"], ["user", "User"]]);
+			const pdesc = input(promote, `promote-desc-${id}`, "Description (optional)", "textarea");
+			const prow = el("p", promote);
+			el("button", prow, "Preview").setAttribute("type", "submit");
+			const go = btn(prow, "Promote", () => {
+				if (!pending) return;
+				const body = send(key("promote"), pending);
+				act(base, `promote “${name}”`, body, (r) => { reviewSent.delete(key("promote")); return { text: `Promoted “${name}” into memory “${String(r.name ?? pname.value)}”.`, undo: undoOf(p.name, r) }; });
+			}, `Promote ${name}`);
+			go.disabled = true;
+			const shown = el("p", promote);
+			let pending: Record<string, unknown> | undefined;
+			const stale = () => { pending = undefined; go.disabled = true; shown.textContent = ""; };
+			for (const f of [pname, ptype, pdesc]) f.addEventListener("input", stale);
+			promote.addEventListener("submit", (event) => {
+				event.preventDefault();
+				stale();
+				if (!pname.value.trim()) { say("Give the memory a name."); msg.focus(); return; }
+				pending = { action: "promote", candidate_id: id, into: { name: pname.value.trim(), type: ptype.value, ...(pdesc.value.trim() ? { description: pdesc.value } : {}) } };
+				shown.textContent = `Preview: a new ${ptype.value} memory “${pname.value.trim()}” in ${p.name} holding this capture's text, linked back to it. Nothing is saved until you choose Promote.`;
+				go.disabled = false;
+				go.focus();
+			});
+			const dismiss = el("form", li);
+			el("h4", dismiss, "Dismiss");
+			const reason = input(dismiss, `dismiss-reason-${id}`, "Reason (required)");
+			reason.setAttribute("maxlength", "10000");
+			el("button", el("p", dismiss), "Dismiss").setAttribute("type", "submit");
+			dismiss.addEventListener("submit", (event) => {
+				event.preventDefault();
+				if (!reason.value.trim()) { say("Say why it is dismissed."); msg.focus(); return; }
+				const body = send(key("dismiss"), { action: "dismiss", candidate_id: id, reason: reason.value.trim() });
+				act(base, `dismiss “${name}”`, body, (r) => { reviewSent.delete(key("dismiss")); return { text: `Dismissed “${name}”.`, undo: undoOf(p.name, r) }; });
+			});
+		};
+		const load = async () => {
+			const id = ++request;
+			list.replaceChildren();
+			say("Loading…");
+			let r: J;
+			try {
+				r = await call(base, "POST", { action: "list", status: status.value, limit: Number(limit.value) });
+				if (!Array.isArray(r?.candidates)) throw new Error("the server sent no list");
+			} catch (err) { if (version === pageVersion && id === request) say(`Could not load suggestions: ${why(err)}`); return; }
+			if (version !== pageVersion || id !== request) return;
+			for (const c of r.candidates) item(c);
+			const n = r.candidates.length;
+			say(n ? `Showing ${n} suggestion${n === 1 ? "" : "s"}${n === Number(limit.value) ? `; there may be more, show up to ${limit.value === "100" ? "100 (the most one read returns)" : "more"}` : ""}.`
+				: `No ${status.value === "all" ? "" : `${status.value} `}suggestions. Suggestions appear only where capture is installed and running.`);
+		};
+		form.addEventListener("submit", (event) => { event.preventDefault(); load(); });
+		load();
+		return h;
+	};
+
 	const render = (moveFocus: boolean) => {
 		pageVersion++;
 		pageButtons = [];
@@ -1781,7 +1887,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		try { name = m ? decodeURIComponent(m[2]!) : undefined; } catch { name = m?.[2]; }
 		let h: Node;
 		// The newer pages: the named active profile, or active work when none is named (asked for if work is not active); for a record, its id.
-		const pg = /^#\/(graph|memories|memory|map|draft|activity|timeline|journals|path)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
+		const pg = /^#\/(graph|memories|memory|map|draft|activity|timeline|journals|path|review)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(hash);
 		const dec = (s?: string) => { if (s === undefined) return undefined; try { return decodeURIComponent(s); } catch { return s; } };
 		if (pg) {
 			const named = dec(pg[2]), id = dec(pg[3]), ok = active();
@@ -1799,6 +1905,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			else if (pg[1] === "timeline") h = timelinePage(view, p, id);
 			else if (pg[1] === "journals") h = journalsPage(view, p, id);
 			else if (pg[1] === "path") h = pathPage(view, p, id);
+			else if (pg[1] === "review") h = reviewPage(view, p);
 			else h = activityPage(view, p);
 		} else if (hash === "#/backups") h = backupsPage(view);
 		else if (hash === "#/work" || m?.[1] === "work") {

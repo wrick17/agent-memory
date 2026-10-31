@@ -376,7 +376,7 @@ describe("dashboard About you", () => {
 		b.go("#/profiles/work");
 		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
 		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
-		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The transfers, wipe and review pages/);
+		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>The transfers and wipe pages/);
 		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
 	});
 
@@ -958,5 +958,47 @@ describe("dashboard knowledge graph", () => {
 			for (const key of ["ArrowLeft", "ArrowUp", "ArrowRight"]) { canvas.on.keydown!({ key, preventDefault() {} } as never); await settle(); }
 			expect(reads).toBe(before); // frames read no computed style
 		}
+	});
+});
+
+describe("dashboard review", () => {
+	it("lists work's captured suggestions as text, promotes only after a preview, and retries an unanswered promote with the same request", async () => {
+		const sent: Record<string, unknown>[] = [];
+		let lose = true;
+		const b = browser({ signedIn: true, hash: "#/review", api: (path, method, body) => {
+			if (path !== "/api/profiles/work/review" || method !== "POST") return;
+			const q = body as Record<string, unknown>;
+			if (q.action === "list") return Response.json({ profile: "work", candidates: lose ? [{ capture_id: "c1", name: HOSTILE, kind: "observation", status: "pending", source: { client: "codex" },
+				content: `Use ${HOSTILE} carefully`, created_at: "2026-10-30T00:00:00Z" }] : [] });
+			sent.push(q);
+			if (lose) { lose = false; throw new Error("answer lost after commit"); }
+			return Response.json({ ok: true, action: "promoted", capture_id: "c1", memory_id: "m9", name: "Careful", activity_id: 7 });
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Review: work");
+		expect(b.seen.bodies[0]).toEqual({ action: "list", status: "pending", limit: 20 });
+		expect(text(b.view())).toContain(`Use ${HOSTILE} carefully`);
+		expect(text(b.view())).toContain("Source client codex");
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(button(b.view(), "Promote").disabled).toBe(true);
+		typeIn(byId(b.view(), "promote-name-c1"), "Careful");
+		find(b.view(), "form")[1]!.on.submit!({ preventDefault() {} });
+		expect(text(b.view())).toContain("Preview: a new project memory “Careful” in work");
+		click(button(b.view(), "Promote"));
+		await settle();
+		expect(status(b).textContent).toContain("Could not promote");
+		expect(sent).toHaveLength(1);
+		// The committed candidate has left the pending list, but the original request remains reachable.
+		expect(text(b.view())).toContain("No pending suggestions");
+		expect(find(b.view(), "form")).toHaveLength(1);
+		click(button(b.view(), "Retry promote"));
+		await settle();
+		expect(sent).toHaveLength(2);
+		expect(sent[1]).toEqual(sent[0]);
+		expect(String(sent[0]!.request_id)).toMatch(/^dashboard:/);
+		expect(sent[0]).toMatchObject({ action: "promote", candidate_id: "c1", into: { name: "Careful", type: "project" } });
+		expect(status(b).textContent).toContain("Promoted into memory “Careful”.");
+		expect(button(b.view(), "Undo last change")).toBeDefined();
 	});
 });
