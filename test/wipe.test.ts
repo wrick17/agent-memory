@@ -1,8 +1,12 @@
+import { BudgetTx, restoreArchived } from "../src/profile/archive";
+import { runArchive } from "../src/profile/archive-operations";
+import { commitArgs } from "../src/profile/work-upload";
+import { resumeTransfer } from "../src/transfer";
 // The profile wipe (section 9) on real Workers SQLite, local R2 and the Vectorize fake: synthetic fixtures only. Transfers
 // copy records out of `test` first; the wipe then closes it, purges its copies elsewhere and clears it.
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { accountTransfer } from "../src/account/transfers";
 import { ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import { sha256 } from "../src/domain/ids";
@@ -10,7 +14,7 @@ import { Fail, type Caller, type Outcome, type ProfileRef } from "../src/domain/
 import { transferStep } from "../src/profile/transfer";
 import { assertNotWiped, purgeOrigin } from "../src/profile/wipe";
 import { readContent, runWrite } from "../src/profile/write";
-import { migrate } from "../src/storage";
+import { migrate, nextSeq } from "../src/storage";
 import { driveTransfer, type TransferPorts } from "../src/transfer";
 import { wipeAccount, wipeProfile, type WipePorts } from "../src/wipe";
 import { call } from "./helpers";
@@ -195,4 +199,175 @@ it("rejects stale contexts at binding, replay and every public profile entry aft
 	const personal = c.account.profiles.find((p) => p.profile === "personal")!;
 	const wrong = { ...personal, generation: "retired-generation" };
 	expect(await (env.ACCOUNT.get(env.ACCOUNT.idFromName(c.caller.userId)) as unknown as Pick<import("../src/account/store").AccountStore, "profileAccess">).profileAccess(wrong)).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
+});
+
+
+describe("observed count origin wipe",()=>{
+	it("erases metadata-only work copies, preserves personal archive restoration, and drains decided personal transfers",{timeout:60_000},async()=>{
+		const run=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+		const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return run.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+		try{
+
+		for(const stop of ["archive","restore","land","publish"]){
+			const r=await rig(),personal=r.ref('personal'),work=r.ref('work');
+			const note=await r.save('unrelated personal note','personal','project','personal payload stays');
+			const person=await r.profile(personal,s=>{
+				const out=runWrite(s,personal,{op:'knowledge',args:{nodes:[{kind:'person',key:'person:github:count-origin',name:'count-origin'}]}},r.ctx('person','person'));
+				return out.created[0]!;
+			});
+			await r.onAccount(s=>s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'personal',1)",person));
+			await r.move(person,'personal','work');
+			const uploaded=await r.profile(work,s=>{
+				const args=commitArgs('wipe/count-origin',{sha:'e'.repeat(40),at:'2001-02-03T04:05:06.000Z',title:'work count source',author:'count-origin'});
+				const out=runWrite(s,work,{op:'upload',args},{actor:'index',platform:'test',routedBy:'test',payloadHash:sha256(JSON.stringify(args)),userId:work.userId});
+				return {out,args,project:String(s.sql.exec("SELECT id FROM nodes WHERE kind='project'").one().id)};
+			});
+			await r.onAccount(s=>{
+				for(const id of uploaded.out.created)s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);
+				s.sql.exec("INSERT INTO request_index(request_id,profile,op,payload_hash,at,seq) VALUES(?,'work','upload','count',?,1)",uploaded.args.request_id,new Date().toISOString());
+			});
+			await r.move(person,'work','personal');
+			await r.profile(personal,s=>{
+				expect(s.sql.exec("SELECT source_profile FROM nodes WHERE id=?",person).one().source_profile).toBe('personal');
+				s.sql.exec("INSERT INTO edges(src,rel,dst,dst_profile,basis,reason,recorded_at,actor,seq) VALUES(?,'relates_to',?,'work','judgment','personal opaque backlink',?,'owner',1)",note.id,uploaded.project,new Date().toISOString());
+			});
+			let removal:number|undefined;
+			if(stop==='archive'||stop==='restore'){
+				removal=await r.profile(personal,s=>{
+					let out=runArchive(s,personal,{action:'forget',memory_id:person,expected_revision:Number(s.sql.exec("SELECT revision FROM nodes WHERE id=?",person).one().revision),request_id:'count-person-forget'},r.ctx('archive','forget'));
+					for(let i=0;i<100 && (out.state!=='complete'||out.cleanup_pending);i++)out=runArchive(s,personal,{action:'resume',operation_id:String(out.operation_id),cursor:String(out.cursor),request_id:'count-forget-'+i},r.ctx('archive','forget-'+i));
+					expect(out.state).toBe('complete');return Number(out.activity_id);
+				});
+				if(stop==='restore')await r.profile(personal,s=>{
+					const out=runArchive(s,personal,{action:'restore',activity_id:removal!,request_id:'count-paused-restore'},r.ctx('restore','paused'));
+					expect(out.state).toBe('running');
+				});
+			}else{
+				const ports:TransferPorts={account:c=>r.onAccount(s=>accountTransfer(s,c)),profile:(ref,c)=>r.profile(ref,s=>transferStep(s,env,ref,c))};
+				r.wipes.resumeCountTransfer=(id,terms)=>resumeTransfer(ports,id,terms);
+				const input={id:crypto.randomUUID(),nodeId:person,from:'personal',to:'test',companyFree:false,context:null};
+				const fault:TransferPorts={...ports,profile:async(ref,c)=>{const out=await ports.profile(ref,c);if(c.op===stop)throw new Error('paused count transfer');return out;}};
+				await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('paused count transfer');
+			}
+			unwrap(await wipeProfile(env,r.wipes,r.caller,'work','work'));
+			await r.profile(personal,s=>{
+				expect(readContent(s.sql,note.id)).toContain('personal payload stays');
+				expect(s.sql.exec("SELECT reason FROM edges WHERE src=? AND dst=?",note.id,uploaded.project).one().reason).toBe('personal opaque backlink');
+			});
+			for(const where of ['personal','test'])await r.profile(r.ref(where),s=>{
+				expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:work:*'").toArray()).toEqual([]);
+				const rows=['nodes','texts','revisions','requests','activity','archive','profile_meta','transfer_parts'].map(t=>({table:t,rows:s.sql.exec('SELECT * FROM '+t).toArray()}));
+				// Existing opaque authored backlinks retain their own validity time. They are not accounting metadata.
+				const residue=rows.flatMap(t=>t.rows.filter(row=>{
+					if(t.table==='archive' && row.source==='edges'){const e=JSON.parse(String(row.payload));if(e.rel==='authored' && e.dst_profile==='work' && e.count_key===null)return false;}
+					return JSON.stringify(row).includes('2001-02-03T04:05:06.000Z');
+				}).map(row=>({table:t.table,key:row.key??row.id??row.request_id})));
+				expect(residue).toEqual([]);
+			});
+			if(stop==='archive')await r.profile(personal,s=>{
+				let out=runArchive(s,personal,{action:'restore',activity_id:removal!,request_id:'count-person-restore'},r.ctx('restore','restore'));
+				for(let i=0;i<100 && (out.state!=='complete'||out.cleanup_pending);i++)out=runArchive(s,personal,{action:'resume',operation_id:String(out.operation_id),cursor:String(out.cursor),request_id:'count-restore-'+i},r.ctx('restore','restore-'+i));
+				expect(out.state).toBe('complete');expect(s.sql.exec("SELECT name FROM nodes WHERE id=?",person).one().name).toBe('count-origin');
+				expect(s.sql.exec("SELECT id FROM edges WHERE rel='works_on'").toArray()).toEqual([]);
+			});
+			else await r.profile(stop==='restore'?personal:r.ref('test'),s=>expect(s.sql.exec("SELECT name FROM nodes WHERE id=?",person).one().name).toBe('count-origin'));
+		}
+		}finally{meter.mockRestore();}
+		expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+		console.log('COUNT_WIPE_RESOURCES',JSON.stringify(peak));
+
+	});
+});
+
+
+describe('counter correction retired history wipe',()=>{
+ it('keeps retired-epoch origin labels through transfer and erases them on the real origin wipe',async()=>{
+  const r=await rig(),personal=r.ref('personal'),work=r.ref('work');
+  const person=await r.profile(personal,s=>runWrite(s,personal,{op:'knowledge',args:{nodes:[{kind:'person',key:'person:github:retired-origin',name:'retired-origin'}]}},r.ctx('person','retired-person')).created[0]!);
+  await r.onAccount(s=>s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'personal',1)",person));await r.move(person,'personal','work');
+  const created=await r.profile(work,s=>{
+   const upload=(i:number)=>{const args=commitArgs('wipe/retired-origin',{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'retired origin '+i,author:'retired-origin'});return runWrite(s,work,{op:'upload',args},{actor:'index',platform:'test',routedBy:'test',payloadHash:sha256(JSON.stringify(args)),userId:work.userId});};
+   const a=upload(1);runWrite(s,work,{op:'undo',args:{activity_id:Number(a.result.activity_id),request_id:'retired-undo'}},r.ctx('undo','retired-undo'));
+   return upload(2).created;
+  });
+  await r.onAccount(s=>{for(const id of created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});await r.move(person,'work','personal');
+  await r.profile(personal,s=>expect(s.sql.exec("SELECT count(*) AS n FROM archive WHERE source='edges' AND json_extract(payload,'$.rel')='works_on' AND json_extract(payload,'$.weight')=0 AND json_extract(payload,'$.count_key') LIKE 'work-count:work:%'").one().n).toBe(1));
+  unwrap(await wipeProfile(env,r.wipes,r.caller,'work','work'));
+  await r.profile(personal,s=>{
+   expect(s.sql.exec('SELECT name FROM nodes WHERE id=?',person).one().name).toBe('retired-origin');
+   expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:work:*'").toArray()).toEqual([]);
+   expect(s.sql.exec("SELECT 1 FROM archive WHERE source='edges' AND json_extract(payload,'$.count_key') LIKE 'work-count:work:%'").toArray()).toEqual([]);
+   expect(s.sql.exec("SELECT 1 FROM edges WHERE count_key LIKE 'work-count:work:%'").toArray()).toEqual([]);
+  });
+ });
+});
+
+
+describe('null-epoch history origin wipe',()=>{
+ it('drains history-only transfers and erases live/archive content without purging personal people or opaque backlinks',async()=>{
+  const run=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+  const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return run.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+  try{
+   for(const archived of [false,true])for(const stop of ['complete','fence','land']){
+    const r=await rig(),personal=r.ref('personal'),work=r.ref('work'),test=r.ref('test');
+    const person=await r.profile(personal,s=>runWrite(s,personal,{op:'knowledge',args:{nodes:[{kind:'person',key:'person:github:null-wipe',name:'null-wipe'}]}},r.ctx('person','null-person')).created[0]!);
+    await r.onAccount(s=>s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'personal',1)",person));await r.move(person,'personal','work');
+    const f=await r.profile(work,s=>{
+     const args=commitArgs('fixture/null-wipe',{sha:'b'.repeat(40),at:'2001-02-03T04:05:06.000Z',title:'origin history',author:'null-wipe'}),out=runWrite(s,work,{op:'upload',args},{...r.ctx('upload','upload'),actor:'index',payloadHash:sha256(JSON.stringify(args))});
+     const row=s.sql.exec("SELECT id,dst FROM edges WHERE rel='works_on'").one();
+     runWrite(s,work,{op:'knowledge',args:{end:[{edge:Number(row.id),valid_to:'2002-03-04T05:06:07.000Z',reason:'ordinary history must be wiped'}]}},r.ctx('end','null-end'));
+     for(let i=0;i<80;i++)s.sql.exec("INSERT INTO evidence(owner,kind,ref,note,seq) VALUES(?,'link',?,'origin history evidence',?)",`e:${row.id}`,'https://example.test/origin-history/'+i,nextSeq(s.sql,'profile_meta'));
+     const forgotten=runWrite(s,work,{op:'owner',args:{action:'forget',memory_id:person,request_id:'wipe-null-forget'}},r.ctx('forget','null-forget'));
+     runWrite(s,work,{op:'restore',args:{activity_id:Number(forgotten.result.activity_id),request_id:'wipe-null-restore'}},r.ctx('restore','null-restore'));
+     if(archived)runWrite(s,work,{op:'owner',args:{action:'forget',memory_id:String(row.dst),request_id:'wipe-null-project'}},r.ctx('forget','null-project'));
+     return {created:out.created,project:String(row.dst)};
+    });
+    await r.onAccount(s=>{for(const id of f.created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+    await r.move(person,'work','test');
+    if(!archived && stop==='complete')await r.profile(test,s=>{
+     const queries=[['edges','SELECT id,src,count_key FROM edges WHERE id>? ORDER BY id LIMIT 10',[0]],['archive','SELECT id,source,payload FROM archive WHERE id>? ORDER BY id LIMIT 10',[0]],['parts','SELECT transfer_id,n,payload FROM transfer_parts WHERE (transfer_id,n)>(?,?) ORDER BY transfer_id,n LIMIT 1',['',0]]] as const;
+     const plans=queries.map(([name,q,params])=>({name,detail:s.sql.exec('EXPLAIN QUERY PLAN '+q,...params).toArray().map(row=>String(row.detail)).join('; ')}));
+     for(const plan of plans)expect(plan.detail).toMatch(/SEARCH .* (INTEGER PRIMARY KEY|PRIMARY KEY)/);
+     console.log('NULL_HISTORY_DISCOVERY_PLANS',JSON.stringify(plans));
+    });
+    await r.profile(test,s=>expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:work:*'").toArray()).toEqual([]));
+    const note=await r.save('personal survivor','personal','project','personal payload stays');
+    await r.profile(personal,s=>s.sql.exec("INSERT INTO edges(src,rel,dst,dst_profile,basis,reason,recorded_at,actor,seq) VALUES(?,'relates_to',?,'work','judgment','personal opaque backlink',?,'owner',1)",note.id,f.project,new Date().toISOString()));
+    const ports:TransferPorts={account:c=>r.onAccount(s=>accountTransfer(s,c)),profile:(ref,c)=>r.profile(ref,s=>transferStep(s,env,ref,c))};
+    r.wipes.resumeCountTransfer=(id,terms)=>resumeTransfer(ports,id,terms);
+    const input={id:crypto.randomUUID(),nodeId:person,from:'test',to:'personal',companyFree:false,context:null};
+    if(stop==='complete'){
+     unwrap(await driveTransfer(ports,input,r.caller));
+     if(archived)await r.profile(personal,s=>s.transactionSync(()=>{
+      const a=s.sql.exec("SELECT id,activity_id,payload FROM archive WHERE source='edges' AND json_extract(payload,'$.rel')='works_on'").one(),row=JSON.parse(String(a.payload));
+      expect(row.id).toBeLessThan(0);
+      const evidence=s.sql.exec("SELECT id FROM archive WHERE source='evidence' AND activity_id=? AND json_extract(payload,'$.owner')=?",a.activity_id!,`e:${row.id}`).toArray();
+      restoreArchived(new BudgetTx(s.sql,nextSeq(s.sql,"profile_meta"),new Date().toISOString()),[Number(a.id),...evidence.map(e=>Number(e.id))]);
+      expect(s.sql.exec('SELECT count_epoch FROM edges WHERE id=?',Number(row.id)).one().count_epoch).toBe(null);
+     }));
+    }
+    else{
+     const fault:TransferPorts={...ports,profile:async(ref,c)=>{const out=await ports.profile(ref,c);if(c.op===stop)throw new Error('pause history-only transfer');return out;}};
+     await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('pause history-only transfer');
+     if(stop==='land')await r.profile(personal,s=>s.sql.exec('DELETE FROM nodes WHERE id=?',person));
+    }
+    unwrap(await wipeProfile(env,r.wipes,r.caller,'work','work'));
+    await r.profile(personal,s=>{
+     expect(readContent(s.sql,note.id)).toContain('personal payload stays');
+     expect(s.sql.exec('SELECT reason FROM edges WHERE src=? AND dst=?',note.id,f.project).one().reason).toBe('personal opaque backlink');
+    });
+    for(const ref of [personal,test])await r.profile(ref,s=>{
+     expect(s.sql.exec("SELECT 1 FROM edges WHERE count_key LIKE 'work-count:work:%'").toArray()).toEqual([]);
+     expect(s.sql.exec("SELECT 1 FROM archive WHERE source='edges' AND json_extract(payload,'$.count_key') LIKE 'work-count:work:%'").toArray()).toEqual([]);
+     expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:work:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]);
+     expect(s.sql.exec('SELECT n FROM transfer_parts').toArray()).toEqual([]);
+     for(const table of ['evidence','archive','requests','activity','profile_meta'])expect(JSON.stringify(s.sql.exec('SELECT * FROM '+table).toArray())).not.toContain('origin history evidence');
+    });
+    const holder=stop==='complete'?personal:test;
+    await r.profile(holder,s=>expect(s.sql.exec('SELECT name,source_profile FROM nodes WHERE id=?',person).one()).toEqual({name:'null-wipe',source_profile:'personal'}));
+   }
+  }finally{meter.mockRestore();}
+  expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+  console.log('NULL_HISTORY_WIPE_RESOURCES',JSON.stringify(peak));
+ });
 });

@@ -1,3 +1,4 @@
+import { assertCountImageOpen, countOrigin, countOriginClosed, countPair, countRestore, unownedCountHistory, saveCountPair, type CountPair } from "./work-counts";
 // Bounded owner archive operations. Images live in archive; metadata holds only fences, hashes and applied keys.
 import { meGuard } from "../domain/guard";
 import { requestHash, sha256 } from "../domain/ids";
@@ -16,9 +17,9 @@ export type ArchiveCommand =
 	| { action: "restore"; activity_id: number; request_id: string }
 	| { action: "resume" | "abort"; operation_id: string; cursor: string; request_id: string };
 type Fence = { attrs: string; status: string; revision: number; seq: number };
-type Applied = { archive: number; source: ArchiveSource; key: SqlStorageValue[]; seq: number; hash: string };
+type Applied = { archive: number; source: ArchiveSource; key: SqlStorageValue[]; seq: number; hash: string; countBefore?: CountPair; borrowed?:boolean };
 export interface ArchiveOperation {
-	id: string; node: string; profile: string; generation: string; origin: string | null;
+	id: string; node: string; profile: string; generation: string; origin: string | null; countOrigins?:string[];
 	action: "forget" | "restore"; state: "running" | "rolling_back" | "complete" | "aborted";
 	phase: string; version: number; activity: number; removal: number; source?: string; undoOf?: number;
 	original: Fence | null; fenceSeq: number; after: number; rows: number; hash: string;
@@ -73,9 +74,10 @@ function archived(sql: SqlStorage, activityId: number, after: number, limit: num
 function keyed(sql: SqlStorage, p: Applied): Row | undefined {
 	return sql.exec<Row>(`SELECT * FROM ${p.source} WHERE ${PK[p.source].map(k => `${k}=?`).join(" AND ")}`, ...p.key).toArray()[0];
 }
-function remember(tx: BudgetTx, o: ArchiveOperation, a: Archived, row: Row, id?: number): void {
+function remember(tx: BudgetTx, o: ArchiveOperation, a: Archived, row: Row, id?: number, countBefore?: CountPair): void {
 	const key = PK[a.source].map(k => k === "id" && a.source === "edges" || k === "rowid" && a.source === "texts" ? id! : row[k]!);
-	const p: Applied = { archive: a.id, source: a.source, key, seq: tx.seq, hash: sha256(a.payload) };
+	const borrowed=countBefore?.archived===null;
+	const p: Applied = { archive: a.id, source: a.source, key, seq:borrowed?countBefore.edge.seq:tx.seq, hash: sha256(a.payload), ...(borrowed?{borrowed:true}:countBefore ? {countBefore} : {}) };
 	save(tx, rowKey(o.id, a.id), p);
 	if (a.source === "edges") save(tx, `${opKey(o.id)}:edge:${String(row.id)}`, id);
 }
@@ -88,8 +90,9 @@ function copy(tx: BudgetTx, o: ArchiveOperation, a: Archived): void {
 		} else row.owner = `e:${mapped}`;
 	}
 	guard(tx.sql, o, row);
+	const countBefore=a.source === "edges" && typeof row.count_key === "string" && !unownedCountHistory(row) ? countRestore(tx,row).pair : undefined;
 	const id = putRow(tx, a.source, row);
-	remember(tx, o, a, row, id);
+	remember(tx, o, a, row, id, countBefore);
 }
 /** Conservative bound before writing, with actual BudgetTx rollback-and-halving as the final authority. */
 function fit<T>(rows:T[]):T[]{let bytes=0,n=0;for(const row of rows){const cost=2*Buffer.byteLength(JSON.stringify(row),"utf8")+1000;if(n&&bytes+cost>600_000)break;bytes+=cost;n++;}return rows.slice(0,n);}
@@ -105,6 +108,7 @@ function begin(tx: BudgetTx, who: Who, c: Extract<ArchiveCommand, { action: "for
 	const sql = tx.sql, id = crypto.randomUUID();
 	if(c.action === "restore"&&!undoOf&&sizeLevel(sql.databaseSize) === "shrink_only")throw Fail.of("size_budget","this profile accepts only shrinking operations and Undo",{reason:"shrink_only"});
 	let n: Row, removal = 0, source: string | undefined;
+	const countOrigins=new Set<string>();
 	if (c.action === "forget") {
 		n = node(sql, c.memory_id)!;
 		if (!n || !["active","retired","superseded"].includes(String(n.status))) throw Fail.of("not_found", "no visible record to forget");
@@ -117,6 +121,7 @@ function begin(tx: BudgetTx, who: Who, c: Extract<ArchiveCommand, { action: "for
 		source = (JSON.parse(a.undo ?? "{}") as { archive_operation?: string }).archive_operation;
 		const from = source ? archiveOperation(sql, source) : undefined;
 		if (!from || from.action !== "forget" || from.state !== "complete" || from.cleanup) throw Fail.of("not_found", "no complete staged removal", { reason: "archive_missing" });
+		for(const origin of from.countOrigins??[]){if(countOriginClosed(sql,origin))throw Fail.of("profile_wiped","an archived aggregate source origin is being wiped");countOrigins.add(origin);}
 		const image = sql.exec<Archived>("SELECT id,source,payload FROM archive WHERE activity_id=? AND source='nodes'", c.activity_id).toArray()[0];
 		if (!image) throw Fail.of("not_found", "archived node was purged", { reason: "archive_missing" });
 		n = JSON.parse(image.payload) as Row; removal = c.activity_id;
@@ -124,11 +129,15 @@ function begin(tx: BudgetTx, who: Who, c: Extract<ArchiveCommand, { action: "for
 	}
 	assertNotWiped(sql, String(n.id)); assertNoTouchingTransfer(sql, String(n.id));
 	assertArchiveEndpoints(sql,String(n.id),String(n.id),"",true);
-	for(const e of sql.exec<Row>("SELECT src,dst,dst_profile FROM edges WHERE src=?1 OR (dst_profile='' AND dst=?1)",String(n.id)))assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile));
+	for(const e of sql.exec<Row>("SELECT src,dst,dst_profile,count_key FROM edges WHERE src=?1 OR (dst_profile='' AND dst=?1)",String(n.id))){
+		assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile));
+		assertCountImageOpen(tx,e);
+		const origin=countOrigin(e.count_key);if(origin)countOrigins.add(origin);
+	}
 	tx.archiveOperation=id;
 	const act = Number(tx.run("INSERT INTO activity(at,actor,op,summary,targets,undo_of,seq) VALUES (?,'owner',?,'archive operation pending',?,?,?) RETURNING id",
 		tx.now, undoOf ? "undo" : c.action, JSON.stringify([n.id]), undoOf ?? (c.action === "restore" ? removal : null), tx.seq).one().id);
-	const o: ArchiveOperation = { id, node: String(n.id), origin: n.source_profile === null ? null : String(n.source_profile), profile: who.profile, generation: who.generation,
+	const o: ArchiveOperation = { id, node: String(n.id), ...(countOrigins.size?{countOrigins:[...countOrigins]}:{}), origin: n.source_profile === null ? null : String(n.source_profile), profile: who.profile, generation: who.generation,
 		action: c.action, state: "running", phase: c.action === "forget" ? "archive_evidence" : "verify_archive", version: 1, activity: act, removal: removal || act,
 		source, undoOf, original: { attrs: String(n.attrs), status: String(n.status), revision: Number(n.revision), seq: Number(n.seq) },
 		fenceSeq: tx.seq, after: 0, rows: 0, hash: "", checked: 0, checkHash: "", guardVersion: "", cleanup: false, me: ctx.meGuard, createdAt: tx.now };
@@ -233,6 +242,12 @@ function finish(tx: BudgetTx, o: ArchiveOperation): void {
 function rollbackRestore(tx: BudgetTx,o: ArchiveOperation,limit:number):void {
 	const ps=parts(tx.sql,o,0,limit);
 	for(const p of ps){const r=keyed(tx.sql,p);if(!r||r.seq!==p.seq)throw conflict("applied_row",o.id,o.profile);
+		if(p.borrowed){tx.run("DELETE FROM profile_meta WHERE key=?",rowKey(o.id,p.archive));continue;}
+		if(p.countBefore){
+			const current=countPair(tx.sql,p.countBefore.key);
+			if(!current || current.epoch!==p.countBefore.epoch || current.edge.id!==r.id || current.edge.seq!==p.seq)throw conflict("count_binding",o.id,o.profile);
+			saveCountPair(tx,{...current,edge:p.countBefore.edge,archived:p.countBefore.archived});
+		}
 		tx.run(`DELETE FROM ${p.source} WHERE ${PK[p.source].map(k=>`${k}=?`).join(" AND ")} AND seq=?`,...p.key,p.seq);tx.run("DELETE FROM profile_meta WHERE key=?",rowKey(o.id,p.archive));}
 	if(!ps.length){tx.run("DELETE FROM nodes WHERE id=? AND seq=?",o.node,o.fenceSeq);o.state="aborted";o.cleanup=true;advance(o,"cleanup_metadata");}
 }
@@ -324,7 +339,7 @@ export function cancelArchivePage(tx:BudgetTx,ids:string[],limit=25):boolean {
 		const ps=parts(tx.sql,o,0,limit);
 		for(const p of ps){
 			// Requests stay for the account's request-fence pass before ordinary purge deletes their result bytes.
-			if(o.state!=="complete"&&p.source!=="requests"&&keyed(tx.sql,p)?.seq===p.seq)tx.run(`DELETE FROM ${p.source} WHERE ${PK[p.source].map(k=>`${k}=?`).join(" AND ")} AND seq=?`,...p.key,p.seq);
+			if(!p.borrowed&&o.state!=="complete"&&p.source!=="requests"&&keyed(tx.sql,p)?.seq===p.seq)tx.run(`DELETE FROM ${p.source} WHERE ${PK[p.source].map(k=>`${k}=?`).join(" AND ")} AND seq=?`,...p.key,p.seq);
 			tx.run("DELETE FROM profile_meta WHERE key=?",rowKey(o.id,p.archive));
 		}
 		if(ps.length)return false;
@@ -363,4 +378,99 @@ export function nextArchiveAlarm(sql:SqlStorage):number|null {
 }
 export function deferArchive(tx:BudgetTx,id:string,reason:string):void {
 	tx.run("UPDATE cursors SET due_at=?,last_error=? WHERE stage=?",Date.now()+60_000,reason,`archive:${id}`);
+}
+
+/** Quiesce only accepted archive operations carrying this origin's person-owned count state. */
+export function drainCountArchives(storage:DurableObjectStorage,who:Who,origin:string,after:string):{ids:string[];after:string|null} {
+	const scan=after==="!"?"":after;
+	const rows=storage.sql.exec<{key:string;value:string}>("SELECT key,value FROM profile_meta WHERE key>? AND key<'archive-op:~' ORDER BY key LIMIT 10",scan||"archive-op:").toArray();
+	for(const row of rows){
+		const o=JSON.parse(row.value) as Partial<ArchiveOperation>;
+		if(!o.id || !o.node || !o.state || !(["running","rolling_back"].includes(o.state)||o.cleanup))continue;
+		const start=`work-count:${origin}:pair:${o.node}:`;
+		if(!o.countOrigins?.includes(origin) && !storage.sql.exec("SELECT 1 FROM profile_meta WHERE key>=? AND key<? LIMIT 1",start,start+"~").toArray().length)continue;
+		const closed=countOriginClosed(storage.sql,origin);
+		const action=o.state==="running" && closed && o.fenceSeq!>closed.seq?"abort":"resume";
+		const cmd={action,operation_id:o.id,cursor:cursor(o as ArchiveOperation),request_id:`count-wipe:${origin}:${o.id}:${o.version}:${action}`} as const;
+		runArchive(storage,who,cmd,{actor:"owner",platform:"server",routedBy:"wipe",payloadHash:requestHash("archive",cmd),userId:who.userId});
+		return {ids:[],after:scan||"!"};
+	}
+	return {ids:[],after:rows.length===10?rows.at(-1)!.key:null};
+}
+
+interface CountRedaction { phase:"archives"|"evidence"|"maps"|"manifests"|"cleanup"|"done"; after:number; key:string; edge?:{id:number;activity:number;owner:string;resume:number}; }
+const countGone=(origin:string,id:number)=>`count-redacted:${origin}:${String(id).padStart(16,"0")}`;
+const countManifest=(origin:string,id:number)=>`count-manifest:${origin}:${String(id).padStart(16,"0")}`;
+
+function redactCountImage(tx:BudgetTx,origin:string,a:Archived & {activity_id:number}):void {
+	const token={hash:sha256(a.payload)};
+	save(tx,countGone(origin,a.id),token);
+	const owner=activity(tx.sql,a.activity_id);
+	if(owner?.undo){
+		const inv=JSON.parse(owner.undo) as {archived?:number[];archive_operation?:string};
+		if(inv.archived){inv.archived=inv.archived.filter(id=>id!==a.id);tx.run("UPDATE activity SET undo=?,seq=? WHERE id=?",JSON.stringify(inv),tx.seq,a.activity_id);}
+		if(inv.archive_operation && !read(tx.sql,countManifest(origin,a.activity_id))){
+			const o=archiveOperation(tx.sql,inv.archive_operation);
+			if(o?.action==="forget" && o.state==="complete" && !o.cleanup)save(tx,countManifest(origin,a.activity_id),{operation:o.id,createdAt:o.createdAt,after:0,hash:"",rows:0});
+		}
+	}
+	tx.run("DELETE FROM archive WHERE id=?",a.id);
+}
+
+/** Remove derived images while retaining every unrelated personal row and reseal its remaining manifest in pages. */
+export function redactCountArchives(tx:BudgetTx,origin:string):boolean {
+	const key=`count-redaction:${origin}`;
+	const v=read<CountRedaction>(tx.sql,key)??{phase:"archives",after:0,key:""};
+	if(v.phase==="archives"){
+		const rows=tx.sql.exec<Archived&{activity_id:number}>("SELECT id,activity_id,source,payload FROM archive WHERE id>? ORDER BY id LIMIT 10",v.after).toArray();
+		let held=false;
+		for(const a of rows){
+			if(a.source==="edges"){
+				const e=JSON.parse(a.payload) as Row;
+				if(countOrigin(e.count_key)===origin){v.edge={id:a.id,activity:a.activity_id,owner:`e:${String(e.id)}`,resume:a.id};v.phase="evidence";v.after=0;held=true;break;}
+			}
+			v.after=a.id;
+		}
+		if(!held && rows.length<10){v.phase="maps";v.key="";}
+	}else if(v.phase==="evidence"){
+		const e=v.edge!;
+		const rows=tx.sql.exec<Archived&{activity_id:number}>("SELECT id,activity_id,source,payload FROM archive WHERE activity_id=? AND id>? ORDER BY id LIMIT 10",e.activity,v.after).toArray();
+		for(const a of rows){if(a.source==="evidence" && (JSON.parse(a.payload) as Row).owner===e.owner)redactCountImage(tx,origin,a);v.after=a.id;}
+		if(rows.length<10){
+			const a=tx.sql.exec<Archived&{activity_id:number}>("SELECT id,activity_id,source,payload FROM archive WHERE id=?",e.id).toArray()[0];
+			if(a)redactCountImage(tx,origin,a);
+			v.phase="archives";v.after=e.resume;delete v.edge;
+		}
+	}else if(v.phase==="maps"){
+		const rows=tx.sql.exec<{key:string;value:string}>("SELECT key,value FROM profile_meta WHERE key>? AND key<'archive-op:~' ORDER BY key LIMIT 10",v.key||"archive-op:").toArray();
+		for(const r of rows){
+			const p=JSON.parse(r.value) as Applied;
+			const gone=p.archive?read<{hash:string}>(tx.sql,countGone(origin,p.archive)):undefined;
+			if((gone && gone.hash===p.hash) || p.countBefore?.origin===origin){
+				tx.run("DELETE FROM profile_meta WHERE key=?",r.key);
+			}
+			v.key=r.key;
+		}
+		if(rows.length<10){v.phase="manifests";v.key="";}
+	}else if(v.phase==="manifests"){
+		const start=`count-manifest:${origin}:`;
+		const row=tx.sql.exec<{key:string;value:string}>("SELECT key,value FROM profile_meta WHERE key>=? AND key<? ORDER BY key LIMIT 1",start,start+"~").toArray()[0];
+		if(!row){v.phase="cleanup";v.key="";}
+		else{
+			const m=JSON.parse(row.value) as {operation:string;createdAt:string;after:number;hash:string;rows:number};
+			const o=archiveOperation(tx.sql,m.operation);
+			if(!o || o.createdAt!==m.createdAt || o.state!=="complete" || o.cleanup)throw conflict("count_manifest_owner");
+			const rows=archived(tx.sql,o.removal,m.after,10);
+			for(const a of rows){m.hash=chain(m.hash,a);m.rows++;m.after=a.id;}
+			if(rows.length<10){o.hash=m.hash;o.rows=m.rows;if(o.countOrigins)o.countOrigins=o.countOrigins.filter(x=>x!==origin);save(tx,opKey(o.id),o);tx.run("DELETE FROM profile_meta WHERE key=?",row.key);}
+			else save(tx,row.key,m);
+		}
+	}else if(v.phase==="cleanup"){
+		const start=`count-redacted:${origin}:`;
+		const rows=tx.sql.exec<{key:string}>("SELECT key FROM profile_meta WHERE key>=? AND key<? ORDER BY key LIMIT 10",start,start+"~").toArray();
+		for(const r of rows)tx.run("DELETE FROM profile_meta WHERE key=?",r.key);
+		if(!rows.length)v.phase="done";
+	}
+	save(tx,key,v);
+	return v.phase==="done";
 }

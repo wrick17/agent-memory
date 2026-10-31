@@ -1,3 +1,4 @@
+import { resumeTransfer, transferPorts } from "./transfer";
 // Owner-only wipe of one profile (section 9, steps 1 to 6). The account closes the profile and records the wipe; the plan and
 // every id page go to permanent R2 objects before anything is deleted; then copies elsewhere are purged, the profile's own
 // generations cleared, and its indexes fenced. A retry replays the same plan. Backup replacement waits for the final stage.
@@ -95,6 +96,7 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 }
 
 export interface WipePorts {
+	resumeCountTransfer?(id:string,terms:string[]):Promise<Outcome<unknown>>;
 	account(cmd: WipeAccountCommand): Promise<Outcome<WipeAccountResult>>;
 	profile(ref: ProfileRef, step: WipeStep): Promise<Outcome<WipeOut>>;
 }
@@ -102,6 +104,7 @@ export interface WipePorts {
 /** Inside AccountStore: its own wipe commands directly, and the integrator's ProfileStore.purgeOrigin(who, step) by stub. */
 export const wipePorts = (env: Env, storage: DurableObjectStorage): WipePorts => ({
 	account: async (cmd) => wipeAccount(storage, cmd),
+	resumeCountTransfer:(id,terms)=>resumeTransfer(transferPorts(env,storage.sql.exec<{value:string}>("SELECT value FROM account_meta WHERE key='user_id'").one().value),id,terms),
 	profile: (ref, step) => (env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
 		{ purgeOrigin(who: ProfileRef, step: WipeStep): Promise<Outcome<WipeOut>> }).purgeOrigin(ref, step),
 });
@@ -122,6 +125,35 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 		const plan: WipePlan = old ? await old.json<WipePlan>() : { record: r, refs: begun.refs! };
 		if (!old) await bucket.put(r.marker_key, JSON.stringify(plan), { onlyIf: { etagDoesNotMatch: "*" } });
 		for (const ref of plan.refs.filter((x) => x.profile === profile)) value(await ports.profile(ref, { op: "close" }));
+		const otherCounts=plan.refs.filter(ref=>ref.profile!==profile);
+		// All destinations close the origin before any copied accounting is drained or removed.
+		for(const ref of otherCounts)value(await ports.profile(ref,{op:"count_close",profile,at:r.wiped_at}));
+		for(const ref of otherCounts){
+			let after="";
+			do{const p=await page(ref,{op:"count_archives",profile,after});after=p.after??"";}while(after);
+		}
+		for(const ref of otherCounts){
+			let after="";
+			do{
+				const p=await page(ref,{op:"count_transfers",profile,after});
+				for(const id of p.ids){
+					if(!ports.resumeCountTransfer)throw Fail.of("moving","finish the transfer carrying this origin's counts before wiping it");
+					const out=await ports.resumeCountTransfer(id,begun.terms!);
+					// A closed-origin or missing-node refusal may have completed an abort; require its terminal replay before continuing.
+					value(!out.ok && ["profile_wiped","revision_conflict"].includes(out.error.code)?await ports.resumeCountTransfer(id,begun.terms!):out);
+				}
+				after=p.after??"";
+			}while(after);
+		}
+		for(const ref of otherCounts){
+			let after="";
+			do{
+				const p=await page(ref,{op:"count_requests",profile,after});
+				if(p.ids.length){await bucket.put(`${r.marker_key}/requests/counts-${ref.generation}-${encodeURIComponent(p.ids[0]!)}.json`,JSON.stringify(p.ids));value(await ports.account({op:"forget",profile,ids:[],requests:p.ids}));}
+				after=p.after??"";
+			}while(after);
+		}
+
 		const prefix = `${r.marker_key}/ids/`;
 		const complete = `${r.marker_key}/planned`;
 		if (!(await bucket.head(complete))) {
@@ -177,6 +209,14 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 			}
 			cursor = listed.truncated ? listed.cursor : undefined;
 		} while (cursor);
+		for(const ref of otherCounts){
+			let done:PurgeResult;
+			do{
+				const reply=value(await ports.profile(ref,{op:"count_cleanup",profile,at:r.wiped_at}));
+				if(!("done" in reply) || typeof reply.done!=="boolean")throw Fail.of("unavailable","observed-count cleanup did not acknowledge completion");
+				done=reply as PurgeResult;counts.redacted+=done.redacted;
+			}while(!done.done);
+		}
 		for (const ref of plan.refs) {
 			if (ref.profile === profile) {
 				// Its vectors and rows go together, by generation; no row-by-row purge of a store that is deleted whole.

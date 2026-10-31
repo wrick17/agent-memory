@@ -1,3 +1,4 @@
+import { archiveCountEdge, restoreCountEdge, countRestore, unownedCountHistory } from "./work-counts";
 // The archive (profile v4, section 5): a removed row is kept whole, as JSON of `SELECT *`, until purge_after. Every removal
 // except the 300-day purge can therefore be undone by putting the same columns back. Shared by C3 transfers and C4 cleanup.
 import { assertArchiveEndpoints } from "./archive-fence";
@@ -78,8 +79,10 @@ export function archiveRows(tx: ArchiveTx, activityId: number, source: ArchiveSo
 	for(const row of rows)edgeFence(tx,source,row);
 	const ids = rows.map((r) => {
 		if (pk.some((c) => r[c] === undefined || r[c] === null)) throw Fail.of("validation", `an archived ${source} row needs its key columns`);
-		return Number(tx.run("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+		const archived = Number(tx.run("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
 			activityId, tx.now, purgeAfterAt, source, JSON.stringify(r), tx.seq).one().id);
+		if(source === "edges")archiveCountEdge(tx,r,archived);
+		return archived;
 	});
 	// Keys as one JSON parameter, so any number of rows stays within 100 bound parameters.
 	tx.run(`DELETE FROM ${source} WHERE (${pk.join(", ")}) IN (SELECT ${pk.map((_, i) => `json_extract(value, '$[${i}]')`).join(", ")} FROM json_each(?))`,
@@ -123,6 +126,11 @@ export function restoreArchived(tx: ArchiveTx, archiveIds: number[]): { nodes: s
  */
 export function putRow(tx: ArchiveTx, source: ArchiveSource, image: Row): number | undefined {
 	edgeFence(tx,source,image);
+	if(source==='edges' && image.count_key && !unownedCountHistory(image)){
+		const current=countRestore(tx,image);
+		if(current.existing!==undefined)return current.existing;
+		image=current.row;
+	}
 	const row: Row = { ...image, seq: tx.seq };
 	if (source === "texts" && tx.sql.exec("SELECT 1 FROM texts WHERE rowid = ?", row.rowid!).toArray().length) delete row.rowid;
 	if (source === "edges" && tx.sql.exec("SELECT 1 FROM edges WHERE id = ?", row.id!).toArray().length) delete row.id;
@@ -132,7 +140,9 @@ export function putRow(tx: ArchiveTx, source: ArchiveSource, image: Row): number
 		// evidence, revisions and requests are WITHOUT ROWID, so only an edge returns its (possibly new) id.
 		const cursor = tx.run(`INSERT INTO ${source} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})${source === "edges" ? " RETURNING id" : source === "texts" ? " RETURNING rowid" : ""}`,
 			...cols.map((c) => row[c]!));
-		return source === "edges" ? Number(cursor.one().id) : source === "texts" ? Number(cursor.one().rowid) : undefined;
+		const id=source === "edges" ? Number(cursor.one().id) : source === "texts" ? Number(cursor.one().rowid) : undefined;
+		if(source === "edges" && image.count_key && !unownedCountHistory(image))restoreCountEdge(tx,image,id!);
+		return id;
 	} catch (e) {
 		if (e instanceof Error && !(e instanceof Fail) && /constraint failed/i.test(e.message)) {
 			throw Fail.of("revision_conflict", "changed since; review by hand", { reason: "key_taken", source });

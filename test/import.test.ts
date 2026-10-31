@@ -78,6 +78,9 @@ describe("profile schema v3 and v4", () => {
 		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:personal:${ref.generation}`)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Put this profile back into its deployed v2 shape, with v2 data, then run the migrations again.
+			for (const name of ["count_receipt_seal", "count_receipt_delete", "count_activity_expiry"]) sql.exec("DROP TRIGGER " + name);
+			for (const name of ["count_dates", "count_person", "count_project", "count_pair_person", "count_pair_project"]) sql.exec("DROP INDEX " + name);
+			for (const q of ["ALTER TABLE requests DROP COLUMN commit_meta", "ALTER TABLE edges DROP COLUMN commit_seal", "ALTER TABLE edges DROP COLUMN count_epoch", "ALTER TABLE edges DROP COLUMN count_key"]) sql.exec(q);
 			for (const q of ["DROP TRIGGER upload_receipts_gone", "DROP TRIGGER refresh_node_gone", "DROP TRIGGER refresh_archive_gone", "DROP TABLE upload_receipts", "DROP TABLE upload_revisions",
 				"DROP TABLE refresh_claims", "DROP TABLE refresh_refs", "DROP TABLE refresh_parts"]) sql.exec(q);
 			for (const q of ["DROP TABLE import_refreshes", "DROP TRIGGER nodes_refresh_fence", "ALTER TABLE import_records DROP COLUMN published_revision", "ALTER TABLE import_records DROP COLUMN published_content_hash", "DROP TABLE archive", "DROP TABLE transfers", "DROP TABLE transfer_parts", "ALTER TABLE activity DROP COLUMN redacted"]) sql.exec(q);
@@ -88,7 +91,7 @@ describe("profile schema v3 and v4", () => {
 			sql.exec("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES ('r-v2', 'save_memory', 'h', '{\"ok\":true}', 'n-v2', ?, 7)", AT);
 			const act = Number(sql.exec("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'agent', 'saved', 'v2 row', '[\"n-v2\"]', 7) RETURNING id", AT).one().id);
 			migrate(s.storage, "profile_meta", PROFILE_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("7");
+			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("8");
 			expect(sql.exec("EXPLAIN QUERY PLAN SELECT id FROM archive WHERE activity_id = 1").toArray().map((r) => String(r.detail)).join(" ")).toContain("archive_activity");
 			expect(sql.exec("PRAGMA index_list('refresh_refs')").toArray()).toContainEqual(expect.objectContaining({ name: "refresh_refs_request", unique: 1 }));
 			expect(sql.exec("EXPLAIN QUERY PLAN SELECT 1 FROM refresh_refs WHERE request_id = 'request' AND claim_id = 'claim'").toArray().map((r) => String(r.detail)).join(" ")).toContain("refresh_refs_request");

@@ -317,6 +317,7 @@ it("the wipe driver waits for bounded fence cancellation before account request 
 		if(s.op === "fence"){fences++;return {ok:true,value:{done:fences>1,preserved:[],purged:[],redacted:0}};}
 		if(s.op === "requests"){expect(fences).toBeGreaterThanOrEqual(2);return {ok:true,value:{ids:["synthetic-request"],after:null}};}
 		if(s.op === "purge"){expect(requestsFenced).toBe(true);purges++;return {ok:true,value:{done:true,preserved:[],purged:[],redacted:0}};}
+		if(s.op === "count_cleanup")return {ok:true,value:{done:true,preserved:[],purged:[],redacted:0}};
 		return {ok:true,value:{ids:[],after:null}};
 	}};
 	const result=await wipeProfile(env,ports,{kind:"owner",userId:id,scopes:[],profiles:"*"},"work","work");expect(result.ok).toBe(true);expect(fences).toBe(2);expect(purges).toBe(1);

@@ -1,13 +1,14 @@
 // AccountStore: one per user. Devices, routing rules, the profile registry, node_index, request_index (section 5).
 import { DurableObject } from "cloudflare:workers";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { randomBase32, sha256 } from "../domain/ids";
+import { canonicalJson, randomBase32, sha256 } from "../domain/ids";
 import { Fail, fail, ok, PROFILE_NAME, PROFILES, SCOPES, type Caller, type Outcome, type ProfileRef, type RoutingRule, type Scope } from "../domain/types";
 import { migrate, nextSeq } from "../storage";
 import { ACCOUNT_MIGRATIONS } from "./schema";
 import * as refresh from "./refresh";
 import { accountTransfer, type AccountTransfer, type TransferCommand } from "./transfers";
 import { resumeTransfer, transferPorts, type TransferInput } from "../transfer";
+import { mayUse, refreshSelectors, type RefreshSelector } from "../routing";
 import { ROW_PAUSE } from "../profile/store";
 import { wipePorts, wipeProfile } from "../wipe";
 
@@ -18,6 +19,11 @@ export type Principal = { kind: "owner"; userId: string; device?: string } | { k
 export interface TransferRequest { input: TransferInput; result?: Record<string, unknown> }
 
 export interface AccountContext { caller: Caller; rules: RoutingRule[]; profiles: ProfileRef[]; known: string[]; sensitiveTerms: string[] }
+
+export interface RefreshScope {
+	version: 1; origin: string; profile: string; generation: string; device_id: string;
+	utc_day: string; issued_at: string; policy_version: string; github: RefreshSelector[]; jira: "assigned-open" | null;
+}
 
 export type AccountCommand =
 	| { op: "listDevices" }
@@ -105,8 +111,8 @@ export class AccountStore extends DurableObject<Env> {
 		await this.env.BACKUPS.put(`generations/${id}.json`, JSON.stringify({ id, profile, purpose, state, at: now() }), { httpMetadata: { contentType: "application/json" } });
 	}
 
-	/** Principal to Caller, plus everything the Worker needs to route and guard. Checks every device token on every call. */
-	async context(p: Principal): Promise<Outcome<AccountContext>> {
+	/** Seeding may await. Each caller validates its principal immediately before its synchronous reads. */
+	private async contextUser(p: Principal): Promise<Outcome<string>> {
 		const userId = p.kind === "owner" ? p.userId : this.meta("user_id");
 		if (!userId) return fail("unauthorized", "unknown device token");
 		try {
@@ -114,15 +120,52 @@ export class AccountStore extends DurableObject<Env> {
 		} catch (e) {
 			return fail("unavailable", `account setup failed: ${(e as Error).message}`);
 		}
-		const caller = p.kind === "owner" ? this.ownerCaller(userId, p.device) : this.deviceCaller(userId, p);
-		if (!caller.ok) return caller;
-		const rules = this.sql.exec<{ id: string; priority: number; match: "remote" | "path"; pattern: string; profile: string; enabled: number }>(
+		return ok(userId);
+	}
+
+	private routingRules(): RoutingRule[] {
+		return this.sql.exec<{ id: string; priority: number; match: "remote" | "path"; pattern: string; profile: string; enabled: number }>(
 			"SELECT id, priority, match, pattern, profile, enabled FROM routing_rules ORDER BY priority").toArray()
 			.map((r) => ({ ...r, enabled: r.enabled === 1 }));
+	}
+
+	/** Principal to Caller and routing context. Device validation is shared with refreshScope. */
+	async context(p: Principal): Promise<Outcome<AccountContext>> {
+		const prepared = await this.contextUser(p);
+		if (!prepared.ok) return prepared;
+		const userId = prepared.value;
+		const caller = p.kind === "owner" ? this.ownerCaller(userId, p.device) : this.deviceCaller(userId, p);
+		if (!caller.ok) return caller;
+		const rules = this.routingRules();
 		const profiles = this.sql.exec<{ name: string; generation: string }>("SELECT name, generation FROM profiles WHERE status = 'active' ORDER BY name").toArray()
 			.map((r) => ({ userId, profile: r.name, generation: r.generation }));
 		const terms = this.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((r) => r.term);
 		return ok({ caller: caller.value, rules, profiles, known: profiles.map((x) => x.profile), sensitiveTerms: [...new Set([...orgTerms(rules), ...terms])] });
+	}
+
+	/** Authenticated selected projection, with no await between device validation and the policy snapshot. */
+	async refreshScope(p: Principal, profile: string): Promise<Outcome<{ scope: RefreshScope; scope_hash: string }>> {
+		// Seeding may await; validate the device in the synchronous snapshot below.
+		const prepared = await this.contextUser(p);
+		if (!prepared.ok) return prepared;
+		if (p.kind !== "device") return fail("forbidden", "a registered ingest device is required");
+		const current = this.deviceCaller(prepared.value, p);
+		if (!current.ok) return current;
+		const caller = current.value;
+		if (!caller.scopes.includes("ingest") || !mayUse(caller, profile) || profile === "me") return fail("forbidden", "this device may not read refresh scope");
+		if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+		const ref = this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ? AND status = 'active'", profile).toArray()[0];
+		if (!ref) return fail("profile_wiped", "this profile generation is closed");
+		const rules = this.routingRules(), github = refreshSelectors(rules, profile);
+		if (!github.ok) return github;
+		const routing_seq = this.sql.exec<{ seq: string }>("SELECT CAST(MAX(seq) AS TEXT) AS seq FROM routing_rules").one().seq;
+		const resource = new URL(this.env.RESOURCE_URL);
+		if (resource.protocol !== "https:") return fail("unavailable", "refresh_scope_unsupported");
+		const issued_at = now(), generation = ref.generation, device_id = caller.deviceId!;
+		const policy_version = sha256(canonicalJson({ version: 1, compiler: "literal-routing-v1", routing_seq, profile, generation, device_id }));
+		const scope: RefreshScope = { version: 1, origin: resource.origin, profile, generation, device_id, utc_day: issued_at.slice(0, 10), issued_at,
+			policy_version, github: github.value, jira: profile === "work" ? "assigned-open" : null };
+		return ok({ scope, scope_hash: sha256(canonicalJson(scope)) });
 	}
 
 	private ownerCaller(userId: string, device?: string): Outcome<Caller> {

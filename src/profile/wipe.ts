@@ -1,3 +1,5 @@
+import { countOrigin, unownedCountHistory, purgePersonCounts, countRequestPage, countStatePage, purgeOriginCounts, type CommitReceipt, type CountPair } from "./work-counts";
+import { drainCountArchives, redactCountArchives } from "./archive-operations";
 // A profile's part of a wipe (section 9, steps 3, 4 and 6). It lists the ids a wipe purges here, names their request ids so the
 // account can fence them first, purges them in bounded steps with their activity redacted first, reports hand-written matches
 // without touching them, and clears a wiped generation. The Worker keeps the content-free plan in R2 before any purge.
@@ -8,7 +10,7 @@ import { Fail, ok, type Outcome } from "../domain/types";
 import { nextSeq } from "../storage";
 import { BudgetTx, type Row } from "./archive";
 import { vectorId } from "./index";
-import { bundleTexts } from "./transfer";
+import { bundleTexts, type Entry } from "./transfer";
 import type { Who } from "./write";
 
 /** One page of a wipe: the wiped profile, its wipe time, at most 100 node ids, and the terms the wiped profile had. */
@@ -18,6 +20,9 @@ export interface Page { ids: string[]; after: string | null }
 export interface PurgeResult { done: boolean; purged: string[]; redacted: number; preserved: string[] }
 
 export type WipeStep =
+	| {op:"count_close"|"count_cleanup";profile:string;at:string}
+	| {op:"count_requests"|"count_transfers"|"count_archives";profile:string;after:string}
+
 	| { op: "origin"; profile: string; after: string }
 	| { op: "requests"; wipe: OriginWipe; after: string }
 	| { op: "purge"; wipe: OriginWipe }
@@ -34,8 +39,8 @@ const marker = (w: OriginWipe) => `wipe:${w.profile}:${w.at}`;
 function originPage(sql: SqlStorage, who: Who, profile: string, after: string): Page {
 	const all = who.profile === profile ? 1 : 0;
 	const ids = sql.exec<{ id: string }>(`SELECT id FROM (
-		SELECT id FROM nodes WHERE source_profile = ? OR ?
-		UNION SELECT json_extract(payload, '$.id') AS id FROM archive WHERE source = 'nodes' AND (json_extract(payload, '$.source_profile') = ? OR ?)
+		SELECT id FROM nodes WHERE source_profile = ? OR (? AND source_profile IS NULL)
+		UNION SELECT json_extract(payload, '$.id') AS id FROM archive WHERE source = 'nodes' AND (json_extract(payload, '$.source_profile') = ? OR (? AND json_extract(payload, '$.source_profile') IS NULL))
 		UNION SELECT json_extract(value,'$.node') AS id FROM profile_meta WHERE key>='archive-node:' AND key<'archive-node:~' AND (json_extract(value,'$.origin')=? OR ?)
 	) WHERE id > ? ORDER BY id LIMIT ${PAGE}`, profile, all, profile, all, profile, all, after).toArray().map((r) => r.id);
 	return { ids, after: ids.length === PAGE ? ids.at(-1)! : null };
@@ -175,6 +180,7 @@ function purge(sql: SqlStorage, who: Who, w: OriginWipe): PurgeResult {
 			tx.run(q, ...args);
 			if (tx.rows > before) return out;
 		}
+		if(!purgePersonCounts(tx,id,who.profile))return out;
 		if (sql.exec("SELECT 1 FROM nodes WHERE id = ?", id).toArray().length) {
 			tx.run("DELETE FROM nodes WHERE id = ?", id);
 			out.purged.push(id);
@@ -223,10 +229,102 @@ async function clear(storage: DurableObjectStorage, env: Env, who: Who): Promise
 }
 
 /** ProfileStore.purgeOrigin(who, step), after bind(who). Internal RPC only: the owner's wipe route is the one caller. */
+interface CountCleanup {phase:"requests"|"activity"|"archives"|"edges"|"state"|"done";after:string;id:number|null}
+function cleanupCounts(sql:SqlStorage,origin:string,at:string):PurgeResult {
+	const tx=new BudgetTx(sql,nextSeq(sql,"profile_meta"),new Date().toISOString());
+	const key=`count-cleanup:${origin}:${at}`;
+	const old=sql.exec<{value:string}>("SELECT value FROM profile_meta WHERE key=?",key).toArray()[0];
+	const v:CountCleanup=old?JSON.parse(old.value) as CountCleanup:{phase:"requests",after:"",id:0};
+	let redacted=0;
+	if(v.phase==="requests"){
+		const rows=sql.exec<{request_id:string;commit_meta:string|null}>("SELECT request_id,commit_meta FROM requests WHERE request_id>? ORDER BY request_id LIMIT 10",v.after).toArray();
+		for(const row of rows){
+			const m=row.commit_meta?JSON.parse(row.commit_meta) as CommitReceipt:undefined;
+			if(m?.origin===origin){
+				if(m.local)tx.run("UPDATE activity SET undo=NULL,summary='upload redacted by origin wipe',redacted=?,seq=? WHERE id=? AND at=? AND json_extract(undo,'$.seq')=?",`wipe:${origin}:${at}`,tx.seq,m.owner.id,m.owner.at,m.owner.seq);
+				tx.run("DELETE FROM requests WHERE request_id=?",row.request_id);
+			}
+			v.after=row.request_id;
+		}
+		if(rows.length<10){v.phase="activity";v.id=0;}
+	}else if(v.phase==="activity"){
+		const rows=sql.exec<{id:number;op:string;undo:string|null}>("SELECT id,op,undo FROM activity WHERE id>? ORDER BY id LIMIT 10",v.id).toArray();
+		for(const a of rows){
+			const inv=a.undo?JSON.parse(a.undo) as {commitReceipt?:CommitReceipt;countOrigins?:string[]}:undefined;
+			if(inv?.commitReceipt?.origin===origin || inv?.countOrigins?.includes(origin)){
+				tx.run("UPDATE activity SET undo=NULL,summary=?,redacted=?,seq=? WHERE id=?",`${a.op} redacted by origin wipe`,`wipe:${origin}:${at}`,tx.seq,a.id);redacted++;
+			}
+			v.id=a.id;
+		}
+		if(rows.length<10)v.phase="archives";
+	}else if(v.phase==="archives"){
+		if(redactCountArchives(tx,origin)){v.phase="edges";v.id=null;}
+	}else if(v.phase==="edges"){
+		// Ordinary history has no registered pair on a foreign profile. Page by the physical key before filtering.
+		const rows=v.id===null?sql.exec<Row>("SELECT id,count_key,count_epoch FROM edges ORDER BY id LIMIT 10").toArray():sql.exec<Row>("SELECT id,count_key,count_epoch FROM edges WHERE id>? ORDER BY id LIMIT 10",v.id).toArray();
+		for(const row of rows){
+			if(unownedCountHistory(row) && countOrigin(row.count_key)===origin){
+				tx.run("DELETE FROM evidence WHERE (owner,kind,ref) IN (SELECT owner,kind,ref FROM evidence WHERE owner=? LIMIT 25)",`e:${row.id}`);
+				if(sql.exec("SELECT 1 FROM evidence WHERE owner=? LIMIT 1",`e:${row.id}`).toArray().length)break;
+				tx.run("DELETE FROM edges WHERE id=?",row.id!);
+			}
+			v.id=Number(row.id);
+			if(tx.spent(.5))break;
+		}
+		if(rows.length<10 && (!rows.length || v.id===rows.at(-1)!.id))v.phase="state";
+	}else if(v.phase==="state"){
+		if(purgeOriginCounts(tx,origin))v.phase="done";
+	}
+	if(v.phase==="done"){v.after="";v.id=0;}
+	tx.run("INSERT INTO profile_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",key,JSON.stringify(v));
+	return {done:v.phase==="done",purged:[],redacted,preserved:[]};
+}
+function countTransfers(storage:DurableObjectStorage,origin:string,after:string):Page {
+	return storage.transactionSync(()=>{
+		const sql=storage.sql,tx=new BudgetTx(sql,nextSeq(sql,"profile_meta"),new Date().toISOString()),ids=new Set<string>();
+		const stop=(id:string|undefined)=>{
+			if(!id)return;
+			const t=sql.exec<{state:string}>("SELECT state FROM transfers WHERE id=?",id).toArray()[0];
+			if(t && (!["committed","aborted"].includes(t.state)||sql.exec("SELECT 1 FROM transfer_parts WHERE transfer_id=? LIMIT 1",id).toArray().length)){
+				ids.add(id);tx.run("INSERT OR REPLACE INTO profile_meta(key,value) VALUES(?,?)",`work-count-stop-transfer:${id}`,JSON.stringify({origin}));
+			}
+		};
+		const moving=(person:SqlStorageValue)=>{
+			const n=sql.exec<{attrs:string}>("SELECT attrs FROM nodes WHERE id=?",person).toArray()[0];
+			stop(n?(JSON.parse(n.attrs) as {transfer?:{id?:string}}).transfer?.id:undefined);
+		};
+		const cursor=after.startsWith("{")?JSON.parse(after) as {phase:"edges"|"archives"|"parts";id:number|null;transfer?:string;n?:number}:undefined;
+		if(!cursor){
+			const page=countStatePage(sql,origin,after);
+			for(const r of page.rows){const p=JSON.parse(r.value) as CountPair;if(p.kind==="pair"){moving(p.person);stop(p.transfer);}}
+			return {ids:[...ids],after:page.after??JSON.stringify({phase:"edges",id:null})};
+		}
+		if(cursor.phase!=="parts"){
+			const rows=cursor.phase==="edges"?(cursor.id===null?sql.exec<Row>("SELECT id,src,count_key FROM edges ORDER BY id LIMIT 10").toArray():sql.exec<Row>("SELECT id,src,count_key FROM edges WHERE id>? ORDER BY id LIMIT 10",cursor.id).toArray()):sql.exec<Row>("SELECT id,source,payload FROM archive WHERE id>? ORDER BY id LIMIT 10",cursor.id).toArray();
+			for(const row of rows){const e=cursor.phase==="edges"?row:row.source==="edges"?JSON.parse(String(row.payload)) as Row:undefined;if(e && countOrigin(e.count_key)===origin)moving(e.src!);}
+			return {ids:[...ids],after:JSON.stringify(rows.length===10?{...cursor,id:Number(rows.at(-1)!.id)}:{phase:cursor.phase==="edges"?"archives":"parts",id:0})};
+		}
+		// Source parts retain the original image; target ledgers retain only its origin labels. One immutable part per page.
+		const part=sql.exec<{transfer_id:string;n:number;payload:string}>("SELECT transfer_id,n,payload FROM transfer_parts WHERE (transfer_id,n)>(?,?) ORDER BY transfer_id,n LIMIT 1",cursor.transfer??"",cursor.n??0).toArray()[0];
+		if(!part)return {ids:[...ids],after:null};
+		const payload=JSON.parse(part.payload) as Entry[]|{countOrigins?:string[]};
+		const carries=Array.isArray(payload)?payload.some(([table,row])=>{const e=table==="edges"?row:table==="archive"&&row.source==="edges"?JSON.parse(String(row.payload)) as Row:undefined;return e && countOrigin(e.count_key)===origin;}):payload.countOrigins?.includes(origin);
+		if(carries)stop(part.transfer_id);
+		return {ids:[...ids],after:JSON.stringify({phase:"parts",id:0,transfer:part.transfer_id,n:part.n})};
+	});
+}
+
 export async function purgeOrigin(storage: DurableObjectStorage, env: Env, who: Who, step: WipeStep): Promise<Outcome<WipeOut>> {
 	try {
 		const sql = storage.sql;
 		switch (step.op) {
+			case "count_close":
+				return ok(storage.transactionSync(()=>{const tx=new BudgetTx(sql,nextSeq(sql,"profile_meta"),new Date().toISOString());tx.run("INSERT OR IGNORE INTO profile_meta(key,value) VALUES(?,?)",`work-count-closed:${step.profile}`,JSON.stringify({at:tx.now,seq:tx.seq}));return {done:true,purged:[],redacted:0,preserved:[]};}));
+			case "count_archives":return ok(drainCountArchives(storage,who,step.profile,step.after));
+			case "count_transfers":return ok(countTransfers(storage,step.profile,step.after));
+			case "count_requests":return ok(countRequestPage(sql,step.profile,step.after));
+			case "count_cleanup":return ok(storage.transactionSync(()=>cleanupCounts(sql,step.profile,step.at)));
+
 			case "close":
 				storage.transactionSync(() => sql.exec("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('closed', 'wiping')"));
 				return ok({ cleared: 0 });

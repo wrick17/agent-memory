@@ -1,6 +1,7 @@
+import { commitArgs } from "../src/profile/work-upload";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { accountTransfer } from "../src/account/transfers";
 import { ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import { sha256 } from "../src/domain/ids";
@@ -561,4 +562,226 @@ describe("C3 accepted intent alarm recovery", () => {
 			expect(await outcome(c, "save_memory", { ...args, profile: "me" })).toMatchObject({ ok: false, error: { code: "idempotency_mismatch" } });
 		}
 	});
+});
+
+
+describe("observed count transfer",()=>{
+	it("freezes foreign arithmetic and cleans metadata on abort even after the incoming node is gone",async()=>{
+		const run=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+		const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return run.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+		try{
+
+		for(const abort of [false,true]){
+			const r=await rig(),who=r.ref("work");
+			const uploaded=await r.profile(who,s=>{
+				const a=commitArgs("fixture/counts",{sha:"a".repeat(40),at:"2026-02-01T00:00:00.000Z",title:"count fixture",author:"count-author"});
+				const out=runWrite(s,who,{op:"upload",args:a},{actor:"index",platform:"test",routedBy:"test",payloadHash:sha256(JSON.stringify(a)),userId:who.userId});
+				return {out,person:String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id),request:a.request_id};
+			});
+			await r.onAccount(s=>{
+				for(const id of uploaded.out.created)s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);
+				s.sql.exec("INSERT INTO request_index(request_id,profile,op,payload_hash,at,seq) VALUES(?,'work','upload','fixture',?,1)",uploaded.request,new Date().toISOString());
+			});
+			const input=inputFor(uploaded.person);
+			if(abort){
+				const fault:TransferPorts={...r.ports,profile:async(ref,step)=>{const out=await r.ports.profile(ref,step);if(step.op==='land')throw new Error('stop after land');return out;}};
+				await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('stop after land');
+				const before=await r.profile(who,s=>s.sql.exec("SELECT payload,sha256 FROM transfer_parts WHERE transfer_id=? ORDER BY n",input.id).toArray());
+				await r.profile(who,s=>s.transactionSync(()=>s.sql.exec("DELETE FROM activity WHERE id=?",Number(uploaded.out.result.activity_id))));
+				expect(await r.profile(who,s=>s.sql.exec("SELECT payload,sha256 FROM transfer_parts WHERE transfer_id=? ORDER BY n",input.id).toArray())).toEqual(before);
+				await r.profile(r.ref('personal'),s=>s.sql.exec("DELETE FROM nodes WHERE id=?",uploaded.person));
+				unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+				await r.profile(r.ref('personal'),s=>expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]));
+				await r.profile(who,s=>expect(s.sql.exec("SELECT status FROM nodes WHERE id=?",uploaded.person).one().status).toBe('active'));
+			}else{
+				unwrap(await driveTransfer(r.ports,input,r.caller));
+				await r.profile(r.ref('personal'),s=>{
+					const edge=s.sql.exec("SELECT weight,dst_profile,count_key FROM edges WHERE rel='works_on'").one();expect(edge.weight).toBe(1);expect(edge.dst_profile).toBe('work');
+					const state=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",edge.count_key!).one().value));expect(state.frozen).toBe(true);expect(state.base).toBe(1);expect(state.origin).toBe('work');
+				});
+			}
+		}
+		}finally{meter.mockRestore();}
+		expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+		console.log('COUNT_TRANSFER_RESOURCES',JSON.stringify(peak));
+
+	});
+});
+
+
+describe("observed count return ownership",()=>{
+	it("adopts frozen totals on return without reviving the old source upload inverse",async()=>{
+		const r=await rig(),who=r.ref('work'),ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId};
+		const first=await r.profile(who,s=>{
+			const a=commitArgs('fixture/return-counts',{sha:'b'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'before move',author:'return-count'}),out=runWrite(s,who,{op:'upload',args:a},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(a))});
+			return {person:String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id),activity:Number(out.result.activity_id),created:out.created};
+		});
+		await r.onAccount(s=>{for(const id of first.created)s.sql.exec("INSERT INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+		unwrap(await driveTransfer(r.ports,inputFor(first.person),r.caller));
+		unwrap(await driveTransfer(r.ports,{...inputFor(first.person),from:'personal',to:'work'},r.caller));
+		await r.profile(who,s=>{
+			const before=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();expect(before.weight).toBe(1);expect(before.dst_profile).toBe('');
+			expect(()=>undo(s,who,first.activity,ctx)).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));
+			const a=commitArgs('fixture/return-counts',{sha:'d'.repeat(40),at:'2026-03-01T00:00:00.000Z',title:'after return',author:'return-count'}),out=runWrite(s,who,{op:'upload',args:a},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(a))});
+			expect(s.sql.exec("SELECT id,weight FROM edges WHERE rel='works_on'").one()).toEqual({id:before.id,weight:2});
+			undo(s,who,Number(out.result.activity_id),ctx);
+			expect(s.sql.exec("SELECT id,weight,valid_from,valid_to FROM edges WHERE rel='works_on'").one()).toEqual({id:before.id,weight:1,valid_from:'2026-02-01T00:00:00.000Z',valid_to:'2026-02-01T00:00:00.000Z'});
+		});
+	});
+});
+
+
+describe('counter correction transfer',()=>{
+ it('carries one frozen total through historical pair images and drops native sealed-edge authority',async()=>{
+  const original=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+  const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return original.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+  try{
+  for(const retired of [false,true])for(const abort of [false,true]){
+  const r=await rig(),who=r.ref('work');
+  const fixture=await r.profile(who,s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId};
+   const upload=(i:number)=>{const args=commitArgs('fixture/correction-transfer',{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'correction transfer '+i,author:'correction-transfer'});return runWrite(s,who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});};
+   if(retired){const old=upload(0);undo(s,who,Number(old.result.activity_id),ctx);}
+   const a=upload(1),person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id);
+   runWrite(s,who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'correction-transfer-forget'}},{...ctx,payloadHash:'forget'});
+   const b=upload(2),old=s.sql.exec("SELECT id,payload,seq FROM archive WHERE source='edges' AND json_extract(payload,'$.rel')='works_on' AND json_extract(payload,'$.weight')>0").one();
+   s.transactionSync(()=>{nextSeq(s.sql,'profile_meta');s.sql.exec('DELETE FROM activity WHERE id=?',Number(b.result.activity_id));});
+   expect(s.sql.exec("SELECT commit_seal FROM edges WHERE rel='authored'").one().commit_seal).not.toBe(null);
+   return {person,created:[...a.created,...b.created],old};
+  });
+  await r.onAccount(s=>{for(const id of new Set(fixture.created))s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+  const input=inputFor(fixture.person);
+  if(abort){
+   const fault:TransferPorts={...r.ports,profile:async(ref,step)=>{const out=await r.ports.profile(ref,step);if(step.op==='land')throw new Error('pause archived correction landing');return out;}};
+   await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('pause archived correction landing');
+   await r.profile(r.ref('personal'),s=>s.sql.exec('DELETE FROM nodes WHERE id=?',fixture.person));
+   unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+   await r.profile(r.ref('personal'),s=>{expect(s.sql.exec('SELECT id FROM archive').toArray()).toEqual([]);expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]);});
+   continue;
+  }
+  unwrap(await driveTransfer(r.ports,input,r.caller));
+  await r.profile(who,s=>expect(s.sql.exec('SELECT id,payload,seq FROM archive WHERE id=?',fixture.old.id!).one()).toEqual(fixture.old));
+  await r.profile(r.ref('personal'),s=>{
+   const edge=s.sql.exec("SELECT * FROM edges WHERE rel='works_on' AND ended_at IS NULL").one();expect(edge.weight).toBe(2);
+   const state=JSON.parse(String(s.sql.exec('SELECT value FROM profile_meta WHERE key=?',edge.count_key!).one().value));expect(state.n).toBe(2);expect(state.base).toBe(2);expect(state.frozen).toBe(true);
+   expect(s.sql.exec('SELECT 1 FROM edges WHERE commit_seal IS NOT NULL').toArray()).toEqual([]);
+   expect(s.sql.exec("SELECT 1 FROM archive WHERE source='edges' AND json_extract(payload,'$.commit_seal') IS NOT NULL").toArray()).toEqual([]);
+   expect(s.sql.exec("SELECT json_extract(payload,'$.weight') AS n FROM archive WHERE source='edges' AND json_extract(payload,'$.rel')='works_on' AND json_extract(payload,'$.count_key') IS NOT NULL ORDER BY n").toArray()).toEqual(retired?[{n:0},{n:2}]:[{n:2}]);
+  });
+  }
+  }finally{meter.mockRestore();}
+  expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+  console.log('F2_F3_TRANSFER_RESOURCES',JSON.stringify(peak));
+ });
+});
+
+describe('INDEPENDENT F2 transfer history',()=>{
+ for(const historical of [false,true])it('moves a restored independently ended aggregate history '+historical,async()=>{
+  const r=await rig(),who=r.ref('work');
+  const fixture=await r.profile(who,s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId};
+   const args=commitArgs('fixture/independent-history',{sha:'e'.repeat(40),at:'2026-02-01T00:00:00Z',title:'historical transfer',author:'historical-transfer'});
+   const out=runWrite(s,who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});
+   const person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id),edge=Number(s.sql.exec("SELECT id FROM edges WHERE rel='works_on'").one().id);
+   if(historical){
+    runWrite(s,who,{op:'knowledge',args:{end:[{edge,valid_to:'2026-03-01T00:00:00.000Z',reason:'independent relationship ended'}]}},{...ctx,payloadHash:'ended'});
+    const forgotten=runWrite(s,who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'independent-history-forget'}},{...ctx,payloadHash:'forget'});
+    runWrite(s,who,{op:'restore',args:{activity_id:Number(forgotten.result.activity_id),request_id:'independent-history-restore'}},{...ctx,payloadHash:'restore'});
+    expect(s.sql.exec("SELECT count_epoch FROM edges WHERE rel='works_on'").one().count_epoch).toBe(null);
+   }
+   if(!historical){s.transactionSync(()=>{nextSeq(s.sql,'profile_meta');s.sql.exec('DELETE FROM activity WHERE id=?',Number(out.result.activity_id));});expect(s.sql.exec("SELECT 1 FROM edges WHERE commit_seal IS NOT NULL").toArray().length).toBeGreaterThan(0);}
+   return {person,created:out.created};
+  });
+  await r.onAccount(s=>{for(const id of fixture.created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+  const result=await driveTransfer(r.ports,inputFor(fixture.person),r.caller);console.log('INDEPENDENT_HISTORY_TRANSFER',historical,JSON.stringify(result));
+  unwrap(result);
+  await r.profile(r.ref('personal'),s=>{const row=s.sql.exec("SELECT count_epoch,weight,ended_at FROM edges WHERE rel='works_on'").one();expect(row.weight).toBe(1);expect(s.sql.exec('SELECT 1 FROM edges WHERE commit_seal IS NOT NULL').toArray()).toEqual([]);expect(s.sql.exec("SELECT 1 FROM archive WHERE source='edges' AND json_extract(payload,'$.commit_seal') IS NOT NULL").toArray()).toEqual([]);if(historical){expect(row.count_epoch).toBe(null);expect(row.ended_at).not.toBe(null);}});
+ });
+});
+
+
+describe('null-epoch ordinary history lifecycle',()=>{
+ for(const archived of [false,true])for(const abort of [false,true])it(`preserves ${archived?'archived':'live'} history on ${abort?'abort after incoming-node loss':'completion'}`,async()=>{
+  const run=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+  const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return run.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+  try{
+   const r=await rig(),who=r.ref('work'),target=r.ref('personal');
+   const f=await r.profile(who,s=>{
+    const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId};
+    const args=commitArgs('fixture/null-history',{sha:'c'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'ordinary history',author:'null-history'});
+    const made=runWrite(s,who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});
+    const person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id),edge=Number(s.sql.exec("SELECT id FROM edges WHERE rel='works_on'").one().id);
+    runWrite(s,who,{op:'knowledge',args:{end:[{edge,valid_to:'2026-03-01T00:00:00.000Z',reason:'owner ended this relationship'}]}},{...ctx,payloadHash:'ended'});
+    s.sql.exec("INSERT INTO evidence(owner,kind,ref,note,seq) VALUES(?,'link','https://example.test/history','owner evidence stays',?)",`e:${edge}`,nextSeq(s.sql,'profile_meta'));
+    const forgotten=runWrite(s,who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'null-forget'}},{...ctx,payloadHash:'forget'});
+    runWrite(s,who,{op:'restore',args:{activity_id:Number(forgotten.result.activity_id),request_id:'null-restore'}},{...ctx,payloadHash:'restore'});
+    const row=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();expect(row.count_epoch).toBe(null);
+    const evidence=s.sql.exec('SELECT kind,ref,note FROM evidence WHERE owner=? ORDER BY kind,ref',`e:${row.id}`).toArray();
+    if(archived)runWrite(s,who,{op:'owner',args:{action:'forget',memory_id:String(row.dst),request_id:'null-project-forget'}},{...ctx,payloadHash:'project-forget'});
+    return {person,created:made.created,row,evidence};
+   });
+   await r.onAccount(s=>{for(const id of f.created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+   const input=inputFor(f.person);
+   if(abort){
+    const fault:TransferPorts={...r.ports,profile:async(ref,step)=>{const out=await r.ports.profile(ref,step);if(step.op==='land')throw new Error('pause ordinary history');return out;}};
+    await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('pause ordinary history');
+    await r.profile(target,s=>s.sql.exec('DELETE FROM nodes WHERE id=?',f.person));
+    expect(await driveTransfer(r.ports,input)).toMatchObject({ok:false,error:{code:'revision_conflict'}});
+    unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+    const clean=()=>r.profile(target,s=>({edges:s.sql.exec('SELECT id FROM edges WHERE src=?',f.person).toArray(),evidence:s.sql.exec('SELECT * FROM evidence').toArray(),archive:s.sql.exec('SELECT id FROM archive').toArray(),parts:s.sql.exec('SELECT n FROM transfer_parts').toArray(),counts:s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()}));
+    expect(await clean()).toEqual({edges:[],evidence:[],archive:[],parts:[],counts:[]});
+    const stable=await clean();unwrap(await driveTransfer(r.ports,input,undefined,[],true));expect(await clean()).toEqual(stable);
+    await r.profile(who,s=>expect(s.sql.exec('SELECT status FROM nodes WHERE id=?',f.person).one().status).toBe('active'));
+   }else{
+    unwrap(await driveTransfer(r.ports,input,r.caller));
+    await r.profile(target,s=>{
+     const a=archived?s.sql.exec("SELECT activity_id,payload FROM archive WHERE source='edges' AND json_extract(payload,'$.rel')='works_on'").one():undefined;
+     const row=a?JSON.parse(String(a.payload)):s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();
+     const expected={...f.row},actual={...row};for(const field of ['id','seq','dst_profile']){delete expected[field];delete actual[field];}
+     const id=row.id;expect(actual).toEqual(expected);expect(row.dst_profile).toBe('work');
+     const evidence=a?s.sql.exec("SELECT json_extract(payload,'$.kind') AS kind,json_extract(payload,'$.ref') AS ref,json_extract(payload,'$.note') AS note FROM archive WHERE source='evidence' AND activity_id=? AND json_extract(payload,'$.owner')=? ORDER BY kind,ref",a.activity_id!,`e:${id}`).toArray():s.sql.exec('SELECT kind,ref,note FROM evidence WHERE owner=? ORDER BY kind,ref',`e:${id}`).toArray();
+     expect(evidence).toEqual(f.evidence);
+     expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]);
+     expect(s.sql.exec('SELECT 1 FROM edges WHERE commit_seal IS NOT NULL').toArray()).toEqual([]);
+    });
+   }
+  }finally{meter.mockRestore();}
+  expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+  console.log('NULL_HISTORY_TRANSFER_RESOURCES',JSON.stringify({archived,abort,...peak}));
+ });
+ for(const changed of ['owner-edit','foreign-epoch','malformed-epoch'])it('refuses '+changed+' as managed transfer authority atomically',async()=>{
+  const r=await rig(),who=r.ref('work');
+  const f=await r.profile(who,s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId},args=commitArgs('fixture/null-negative',{sha:'d'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'managed negative',author:'null-negative'});
+   const made=runWrite(s,who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});
+   const row=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();
+   if(changed==='owner-edit')runWrite(s,who,{op:'knowledge',args:{end:[{edge:Number(row.id),valid_to:'2026-03-01T00:00:00.000Z',reason:'independent managed edit'}]}},{...ctx,payloadHash:'end'});
+   else s.sql.exec('UPDATE edges SET count_epoch=? WHERE id=?',changed==='foreign-epoch'?'0'.repeat(64):'malformed',row.id!);
+   return {person:String(row.src),created:made.created};
+  });
+  await r.onAccount(s=>{for(const id of f.created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+  const before=await r.profile(who,s=>s.sql.exec('SELECT * FROM edges').toArray());
+  expect(await driveTransfer(r.ports,inputFor(f.person),r.caller)).toMatchObject({ok:false,error:{code:'revision_conflict'}});
+  expect(await r.profile(who,s=>s.sql.exec('SELECT * FROM edges').toArray())).toEqual(before);
+  await r.profile(r.ref('personal'),s=>expect(s.sql.exec('SELECT id FROM edges').toArray()).toEqual([]));
+ });
+});
+
+
+describe('null-epoch archive authority negatives',()=>{
+ for(const epoch of ['0'.repeat(64),'malformed'])it('refuses an archived nonowned non-null epoch '+epoch.slice(0,8),async()=>{
+  const r=await rig(),who=r.ref('work');
+  const f=await r.profile(who,s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:who.userId},args=commitArgs('fixture/archive-epoch-negative',{sha:'a'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'archive epoch negative',author:'archive-negative'});
+   const made=runWrite(s,who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))}),edge=s.sql.exec("SELECT src,dst FROM edges WHERE rel='works_on'").one();
+   runWrite(s,who,{op:'owner',args:{action:'forget',memory_id:String(edge.dst),request_id:'negative-project-forget'}},{...ctx,payloadHash:'forget'});
+   s.sql.exec("UPDATE archive SET payload=json_set(payload,'$.count_epoch',?) WHERE source='edges' AND json_extract(payload,'$.rel')='works_on'",epoch);
+   return {person:String(edge.src),created:made.created};
+  });
+  await r.onAccount(s=>{for(const id of f.created)s.sql.exec("INSERT OR IGNORE INTO node_index(node_id,profile,seq) VALUES(?,'work',1)",id);});
+  const before=await r.profile(who,s=>s.sql.exec('SELECT * FROM archive ORDER BY id').toArray());
+  expect(await driveTransfer(r.ports,inputFor(f.person),r.caller)).toMatchObject({ok:false,error:{code:'revision_conflict'}});
+  expect(await r.profile(who,s=>s.sql.exec('SELECT * FROM archive ORDER BY id').toArray())).toEqual(before);
+  await r.profile(r.ref('personal'),s=>expect(s.sql.exec('SELECT id FROM archive').toArray()).toEqual([]));
+ });
 });

@@ -1,3 +1,4 @@
+import { purgePersonCounts, sealObservation } from "./work-counts";
 // Housekeeping (section 12): deterministic alarm stages, one bounded step per call, with cursors. Exact dedupe, the 90-day
 // capture TTL into the archive, and the 300-day purge. Every change except purge keeps its undo; protected nodes are only
 // flagged. The size level (section 6) is measured on every call.
@@ -51,7 +52,7 @@ export function housekeep(storage: DurableObjectStorage, who: Who, now = Date.no
 	const first = stages[0]!;
 	if (first.dueAt > now) return { stage: null, more: false, purged: [], size, nextDue: first.dueAt };
 	const r: StepResult = first.stage === "dedupe" ? dedupe(storage, who, Number(first.cursor ?? 0)) : first.stage === "ttl" ? ttl(storage, who, now, first.cursor)
-		: first.stage === "queue" ? queueStep(storage, who, Number(first.cursor ?? 0), now) : purge(storage, now);
+		: first.stage === "queue" ? queueStep(storage, who, Number(first.cursor ?? 0), now) : purge(storage, who, now);
 	const dueAt = r.more ? now : now + DAY;
 	sql.exec(`INSERT INTO cursors (stage, cursor, due_at, last_run_at, last_error, stats) VALUES (?, ?, ?, ?, NULL, ?)
 		ON CONFLICT (stage) DO UPDATE SET cursor = excluded.cursor, due_at = excluded.due_at, last_run_at = excluded.last_run_at, last_error = NULL, stats = excluded.stats`,
@@ -147,7 +148,7 @@ function ttl(storage: DurableObjectStorage, who: Who, now: number, cursor: strin
  * Archive rows past purge_after are deleted for good, the one change without undo. A purged node's request records go with
  * it, a bounded batch per step. Activity older than 400 days is deleted. The activity row keeps counts and ids only.
  */
-function purge(storage: DurableObjectStorage, now: number): StepResult {
+function purge(storage: DurableObjectStorage, who: Who, now: number): StepResult {
 	if (storage.sql.exec("SELECT 1 FROM cursors WHERE stage = 'purge_cleanup'").toArray().length) return { more: true, stats: { pending_cleanup: 1 } };
 	return storage.transactionSync(() => {
 		const sql = storage.sql;
@@ -160,11 +161,14 @@ function purge(storage: DurableObjectStorage, now: number): StepResult {
 		for (const r of rows) {
 			if (tx.spent(SOFT) || requests.length + purged.length >= 100) { more = true; break; }
 			if (r.node && !sql.exec("SELECT 1 FROM nodes WHERE id = ?", r.node).toArray().length) {
-				const ids = sql.exec<{ request_id: string }>("SELECT request_id FROM requests WHERE node_id = ? ORDER BY request_id LIMIT ?", r.node, 100 - requests.length - purged.length).toArray().map((q) => q.request_id);
+				const offered = sql.exec<{ request_id: string }>("SELECT request_id FROM requests WHERE node_id = ? ORDER BY request_id LIMIT ?", r.node, 100 - requests.length - purged.length).toArray().map((q) => q.request_id);
+				const ids:string[]=[];
+				for(const id of offered){if(tx.spent(0.35))break;sealObservation(tx,id);ids.push(id);}
 				if (ids.length) tx.run("DELETE FROM requests WHERE request_id IN (SELECT value FROM json_each(?))", JSON.stringify(ids));
 				requests.push(...ids);
 				// A node with more request records than one batch keeps its archive row until the next step finishes them.
 				if (sql.exec("SELECT 1 FROM requests WHERE node_id = ? LIMIT 1", r.node).toArray().length) { more = true; break; }
+				if(!purgePersonCounts(tx,r.node,who.profile)){more=true;break;}
 				purged.push(r.node);
 			}
 			tx.run("DELETE FROM archive WHERE id = ?", r.id);
@@ -173,16 +177,21 @@ function purge(storage: DurableObjectStorage, now: number): StepResult {
 		}
 		const old = new Date(now - ACTIVITY_DAYS * DAY).toISOString();
 		const stale = tx.spent(SOFT) ? [] : sql.exec<{ id: number }>("SELECT id FROM activity WHERE NOT EXISTS (SELECT 1 FROM profile_meta WHERE key='archive-pin:'||activity.id) AND at < ? ORDER BY id LIMIT 100", old).toArray().map((a) => a.id);
-		const removable:number[]=[];
-		for(const id of stale){if(tx.spent(SOFT)){more=true;break;}if(retireArchivePage(tx,id))removable.push(id);else more=true;}
-		if (removable.length) tx.run("DELETE FROM activity WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(removable));
+		let expired=0;
+		for(const id of stale){
+			if(tx.spent(SOFT)){more=true;break;}
+			if(retireArchivePage(tx,id)){
+				// Charge this row's expiry triggers before taking another item, leaving the existing half-budget headroom.
+				tx.run("DELETE FROM activity WHERE id=?",id);expired++;
+			}else more=true;
+		}
 		more ||= stale.length === 100;
 		if (done || stale.length) {
 			tx.run("INSERT INTO activity (at, actor, op, summary, targets, seq) VALUES (?, 'keep', 'purge', ?, ?, ?)", tx.now,
-				`purged ${done} archived rows (${purged.length} nodes) and ${stale.length} activity rows older than ${ACTIVITY_DAYS} days`, JSON.stringify(purged), tx.seq);
+				`purged ${done} archived rows (${purged.length} nodes) and ${expired} activity rows older than ${ACTIVITY_DAYS} days`, JSON.stringify(purged), tx.seq);
 		}
 		if (purged.length || requests.length) tx.run("INSERT INTO cursors (stage, cursor, due_at) VALUES ('purge_cleanup', ?, 0)", JSON.stringify({ nodes: purged, requests }));
-		return { more, purged, stats: { rows: done, nodes: purged.length, activity: stale.length } };
+		return { more, purged, stats: { rows: done, nodes: purged.length, activity: expired } };
 	});
 }
 

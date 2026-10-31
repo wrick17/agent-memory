@@ -1,5 +1,5 @@
 // Owner-only REST: protected-resource metadata, whoami, device tokens and the minimal Settings page (sections 8 and 15).
-import type { AccountCommand, AccountContext, AccountStore } from "./account/store";
+import type { AccountCommand, AccountContext, AccountStore, Principal } from "./account/store";
 import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
@@ -169,6 +169,7 @@ const markersQuery = z.object({ repo: z.string().min(1).max(512).optional(), pat
 async function markersRead(request: Request, env: Env): Promise<Response> {
 	const auth = await authenticate(request, env, "resource", true);
 	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	if (new URL(request.url).searchParams.has("refresh_scope")) return refreshScopeRead(request, env, auth.principal);
 	const ctx = await accountStub(env, env.OWNER_USER_ID).context(auth.principal);
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot read upload markers" } }, 403);
@@ -188,6 +189,33 @@ async function markersRead(request: Request, env: Env): Promise<Response> {
 		? { profile: ref.profile, generation: ref.generation, device_id: caller.deviceId, utc_day: new Date().toISOString().slice(0, 10) } : null;
 	return r.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, refresh_context, ...(r.value as Record<string, unknown>) })
 		: json({ error: r.error }, r.error.code === "busy" ? 503 : 400);
+}
+
+const refreshScopeQuery = z.object({ profile: z.string().regex(PROFILE_NAME), refresh_scope: z.literal("1") }).strict();
+
+async function refreshScopeRead(request: Request, env: Env, principal: Principal): Promise<Response> {
+	const url = new URL(request.url), params = url.searchParams;
+	const q = refreshScopeQuery.safeParse(Object.fromEntries(params));
+	if (!q.success || [...params.keys()].length !== 2) return json({ error: { code: "validation", message: "invalid refresh scope query" } }, 400);
+	if (new URL(env.RESOURCE_URL).protocol !== "https:") return json({ error: { code: "unavailable", message: "refresh_scope_unsupported" } }, 503);
+	if (url.origin !== new URL(env.RESOURCE_URL).origin) return json({ error: { code: "forbidden", message: "refresh scope origin mismatch" } }, 403);
+	const account = accountStub(env, env.OWNER_USER_ID) as unknown as Pick<AccountStore, "refreshScope">;
+	const before = await account.refreshScope(principal, q.data.profile);
+	const refused = (error: { code: string; message: string }) => json({ error }, error.code === "unauthorized" ? 401 : error.code === "forbidden" ? 403 : error.code === "unavailable" || error.code === "busy" ? 503 : 400);
+	if (!before.ok) return refused(before.error);
+	const initial = before.value.scope;
+	if (initial.origin !== url.origin) return refused({ code: "forbidden", message: "refresh scope origin mismatch" });
+	const ref = { userId: env.OWNER_USER_ID, profile: initial.profile, generation: initial.generation };
+	const markers = await profileStub(env, ref).read(ref, { kind: "markers", repo: null });
+	if (!markers.ok) return refused(markers.error);
+	// The profile read awaits another object. Refuse a changed policy rather than mixing snapshots.
+	const final = await account.refreshScope(principal, q.data.profile);
+	if (!final.ok) return refused(final.error);
+	const scope = final.value.scope;
+	if (scope.origin !== initial.origin || scope.profile !== initial.profile || scope.generation !== initial.generation || scope.device_id !== initial.device_id || scope.policy_version !== initial.policy_version)
+		return refused({ code: "busy", message: "refresh_scope_changed" });
+	const refresh_context = { profile: scope.profile, generation: scope.generation, device_id: scope.device_id, utc_day: scope.utc_day };
+	return json({ ...(markers.value as Record<string, unknown>), profile: scope.profile, routed_by: "explicit", refresh_context, refresh_scope: final.value });
 }
 
 // ---------- staged import (section 16) ----------

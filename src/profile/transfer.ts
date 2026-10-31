@@ -1,3 +1,4 @@
+import { assertCountImageOpen, unownedCountHistory, sealMovingPerson, countOrigin, countOriginClosed, closedTransferCounts, cleanupTransferredCounts, countSnapshot, foreignCommit, landCount, purgePersonCounts } from "./work-counts";
 // A profile's part of a transfer (section 9). The source fences the node, packs its bundle into hashed parts, and after the
 // target published, archives what moved and leaves a content-free tombstone. The target lands each part once, guards the
 // materialized rows, and publishes. Every step is one transaction, idempotent, and bounded by the 1,000-row, 1 MB budget.
@@ -107,7 +108,7 @@ function bundle(sql: SqlStorage, nodeId: string): Entry[] {
 	for (const r of sql.exec<Row>("SELECT * FROM revisions WHERE node_id = ? ORDER BY revision", nodeId)) out.push(["revisions", strip(r)]);
 	for (const q of sql.exec<Row>("SELECT * FROM requests WHERE node_id = ? ORDER BY request_id", nodeId)) out.push(["requests", strip(q)]);
 	const edges = sql.exec<Row>("SELECT * FROM edges WHERE src = ? ORDER BY id", nodeId).toArray();
-	for (const e of edges) out.push(["edges", strip(e)]);
+	for (const e of edges) { const count_state=countSnapshot(sql,e); out.push(["edges", {...strip(e),commit_seal:null,...(count_state?{count_state}:{})}]); }
 	const owners = JSON.stringify([`n:${nodeId}`, ...edges.map((e) => `e:${String(e.id)}`)]);
 	for (const v of sql.exec<Row>("SELECT * FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) ORDER BY owner, kind, ref", owners)) out.push(["evidence", strip(v)]);
 	for (const a of sql.exec<Row>(`SELECT activity_id, source, payload, purge_after FROM archive a WHERE
@@ -116,14 +117,19 @@ function bundle(sql: SqlStorage, nodeId: string): Entry[] {
 		OR (source = 'evidence' AND (json_extract(payload, '$.owner') = 'n:' || ?1 OR EXISTS
 			(SELECT 1 FROM archive e WHERE e.source = 'edges' AND e.activity_id = a.activity_id
 			AND json_extract(e.payload, '$.src') = ?1 AND 'e:' || json_extract(e.payload, '$.id') = json_extract(a.payload, '$.owner'))))
-		ORDER BY CASE source WHEN 'edges' THEN 0 WHEN 'evidence' THEN 1 ELSE 2 END, id`, nodeId)) out.push(["archive", a]);
+		ORDER BY CASE source WHEN 'edges' THEN 0 WHEN 'evidence' THEN 1 ELSE 2 END, id`, nodeId)) {
+		const image=a.source==='edges'?JSON.parse(String(a.payload)) as Row:undefined;
+		const count_state=image?countSnapshot(sql,image):null;
+		if(image){image.commit_seal=null;a.payload=JSON.stringify(image);}
+		out.push(["archive",{...a,...(count_state?{count_state}:{})}]);
+	}
 	return out;
 }
 
 /** What landing one entry writes in the target (rowsWritten as measured for the import: a live text is 5, see domain/import-cost.ts). */
 function cost([table, r]: Entry): { rows: number; bytes: number } {
 	const live = table === "texts" && r.live === 1;
-	const rows = { nodes: 12, texts: live ? 5 : 3, revisions: 2, requests: 3, edges: 6, evidence: 3, archive: 3 }[table];
+	const rows = { nodes: 12, texts: live ? 5 : 3, revisions: 2, requests: r.commit_meta ? 8 : 3, edges: 6, evidence: 3, archive: 3 }[table] + (r.count_state ? 16 : 0);
 	return { rows, bytes: utf8(JSON.stringify(r)) + (live ? 2 * utf8(String(r.body)) : 0) };
 }
 
@@ -168,7 +174,8 @@ function put(tx: BudgetTx, source: ArchiveSource, r: Row): number | undefined {
 }
 
 /** The target's ledger of applied parts: one row per part, holding the part hash and what later parts need from it. */
-interface Ledger { activity?: number; status?: string; edges?: Record<string, string>; bundle?: string; revision?: number }
+interface Ledger {
+	countOrigins?:string[]; activity?: number; status?: string; edges?: Record<string, string>; bundle?: string; revision?: number }
 function ledger(sql: SqlStorage, id: string): (Ledger & { n: number; sha256: string })[] {
 	return sql.exec<{ n: number; payload: string; sha256: string }>("SELECT n, payload, sha256 FROM transfer_parts WHERE transfer_id = ? ORDER BY n", id).toArray()
 		.map((r) => ({ ...(JSON.parse(r.payload) as Ledger), n: r.n, sha256: r.sha256 }));
@@ -205,15 +212,24 @@ function landEntry(tx: BudgetTx, who: Who, s: Extract<TransferStep, { op: "land"
 		}
 		case "texts": case "revisions": case "requests":
 			mine(r.node_id === s.nodeId);
-			put(tx, table, r);
+			put(tx, table, table === "requests" && r.commit_meta ? {...r,commit_meta:foreignCommit(r.commit_meta)} : r);
 			return;
 		case "edges": {
 			mine(r.src === s.nodeId);
+			assertCountImageOpen(tx,r);
 			const old = String(r.id);
 			// '' means the edge's own profile: the source. A target in this profile becomes ''.
 			const dst = r.dst_profile === "" ? s.from : r.dst_profile === who.profile ? "" : r.dst_profile;
 			assertArchiveEndpoints(tx.sql,String(r.src),String(r.dst),String(dst),true);
-			const id = put(tx, "edges", { ...r, dst_profile: dst! });
+			const {count_state,count_key,...plain}=r;plain.commit_seal=null;
+			const id = put(tx, "edges", { ...plain, dst_profile: dst! });
+			if(typeof count_state === "string"){
+				tx.run("UPDATE edges SET count_key=? WHERE id=?",count_key!,id!);
+				landCount(tx,r,tx.sql.exec<Row>("SELECT * FROM edges WHERE id=?",id!).one(),count_state,s.id,s.nodeId);
+			}else if(count_key){
+				if(!unownedCountHistory(r) && (r.weight!==0 || r.ended_at===null || typeof r.count_epoch!=="string"))throw refuse("foreign_row","a managed edge requires its accounting snapshot");
+				tx.run("UPDATE edges SET count_key=? WHERE id=?",count_key,id!);
+			}
 			edges[`e:${old}`] = `e:${String(id)}`;
 			return;
 		}
@@ -226,7 +242,11 @@ function landEntry(tx: BudgetTx, who: Who, s: Extract<TransferStep, { op: "land"
 		case "archive": {
 			if (!["texts", "revisions", "requests", "edges", "evidence"].includes(String(r.source))) throw refuse("foreign_row", "an archived row of this bundle has an unknown source");
 			const row = JSON.parse(String(r.payload)) as Row;
+			const original={...row};
+			if(r.source === "requests" && row.commit_meta)row.commit_meta=foreignCommit(row.commit_meta);
 			if (r.source === "edges") {
+				row.commit_seal=null;
+				assertCountImageOpen(tx,row);
 				mine(row.src === s.nodeId);
 				const old = `a:${String(r.activity_id)}:e:${String(row.id)}`;
 				// Negative ids reserve a distinct archived identity, including across later moves and restores.
@@ -240,7 +260,9 @@ function landEntry(tx: BudgetTx, who: Who, s: Extract<TransferStep, { op: "land"
 				mine(owner === `n:${s.nodeId}` || Object.entries(edges).some(([k, v]) => k.startsWith("a:") && v === owner));
 				row.owner = owner;
 			} else mine(row.node_id === s.nodeId);
-			tx.run("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, ?, ?, ?)", activity, tx.now, r.purge_after!, r.source!, JSON.stringify(row), tx.seq);
+			const archive=Number(tx.run("INSERT INTO archive (activity_id, at, purge_after, source, payload, seq) VALUES (?, ?, ?, ?, ?, ?) RETURNING id", activity, tx.now, r.purge_after!, r.source!, JSON.stringify(row), tx.seq).one().id);
+			if(r.source === "edges" && typeof r.count_state === "string")landCount(tx,original,row,r.count_state,s.id,s.nodeId,archive);
+			else if(r.source === "edges" && row.count_key && !unownedCountHistory(row) && (row.weight!==0 || row.ended_at===null || typeof row.count_epoch!=="string"))throw refuse("foreign_row","an archived managed edge requires its accounting snapshot");
 			return;
 		}
 	}
@@ -270,6 +292,7 @@ function land(sql: SqlStorage, who: Who, s: Extract<TransferStep, { op: "land" }
 	const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 	// A previous source retains its request history. Drain it in replayable steps before accepting part one.
 	if (!parts.length && nodeRow(sql, s.nodeId)?.status === "moved") {
+		if(!purgePersonCounts(tx,s.nodeId,who.profile))return {state:"cleaning",done:false};
 		for (const q of ["DELETE FROM revisions WHERE (node_id, revision) IN (SELECT node_id, revision FROM revisions WHERE node_id = ? LIMIT 100)",
 			"DELETE FROM requests WHERE request_id IN (SELECT request_id FROM requests WHERE node_id = ? LIMIT 100)"]) {
 			const before = tx.rows;
@@ -280,6 +303,11 @@ function land(sql: SqlStorage, who: Who, s: Extract<TransferStep, { op: "land" }
 	const meta: Ledger = {};
 	if (!t) tx.run("INSERT INTO transfers (id, node_id, direction, peer, state, parts, created_at, updated_at, seq) VALUES (?, ?, 'in', ?, 'sent', ?, ?, ?, ?)", s.id, s.nodeId, s.from, s.of, tx.now, tx.now, tx.seq);
 	const entries = JSON.parse(s.payload) as Entry[];
+	// The part ledger keeps origin labels for wipe discovery even if the incoming node disappears.
+	meta.countOrigins=[...new Set(entries.flatMap(([table,row])=>{
+		const e=table==='edges'?row:table==='archive'&&row.source==='edges'?JSON.parse(String(row.payload)) as Row:undefined;
+		const origin=e?countOrigin(e.count_key):null;return origin?[origin]:[];
+	}))];
 	if (s.n === 1) {
 		if (entries[0]?.[0] !== "nodes") throw refuse("foreign_row", "the first part must start with the node");
 		meta.status = String(entries[0][1].status);
@@ -328,6 +356,7 @@ function commit(sql: SqlStorage, s: { id: string }): TransferOut {
 		tx.run("UPDATE nodes SET attrs = json_set(attrs, '$.transfer.activity', ?), seq = ? WHERE id = ?", f.activity, tx.seq, t.node_id);
 	}
 	tx.run("UPDATE transfers SET updated_at = ?, seq = ? WHERE id = ?", tx.now, tx.seq, s.id);
+	if(node.kind === "person" && !sealMovingPerson(tx,t.node_id))return {state:t.state,done:false};
 	const until = purgeAfter(tx.now);
 	const texts = sql.exec<Row>("SELECT * FROM texts WHERE node_id = ? ORDER BY rowid LIMIT 200", t.node_id).toArray();
 	if (texts.length) {
@@ -349,6 +378,7 @@ function commit(sql: SqlStorage, s: { id: string }): TransferOut {
 		tx.run("DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT transfer_id, n FROM transfer_parts WHERE transfer_id = ? LIMIT 100)", s.id);
 		return { state: t.state, done: false };
 	}
+	if(!cleanupTransferredCounts(tx,s.id,false))return {state:t.state,done:false};
 	const { transfer: _fence, ...attrs } = JSON.parse(String(node.attrs)) as { transfer: Fence };
 	archiveRows(tx, f.activity, "nodes", [{ ...node, status: f.status, attrs: JSON.stringify(attrs) }], until);
 	const identity = { id: s.id, sha256: f.sha256, revision: f.revision };
@@ -369,21 +399,22 @@ function commit(sql: SqlStorage, s: { id: string }): TransferOut {
 	return { state: "committed", done: true, vector: t.node_id };
 }
 
-/** Undoes a landing in bounded steps: only rows of a record that is still incoming, the node last. */
+/** Undoes an unpublished landing in bounded steps; its durable part ledger owns archives even after the node is gone. */
 function abortIn(sql: SqlStorage, s: Extract<TransferStep, { op: "abort"; side: "in" }>): TransferOut {
 	const t = transferRow(sql, s.id);
 	const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 	if (!t) {
 		// Recorded, so a late part is refused instead of landing after the abort.
 		tx.run("INSERT INTO transfers (id, node_id, direction, peer, state, parts, created_at, updated_at, seq) VALUES (?, ?, 'in', ?, 'aborted', 0, ?, ?, ?)", s.id, s.nodeId, s.from, tx.now, tx.now, tx.seq);
-		return { state: "aborted", done: true };
+		return { state: "aborted", done: cleanupTransferredCounts(tx,s.id,true) };
 	}
 	if (t.direction !== "in") throw refuse("wrong_side", `transfer '${s.id}' leaves this profile`);
-	if (t.state === "aborted") return { state: t.state, done: true };
+	if (t.state === "aborted") return { state: t.state, done: cleanupTransferredCounts(tx,s.id,true) };
 	if (t.state === "published" || t.state === "committed") throw refuse("published", `transfer '${s.id}' is already published here`);
+	if(!cleanupTransferredCounts(tx,s.id,true))return {state:t.state,done:false};
 	const node = nodeRow(sql, t.node_id);
-	if (node?.status === "incoming") {
-		const activity = ledger(sql, s.id)[0]?.activity ?? -1;
+	const activity = ledger(sql, s.id)[0]?.activity ?? -1;
+	if (!node || node.status === "incoming") {
 		const edges = sql.exec<{ id: number }>("SELECT id FROM edges WHERE src = ?", t.node_id).toArray().map((e) => `e:${e.id}`);
 		const batches: [string, SqlStorageValue][] = [
 			["DELETE FROM texts WHERE rowid IN (SELECT rowid FROM texts WHERE node_id = ? LIMIT 60)", t.node_id],
@@ -391,7 +422,6 @@ function abortIn(sql: SqlStorage, s: Extract<TransferStep, { op: "abort"; side: 
 			["DELETE FROM requests WHERE request_id IN (SELECT request_id FROM requests WHERE node_id = ? LIMIT 150)", t.node_id],
 			["DELETE FROM evidence WHERE (owner, kind, ref) IN (SELECT owner, kind, ref FROM evidence WHERE owner IN (SELECT value FROM json_each(?)) LIMIT 150)", JSON.stringify([`n:${t.node_id}`, ...edges])],
 			["DELETE FROM edges WHERE id IN (SELECT id FROM edges WHERE src = ? LIMIT 100)", t.node_id],
-			["DELETE FROM archive WHERE id IN (SELECT id FROM archive WHERE activity_id = ? LIMIT 200)", activity],
 		];
 		for (const [q, p] of batches) {
 			const before = tx.rows;
@@ -400,6 +430,9 @@ function abortIn(sql: SqlStorage, s: Extract<TransferStep, { op: "abort"; side: 
 		}
 		tx.run("DELETE FROM nodes WHERE id = ? AND status = 'incoming'", t.node_id);
 	}
+	const beforeArchives=tx.rows;
+	tx.run("DELETE FROM archive WHERE id IN (SELECT id FROM archive WHERE activity_id = ? LIMIT 200)",activity);
+	if(tx.rows>beforeArchives)return {state:t.state,done:false};
 	if (sql.exec("SELECT 1 FROM transfer_parts WHERE transfer_id = ? LIMIT 1", s.id).toArray().length) {
 		tx.run("DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT transfer_id, n FROM transfer_parts WHERE transfer_id = ? LIMIT 100)", s.id);
 		return { state: t.state, done: false };
@@ -428,6 +461,7 @@ function abortOut(sql: SqlStorage, s: Extract<TransferStep, { op: "abort"; side:
 		tx.run("DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT transfer_id, n FROM transfer_parts WHERE transfer_id = ? LIMIT 100)", s.id);
 		return { state: t.state, done: false };
 	}
+	if(!cleanupTransferredCounts(tx,s.id,false))return {state:t.state,done:false};
 	if (f) tx.run("UPDATE nodes SET status = ?, attrs = json_remove(attrs, '$.transfer'), seq = ? WHERE id = ? AND status = 'moving'", f.status, tx.seq, t.node_id);
 	tx.run("UPDATE transfers SET state = 'aborted', updated_at = ?, seq = ? WHERE id = ?", tx.now, tx.seq, s.id);
 	return { state: "aborted", done: true };
@@ -441,9 +475,15 @@ function archiveExclusion(sql:SqlStorage,who:Who,s:TransferStep):void {
 	const nodeId=("nodeId" in s?s.nodeId:undefined)??transferRow(sql,s.id)?.node_id;
 	if(nodeId) {
 		assertArchiveEndpoints(sql,nodeId,nodeId,"",true);
-		for(const e of sql.exec<Row>("SELECT src,dst,dst_profile FROM edges WHERE src=?1 OR (dst_profile='' AND dst=?1)",nodeId))assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile),true);
+		for(const e of sql.exec<Row>("SELECT src,dst,dst_profile,count_key FROM edges WHERE src=?1 OR (dst_profile='' AND dst=?1)",nodeId)){
+			assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile),true);
+			const origin=countOrigin(e.count_key);
+			if(s.op === "fence" && !terminal && origin && countOriginClosed(sql,origin))throw Fail.of("moving","this node's observed-count origin is being wiped");
+		}
 		for(const a of sql.exec<{payload:string}>("SELECT payload FROM archive WHERE source='edges' AND (json_extract(payload,'$.src')=?1 OR (json_extract(payload,'$.dst_profile')='' AND json_extract(payload,'$.dst')=?1))",nodeId)){
 			const e=JSON.parse(a.payload) as Row;assertArchiveEndpoints(sql,String(e.src),String(e.dst),String(e.dst_profile),true);
+			const origin=countOrigin(e.count_key);
+			if(s.op === "fence" && !terminal && origin && countOriginClosed(sql,origin))throw Fail.of("moving","this node's observed-count origin is being wiped");
 		}
 	}
 	const payloads=s.op === "land"?[s.payload]:sql.exec<{payload:string}>("SELECT payload FROM transfer_parts WHERE transfer_id=?",s.id).toArray().map(p=>p.payload);
@@ -528,6 +568,11 @@ function apply(sql: SqlStorage, who: Who, s: TransferStep): TransferOut {
 			const t = side(sql, s.id, "in");
 			if (t.state === "published" || t.state === "committed") return { state: t.state };
 			if (t.state !== "landed") throw refuse("not_landed", `transfer '${s.id}' is ${t.state}`);
+			if(closedTransferCounts(sql,s.id) || !nodeRow(sql,t.node_id)){
+				const tx=new BudgetTx(sql,nextSeq(sql,"profile_meta"),new Date().toISOString());
+				tx.run("UPDATE transfers SET state='sent',updated_at=?,seq=? WHERE id=?",tx.now,tx.seq,s.id);
+				return {state:"refused",error:closedTransferCounts(sql,s.id)?{code:"profile_wiped",message:"an aggregate's source origin is being wiped"}:{code:"revision_conflict",message:"the incoming transfer node is missing"}};
+			}
 			if (who.profile === "me") {
 				// The guard runs inside the publishing transaction, so a term registered since landing is seen (section 5). A refusal
 				// un-lands the record, which no later publish or land can undo, and lets the account abort after its commit decision.
@@ -554,6 +599,7 @@ function apply(sql: SqlStorage, who: Who, s: TransferStep): TransferOut {
 			if (t.state === "committed") return { state: t.state, done: true };
 			if (t.state !== "published") throw refuse("not_published", `transfer '${s.id}' is ${t.state}`);
 			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+			if(!cleanupTransferredCounts(tx,s.id,false))return {state:t.state,done:false};
 			if (sql.exec("SELECT 1 FROM transfer_parts WHERE transfer_id = ? LIMIT 1", s.id).toArray().length) {
 		tx.run("DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT transfer_id, n FROM transfer_parts WHERE transfer_id = ? LIMIT 100)", s.id);
 		return { state: t.state, done: false };

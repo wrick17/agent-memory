@@ -1,3 +1,4 @@
+import { managedCount, countPair, sameCountEdge, undoCommitReceipt, reverseObservation, nextClaim, sealedDependency, sealedStructural, liveCommit, type CommitReceipt, type EndpointClaim } from "./work-counts";
 import { assertArchiveEndpoints } from "./archive-fence";
 // Undo (section 12). Every write stores the inverse of what it changed in activity.undo, in the same transaction; undo runs
 // that inverse through runWrite with request_id "undo:<activity id>", so a retried undo replays its first result. The inverse
@@ -31,7 +32,9 @@ export interface Inverse {
 	/** Nodes it changed: columns and the head and body rows it replaced go back; entries it folded go live again. */
 	nodes?: { id: string; expect: number; row: Row; texts: Row[] }[];
 	/** Nodes it created: archived. */
-	created?: { id: string; expect: number }[];
+	created?: EndpointClaim[];
+	commitReceipt?: CommitReceipt;
+	countOrigins?: string[];
 	/** Standalone text rows restored on an existing session: archived while the row and owner remain unchanged. */
 	texts?: { rowid: number; node_id: string; expect: number; ownerSeq: number }[];
 	/** Edges it added between nodes that existed before: archived with their evidence. */
@@ -100,12 +103,12 @@ export function beforeImages(sql: SqlStorage, cmd: WriteCommand): Before {
  * The inverse of the write that just ran in `tx`, from the rows stamped with its seq. null when it changed a node no image
  * covers: no undo is better than a wrong one. `after.created` are the node ids the write created.
  */
-export function inverseOf(before: Before, after: { created: string[]; consumed?: Consumed[] }, tx: ArchiveTx): Inverse | null {
+export function inverseOf(before: Before, after: { created: string[]; consumed?: Consumed[]; commitReceipt?: CommitReceipt }, tx: ArchiveTx): Inverse | null {
 	const { sql, seq, now } = tx;
 	const created = new Set(after.created);
-	const inv: Required<Omit<Inverse, "seq">> & { seq: number } = { seq, nodes: [], created: [], edges: [], evidence: [], evidenceRows: [], reopen: [], archived: [], flags: [], mentions: [], texts: [] };
+	const inv: Required<Omit<Inverse, "seq" | "commitReceipt" | "countOrigins">> & { seq: number; commitReceipt?: CommitReceipt } = { seq, nodes: [], created: [], edges: [], evidence: [], evidenceRows: [], reopen: [], archived: [], flags: [], mentions: [], texts: [] };
 	for (const n of sql.exec<{ id: string; revision: number }>("SELECT id, revision FROM nodes WHERE seq = ?", seq).toArray()) {
-		if (created.has(n.id)) { inv.created.push({ id: n.id, expect: n.revision }); continue; }
+		if (created.has(n.id)) { inv.created.push({ id: n.id, expect: n.revision, ...(after.commitReceipt && (n.id === after.commitReceipt.person || n.id === after.commitReceipt.project) ? {countOwner:after.commitReceipt.owner} : {}) }); continue; }
 		const b = before.nodes[n.id];
 		if (!b) return null;
 		// A row is kept only if it is still the imaged one: SQLite may have given its rowid to a row this write inserted.
@@ -117,14 +120,18 @@ export function inverseOf(before: Before, after: { created: string[]; consumed?:
 		if (!covered.has(t.node_id)) inv.texts.push({ rowid: t.rowid, node_id: t.node_id, expect: t.revision, ownerSeq: t.owner_seq });
 	}
 	const newEdges = new Set<number>();
+	const commit=after.commitReceipt;
+	inv.commitReceipt=commit;
+	const pair=commit?.pair?countPair(sql,commit.pair):undefined;
 	for (const e of sql.exec<{ id: number; src: string; dst: string; recorded_at: string; ended_at: string | null }>("SELECT id, src, dst, recorded_at, ended_at FROM edges WHERE seq = ?", seq).toArray()) {
+		if(pair?.edge.id===e.id && commit?.counted && pair.epoch===commit.epoch)continue;
 		if (e.ended_at === now && before.edges[String(e.id)]) {
 			const b = before.edges[String(e.id)];
 			if (!b) return null;
 			inv.reopen.push({ id: e.id, valid_to: b.valid_to ?? null });
 		} else {
 			newEdges.add(e.id);
-			if (!created.has(e.src) && !created.has(e.dst)) inv.edges.push(e.id);
+			if (!created.has(e.src) && !created.has(e.dst) && !commit?.structural.some(c=>c.id===e.id)) inv.edges.push(e.id);
 		}
 	}
 	const owners = new Set(before.owners);
@@ -146,10 +153,16 @@ export function inverseOf(before: Before, after: { created: string[]; consumed?:
 }
 
 /** Wire hook for runWrite: after the op, store its inverse on the activity row it wrote. */
-export function recordUndo(tx: ArchiveTx, before: Before, out: Pick<WriteOutput, "created" | "result"> & { consumed?: Consumed[] }): void {
+export function recordUndo(tx: ArchiveTx, before: Before, out: Pick<WriteOutput, "created" | "result"> & { consumed?: Consumed[]; commitReceipt?: CommitReceipt }): void {
 	const id = out.result.activity_id;
 	if (typeof id !== "number") return;
 	const inv = inverseOf(before, out, tx);
+	if(inv){
+		const origins=new Set(out.commitReceipt?[out.commitReceipt.origin]:[]);
+		for(const e of inv.reopen??[]){const row=tx.sql.exec<Row>("SELECT count_key FROM edges WHERE id=?",e.id).toArray()[0];if(typeof row?.count_key === "string"){const p=countPair(tx.sql,row.count_key);if(p)origins.add(p.origin);}}
+		if(origins.size)inv.countOrigins=[...origins];
+	}
+	if(out.commitReceipt && !inv)throw Fail.of("size_budget","commit upload requires a complete typed inverse");
 	const targets = tx.sql.exec<{ targets: string }>("SELECT targets FROM activity WHERE id = ?", id).one().targets;
 	const dependencies = [...new Set<string>([...JSON.parse(targets), ...(inv?.mentions ?? []).map((m) => String(m.row.owner).slice(2)), ...(inv?.texts ?? []).map((t) => t.node_id)])];
 	tx.run("UPDATE activity SET undo = ?, targets = ? WHERE id = ?", inv && JSON.stringify(inv), JSON.stringify(dependencies), id);
@@ -164,14 +177,24 @@ export function recordUndo(tx: ArchiveTx, before: Before, out: Pick<WriteOutput,
  */
 export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: "undo", summary: `undid activity ${args.activity_id}` }): WriteOutput {
 	const sql = tx.sql, of = args.activity_id;
-	const a = sql.exec<{ op: string; undo: string | null; redacted: string | null; undone_by: number | null; targets: string }>(
-		"SELECT op, undo, redacted, undone_by, targets FROM activity WHERE id = ?", of).toArray()[0];
+	const a = sql.exec<{ op: string; undo: string | null; redacted: string | null; undone_by: number | null; targets: string; at: string }>(
+		"SELECT op, undo, redacted, undone_by, targets, at FROM activity WHERE id = ?", of).toArray()[0];
 	if (!a) throw Fail.of("not_found", `no activity ${of}`);
 	// wiring: ErrorCode gains "undo_redacted".
 	if (a.redacted) throw Fail.of("undo_redacted" as ErrorCode, "a wipe removed this change's content; it cannot be undone", { reason: "undo_redacted" });
 	if (a.undone_by !== null) throw Fail.of("validation", `activity ${of} was already undone`, { reason: "already_undone", undone_by: a.undone_by });
 	if (!a.undo) throw Fail.of("validation", "this change has no undo", { reason: "no_undo" });
 	const inv = JSON.parse(a.undo) as Inverse;
+	if(inv.commitReceipt && (a.op!=="upload" || inv.commitReceipt.owner.id!==of || inv.commitReceipt.owner.at!==a.at || inv.commitReceipt.owner.seq!==inv.seq))throw Fail.of("revision_conflict","commit inverse belongs to another activity");
+	const counted=inv.commitReceipt?undoCommitReceipt(sql,inv.commitReceipt):undefined;
+	if(counted)reverseObservation(tx,counted.meta,counted.pair);
+	const retained=new Map<string,CommitReceipt|"sealed">();
+	if(counted)for(const c of inv.created??[]){
+		const person=c.id===counted.meta.person,project=c.id===counted.meta.project;
+		if(!person&&!project)continue;
+		const next=nextClaim(sql,c.id,person,counted.meta.request);
+		if(next)retained.set(c.id,next);else if(sealedDependency(sql,c.id,person))retained.set(c.id,"sealed");
+	}
 	const conflict = (details: Record<string, unknown>) => Fail.of("revision_conflict", "changed since; review by hand", details);
 	for (const n of [...(inv.nodes ?? []), ...(inv.created ?? [])]) {
 		const cur = sql.exec<{ revision: number }>("SELECT revision FROM nodes WHERE id = ?", n.id).toArray()[0];
@@ -185,8 +208,28 @@ export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: 
 	}
 	const around = "SELECT 'e:' || id FROM edges WHERE src = ?1 OR (dst = ?1 AND dst_profile = '')";
 	for (const c of inv.created ?? []) {
-		if (any(`SELECT 1 FROM edges WHERE (src = ?1 OR (dst = ?1 AND dst_profile = '')) AND seq <> ?2`, c.id, S)
-			|| any(`SELECT 1 FROM evidence WHERE (owner = 'n:' || ?1 OR owner IN (${around})) AND seq <> ?2`, c.id, S)) throw conflict({ node: c.id });
+		if(!counted){
+			if(any(`SELECT 1 FROM edges WHERE (src = ?1 OR (dst = ?1 AND dst_profile = '')) AND seq <> ?2`,c.id,S) || any(`SELECT 1 FROM evidence WHERE (owner = 'n:' || ?1 OR owner IN (${around})) AND seq <> ?2`,c.id,S))throw conflict({node:c.id});
+			continue;
+		}
+		const ownSeq=c.countOwner?.seq??S;
+		const incident=sql.exec<Row>(`SELECT * FROM edges WHERE src=?1 OR (dst=?1 AND dst_profile='') LIMIT ${MAX_EDGES+1}`,c.id).toArray();
+		if(incident.length>MAX_EDGES)throw Fail.of("size_budget","too many incident edges for a guarded commit Undo");
+		if(any("SELECT 1 FROM evidence WHERE owner=? AND seq<>? LIMIT 1",`n:${c.id}`,ownSeq))throw conflict({node:c.id});
+		for(const e of incident){
+			let evidenceSeq=e.seq!;
+			const registered=typeof e.count_key === "string" ? countPair(sql,e.count_key) : undefined;
+			const managed=registered && sameCountEdge(e,registered.edge);
+			if(managed)managedCount(sql,registered);
+			if(!managed && e.seq!==ownSeq && !counted.meta.structural.some(t=>sameCountEdge(e,t))){
+				const r=sql.exec<{commit_meta:string|null}>("SELECT commit_meta FROM requests WHERE request_id=?",e.request_id!).toArray()[0];
+				const m=r?.commit_meta?JSON.parse(r.commit_meta) as CommitReceipt:undefined;
+				const sealed=sealedStructural(sql,e,c.id,c.id===counted.meta.person);
+				if(sealed!==undefined){if(!retained.has(c.id))retained.set(c.id,'sealed');evidenceSeq=sealed;}
+				else if(!retained.has(c.id) || !m || !liveCommit(sql,m) || !m.structural.some(t=>sameCountEdge(e,t)))throw conflict({node:c.id,edge:e.id});
+			}
+			if(any("SELECT 1 FROM evidence WHERE owner=? AND seq<>? LIMIT 1",`e:${String(e.id)}`,managed?ownSeq:evidenceSeq))throw conflict({node:c.id,edge:e.id});
+		}
 	}
 	for (const id of inv.edges ?? []) {
 		if (!any("SELECT 1 FROM edges WHERE id = ? AND seq = ?", id, S) || any("SELECT 1 FROM evidence WHERE owner = ? AND seq <> ?", `e:${id}`, S)) throw conflict({ edge: id });
@@ -214,7 +257,21 @@ export function revert(tx: UndoTx, args: { activity_id: number }, label = { op: 
 	const keep = purgeAfter(tx.now);
 	let embedDue = false;
 	if (inv.texts?.length) archiveRows(tx, activityId, "texts", sql.exec<Row>("SELECT * FROM texts WHERE rowid IN (SELECT value FROM json_each(?))", JSON.stringify(inv.texts.map((t) => t.rowid))).toArray(), keep);
-	for (const c of inv.created ?? []) archiveNode(tx, activityId, c.id, keep);
+	if(counted)for(const e of counted.meta.structural){
+		archiveRows(tx,activityId,"evidence",sql.exec<Row>("SELECT * FROM evidence WHERE owner=?",`e:${e.id}`).toArray(),keep);
+		archiveRows(tx,activityId,"edges",sql.exec<Row>("SELECT * FROM edges WHERE id=?",e.id).toArray(),keep);
+	}
+	for(const c of inv.created??[]){
+		const target=retained.get(c.id);
+		if(target && target!=="sealed"){
+			const a=sql.exec<{undo:string}>("SELECT undo FROM activity WHERE id=?",target.owner.id).one();
+			const next=JSON.parse(a.undo) as Inverse;
+			next.created=[...(next.created??[]).filter(old=>old.id!==c.id),c];
+			tx.run("UPDATE activity SET undo=?,seq=? WHERE id=?",JSON.stringify(next),tx.seq,target.owner.id);
+		}else if(target==="sealed"){
+			tx.run("INSERT OR IGNORE INTO profile_meta(key,value) VALUES(?,?)",`work-count:${counted!.meta.origin}:claim:${c.id}`,JSON.stringify({kind:"claim",origin:counted!.meta.origin,node:c.id,expect:c.expect,owner:c.countOwner??counted!.meta.owner}));
+		}else archiveNode(tx,activityId,c.id,keep);
+	}
 	for (const id of inv.edges ?? []) {
 		const edge = sql.exec<Row>("SELECT * FROM edges WHERE id = ?", id).toArray();
 		archiveRows(tx, activityId, "evidence", sql.exec<Row>("SELECT * FROM evidence WHERE owner = ?", `e:${id}`).toArray(), keep);

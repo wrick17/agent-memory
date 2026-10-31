@@ -1,3 +1,4 @@
+import type { CommitReceipt } from "./work-counts";
 import { policyOf, POLICY_ATTRS_SQL } from "../domain/import-policy";
 // The one write path for phase 1: save (create, update, rename, scope move, retire, supersede) and append.
 // Ports BothQ memory_store.py semantics. Runs inside one transactionSync per call; never awaits.
@@ -50,6 +51,7 @@ export class Tx {
 	bytes = 0;
 	/** Mention rows this write resolved, for its undo (extract.ts). */
 	consumed: Consumed[] = [];
+	commitReceipt?: CommitReceipt;
 	constructor(readonly sql: SqlStorage, readonly seq: number, readonly now: string, readonly ctx: WriteContext, readonly requestId: string | null,
 		readonly guard: (material: unknown) => void = () => {}) {}
 	run(query: string, ...params: SqlStorageValue[]): SqlStorageCursor<Record<string, SqlStorageValue>> {
@@ -818,10 +820,10 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 		const out: WriteOutput = flags.length ? { result: { action: "flagged", memory_id: refused[0]!.id, activity_id: flags.at(-1) }, created: [], embedDue: false }
 			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
-		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed });
+		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed, commitReceipt: tx.commitReceipt });
 		if (requestId) {
-			tx.run("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
-				requestId, cmd.op, ctx.payloadHash, JSON.stringify(out.result), String(out.result.memory_id ?? out.result.capture_id ?? ""), tx.now, tx.seq);
+			tx.run("INSERT INTO requests (request_id, op, payload_hash, result, node_id, at, seq, commit_meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				requestId, cmd.op, ctx.payloadHash, JSON.stringify(out.result), String(out.result.memory_id ?? out.result.capture_id ?? ""), tx.now, tx.seq, tx.commitReceipt ? JSON.stringify(tx.commitReceipt) : null);
 		}
 		return out;
 	});

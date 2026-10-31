@@ -1,18 +1,23 @@
+import { runArchive } from "../src/profile/archive-operations";
+import { nextSeq } from "../src/storage";
 // AM-12 commit uploads through the real /v1/ingest with a job-scoped token, into the actual profile object, its graph and the board.
 // Each case uses its own profile and routing rule on the owner's account, so no other test file shares or closes it.
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { refreshSelectors } from "../src/routing";
+import type { RoutingRule } from "../src/domain/types";
+import type { AccountStore } from "../src/account/store";
 import { resetKeyCache } from "../src/auth";
 import { api } from "../src/api";
 import { plan as accountPlan, type Ledger } from "../src/account/refresh";
 import { canonicalJson, sha256, uuid5 } from "../src/domain/ids";
 import { driveTransfer, transferPorts } from "../src/transfer";
-import { housekeep, OBJECT_LIMIT } from "../src/profile/housekeeping";
+import { cleanupPurge, housekeep, OBJECT_LIMIT } from "../src/profile/housekeeping";
 import { undo } from "../src/profile/undo";
 import { BudgetTx } from "../src/profile/archive";
 import { foldStep } from "../src/profile/compact";
-import { readContent, runWrite } from "../src/profile/write";
+import { Tx, readContent, runWrite } from "../src/profile/write";
 import { commitArgs, prArgs, ticketArgs, uploadTerms } from "../src/profile/work-upload";
 import { ackPart, FINISH_READS, installMirror, markRegistered, partHash, planHash, receiptSeq, sealPlan, terminal, type Binding, type Parts } from "../src/profile/daily-proof";
 import { call, contextFor, deviceToken, outcome, OWNER } from "./helpers";
@@ -52,6 +57,207 @@ const sorted = <T,>(rows: T[]) => [...rows].sort((x, y) => (JSON.stringify(x) < 
 const graph = (sql: SqlStorage) => sql.exec<{ src: string; rel: string; dst: string; basis: string }>(`SELECT coalesce(a.key, a.name) AS src, e.rel, coalesce(b.key, b.name) AS dst, e.basis
 	FROM edges e JOIN nodes a ON a.id = e.src JOIN nodes b ON b.id = e.dst WHERE e.ended_at IS NULL ORDER BY src, e.rel, dst`).toArray();
 
+describe("observed commit receipt contract", () => {
+	it("reverses its own observation in both Undo orders with shared new endpoints", async () => {
+		const measured:unknown[]=[];
+		for (const preexisting of [false,true]) for (const order of [[0,1],[1,0]]) {
+			const p=await isolated();
+			if(preexisting)await call(p.c,"record_knowledge",{profile:p.name,nodes:[{kind:"person",key:"person:github:count-person",name:"count-person"},{kind:"project",key:"github:"+p.ns,name:p.ns}]});
+			const commits=[{sha:hex("count-a"),at:ago(60),title:"one",author:"count-person"},{sha:hex("count-b"),at:ago(120),title:"two",author:"count-person"}];
+			expect((await post(p.token,{repo:{remote:p.remote},commits})).data.commits?.map(c=>c.status)).toEqual(["stored","stored"]);
+			await p.inProfile((s)=>{
+				const before=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();
+				expect(before.weight).toBe(2);expect(before.valid_from).toBe(commits[1]!.at);expect(before.valid_to).toBe(commits[0]!.at);
+				const activities=s.sql.exec<{id:number}>("SELECT id FROM activity WHERE op='upload' ORDER BY id").toArray();
+				for(const i of order){
+					const run=Tx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+					const spy=vi.spyOn(Tx.prototype,'run').mockImplementation(function(this:Tx,q,...params){try{return run.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+					try{expect(undo(s,p.who,activities[i]!.id,{actor:"owner",platform:"test",routedBy:"test",userId:p.who.userId}).result.action).toBe("undone");}finally{spy.mockRestore();}
+					expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);measured.push({preexisting,order,upload:i,...peak});
+				}
+				expect(s.sql.exec("SELECT id FROM nodes WHERE kind IN ('person','project','commit')").toArray()).toHaveLength(preexisting?2:0);
+			});
+		}
+		console.log('COUNT_UNDO_RESOURCES',JSON.stringify(measured));
+	});
+	it("keeps project-only dependencies and independent pairs through both Undo orders",async()=>{
+		for(const author of [undefined,'other-author'])for(const order of [[0,1],[1,0]]){
+			const p=await isolated();
+			await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('shared-a'),at:ago(60),title:'first',author:'one-author'},{sha:hex('shared-b'),at:ago(30),title:'second',...(author?{author}:{})}]});
+			await p.inProfile(s=>{const acts=s.sql.exec<{id:number}>("SELECT id FROM activity WHERE op='upload' ORDER BY id").toArray();for(const i of order)expect(undo(s,p.who,acts[i]!.id,{actor:'owner',platform:'test',routedBy:'test',userId:p.who.userId}).result.action).toBe('undone');expect(s.sql.exec("SELECT id FROM nodes").toArray()).toEqual([]);});
+		}
+	});
+	it("starts a fresh epoch after complete Undo and guards structural evidence with pre-existing endpoints",async()=>{
+		const p=await isolated(),ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+		await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('epoch-first'),at:ago(60),title:'first',author:'epoch-person'}]});
+		const old=await p.inProfile(s=>{const e=s.sql.exec("SELECT count_key FROM edges WHERE rel='works_on'").one(),state=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",e.count_key!).one().value));undo(s,p.who,Number(s.sql.exec("SELECT id FROM activity WHERE op='upload'").one().id),ctx);expect(s.sql.exec('SELECT id FROM nodes').toArray()).toEqual([]);return state.epoch;});
+		await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('epoch-next'),at:ago(30),title:'next',author:'epoch-person'}]});
+		await p.inProfile(s=>{const e=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one(),state=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",e.count_key!).one().value));expect(state.epoch).not.toBe(old);expect(e.weight).toBe(1);});
+		const q=await isolated();
+		await call(q.c,'record_knowledge',{profile:q.name,nodes:[{kind:'person',key:'person:github:evidence-person',name:'evidence-person'},{kind:'project',key:'github:'+q.ns,name:q.ns},{kind:'commit',key:'git:'+q.ns+'@'+'c'.repeat(40),name:'existing commit'}]});
+		await post(q.token,{repo:{remote:q.remote},commits:[{sha:'c'.repeat(40),at:ago(60),title:'existing',author:'evidence-person'}]});
+		await q.inProfile(s=>{const a=Number(s.sql.exec("SELECT id FROM activity WHERE op='upload'").one().id),e=s.sql.exec("SELECT id FROM edges WHERE rel='part_of'").one();s.sql.exec("INSERT INTO evidence(owner,kind,ref,note,seq) VALUES(?,'url','https://example.invalid/later','later structural evidence',999)",'e:'+String(e.id));const before=s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray();expect(()=>undo(s,q.who,a,{...ctx,userId:q.who.userId})).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));expect(s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray()).toEqual(before);expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(1);});
+	});
+	it("reverses date extremes, preserves aggregate evidence and refuses later structural or agent edits atomically",async()=>{
+		const p=await isolated();
+		await call(p.c,'record_knowledge',{profile:p.name,nodes:[{kind:'person',key:'person:github:extremes',name:'extremes'},{kind:'project',key:'github:'+p.ns,name:p.ns}]});
+		const commits=[60,120,30].map((t,i)=>({sha:hex('extreme'+i),at:ago(t),title:'date '+i,author:'extremes'}));
+		await post(p.token,{repo:{remote:p.remote},commits});
+		await p.inProfile(s=>{
+			const acts=s.sql.exec<{id:number}>("SELECT id FROM activity WHERE op='upload' ORDER BY id").toArray(),edge=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();
+			s.sql.exec("INSERT INTO evidence(owner,kind,ref,note,seq) VALUES(?,'url','https://example.invalid','agent evidence',999)",'e:'+String(edge.id));
+			const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+			undo(s,p.who,acts[1]!.id,ctx);expect(s.sql.exec("SELECT id,weight,valid_from,valid_to FROM edges WHERE rel='works_on'").one()).toEqual({id:edge.id,weight:2,valid_from:commits[0]!.at,valid_to:commits[2]!.at});
+			undo(s,p.who,acts[2]!.id,ctx);expect(s.sql.exec("SELECT weight,valid_from,valid_to FROM edges WHERE rel='works_on'").one()).toEqual({weight:1,valid_from:commits[0]!.at,valid_to:commits[0]!.at});
+			expect(s.sql.exec("SELECT note FROM evidence WHERE owner=?",'e:'+String(edge.id)).one().note).toBe('agent evidence');
+			const before=s.sql.exec("SELECT * FROM requests ORDER BY request_id").toArray();
+			s.sql.exec("UPDATE edges SET ended_at=?,seq=999 WHERE id=?",new Date().toISOString(),edge.id!);
+			expect(()=>undo(s,p.who,acts[0]!.id,ctx)).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));
+			expect(s.sql.exec("SELECT * FROM requests ORDER BY request_id").toArray()).toEqual(before);
+		});
+	});
+	it("retains seen count across Forget and seals expired activity without borrowing a reused activity id",async()=>{
+		const p=await isolated();await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('forget-count'),at:ago(60),title:'forget detail',author:'forget-author'}]});
+		await p.inProfile(s=>{
+			const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId},a=s.sql.exec<{id:number;at:string}>("SELECT id,at FROM activity WHERE op='upload'").one(),request=s.sql.exec<{request_id:string;payload_hash:string}>("SELECT request_id,payload_hash FROM requests WHERE op='upload'").one(),commit=s.sql.exec("SELECT id FROM nodes WHERE kind='commit'").one();
+			const before=s.sql.exec("SELECT id,weight,valid_from,valid_to FROM edges WHERE rel='works_on'").one();
+			runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:String(commit.id),request_id:'count-forget'}},{...ctx,payloadHash:'count-forget'});
+			expect(s.sql.exec("SELECT id,weight,valid_from,valid_to FROM edges WHERE rel='works_on'").one()).toEqual(before);
+			s.transactionSync(()=>{nextSeq(s.sql,'profile_meta');s.sql.exec("DELETE FROM activity WHERE id=?",a.id);});
+			expect(s.sql.exec("SELECT commit_meta FROM requests WHERE request_id=?",request.request_id).one().commit_meta).toBe(null);
+			const state=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",s.sql.exec("SELECT count_key FROM edges WHERE rel='works_on'").one().count_key!).one().value));expect(state.base).toBe(1);
+			s.sql.exec("INSERT INTO activity(id,at,actor,op,summary,targets,undo,seq) VALUES(?,?,'owner','save','another identity','[]',?,999)",a.id,a.at,JSON.stringify({seq:999}));
+			expect(undo(s,p.who,a.id,ctx).result.action).toBe("undone");
+			expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(1);
+		});
+	});
+	it("preserves current judgment blockers and refuses later endpoint revisions without partial accounting",async()=>{
+		const p=await isolated();
+		await call(p.c,'record_knowledge',{profile:p.name,nodes:[{kind:'person',key:'person:github:judged-person',name:'judged-person'},{kind:'project',key:'github:'+p.ns,name:p.ns}],edges:[{from:{kind:'person',key:'person:github:judged-person'},rel:'works_on',to:{kind:'project',key:'github:'+p.ns},reason:'owner judgment',evidence:[{kind:'url',ref:'https://example.invalid/judgment'}]}]});
+		const before=await p.inProfile(s=>({edge:s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one(),evidence:s.sql.exec('SELECT * FROM evidence ORDER BY owner,kind,ref').toArray()}));
+		await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('judged-count'),at:ago(60),title:'blocked aggregate',author:'judged-person'}]});
+		await p.inProfile(s=>{expect(s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one()).toEqual(before.edge);expect(s.sql.exec('SELECT * FROM evidence ORDER BY owner,kind,ref').toArray()).toEqual(before.evidence);expect(JSON.parse(String(s.sql.exec("SELECT commit_meta FROM requests WHERE op='upload'").one().commit_meta)).counted).toBe(0);});
+		const q=await isolated();await post(q.token,{repo:{remote:q.remote},commits:[{sha:hex('node-conflict'),at:ago(60),title:'endpoint revision',author:'later-endpoint'}]});
+		await q.inProfile(s=>{const activity=Number(s.sql.exec("SELECT id FROM activity WHERE op='upload'").one().id);s.sql.exec("UPDATE nodes SET revision=revision+1,seq=999 WHERE kind='person'");const requests=s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray(),pair=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();expect(()=>undo(s,q.who,activity,{actor:'owner',platform:'test',routedBy:'test',userId:q.who.userId})).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));expect(s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray()).toEqual(requests);expect(s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one()).toEqual(pair);});
+	});
+
+	it("rebinds a remapped archive edge exactly and restores the archived binding on staged abort",async()=>{
+		const p=await isolated();await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('archive-count'),at:ago(60),title:'archive',author:'archive-count'}]});
+		await p.inProfile(s=>{
+			const ctx=(hash:string)=>({actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId,payloadHash:hash});
+			const person=s.sql.exec("SELECT id,revision FROM nodes WHERE kind='person'").one(),edge=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one(),key=String(edge.count_key);
+			let f=runArchive(s,p.who,{action:'forget',memory_id:String(person.id),expected_revision:Number(person.revision),request_id:'arc-count-forget'},ctx('f'));
+			for(let i=0;i<100 && f.state!=='complete';i++)f=runArchive(s,p.who,{action:'resume',operation_id:String(f.operation_id),cursor:String(f.cursor),request_id:'arc-f-'+i},ctx('f'+i));
+			expect(f.state).toBe('complete');
+			const archived=s.sql.exec("SELECT value FROM profile_meta WHERE key=?",key).one().value;
+			// Force normal integer-key remapping without changing any managed row.
+			s.sql.exec("INSERT INTO edges(id,src,rel,dst,dst_profile,basis,recorded_at,actor,seq) SELECT ?,p.id,'relates_to',c.id,'','identifier',?,'owner',999 FROM nodes p,nodes c WHERE p.kind='project' AND c.kind='commit' LIMIT 1",edge.id!,new Date().toISOString());
+			const unrelated=s.sql.exec("SELECT * FROM edges WHERE id=?",edge.id!).one();
+			let r=runArchive(s,p.who,{action:'restore',activity_id:Number(f.activity_id),request_id:'arc-count-restore'},ctx('r'));
+			for(let i=0;i<100 && !s.sql.exec("SELECT 1 FROM edges WHERE rel='works_on'").toArray().length;i++)r=runArchive(s,p.who,{action:'resume',operation_id:String(r.operation_id),cursor:String(r.cursor),request_id:'arc-r-'+i},ctx('r'+i));
+			expect(s.sql.exec("SELECT id FROM edges WHERE rel='works_on'").one().id).not.toBe(edge.id);
+			r=runArchive(s,p.who,{action:'abort',operation_id:String(r.operation_id),cursor:String(r.cursor),request_id:'arc-count-abort'},ctx('a'));
+			for(let i=0;i<100 && (r.state!=='aborted'||r.cleanup_pending);i++)r=runArchive(s,p.who,{action:'resume',operation_id:String(r.operation_id),cursor:String(r.cursor),request_id:'arc-a-'+i},ctx('a'+i));
+			expect(r.state).toBe('aborted');expect(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",key).one().value).toBe(archived);
+			expect(s.sql.exec("SELECT * FROM edges WHERE id=?",edge.id!).one()).toEqual(unrelated);
+		});
+	});
+	it("purges a source person's ownership metadata before accepting a fresh identity epoch",async()=>{
+		const p=await isolated();await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('source-person'),at:ago(60),title:'source person',author:'purge-person'}]});
+		const old=await p.inProfile(async s=>{
+			const person=s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id,key=s.sql.exec("SELECT count_key FROM edges WHERE rel='works_on'").one().count_key;
+			const before=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",key!).one().value));
+			runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:String(person),request_id:'purge-person-forget'}},{actor:'owner',platform:'test',routedBy:'test',payloadHash:'forget',userId:p.who.userId});
+			const now=Date.now();s.sql.exec("UPDATE archive SET purge_after=?",new Date(now-1).toISOString());
+			for(const stage of ['dedupe','ttl','queue'])s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES(?,?)",stage,now+86_400_000);
+			for(let i=0;i<100 && s.sql.exec("SELECT 1 FROM archive").toArray().length;i++){
+				s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");housekeep(s,p.who,now);await cleanupPurge(s,async ids=>{const result=await account().prunePurged(p.who,ids);expect(result.ok).toBe(true);});
+			}
+			expect(s.sql.exec("SELECT key FROM profile_meta WHERE key=?",key!).toArray()).toEqual([]);
+			expect(s.sql.exec("SELECT request_id FROM requests WHERE commit_meta IS NOT NULL").toArray()).toEqual([]);
+			return {person:String(person),epoch:before.epoch};
+		});
+		await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('fresh-person'),at:ago(30),title:'fresh person',author:'purge-person'}]});
+		await p.inProfile(s=>{
+			const edge=s.sql.exec("SELECT * FROM edges WHERE rel='works_on' AND ended_at IS NULL").one(),state=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",edge.count_key!).one().value));
+			expect(edge.src).toBe(old.person);expect(state.epoch).not.toBe(old.epoch);expect(edge.weight).toBe(1);
+			const a=s.sql.exec<{id:number}>("SELECT id FROM activity WHERE op='upload' ORDER BY id DESC LIMIT 1").one();undo(s,p.who,a.id,{actor:'owner',platform:'test',routedBy:'test',userId:p.who.userId});
+			expect(s.sql.exec("SELECT id FROM nodes WHERE id=?",old.person).toArray()).toEqual([]);
+		});
+	});
+	it("uses five real indexes and bounded extrema probes with unrelated receipt history",async()=>{
+		const p=await isolated();await post(p.token,{repo:{remote:p.remote},commits:[{sha:hex('plans'),at:ago(60),title:'plans',author:'plan-person'}]});
+		const measured=await p.inProfile(s=>{
+			const row=s.sql.exec<{commit_meta:string}>("SELECT commit_meta FROM requests WHERE commit_meta IS NOT NULL LIMIT 1").one(),m=JSON.parse(row.commit_meta);
+			for(let page=0;page<32;page++)s.transactionSync(()=>{const tx=new BudgetTx(s.sql,nextSeq(s.sql,'profile_meta'),new Date().toISOString());for(let i=0;i<32;i++){const id='irrelevant:'+page+':'+i;tx.run("INSERT INTO requests(request_id,op,payload_hash,result,node_id,at,seq,commit_meta) VALUES(?,'upload','h','{}','none',?,?,?)",id,tx.now,tx.seq,JSON.stringify({...m,request:id,pair:'other:'+id,person:'other:'+id,project:'other:'+id}));}expect(tx.rows).toBeLessThanOrEqual(1000);expect(tx.bytes).toBeLessThanOrEqual(1000000);});
+			const queries:[string,string,SqlStorageValue[]][]=[
+				['count_dates',"SELECT json_extract(commit_meta,'$.at') FROM requests WHERE json_extract(commit_meta,'$.pair')=? AND json_extract(commit_meta,'$.epoch')=? AND json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1 AND json_extract(commit_meta,'$.counted')=1 ORDER BY json_extract(commit_meta,'$.at') ASC,request_id ASC LIMIT 1",[m.pair,m.epoch]],
+				['count_person',"SELECT request_id FROM requests WHERE json_extract(commit_meta,'$.person')=? AND json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1 ORDER BY request_id LIMIT 1",[m.person]],
+				['count_project',"SELECT request_id FROM requests WHERE json_extract(commit_meta,'$.project')=? AND json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1 ORDER BY request_id LIMIT 1",[m.project]],
+				['count_pair_person',"SELECT key FROM profile_meta WHERE key GLOB 'work-count:*:pair:*' AND json_extract(value,'$.person')=? AND json_extract(value,'$.n')>0 LIMIT 1",[m.person]],
+				['count_pair_project',"SELECT key FROM profile_meta WHERE key GLOB 'work-count:*:pair:*' AND json_extract(value,'$.project')=? AND json_extract(value,'$.n')>0 LIMIT 1",[m.project]],
+			];
+			const plans=queries.map(([index,q,v])=>{const plan=s.sql.exec<{detail:string}>('EXPLAIN QUERY PLAN '+q,...v).toArray();expect(plan.some(p=>p.detail.includes(index))).toBe(true);expect(plan.some(p=>p.detail.includes('TEMP B-TREE'))).toBe(false);const cur=s.sql.exec(q,...v);cur.toArray();return {index,plan,reads:cur.rowsRead};});
+			const q=queries[0]![1].replaceAll(' ASC',' DESC'),cur=s.sql.exec(q,m.pair,m.epoch);cur.toArray();expect(cur.rowsRead).toBeLessThan(20);expect(plans[0]!.reads).toBeLessThan(20);
+			return {plans,descending_reads:cur.rowsRead,unrelated_receipts:1024};
+		});
+		console.log('COUNT_INDEX_PLANS',JSON.stringify(measured));
+	});
+
+	it("charges real accounting/trigger writes and rolls back row, UTF-8 and bind refusals before marker publication",async()=>{
+		const metrics:Record<string,unknown>={};
+		for(const kind of ['rows','utf8','binds'] as const){
+			const p=await isolated(),commit={sha:hex('budget-'+kind),at:ago(60),title:'accounting budget',author:'budget-author'};
+			if(kind==='rows')await p.inProfile(s=>{s.sql.exec("CREATE TABLE count_amplified(n INTEGER)");s.sql.exec("CREATE TRIGGER amplify_count AFTER INSERT ON profile_meta WHEN NEW.key GLOB 'work-count:*:pair:*' BEGIN INSERT INTO count_amplified SELECT value FROM json_each('"+JSON.stringify(Array.from({length:1001},(_,i)=>i))+"'); END");});
+			let peak={rows:0,bytes:0,binds:0},inject=true;
+			const run=Tx.prototype.run,spy=vi.spyOn(Tx.prototype,'run').mockImplementation(function(this:Tx,q,...params){
+				let binds=params.length;
+				try{
+					if(inject && q.startsWith('INSERT INTO requests')){
+						inject=false;
+						if(kind==='utf8')run.call(this,'SELECT ?','é'.repeat(500001));
+						if(kind==='binds'){binds=101;run.call(this,'SELECT ?',...Array<SqlStorageValue>(101).fill(1));}
+					}
+					return run.call(this,q,...params);
+				}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,binds)};}
+			});
+			let result:Awaited<ReturnType<typeof post>>;
+			try{result=await post(p.token,{repo:{remote:p.remote},commits:[commit],marker:{head:commit.sha,as_of:ago(1)}});}finally{spy.mockRestore();}
+			expect(result!.data.commits?.[0]?.reason).toBe('size_budget');expect(result!.data.marker?.status).toBe('refused');
+			await p.inProfile(s=>{for(const table of ['nodes','edges','revisions','requests','markers'])expect(s.sql.exec('SELECT count(*) AS n FROM '+table).one().n).toBe(0);expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*'").toArray()).toEqual([]);if(kind==='rows'){expect(s.sql.exec('SELECT count(*) AS n FROM count_amplified').one().n).toBe(0);s.sql.exec('DROP TRIGGER amplify_count');}});
+			metrics[kind]=peak;
+			let accepted={rows:0,bytes:0,binds:0};
+			const measure=vi.spyOn(Tx.prototype,'run').mockImplementation(function(this:Tx,q,...params){try{return run.call(this,q,...params);}finally{accepted={rows:Math.max(accepted.rows,this.rows),bytes:Math.max(accepted.bytes,this.bytes),binds:Math.max(accepted.binds,params.length)};}});
+			try{expect((await post(p.token,{repo:{remote:p.remote},commits:[commit]})).data.commits?.[0]?.status).toBe('stored');}finally{measure.mockRestore();}
+			expect(accepted.rows).toBeGreaterThan(0);expect(accepted.bytes).toBeGreaterThan(0);expect(accepted.binds).toBeGreaterThan(0);expect(accepted.rows).toBeLessThanOrEqual(1000);expect(accepted.bytes).toBeLessThanOrEqual(1000000);expect(accepted.binds).toBeLessThanOrEqual(100);metrics[kind+'-accepted']=accepted;
+			const seal=await p.inProfile(s=>s.transactionSync(()=>{const tx=new BudgetTx(s.sql,nextSeq(s.sql,'profile_meta'),new Date().toISOString());const id=String(s.sql.exec("SELECT request_id FROM requests WHERE commit_meta IS NOT NULL LIMIT 1").one().request_id);tx.run('DELETE FROM requests WHERE request_id=?',id);expect(tx.rows).toBeLessThanOrEqual(1000);expect(tx.bytes).toBeLessThanOrEqual(1000000);expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(1);return {rows:tx.rows,bytes:tx.bytes,binds:1,daily_trigger_present:s.sql.exec("SELECT 1 FROM sqlite_master WHERE name='upload_receipts_gone'").toArray().length===1};}));
+			metrics[kind+'-seal']=seal;
+			expect((await post(p.token,{repo:{remote:p.remote},commits:[commit]})).data.commits?.[0]?.status).toBe('stored');
+			await p.inProfile(s=>expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(2));
+		}
+		console.log('COUNT_RESOURCE_MEASURE',JSON.stringify(metrics));
+	});
+
+	it("follows generic writer expiry without permanent distinctness or a counter-specific refusal", async () => {
+		const p = await isolated();
+		await p.inProfile((s) => {
+			const a = commitArgs(p.ns, { sha: hex("generic-expiry"), at: ago(60), title: "expiry contract", author: "expiry-author" });
+			const ctx = { actor: "index" as const, platform: "test", routedBy: "test", payloadHash: sha256(canonicalJson(a)), userId: p.who.userId };
+			const first = runWrite(s, p.who, { op: "upload", args: a }, ctx);
+			expect(first.result.action).toBe("stored");
+			expect(runWrite(s, p.who, { op: "upload", args: a }, ctx).result.action).toBe("replayed");
+			s.transactionSync(() => s.sql.exec("DELETE FROM requests WHERE request_id = ?", a.request_id));
+			const tombstone = s.sql.exec("SELECT * FROM deleted_rows WHERE tbl = 'requests' AND pk = ?", a.request_id).toArray();
+			expect(tombstone).toHaveLength(1);
+			const accepted = runWrite(s, p.who, { op: "upload", args: a }, ctx);
+			expect(accepted.result.action).toBe("stored");
+			expect(accepted.result.activity_id).not.toBe(first.result.activity_id);
+			// The generic table's tombstone behavior, including any trigger cleanup, stays authoritative.
+			expect(s.sql.exec("SELECT * FROM deleted_rows WHERE tbl = 'requests' AND pk = ?", a.request_id).toArray()).toEqual([]);
+		});
+	});
+});
+
 describe("work uploads", () => {
 	it("publishes commits with their person and project, identifier edges only, board activity, replay and refusal", async () => {
 		const p = await isolated();
@@ -82,6 +288,7 @@ describe("work uploads", () => {
 				{ src: `git:${p.ns}@${s2}`, rel: "part_of", dst: `github:${p.ns}`, basis: "identifier" },
 				{ src: `git:${p.ns}@${s2}`, rel: "relates_to", dst: "jira:WU-12", basis: "identifier" },
 				{ src: "person:github:a-lee", rel: "authored", dst: `git:${p.ns}@${s1}`, basis: "identifier" },
+				{ src: "person:github:a-lee", rel: "works_on", dst: `github:${p.ns}`, basis: "identifier" },
 				{ src: "wu journal", rel: "relates_to", dst: `git:${p.ns}@${s1}`, basis: "identifier" },
 			]));
 			expect(sql.exec("SELECT 1 FROM evidence WHERE kind = 'mention' AND ref = ?", `git:${p.ns}@${s1}`).toArray()).toEqual([]);
@@ -1107,6 +1314,23 @@ describe("daily refresh proofs", () => {
 	}
 	type Ack = { proof: { items: { request_id: string; original_action: string; disposition: string }[] }; receipt_hash: string };
 	const acknowledged = (r: unknown) => { expect(r).toMatchObject({ ok: true, value: { refresh: { status: "acknowledged" } } }); return (r as { value: { refresh: Ack } }).value.refresh; };
+	it("observed count pruning charges populated daily delete triggers with the receipt seal",async()=>{
+		const f=await claimed([[wire(1,at(1))]]);acknowledged(await f.send(0));
+		const commit={sha:hex('daily-seal'),at:ago(60),title:'daily coexistence',author:'daily-count'};
+		expect((await post(f.p.token,{repo:{remote:f.p.remote},commits:[commit]})).data.commits?.[0]?.status).toBe('stored');
+		const measure=await f.p.inProfile(st=>physical(st,()=>st.transactionSync(()=>{
+			const tx=new BudgetTx(st.sql,nextSeq(st.sql,'profile_meta'),new Date().toISOString()),ids=st.sql.exec<{request_id:string}>("SELECT request_id FROM requests WHERE commit_meta IS NOT NULL UNION SELECT request_id FROM refresh_refs WHERE claim_id=?",f.b.claim_id).toArray().map(r=>r.request_id);
+			expect(ids).toHaveLength(2);tx.run('DELETE FROM requests WHERE request_id IN (SELECT value FROM json_each(?))',JSON.stringify(ids));
+			for(const table of ['upload_receipts','upload_revisions','refresh_refs','refresh_parts'])expect(st.sql.exec('SELECT count(*) AS n FROM '+table).one().n).toBe(0);
+			expect(st.sql.exec('SELECT parts,invalid FROM refresh_claims WHERE claim_id=?',f.b.claim_id).one()).toEqual({parts:null,invalid:'source_deleted'});
+			const edge=st.sql.exec("SELECT count_key,weight FROM edges WHERE rel='works_on'").one();expect(edge.weight).toBe(1);expect(JSON.parse(String(st.sql.exec('SELECT value FROM profile_meta WHERE key=?',edge.count_key!).one().value)).base).toBe(1);
+			expect(st.sql.exec("SELECT count(*) AS n FROM deleted_rows WHERE tbl='requests' AND pk IN (SELECT value FROM json_each(?))",JSON.stringify(ids)).one().n).toBe(2);
+			expect(tx.rows).toBeLessThanOrEqual(1000);expect(tx.bytes).toBeLessThanOrEqual(1000000);return {rows:tx.rows,bytes:tx.bytes,binds:1};
+		})));
+		expect(measure.writes).toBe(measure.value.rows);console.log('COUNT_DAILY_DELETE_RESOURCES',JSON.stringify(measure));
+		expect((await post(f.p.token,{repo:{remote:f.p.remote},commits:[commit]})).data.commits?.[0]?.status).toBe('stored');
+		await f.p.inProfile(st=>expect(st.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(2));
+	});
 
 	it("acknowledges 64 cap-sized parts, finishes all 1,600 refs inside the measured read budget, and refuses past budgets without writing", { timeout: 900_000 }, async () => {
 		const items = Array.from({ length: 64 }, (_, part) => Array.from({ length: 25 }, (_, i) => wire(part * 25 + i + 1, at(part * 25 + i))));
@@ -1824,6 +2048,8 @@ describe("daily refresh server", () => {
 			return {status:res.status,data:await res.json() as any};
 		};
 		try {
+			const scope = await ownerHit("GET", `/v1/markers?profile=${p.name}&refresh_scope=1`);
+			expect(scope.status).toBe(403); expect(scope.data.refresh_scope).toBeUndefined();
 			const path = `/api/profiles/${p.name}/refresh/${c.b.claim_id}/abandon`, bytes = JSON.stringify({day:c.b.day,generation:p.who.generation,request_id:"independent-owner-abandon"});
 			for (const [op, body] of [["claim", c.body.claim], ["plan", c.body.plan], ["finish", c.body.finish()]] as const) expect((await ownerHit("POST", `/v1/refresh/${op}`, body)).status).toBe(403);
 			const closed = await ownerHit("POST",path,bytes); expect(closed).toMatchObject({status:200,data:{claim:{state:"abandoned"}}});
@@ -1852,4 +2078,451 @@ describe("daily refresh server", () => {
 		expect(await c.finish("done", JSON.stringify({ ...JSON.parse(bytes), request_id: "later-authorized-observation" }))).toEqual(done);
     });
 
+});
+
+
+describe("default refresh scope", () => {
+	let saved: Record<string, SqlStorageValue>[];
+	beforeEach(async () => { saved = await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("SELECT * FROM routing_rules").toArray()); });
+	afterEach(async () => { await runInDurableObject(account(), (_i, st) => {
+		st.storage.sql.exec("DELETE FROM routing_rules");
+		for (const row of saved) st.storage.sql.exec(`INSERT INTO routing_rules (${Object.keys(row).join(",")}) VALUES (${Object.keys(row).map(() => "?").join(",")})`, ...Object.values(row));
+	}); });
+	const rules = (input: Partial<RoutingRule>[], profile = "selected"): RoutingRule[] => input.map((r, i) => ({ id: `scope-${i}`, match: "remote", pattern: "github.com/chosen/*", priority: i, enabled: true, profile, ...r }));
+	const replace = (input: RoutingRule[]) => runInDurableObject(account(), (_i, st) => {
+		st.storage.sql.exec("DELETE FROM routing_rules");
+		for (const r of input) st.storage.sql.exec("INSERT INTO routing_rules (id, priority, match, pattern, profile, enabled, seq) VALUES (?, ?, ?, ?, ?, ?, 79)", r.id, r.priority, r.match, r.pattern, r.profile, r.enabled ? 1 : 0);
+	});
+	const fresh = async () => {
+		const p = await isolated();
+		await replace(rules([{ pattern: "github.com/foreign-private/exception", profile: "work" }, { pattern: `github.com/${p.org}/*` }], p.name));
+		return p;
+	};
+	const readScope = async (token: string, profile: string, query = `profile=${profile}&refresh_scope=1`, overrides: Partial<Env> = {}, requestOrigin = origin) => {
+		const res = await api(new Request(`${requestOrigin}/v1/markers?${query}`, { headers: { authorization: `Bearer ${token}` } }), { ...env, ...overrides });
+		return { status: res.status, data: await res.json() as any };
+	};
+	it("serves a closed authenticated positive scope through the real marker route", async () => {
+		const p = await fresh();
+		const got = await readScope(p.token, p.name);
+		expect(got.status).toBe(200);
+		const { scope, scope_hash } = got.data.refresh_scope;
+		expect(scope).toEqual({ version: 1, origin, profile: p.name, generation: p.who.generation,
+			device_id: expect.any(String), utc_day: expect.any(String), issued_at: expect.any(String), policy_version: expect.any(String),
+			github: [{ kind: "owner", name: p.org.toLowerCase() }], jira: null });
+		expect(new Date(scope.issued_at).toISOString()).toBe(scope.issued_at);
+		expect(scope.utc_day).toBe(scope.issued_at.slice(0, 10));
+		expect(scope_hash).toBe(sha256(canonicalJson(scope)));
+		expect(Object.keys(got.data.refresh_scope).sort()).toEqual(["scope", "scope_hash"]);
+		expect(got.data.refresh_context).toEqual({ profile: scope.profile, generation: scope.generation, device_id: scope.device_id, utc_day: scope.utc_day });
+	});
+	it("preserves ordered positive owners, exact matches, shadowing and deduplication", () => {
+		const compile = (input: Partial<RoutingRule>[]) => refreshSelectors(rules(input), "selected");
+		expect(compile([
+			{ pattern: "github.com/elsewhere/*", profile: "foreign" },
+			{ pattern: "github.com/Chosen/One" }, { pattern: "github.com/Chosen/*" },
+			{ pattern: "github.com/chosen/two", profile: "foreign" }, { pattern: "**", profile: "foreign" },
+		])).toEqual({ ok: true, value: [{ kind: "owner", name: "chosen" }] });
+		expect(compile([{ pattern: "github.com/chosen/*" }, { pattern: "github.com/chosen/two", profile: "foreign" }, { pattern: "github.com/chosen/*" }]))
+			.toEqual({ ok: true, value: [{ kind: "owner", name: "chosen" }] });
+		expect(compile([{ pattern: "github.com/chosen/one", profile: "foreign" }, { pattern: "github.com/chosen/one" }, { pattern: "github.com/positive/two" }, { pattern: "github.com/positive/two" }]))
+			.toEqual({ ok: true, value: [{ kind: "repo", name: "positive/two" }] });
+		const refused = { ok: false, error: { code: "unavailable", message: "refresh_scope_unsupported" } };
+		for (const input of [
+			[{ pattern: "github.com/chosen/secret", profile: "foreign" }, {}],
+			[{ pattern: "github.com/chosen/*", profile: "foreign" }, {}],
+			[{ pattern: "github.com/chosen/*", profile: "foreign" }, { pattern: "github.com/chosen/repo" }],
+			[{ pattern: "github.com/other**", profile: "foreign" }, {}],
+		]) expect(compile(input)).toEqual(refused);
+	});
+
+	it("refuses unsupported selected rules, ambiguous priorities and caps as a whole", () => {
+		const rejected = (input: RoutingRule[]) => expect(refreshSelectors(input, "selected")).toEqual({ ok: false, error: { code: "unavailable", message: "refresh_scope_unsupported" } });
+		for (const bad of ["github.com/chosen/**", "github.com/cho*/*", "github.com/chosen/re*", "gitlab.com/chosen/*", "https://github.com/chosen/repo", "github.com/chosen/repo.git", "github.com/chosen/repo.", "github.com/chosen/..", "github.com/-bad/repo", "github.com/chosen/a/b"])
+			rejected(rules([{}, { pattern: bad }]));
+		rejected(rules([{}, { match: "path", pattern: "/work" }]));
+		rejected([]); // a device default and Work Jira alone supply no positive selector
+		rejected(rules([{ profile: "foreign" }]));
+		rejected(rules([{ priority: 1 }, { priority: 1, pattern: "github.com/foreign/*", profile: "foreign" }]));
+		const literal = (n: number) => rules(Array.from({ length: n }, (_, i) => ({ pattern: `github.com/org/repo${i}` })));
+		expect(refreshSelectors(literal(64), "selected").ok).toBe(true);
+		rejected(literal(65));
+		const capped = rules([{}, ...Array.from({ length: 127 }, (_, i) => ({ pattern: `github.com/foreign${i}/*`, profile: "foreign" }))]);
+		expect(refreshSelectors(capped, "selected").ok).toBe(true);
+		rejected([...capped, { ...capped[0]!, id: "excess", priority: 129, profile: "foreign" }]);
+		expect(refreshSelectors(rules([{}, { match: "path", enabled: false, pattern: "/unused" }, { profile: "me", pattern: "**" }]), "selected").ok).toBe(true);
+	});
+
+	it("rejects every unsupported query and origin before scope detail, preserving exact old markers", async () => {
+		const p = await fresh();
+		for (const query of ["refresh_scope=1", "profile=me&refresh_scope=1", `profile=${p.name}&refresh_scope=0`, `profile=${p.name}&refresh_scope=true`, `profile=${p.name}&refresh_scope=`,
+			`profile=${p.name}&refresh_scope=1&refresh_scope=1`, `profile=${p.name}&profile=${p.name}&refresh_scope=1`,
+			...['repo=x', 'path=/work', 'session=codex:x', 'unknown=1'].map((key) => `profile=${p.name}&refresh_scope=1&${key}`)]) {
+			const got = await readScope(p.token, p.name, query);
+			expect(got.status).toBe(query.includes("profile=me") ? 403 : 400);
+			expect(got.data.refresh_scope).toBeUndefined();
+			expect(JSON.stringify(got.data)).not.toContain(p.org.toLowerCase());
+		}
+		expect((await readScope(p.token, p.name, undefined, {}, "https://other.test")).status).toBe(403);
+		expect((await readScope(p.token, p.name, undefined, { RESOURCE_URL: "http://memory.test/mcp" }, "http://memory.test")).status).toBe(503);
+		const old = await readScope(p.token, p.name, `profile=${p.name}`);
+		expect(old).toEqual({ status: 200, data: { profile: p.name, routed_by: "explicit", refresh_context: {
+			profile: p.name, generation: p.who.generation, device_id: p.token.split("_")[2], utc_day: new Date().toISOString().slice(0, 10),
+		}, repo: null, marker: null, captures: null, daily: { batch: { last_lease_at: null, next_allowed_at: null }, refresh: null } } });
+	});
+
+	it("checks real device secrets, grants, expiry, revocation and active/recovery gates without scope leaks", async () => {
+		const p = await fresh(), q = `profile=${p.name}&refresh_scope=1`;
+		const disallowed = await deviceToken(`scope-other-${p.name}`, ["ingest"], ["personal"]);
+		const reader = await deviceToken(`scope-reader-${p.name}`, ["read"], [p.name]);
+		for (const [token, status] of [[disallowed.token, 403], [reader.token, 403], [p.token.slice(0, -1) + (p.token.endsWith("0") ? "1" : "0"), 401]] as const) {
+			const got = await readScope(token, p.name, q);
+			expect(got.status).toBe(status); expect(JSON.stringify(got.data)).not.toContain(p.org.toLowerCase());
+		}
+		for (const update of ["enabled = 0", "revoked_at = '2020-01-01T00:00:00Z'", "expires_at = '2020-01-01T00:00:00Z'", "expires_at = 'unreadable'"]) {
+			await runInDurableObject(account(), (_i, st) => st.storage.sql.exec(`UPDATE devices SET ${update} WHERE id = ?`, p.token.split("_")[2]!));
+			expect((await readScope(p.token, p.name)).status).toBe(401);
+			await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("UPDATE devices SET enabled = 1, revoked_at = NULL, expires_at = NULL WHERE id = ?", p.token.split("_")[2]!));
+		}
+		await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = ?", p.name));
+		expect((await readScope(p.token, p.name)).status).toBe(400);
+		await runInDurableObject(account(), (_i, st) => { st.storage.sql.exec("UPDATE profiles SET status = 'active' WHERE name = ?", p.name); st.storage.sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'restoring')"); });
+		try { expect((await readScope(p.token, p.name)).status).toBe(503); }
+		finally { await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'")); }
+		await p.inProfile((st) => st.sql.exec("INSERT INTO profile_meta (key, value) VALUES ('closed', '1')"));
+		expect((await readScope(p.token, p.name)).status).toBe(400);
+		const store = account() as unknown as Pick<AccountStore, "refreshScope">;
+		expect(await store.refreshScope({ kind: "owner", userId: OWNER, device: `job-${p.name}` }, p.name)).toMatchObject({ ok: false, error: { code: "forbidden" } });
+	});
+
+	it.each(["generation", "policy", "device", "grant", "recovery"] as const)("refuses %s changes at the actual awaited profile markers read", async (change) => {
+		const p = await fresh(), profiles = env.PROFILE;
+		let crossed = false;
+		const get = (id: DurableObjectId) => ({ read: async (...args: Parameters<ReturnType<typeof profiles.get>["read"]>) => {
+			const result = await profiles.get(id).read(...args);
+			crossed = true;
+			await runInDurableObject(account(), (_i, st) => {
+				if (change === "generation") st.storage.sql.exec("UPDATE profiles SET generation = 'new-generation' WHERE name = ?", p.name);
+				if (change === "policy") st.storage.sql.exec("UPDATE routing_rules SET seq = seq + 1");
+				if (change === "device") st.storage.sql.exec("UPDATE devices SET revoked_at = 'now' WHERE id = ?", p.token.split("_")[2]!);
+				if (change === "grant") st.storage.sql.exec("UPDATE devices SET profiles = '[]' WHERE id = ?", p.token.split("_")[2]!);
+				if (change === "recovery") st.storage.sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'restoring')");
+			});
+			return result;
+		} });
+		try {
+			const got = await readScope(p.token, p.name, undefined, { PROFILE: { idFromName: (name: string) => profiles.idFromName(name), get } as unknown as Env["PROFILE"] });
+			expect(crossed).toBe(true);
+			expect(got.status).toBe(change === "device" ? 401 : change === "grant" ? 403 : 503);
+			expect(got.data.refresh_scope).toBeUndefined(); expect(got.data.refresh_context).toBeUndefined();
+		} finally { if (change === "recovery") await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'")); }
+	});
+
+	it("binds policy to actual rule replacement revision without hashing foreign names, and Work needs GitHub", async () => {
+		const p = await fresh();
+		const first = (await readScope(p.token, p.name)).data.refresh_scope.scope;
+		expect(first.policy_version).toBe(sha256(canonicalJson({ version: 1, compiler: "literal-routing-v1", routing_seq: "79", profile: p.name, generation: p.who.generation, device_id: first.device_id })));
+		const nextRules = rules([{ pattern: `github.com/${p.org}/*` }, { profile: "personal", pattern: "github.com/new-foreign-private/*" }], p.name);
+		expect((await (account() as unknown as Pick<AccountStore, "admin">).admin({ op: "setRules", rules: nextRules })).ok).toBe(true);
+		const second = (await readScope(p.token, p.name)).data.refresh_scope.scope;
+		expect(second.github).toEqual(first.github); expect(second.policy_version).not.toBe(first.policy_version);
+		expect(JSON.stringify(second)).not.toMatch(/foreign|priority|default|sensitive/);
+		const max = await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("SELECT CAST(MAX(seq) AS TEXT) AS seq FROM routing_rules").one().seq);
+		expect(second.policy_version).toBe(sha256(canonicalJson({ version: 1, compiler: "literal-routing-v1", routing_seq: max, profile: p.name, generation: p.who.generation, device_id: second.device_id })));
+		const work = await deviceToken(`scope-work-${p.name}`, ["ingest"], ["work"]);
+		await replace(rules([{ pattern: "github.com/work-owner/*" }], "work"));
+		expect((await readScope(work.token, "work")).data.refresh_scope.scope.jira).toBe("assigned-open");
+		await replace([]);
+		expect(await readScope(work.token, "work")).toEqual({ status: 503, data: { error: { code: "unavailable", message: "refresh_scope_unsupported" } } });
+	});
+
+	it("returns only a generic unsupported result for foreign exceptions and unsupported HTTP scopes", async () => {
+		const p = await fresh();
+		for (const input of [
+			rules([{ profile: "work", pattern: `github.com/${p.org}/secret` }, { pattern: `github.com/${p.org}/*` }], p.name),
+			rules([{ profile: "work", pattern: `github.com/${p.org}/*` }, { pattern: `github.com/${p.org}/only` }], p.name),
+			rules([{ pattern: `github.com/${p.org}/*` }, { match: "path", pattern: "/private/work" }], p.name),
+			rules([{ pattern: `github.com/${p.org}/*`, priority: 1 }, { profile: "personal", pattern: "**", priority: 1 }], p.name),
+		]) {
+			await replace(input);
+			expect(await readScope(p.token, p.name)).toEqual({ status: 503, data: { error: { code: "unavailable", message: "refresh_scope_unsupported" } } });
+		}
+	});
+
+	it("measures warm SQL and inherits only hourly device bookkeeping, without ledger, mirror or progress effects", async () => {
+		const p = await fresh();
+		await readScope(p.token, p.name); // initialize the profile and account before measured reads
+		const profile = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		const start = (stub: typeof profile | ReturnType<typeof account>) => runInDurableObject(stub, (instance, st) => {
+			const sql = st.storage.sql, exec = sql.exec;
+			const calls: { q: string; c: SqlStorageCursor<Record<string, SqlStorageValue>> }[] = [];
+			(instance as any).scopeSQL = { calls, exec };
+			sql.exec = ((q: string, ...args: SqlStorageValue[]) => { const c = exec.call(sql, q, ...args); calls.push({ q, c }); return c; }) as SqlStorage["exec"];
+		});
+		const stop = (stub: typeof profile | ReturnType<typeof account>) => runInDurableObject(stub, (instance, st) => {
+			const spy = (instance as any).scopeSQL as { calls: { q: string; c: SqlStorageCursor<Record<string, SqlStorageValue>> }[]; exec: SqlStorage["exec"] };
+			st.storage.sql.exec = spy.exec; delete (instance as any).scopeSQL;
+			return spy.calls.map(({ q, c }) => ({ q, reads: c.rowsRead, writes: c.rowsWritten }));
+		});
+		const unchanged = () => runInDurableObject(account(), (_i, st) => ["routing_rules", "sensitive_terms", "refresh_days", "request_index", "node_index"].map((t) => st.storage.sql.exec(`SELECT * FROM ${t}`).toArray()));
+		const before = await unchanged();
+		for (const stale of [false, true]) {
+			if (stale) await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("UPDATE devices SET last_used_at = '2000-01-01T00:00:00Z' WHERE id = ?", p.token.split("_")[2]!));
+			await start(account()); await start(profile);
+			const got = await readScope(p.token, p.name);
+			const a = await stop(account()), b = await stop(profile);
+			expect(got.status).toBe(200);
+			expect(b.reduce((n, x) => n + x.writes, 0)).toBe(0);
+			expect(a.filter((x) => x.writes).every((x) => /^(UPDATE devices SET last_used_at|INSERT INTO account_meta)/.test(x.q))).toBe(true);
+			if (stale) expect(a.reduce((n, x) => n + x.writes, 0)).toBeGreaterThan(0);
+			else expect(a.reduce((n, x) => n + x.writes, 0)).toBe(0);
+			expect(a.some((x) => /refresh_days|sensitive_terms|request_index/.test(x.q))).toBe(false);
+			console.log("SCOPE_SQL", JSON.stringify({ stale, account: a, profile: b }));
+		}
+		expect(await unchanged()).toEqual(before);
+		expect(await p.inProfile((st) => ["refresh_claims", "refresh_refs", "refresh_parts"].map((t) => st.sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n))).toEqual([0, 0, 0]);
+	});
+
+});
+
+// Independent disposable reviewer controls. Product source is unchanged.
+describe('independent counter review',()=>{
+ it('review: expires a full page of real upload activities within the transaction cap',async()=>{
+  const p=await isolated();
+  const metrics=await p.inProfile(s=>{
+   for(let i=0;i<100;i++){
+    const a=commitArgs(p.ns+'-'+i,{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'bulk expiry '+i,author:'bulk-expiry-'+i});
+    runWrite(s,p.who,{op:'upload',args:a},{actor:'index',platform:'test',routedBy:'test',userId:p.who.userId,payloadHash:sha256(JSON.stringify(a))});
+   }
+   const now=Date.now()+401*86400000;
+   for(const stage of ['dedupe','ttl','queue'])s.sql.exec('INSERT OR REPLACE INTO cursors(stage,due_at) VALUES(?,?)',stage,now+86400000);
+   s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");
+   const before=s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload'").one().n;
+   let peak=0;const run=BudgetTx.prototype.run;
+   const spy=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return run.call(this,q,...params);}finally{peak=Math.max(peak,this.rows);}});
+   try{housekeep(s,p.who,now);}catch(e){try{housekeep(s,p.who,now);}catch(again){console.log('REVIEW_BULK_RETRY',JSON.stringify({failure:(again as any).failure,remaining:s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload'").one().n}));}throw e;}finally{spy.mockRestore();console.log('REVIEW_BULK_EXPIRY',JSON.stringify({before,peak,after:s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload'").one().n}));}
+   expect(s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload'").one().n).toBeLessThan(Number(before));
+   return {before,peak};
+  });console.log('REVIEW_BULK_METRICS',JSON.stringify(metrics));
+ });
+ it('review: reverses a transferred endpoint claim after an older sibling seals',async()=>{
+  const p=await isolated();
+  const metrics=await p.inProfile(s=>{
+   const acts:number[]=[],requests:string[]=[];
+   const now=Date.now();vi.useFakeTimers({toFake:['Date']});
+   try{
+   for(const i of [1,3,2]){
+    vi.setSystemTime(now-(i===2?100:500)*86400000);
+    const a=commitArgs(p.ns,{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'sealed sibling '+i,author:'sealed-sibling'});
+    requests.push(a.request_id);
+    acts.push(Number(runWrite(s,p.who,{op:'upload',args:a},{actor:'index',platform:'test',routedBy:'test',userId:p.who.userId,payloadHash:sha256(JSON.stringify(a))}).result.activity_id));
+   }
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+   undo(s,p.who,acts[0]!,ctx);
+   const claimed=JSON.parse(String(s.sql.exec('SELECT undo FROM activity WHERE id=?',acts[2]!).one().undo));
+   expect(claimed.created.map((c:any)=>c.id)).toHaveLength(3); // own commit plus handed person/project
+   // B is 500 days old and C 100 days old. Run the real generic expiry path.
+   vi.useRealTimers();
+   for(const stage of ['dedupe','ttl','queue'])s.sql.exec('INSERT OR REPLACE INTO cursors(stage,due_at) VALUES(?,?)',stage,now+86400000);
+   s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");
+   housekeep(s,p.who,now);
+   expect(s.sql.exec('SELECT id FROM activity WHERE id=?',acts[1]!).toArray()).toEqual([]);
+   expect(s.sql.exec('SELECT commit_meta FROM requests WHERE request_id=?',requests[1]!).one().commit_meta).toBe(null);
+   const before=s.sql.exec("SELECT id,weight FROM edges WHERE rel='works_on'").one();
+   try{undo(s,p.who,acts[2]!,ctx);}
+   catch(e){console.log('REVIEW_SEALED_CLAIM',JSON.stringify({failure:(e as any).failure,before,after:s.sql.exec("SELECT id,weight FROM edges WHERE rel='works_on'").one(),claimed:claimed.created}));throw e;}
+   expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(1);
+   return {before};
+   }finally{vi.useRealTimers();}
+  });console.log('REVIEW_SEALED_CLAIM_SUCCESS',JSON.stringify(metrics));
+ });
+ it('review: accepts another commit after ordinary person Forget',async()=>{
+  const p=await isolated();
+  await p.inProfile(s=>{
+   const make=(i:number)=>commitArgs(p.ns,{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'person forget '+i,author:'forgotten-person'});
+   const ctx={actor:'index' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+   const a=make(1);runWrite(s,p.who,{op:'upload',args:a},{...ctx,payloadHash:sha256(JSON.stringify(a))});
+   const person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id);
+   runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'review-forget-person'}},{...ctx,actor:'owner',payloadHash:'review-forget'});
+   const b=make(2);
+   try{const out=runWrite(s,p.who,{op:'upload',args:b},{...ctx,payloadHash:sha256(JSON.stringify(b))});expect(out.result.action).toBe('stored');}
+   catch(e){console.log('REVIEW_AFTER_FORGET',JSON.stringify({failure:(e as any).failure,person}));throw e;}
+  });
+ });
+});
+
+describe('counter review corrections',()=>{
+ it('F1 drains and repeats 100 distinct-pair expirations with actual transaction and outbox headroom',async()=>{
+  const p=await isolated();
+  const proof=await p.inProfile(async s=>{
+   const ctx={actor:'index' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+   const now=Date.now()+401*86400000;
+   for(let i=0;i<100;i++){
+    const args=commitArgs(p.ns+'-'+i,{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'distinct expiry '+i,author:'distinct-'+i});
+    runWrite(s,p.who,{op:'upload',args},{...ctx,payloadHash:sha256(JSON.stringify(args))});
+   }
+   const note=runWrite(s,p.who,{op:'save',args:{name:'purge outbox companion',type:'project',description:'synthetic',request_id:'f1-note'}},{...ctx,actor:'owner',payloadHash:'note'});
+   runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:String(note.result.memory_id),request_id:'f1-forget'}},{...ctx,actor:'owner',payloadHash:'forget'});
+   const young=commitArgs(p.ns+'-young',{sha:'f'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'not yet 400 days',author:'young'});
+   vi.useFakeTimers({toFake:['Date']});
+   try{vi.setSystemTime(now-399*86400000);runWrite(s,p.who,{op:'upload',args:young},{...ctx,payloadHash:'young'});}finally{vi.useRealTimers();}
+   const transactions:{rows:number;bytes:number;binds:number}[]=[],progress:number[]=[];
+   let cursors:SqlStorageCursor<Record<string,SqlStorageValue>>[]=[],bytes=0,binds=0;
+   const metered={sql:{exec(q:string,...v:SqlStorageValue[]){const c=s.sql.exec(q,...v);cursors.push(c);bytes+=v.reduce<number>((n,x)=>n+(typeof x==='string'?Buffer.byteLength(x,'utf8'):0),0);binds=Math.max(binds,v.length);return c;},get databaseSize(){return s.sql.databaseSize;}},transactionSync<T>(fn:()=>T){cursors=[];bytes=0;binds=0;const out=s.transactionSync(fn);transactions.push({rows:cursors.reduce((n,c)=>n+c.rowsWritten,0),bytes,binds});return out;}} as unknown as DurableObjectStorage;
+   for(const stage of ['dedupe','ttl','queue'])s.sql.exec('INSERT OR REPLACE INTO cursors(stage,due_at) VALUES(?,?)',stage,now+86400000);
+   let outboxes=0;
+   for(let pass=0;pass<20;pass++){
+    s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");housekeep(metered,p.who,now);
+    if(s.sql.exec("SELECT 1 FROM cursors WHERE stage='purge_cleanup'").toArray().length)outboxes++;
+    await cleanupPurge(s,async ids=>expect((await account().prunePurged(p.who,ids)).ok).toBe(true));
+    const left=Number(s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload' AND at<?",new Date(now-400*86400000).toISOString()).one().n);progress.push(left);
+    if(!left)break;
+    if(progress.length>1)expect(left).toBeLessThan(progress.at(-2)!);
+   }
+   expect(progress.at(-1)).toBe(0);expect(outboxes).toBeGreaterThan(0);
+   expect(s.sql.exec("SELECT count(*) AS n FROM activity WHERE op='upload'").one().n).toBe(1);
+   expect(s.sql.exec("SELECT commit_meta FROM requests WHERE request_id=?",young.request_id).one().commit_meta).not.toBe(null);
+   const totals=()=>s.sql.exec("SELECT sum(json_extract(value,'$.n')) AS n,sum(json_extract(value,'$.base')) AS base,count(*) AS pairs FROM profile_meta WHERE key GLOB 'work-count:*:pair:*'").one();
+   expect(totals()).toEqual({n:101,base:100,pairs:101});const before=totals();
+   s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");housekeep(metered,p.who,now);expect(totals()).toEqual(before);
+   for(const t of transactions){expect(t.rows).toBeLessThanOrEqual(1000);expect(t.bytes).toBeLessThanOrEqual(1000000);expect(t.binds).toBeLessThanOrEqual(100);}
+   return {distinct_pairs:100,progress,outboxes,transactions,maximum:{rows:Math.max(...transactions.map(t=>t.rows)),bytes:Math.max(...transactions.map(t=>t.bytes)),binds:Math.max(...transactions.map(t=>t.binds))}};
+  });console.log('F1_ACTUAL_DRAIN',JSON.stringify(proof));
+ });
+ it('F2 preserves totals and forgotten content across acceptance, Undo and old staged restore rollback',async()=>{
+  const p=await isolated();
+  await p.inProfile(s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+   const observed=Date.now();
+   const upload=(i:number)=>{const args=commitArgs(p.ns,{sha:i.toString(16).padStart(40,'0'),at:new Date(observed-(60-i)*60000).toISOString(),title:'forget successor '+i,author:'forget-successor'});return runWrite(s,p.who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});};
+   upload(1);const person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id);
+   runWrite(s,p.who,{op:'knowledge',args:{nodes:[{kind:'person',key:'person:github:forget-successor',name:'forget-successor',description:'forgotten owner prose'}]}},{...ctx,payloadHash:'private-note'});
+   const old=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one(),epoch=String(old.count_epoch);
+   const run=(c:Parameters<typeof runArchive>[2])=>runArchive(s,p.who,c,{...ctx,payloadHash:sha256(JSON.stringify(c))});
+   const drain=(out:ReturnType<typeof run>)=>{for(let i=0;i<100 && (out.state!=='complete'||out.cleanup_pending);i++)out=run({action:'resume',operation_id:String(out.operation_id),cursor:String(out.cursor),request_id:'f2-page-'+crypto.randomUUID()});expect(out.state).toBe('complete');return out;};
+   const forgotten=drain(run({action:'forget',memory_id:person,expected_revision:Number(s.sql.exec('SELECT revision FROM nodes WHERE id=?',person).one().revision),request_id:'f2-first-forget'}));
+   const archiveBefore=s.sql.exec('SELECT id,payload,seq FROM archive WHERE activity_id=? ORDER BY id',Number(forgotten.activity_id)).toArray();
+   const b=upload(2);upload(3);
+   expect(s.sql.exec("SELECT description FROM nodes WHERE id=?",person).one().description).not.toContain('forgotten owner prose');
+   expect(s.sql.exec('SELECT id,payload,seq FROM archive WHERE activity_id=? ORDER BY id',Number(forgotten.activity_id)).toArray()).toEqual(archiveBefore);
+   expect(s.sql.exec("SELECT weight,count_epoch FROM edges WHERE rel='works_on' AND ended_at IS NULL").one()).toEqual({weight:3,count_epoch:epoch});
+   expect(upload(2).result.action).toBe('replayed');
+   undo(s,p.who,Number(b.result.activity_id),ctx);expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(2);
+   runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'f2-second-forget'}},{...ctx,payloadHash:'second-forget'});
+   const key=String(old.count_key),before=String(s.sql.exec('SELECT value FROM profile_meta WHERE key=?',key).one().value);
+   let restoring=run({action:'restore',activity_id:Number(forgotten.activity_id),request_id:'f2-old-restore-abort'});
+   for(let i=0;i<100 && !s.sql.exec("SELECT 1 FROM edges WHERE rel='works_on'").toArray().length;i++)restoring=run({action:'resume',operation_id:String(restoring.operation_id),cursor:String(restoring.cursor),request_id:'f2-copy-'+i});
+   expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(2);
+   restoring=run({action:'abort',operation_id:String(restoring.operation_id),cursor:String(restoring.cursor),request_id:'f2-abort'});
+   for(let i=0;i<100 && (restoring.state!=='aborted'||restoring.cleanup_pending);i++)restoring=run({action:'resume',operation_id:String(restoring.operation_id),cursor:String(restoring.cursor),request_id:'f2-abort-'+i});
+   expect(restoring.state).toBe('aborted');expect(s.sql.exec('SELECT value FROM profile_meta WHERE key=?',key).one().value).toBe(before);
+   drain(run({action:'restore',activity_id:Number(forgotten.activity_id),request_id:'f2-old-restore-complete'}));
+   expect(s.sql.exec("SELECT description FROM nodes WHERE id=?",person).one().description).toBe('forgotten owner prose');
+   expect(s.sql.exec("SELECT weight,count_epoch FROM edges WHERE rel='works_on' AND ended_at IS NULL").one()).toEqual({weight:2,count_epoch:epoch});
+   const d=upload(4);undo(s,p.who,Number(d.result.activity_id),ctx);expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(2);
+   const edge=s.sql.exec("SELECT id FROM edges WHERE rel='works_on' AND ended_at IS NULL").one();s.sql.exec('UPDATE edges SET ended_at=?,seq=9999 WHERE id=?',new Date().toISOString(),edge.id!);
+   const receipts=s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray();expect(()=>upload(5)).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));expect(s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray()).toEqual(receipts);
+   const ended=runWrite(s,p.who,{op:'owner',args:{action:'forget',memory_id:person,request_id:'f2-agent-ended-forget'}},{...ctx,payloadHash:'agent-ended-forget'});
+   const image=JSON.parse(String(s.sql.exec("SELECT payload FROM archive WHERE activity_id=? AND source='edges' AND json_extract(payload,'$.rel')='works_on'",Number(ended.result.activity_id)).one().payload));
+   expect(image.count_key).toBe(key);expect(image.count_epoch).toBe(null);
+   runWrite(s,p.who,{op:'restore',args:{activity_id:Number(ended.result.activity_id),request_id:'f2-agent-ended-restore'}},{...ctx,payloadHash:'agent-ended-restore'});
+   expect(s.sql.exec("SELECT count_epoch,ended_at,weight FROM edges WHERE rel='works_on'").one()).toMatchObject({count_epoch:null,ended_at:expect.any(String),weight:2});
+  });
+ });
+ it('F3 preserves both Undo orders through natural expiry and refuses independent sealed-row, evidence and node edits',async()=>{
+  const summaries:unknown[]=[];
+  for(const variant of ['reverse-first','edge','evidence','node']){
+   const p=await isolated();
+   await p.inProfile(s=>{
+    const now=Date.now(),acts:number[]=[],ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+    vi.useFakeTimers({toFake:['Date']});
+    try{for(const i of [1,3,2]){vi.setSystemTime(now-(i===2?100:500)*86400000);const args=commitArgs(p.ns,{sha:i.toString(16).padStart(40,'0'),at:'2026-02-01T00:00:00.000Z',title:'sealed order '+i,author:'sealed-order'});acts.push(Number(runWrite(s,p.who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))}).result.activity_id));}}finally{vi.useRealTimers();}
+    if(variant==='reverse-first')undo(s,p.who,acts[2]!,ctx);
+    undo(s,p.who,acts[0]!,ctx);
+    for(const stage of ['dedupe','ttl','queue'])s.sql.exec('INSERT OR REPLACE INTO cursors(stage,due_at) VALUES(?,?)',stage,now+86400000);
+    s.sql.exec("INSERT OR REPLACE INTO cursors(stage,due_at) VALUES('purge',0)");housekeep(s,p.who,now);
+    expect(s.sql.exec('SELECT id FROM activity WHERE id IN (?,?)',acts[0]!,acts[1]!).toArray()).toEqual([]);
+    const sibling=s.sql.exec("SELECT * FROM edges WHERE rel='authored' AND commit_seal IS NOT NULL").one();
+    if(variant==='reverse-first'){expect(s.sql.exec("SELECT weight FROM edges WHERE rel='works_on'").one().weight).toBe(1);const owner=JSON.parse(String(s.sql.exec("SELECT value FROM profile_meta WHERE key=?",'work-count:'+p.name+':claim:'+String(sibling.src)).one().value)).owner;expect(owner.seq).toBe(1);summaries.push({variant,weight:1,sealed_creator_seq:owner.seq});return;}
+    expect(JSON.parse(String(sibling.commit_seal)).seq).toBe(sibling.seq);
+    if(variant==='edge')s.sql.exec('UPDATE edges SET reason=?,seq=9999 WHERE id=?','independent edit',sibling.id!);
+    if(variant==='evidence')s.sql.exec("INSERT INTO evidence(owner,kind,ref,note,seq) VALUES(?,'url','https://example.invalid/sealed','later evidence',9999)",'e:'+String(sibling.id));
+    if(variant==='node')s.sql.exec("UPDATE nodes SET revision=revision+1,seq=9999 WHERE kind='person'");
+    const receipts=s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray(),count=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();
+    expect(()=>undo(s,p.who,acts[2]!,ctx)).toThrow(expect.objectContaining({failure:expect.objectContaining({code:'revision_conflict'})}));
+    expect(s.sql.exec('SELECT * FROM requests ORDER BY request_id').toArray()).toEqual(receipts);expect(s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one()).toEqual(count);summaries.push({variant,atomic_conflict:true});
+   });
+  }console.log('F3_ORDERS_AND_CONFLICTS',JSON.stringify(summaries));
+ });
+});
+
+describe('INDEPENDENT F123 closure',()=>{
+ it('staged restore abort preserves independently ended historical aggregate',async()=>{
+  const p=await isolated();await p.inProfile(s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId};
+   const args=commitArgs(p.ns,{sha:'d'.repeat(40),at:'2026-02-01T00:00:00Z',title:'ended history',author:'ended-history'});
+   runWrite(s,p.who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});
+   const person=String(s.sql.exec("SELECT id FROM nodes WHERE kind='person'").one().id),edge=Number(s.sql.exec("SELECT id FROM edges WHERE rel='works_on'").one().id);
+   runWrite(s,p.who,{op:'knowledge',args:{end:[{edge,valid_to:'2026-03-01T00:00:00.000Z',reason:'independent relationship ended'}]}},{...ctx,payloadHash:'ended'});
+   const run=(c:Parameters<typeof runArchive>[2])=>runArchive(s,p.who,c,{...ctx,payloadHash:sha256(JSON.stringify(c))});
+   let n=0;const resume=(o:ReturnType<typeof run>)=>run({action:'resume',operation_id:String(o.operation_id),cursor:String(o.cursor),request_id:'independent-page-'+n++});
+   let f=run({action:'forget',memory_id:person,expected_revision:Number(s.sql.exec('SELECT revision FROM nodes WHERE id=?',person).one().revision),request_id:'independent-ended-forget'});
+   for(let i=0;i<100&&(f.state!=='complete'||f.cleanup_pending);i++)f=resume(f);expect(f.state).toBe('complete');
+   const frozen=s.sql.exec('SELECT * FROM archive WHERE activity_id=? ORDER BY id',Number(f.activity_id)).toArray();
+   let o=run({action:'restore',activity_id:Number(f.activity_id),request_id:'independent-ended-restore'});
+   for(let i=0;i<100&&!s.sql.exec("SELECT 1 FROM edges WHERE rel='works_on'").toArray().length;i++)o=resume(o);
+   expect(s.sql.exec("SELECT count_epoch,weight,ended_at FROM edges WHERE rel='works_on'").one()).toEqual({count_epoch:null,weight:1,ended_at:expect.any(String)});
+   console.log('INDEPENDENT_UNOWNED_APPLIED',JSON.stringify(s.sql.exec("SELECT key,value FROM profile_meta WHERE key LIKE 'archive-op:%:row:%'").toArray()));
+   o=run({action:'abort',operation_id:String(o.operation_id),cursor:String(o.cursor),request_id:'independent-ended-abort'});
+   for(let i=0;i<100&&(o.state!=='aborted'||o.cleanup_pending);i++){
+    try{o=resume(o);}catch(error){
+     const current=s.sql.exec('SELECT status,seq FROM nodes WHERE id=?',person).toArray();
+     const snapshot=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").toArray();
+     let again:unknown;try{resume(o);}catch(next){again=next;}
+     expect(again).toMatchObject({failure:{code:'revision_conflict',details:{reason:'applied_row'}}});
+     expect(s.sql.exec('SELECT status,seq FROM nodes WHERE id=?',person).toArray()).toEqual(current);
+     expect(s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").toArray()).toEqual(snapshot);
+     console.log('INDEPENDENT_ABORT_RETRY',JSON.stringify({first:(error as {failure:unknown}).failure,second:(again as {failure:unknown}).failure,node:current,archives_intact:s.sql.exec('SELECT * FROM archive WHERE activity_id=? ORDER BY id',Number(f.activity_id)).toArray().length===frozen.length}));
+     throw error;
+    }
+   }
+   expect(o.state).toBe('aborted');expect(s.sql.exec('SELECT * FROM archive WHERE activity_id=? ORDER BY id',Number(f.activity_id)).toArray()).toEqual(frozen);
+   expect(s.sql.exec("SELECT 1 FROM edges WHERE rel='works_on'").toArray()).toEqual([]);
+  });
+ });
+});
+
+
+
+describe('null-epoch staged archive retries',()=>{
+ it('aborts two copied restores atomically on replay, then completes with exact ordinary history',async()=>{
+  const runTx=BudgetTx.prototype.run;let peak={rows:0,bytes:0,binds:0};
+  const meter=vi.spyOn(BudgetTx.prototype,'run').mockImplementation(function(this:BudgetTx,q,...params){try{return runTx.call(this,q,...params);}finally{peak={rows:Math.max(peak.rows,this.rows),bytes:Math.max(peak.bytes,this.bytes),binds:Math.max(peak.binds,params.length)};}});
+  try{const p=await isolated();await p.inProfile(s=>{
+   const ctx={actor:'owner' as const,platform:'test',routedBy:'test',userId:p.who.userId},args=commitArgs(p.ns,{sha:'f'.repeat(40),at:'2026-02-01T00:00:00.000Z',title:'ordinary archive retries',author:'ordinary-retries'});
+   runWrite(s,p.who,{op:'upload',args},{...ctx,actor:'index',payloadHash:sha256(JSON.stringify(args))});
+   const row=s.sql.exec("SELECT id,src FROM edges WHERE rel='works_on'").one();
+   runWrite(s,p.who,{op:'knowledge',args:{end:[{edge:Number(row.id),valid_to:'2026-03-01T00:00:00.000Z',reason:'independent archive history'}]}},{...ctx,payloadHash:'end'});
+   let n=0;const run=(c:Parameters<typeof runArchive>[2])=>runArchive(s,p.who,c,{...ctx,payloadHash:sha256(JSON.stringify(c))}),resume=(o:ReturnType<typeof run>)=>run({action:'resume',operation_id:String(o.operation_id),cursor:String(o.cursor),request_id:'ordinary-page-'+n++});
+   let f=run({action:'forget',memory_id:String(row.src),expected_revision:Number(s.sql.exec('SELECT revision FROM nodes WHERE id=?',row.src!).one().revision),request_id:'ordinary-forget'});
+   for(let i=0;i<100&&(f.state!=='complete'||f.cleanup_pending);i++)f=resume(f);expect(f.state).toBe('complete');
+   const frozen=s.sql.exec('SELECT * FROM archive WHERE activity_id=? ORDER BY id',Number(f.activity_id)).toArray();
+   const image=JSON.parse(String(frozen.find(a=>a.source==='edges'&&JSON.parse(String(a.payload)).rel==='works_on')!.payload));
+   for(let i=0;i<3;i++){
+    let o=run({action:'restore',activity_id:Number(f.activity_id),request_id:'ordinary-restore-'+i});
+    for(let j=0;j<100&&!s.sql.exec("SELECT 1 FROM edges WHERE rel='works_on'").toArray().length;j++)o=resume(o);
+    const live=s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").one();expect({...live,seq:image.seq}).toEqual(image);
+    if(i===2){for(let j=0;j<100&&(o.state!=='complete'||o.cleanup_pending);j++)o=resume(o);expect(o.state).toBe('complete');break;}
+    o=run({action:'abort',operation_id:String(o.operation_id),cursor:String(o.cursor),request_id:'ordinary-abort-'+i});
+    for(let j=0;j<100&&(o.state!=='aborted'||o.cleanup_pending);j++)o=resume(o);expect(o.state).toBe('aborted');
+    const state=()=>({node:s.sql.exec('SELECT * FROM nodes WHERE id=?',row.src!).toArray(),edges:s.sql.exec("SELECT * FROM edges WHERE rel='works_on'").toArray(),archive:s.sql.exec('SELECT * FROM archive WHERE activity_id=? ORDER BY id',Number(f.activity_id)).toArray()});
+    const stable=state();expect(stable.edges).toEqual([]);expect(stable.archive).toEqual(frozen);
+    o=resume(o);expect(state()).toEqual(stable);
+    const c={action:'resume' as const,operation_id:String(o.operation_id),cursor:String(o.cursor),request_id:'ordinary-terminal-replay-'+i};
+    const received=run(c);expect(run(c)).toEqual({...received,action:'replayed'});expect(state()).toEqual(stable);
+   }
+  });}finally{meter.mockRestore();}
+  expect(peak.rows).toBeGreaterThan(0);expect(peak.rows).toBeLessThanOrEqual(1000);expect(peak.bytes).toBeLessThanOrEqual(1000000);expect(peak.binds).toBeLessThanOrEqual(100);
+  console.log('NULL_HISTORY_ARCHIVE_RESOURCES',JSON.stringify(peak));
+ });
 });

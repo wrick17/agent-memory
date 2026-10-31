@@ -33,6 +33,45 @@ export function matchRule(rules: RoutingRule[], repo?: RepoRef): RoutingRule | u
 		?? (repo.path ? live.find((r) => r.match === "path" && pathMatch(r.pattern, repo.path!)) : undefined);
 }
 
+export type RefreshSelector = { kind: "owner" | "repo"; name: string };
+
+/** Positive inventory only. An unprovable owner-wide first match refuses the whole projection. */
+export function refreshSelectors(rules: RoutingRule[], profile: string): Outcome<RefreshSelector[]> {
+	const unsupported = () => fail("unavailable", "refresh_scope_unsupported");
+	const live = rules.filter((r) => r.enabled && r.profile !== "me").sort((a, b) => a.priority - b.priority);
+	const remote = live.filter((r) => r.match === "remote");
+	if (live.length > 128 || new Set(remote.map((r) => r.priority)).size !== remote.length) return unsupported();
+	const literal = (r: RoutingRule) => {
+		const pattern = r.pattern.toLowerCase();
+		const m = /^github\.com\/([a-z0-9][\w.-]*)\/(\*|[\w.-]+)$/.exec(pattern);
+		if (r.match !== "remote" || !m || normalizeRemote(pattern) !== pattern || /\.$/.test(pattern)) return null;
+		return { owner: m[1]!, kind: m[2] === "*" ? "owner" as const : "repo" as const, name: m[2] === "*" ? m[1]! : `${m[1]}/${m[2]}` };
+	};
+	if (live.some((r) => r.profile === profile && !literal(r))) return unsupported();
+	const selected: RefreshSelector[] = [];
+	for (const [i, r] of remote.entries()) {
+		if (r.profile !== profile) continue;
+		const scope = literal(r)!;
+		if (scope.kind === "repo") {
+			if (matchRule(live, { remote: `github.com/${scope.name}` })?.profile === profile) selected.push({ kind: scope.kind, name: scope.name });
+			continue;
+		}
+		let shadowed = false;
+		for (const before of remote.slice(0, i)) {
+			const earlier = literal(before);
+			if (!earlier) return unsupported();
+			if (earlier.owner !== scope.owner) continue;
+			if (earlier.kind === "owner") { shadowed = before.profile !== profile; break; }
+			if (before.profile !== profile) return unsupported();
+		}
+		if (!shadowed) selected.push({ kind: scope.kind, name: scope.name });
+	}
+	const owners = new Set(selected.filter((s) => s.kind === "owner").map((s) => s.name));
+	const unique = [...new Map(selected.filter((s) => s.kind === "owner" || !owners.has(s.name.split("/")[0]!)).map((s) => [`${s.kind}:${s.name}`, s])).values()]
+		.sort((a, b) => a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+	return unique.length && unique.length <= 64 ? ok(unique) : unsupported();
+}
+
 /** The profile the repo or device default points at, ignoring any explicit profile. Used by the `me` guard. */
 export function contextProfile(caller: Caller, rules: RoutingRule[], repo?: RepoRef): string | null {
 	return matchRule(rules, repo)?.profile ?? caller.defaultProfile ?? null;

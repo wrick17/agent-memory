@@ -1,3 +1,4 @@
+import { edgeIdentity, observeCommit, type CountEdge } from "./work-counts";
 import { assertArchiveEndpoints } from "./archive-fence";
 // Work uploads (sections 4, 10 and 13): bounded metadata the owner's machines read locally, published through the shared write
 // path as actor `index`. The server never calls GitHub or Jira. Commits, PR snapshots and Jira ticket snapshots (work only).
@@ -206,12 +207,19 @@ export function upload(tx: Tx, who: Who, a: UploadArgs): WriteOutput {
 	if (a.author) ids.set(personKey(a.author), ensure(tx, who, created, "person", personKey(a.author), a.author, { github: a.author }));
 	const commit = ids.get(key)!;
 	let edges = 0;
-	for (const e of structuralEdges({ key, project, ...(a.author ? { author: a.author } : {}) })) edges += identifierEdge(tx, ids.get(e.from)!, e.rel, ids.get(e.to)!, a.at);
+	const structural: CountEdge[]=[];
+	for (const e of structuralEdges({ key, project, ...(a.author ? { author: a.author } : {}) })) {
+		const src=ids.get(e.from)!,dst=ids.get(e.to)!;
+		const added=identifierEdge(tx,src,e.rel,dst,a.at);edges+=added;
+		if(added)structural.push(edgeIdentity(tx.sql.exec<Record<string,SqlStorageValue>>("SELECT * FROM edges WHERE src=? AND rel=? AND dst=? AND dst_profile='' AND ended_at IS NULL",src,e.rel,dst).one()));
+	}
 	// An existing commit node (written by an agent) keeps its content; only a new one publishes its title's mentions.
 	if (created.includes(commit)) linkIdentifiers(tx, commit, a.title);
 	// A short SHA may name multiple commits. Keep its mention evidence until a full identity is supplied.
 	for (const [k, id] of ids) resolveMentions(tx, id, k);
 	const activityId = activity(tx, "upload", `uploaded a commit (new: ${created.length} nodes, ${edges} edges)`, [...new Set(ids.values())]);
+	assertArchiveEndpoints(tx.sql,ids.get(personKey(a.author??""))??commit,ids.get(project)!,"");
+	tx.commitReceipt=observeCommit(tx,who,a.request_id,a.author?ids.get(personKey(a.author))!:null,ids.get(project)!,a.at,{id:activityId,at:tx.now,seq:tx.seq},structural);
 	return { result: { ok: true, action: "stored", memory_id: commit, key, new_nodes: created.length, new_edges: edges, activity_id: activityId, node_ids: [...ids.values()] }, created, embedDue: false };
 }
 

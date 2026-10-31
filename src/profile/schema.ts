@@ -20,6 +20,28 @@ const ERASE = `UPDATE refresh_claims SET parts = NULL, invalid = 'source_deleted
 		(SELECT 1 FROM json_each(refresh_claims.parts, '$.sources') s WHERE json_extract(s.value, '$.namespace') = `;
 const NAMESPACE = (key: string) => `CASE WHEN instr(${key}, '#') THEN substr(${key}, 8, instr(${key}, '#') - 8) ELSE substr(${key}, 8) END`;
 
+// Used only by v8 triggers. A deleted request loses replay authority but its accepted observation stays sealed.
+const COUNT_SEAL = `
+	UPDATE edges SET commit_seal=json_object('seq',(SELECT CAST(value AS INTEGER) FROM profile_meta WHERE key='write_seq'),'evidence',json_extract(OLD.commit_meta,'$.owner.seq')),
+		seq=(SELECT CAST(value AS INTEGER) FROM profile_meta WHERE key='write_seq')
+	WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(OLD.commit_meta,'$.structural'))
+	AND EXISTS (SELECT 1 FROM json_each(OLD.commit_meta,'$.structural') e WHERE
+		edges.id=json_extract(e.value,'$.id') AND edges.src=json_extract(e.value,'$.src') AND edges.dst=json_extract(e.value,'$.dst')
+		AND edges.dst_profile=json_extract(e.value,'$.dst_profile') AND edges.rel=json_extract(e.value,'$.rel') AND edges.basis=json_extract(e.value,'$.basis')
+		AND edges.recorded_at=json_extract(e.value,'$.recorded_at') AND edges.request_id IS json_extract(e.value,'$.request_id') AND edges.seq=json_extract(e.value,'$.seq'));
+	UPDATE profile_meta SET value=json_set(value,
+		'$.base',json_extract(value,'$.base')+1,
+		'$.baseFirst',CASE WHEN json_extract(value,'$.baseFirst') IS NULL OR json_extract(OLD.commit_meta,'$.at')<json_extract(value,'$.baseFirst') THEN json_extract(OLD.commit_meta,'$.at') ELSE json_extract(value,'$.baseFirst') END,
+		'$.baseLast',CASE WHEN json_extract(value,'$.baseLast') IS NULL OR json_extract(OLD.commit_meta,'$.at')>json_extract(value,'$.baseLast') THEN json_extract(OLD.commit_meta,'$.at') ELSE json_extract(value,'$.baseLast') END)
+	WHERE key=json_extract(OLD.commit_meta,'$.pair') AND json_extract(value,'$.epoch')=json_extract(OLD.commit_meta,'$.epoch') AND json_extract(OLD.commit_meta,'$.counted')=1;
+	INSERT OR IGNORE INTO profile_meta(key,value)
+		SELECT 'work-count:'||json_extract(OLD.commit_meta,'$.origin')||':claim:'||json_extract(c.value,'$.id'),
+		json_object('kind','claim','origin',json_extract(OLD.commit_meta,'$.origin'),'node',json_extract(c.value,'$.id'),'expect',json_extract(c.value,'$.expect'),'owner',coalesce(json_extract(c.value,'$.countOwner'),json_extract(OLD.commit_meta,'$.owner')))
+		FROM activity a,json_each(a.undo,'$.created') c
+		WHERE a.id=json_extract(OLD.commit_meta,'$.owner.id') AND a.at=json_extract(OLD.commit_meta,'$.owner.at') AND json_extract(a.undo,'$.seq')=json_extract(OLD.commit_meta,'$.owner.seq')
+		AND json_extract(c.value,'$.id') IN (json_extract(OLD.commit_meta,'$.person'),json_extract(OLD.commit_meta,'$.project'));
+`;
+
 export const PROFILE_MIGRATIONS: Migration[] = [[
 	`CREATE TABLE nodes (
 		id TEXT PRIMARY KEY,
@@ -290,5 +312,24 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	END`,
 	`CREATE TRIGGER refresh_archive_gone AFTER DELETE ON archive WHEN OLD.source = 'nodes' AND json_extract(OLD.payload, '$.key') LIKE 'github:%' BEGIN
 		${ERASE}${NAMESPACE("json_extract(OLD.payload, '$.key')")});
+	END`,
+], [
+	// v8: reversible observed-commit facts and constant-size pair state. Generic replay/retention is unchanged.
+	"ALTER TABLE requests ADD COLUMN commit_meta TEXT CHECK(commit_meta IS NULL OR json_valid(commit_meta))",
+	"ALTER TABLE edges ADD COLUMN count_key TEXT",
+	"ALTER TABLE edges ADD COLUMN count_epoch TEXT",
+	"ALTER TABLE edges ADD COLUMN commit_seal TEXT CHECK(commit_seal IS NULL OR json_valid(commit_seal))",
+	"CREATE INDEX count_dates ON requests(json_extract(commit_meta,'$.pair'),json_extract(commit_meta,'$.epoch'),json_extract(commit_meta,'$.at'),request_id) WHERE json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1 AND json_extract(commit_meta,'$.counted')=1",
+	"CREATE INDEX count_person ON requests(json_extract(commit_meta,'$.person'),request_id) WHERE json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1",
+	"CREATE INDEX count_project ON requests(json_extract(commit_meta,'$.project'),request_id) WHERE json_extract(commit_meta,'$.local')=1 AND json_extract(commit_meta,'$.active')=1",
+	"CREATE INDEX count_pair_person ON profile_meta(json_extract(value,'$.person'),json_extract(value,'$.n')) WHERE key GLOB 'work-count:*:pair:*'",
+	"CREATE INDEX count_pair_project ON profile_meta(json_extract(value,'$.project'),json_extract(value,'$.n')) WHERE key GLOB 'work-count:*:pair:*'",
+	`CREATE TRIGGER count_receipt_seal BEFORE UPDATE OF commit_meta ON requests
+		WHEN NEW.commit_meta IS NULL AND json_extract(OLD.commit_meta,'$.local')=1 AND json_extract(OLD.commit_meta,'$.active')=1 BEGIN ${COUNT_SEAL} END`,
+	`CREATE TRIGGER count_receipt_delete BEFORE DELETE ON requests
+		WHEN json_extract(OLD.commit_meta,'$.local')=1 AND json_extract(OLD.commit_meta,'$.active')=1 BEGIN ${COUNT_SEAL} END`,
+	`CREATE TRIGGER count_activity_expiry BEFORE DELETE ON activity WHEN json_extract(OLD.undo,'$.commitReceipt.request') IS NOT NULL BEGIN
+		UPDATE requests SET commit_meta=NULL,seq=(SELECT CAST(value AS INTEGER) FROM profile_meta WHERE key='write_seq') WHERE request_id=json_extract(OLD.undo,'$.commitReceipt.request')
+		AND json_extract(commit_meta,'$.owner.id')=OLD.id AND json_extract(commit_meta,'$.owner.at')=OLD.at AND json_extract(commit_meta,'$.owner.seq')=json_extract(OLD.undo,'$.seq');
 	END`,
 ]];
