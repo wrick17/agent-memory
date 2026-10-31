@@ -9,15 +9,16 @@ type El = { tag: string; textContent: string; value: string; hidden: boolean; di
 	addEventListener(type: string, f: () => unknown): void };
 let active: El | undefined; // the stand-in document.activeElement
 // A 2D context that draws nothing and records text: its font, place and width (7 px a character, as measureText reports here).
-type Ctx = Record<string, unknown> & { arcs: number; fills: number; images: number; font: string; texts: { font: string; t: string; x: number; y: number; w: number }[] };
+type Ctx = Record<string, unknown> & { arcs: number; fills: number; images: number; font: string; fillStyle: string; fillStyles: string[];
+	texts: { font: string; t: string; x: number; y: number; w: number; color: string }[] };
 const context = (): Ctx => {
-	const c: Ctx = { arcs: 0, fills: 0, images: 0, font: "", texts: [] };
-	for (const f of ["setTransform", "clearRect", "beginPath", "moveTo", "lineTo", "stroke", "scale"]) c[f] = () => {};
+	const c: Ctx = { arcs: 0, fills: 0, images: 0, font: "", fillStyle: "", fillStyles: [], texts: [] };
+	for (const f of ["setTransform", "clearRect", "beginPath", "moveTo", "lineTo", "stroke", "scale", "strokeText"]) c[f] = () => {};
 	c.arc = () => { c.arcs++; };
-	c.fill = () => { c.fills++; };
+	c.fill = () => { c.fills++; c.fillStyles.push(c.fillStyle); };
 	c.drawImage = () => { c.images++; };
 	c.measureText = (t: string) => ({ width: t.length * 7 });
-	c.fillText = (t: string, x: number, y: number) => { c.texts.push({ font: c.font, t, x, y, w: t.length * 7 }); };
+	c.fillText = (t: string, x: number, y: number) => { c.texts.push({ font: c.font, t, x, y, w: t.length * 7, color: c.fillStyle }); };
 	return c;
 };
 const make = (tag: string, hidden = false): El => {
@@ -928,5 +929,34 @@ describe("dashboard knowledge graph", () => {
 		await settle();
 		expect([dotLayer!.ctx.arcs - before.layer, screen!.ctx.arcs - before.screen, screen!.ctx.images - before.images]).toEqual([0, 0, 1]);
 		expect(stamped).toBeGreaterThan(0);
+	});
+
+	it("colours canvas text to 4.5:1 against the canvas's actual background in dark and light, read once, not per frame", async () => {
+		const lum = (c: number[]) => c.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }).reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i]!, 0);
+		const rgb = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+		for (const [surface, dark] of [[[26, 28, 29], true], [[251, 252, 253], false]] as const) {
+			let reads = 0;
+			const b = browser({ signedIn: true, api: graphApi() });
+			// A forced dark page: the canvas's computed background, whatever the colour-scheme media query says.
+			Object.assign(b.win, { getComputedStyle: (e: El) => { reads++; return { backgroundColor: e.tag === "canvas" ? `rgb(${surface.join(", ")})` : "rgba(0, 0, 0, 0)" }; } });
+			await dashboardMain(b.win);
+			await loaded(b);
+			typeIn(byId(b.view(), "graph-q"), "Record 1");
+			click(button(b.view(), "Record 1"));
+			const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
+			canvas.ctx.texts = [];
+			click(button(b.view(), "Fit"));
+			await settle();
+			const texts = canvas.ctx.texts;
+			expect(texts.some((t) => t.t === "Record 1") && texts.some((t) => t.font.startsWith("600"))).toBe(true);
+			for (const t of texts) {
+				const [x, y] = [lum(rgb(t.color)), lum([...surface])].sort((p, q) => q - p);
+				expect((x! + 0.05) / (y! + 0.05)).toBeGreaterThanOrEqual(4.5);
+			}
+			expect(canvas.ctx.fillStyles).toContain(dark ? "#3987e5" : "#2a78d6");
+			const before = reads;
+			for (const key of ["ArrowLeft", "ArrowUp", "ArrowRight"]) { canvas.on.keydown!({ key, preventDefault() {} } as never); await settle(); }
+			expect(reads).toBe(before); // frames read no computed style
+		}
 	});
 });

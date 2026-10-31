@@ -4,13 +4,13 @@ Give your coding agents a shared place to remember what matters. Agent Memory is
 
 ## Where it stands
 
-Agent Memory has imported and refreshed 1,374 approved Work records on the owner service; 119 records remain held. Fresh Codex and Claude conversations can use the installed, authenticated clients for core memory calls. Start a new conversation to pick up the current tools; an app restart is not required.
+Agent Memory has imported and refreshed 1,374 approved Work records: 1,014 from BothQ, 310 from Codex Markdown, and 50 from Claude Markdown. Another 119 records remain held. These are selected sources, not complete chat histories. Fresh Codex and Claude conversations can use the installed, authenticated clients for core memory calls; start a new conversation to load the current tools.
 
-The [dashboard](https://memory.wrick17.com/) works with the existing owner session. Fresh Google sign-in is not configured or verified. [Verification](docs/combined-verification-2026-10-30.md#live-dashboard-and-post-cutover-backup-2026-10-31).
+The [dashboard](https://memory.wrick17.com/) opens the Work graph with 1,379 records and 174 links. Dark canvas text contrast and fresh owner Google sign-in passed selected live checks. [Verification](docs/combined-verification-2026-10-30.md#live-whole-graph-2026-10-31).
 
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-Automatic capture is not running. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
+Automatic capture is off and not installed; a private capture patch remains under review. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.
 
 ## Completed development milestones
 
@@ -18,6 +18,7 @@ Automatic capture is not running. The project corpus, self-host setup, first sch
 - [x] Imported and audited 1,374 approved Work records, then completed the guarded final refresh. The 119 held records were not imported.
 - [x] Restored the hosted Work profile and Account; created and verified the new Agent Memory task journal.
 - [x] Deployed the dashboard and verified a synthetic Work reference save, retry, edit and history in the owner browser session.
+- [x] Deployed the whole Work graph and verified its live metadata, search, selection and navigation controls.
 
 ## Feature acceptance
 

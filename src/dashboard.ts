@@ -1424,6 +1424,31 @@ export async function dashboardMain(win: any): Promise<void> {
 			return true;
 		};
 		measure();
+		// Canvas pixels follow neither CSS nor a browser's forced dark mode, so the canvas palette follows the canvas's actual computed
+		// background: read once here and again only on a resize or a colour-scheme change, never per frame. Text takes the first
+		// candidate reaching 4.5:1 against it; dots use the dark or light steps of the same three hues.
+		type Theme = { id: string; bg: string; ink: string; muted: string; match: string; ring: string; edge: string; hues: string[] };
+		const rgbOf = (c: unknown): number[] | null => {
+			const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?/.exec(typeof c === "string" ? c : "");
+			return m && (m[4] === undefined || parseFloat(m[4]) > 0) ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+		};
+		const lum = (c: number[]) => c.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }).reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i]!, 0);
+		const ratio = (a: number[], b: number[]) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x! + 0.05) / (y! + 0.05); };
+		const hex = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+		let theme: Theme | undefined;
+		const readTheme = () => {
+			const css = (e: unknown) => { try { return win.getComputedStyle?.(e)?.backgroundColor; } catch { return undefined; } };
+			const bg = rgbOf(css(canvas)) ?? rgbOf(css(doc.body)) ?? (win.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? [26, 28, 29] : [251, 252, 253]);
+			const dark = lum(bg) < 0.18, pick = (c: string[]) => c.find((x) => ratio(hex(x), bg) >= 4.5) ?? (dark ? "#ffffff" : "#000000");
+			const next: Theme = { id: bg.join(","), bg: `rgb(${bg.join(",")})`, ink: pick(dark ? ["#e6edf3"] : ["#1b1f24"]), muted: pick(dark ? ["#9da7b3", "#c9d1d9"] : ["#57606a", "#424a53"]),
+				match: pick(dark ? ["#d29922", "#e3b341"] : ["#9a6700", "#7d4e00"]), ring: dark ? "#e6edf3" : "#1b1f24", edge: dark ? "rgba(157,167,179,0.65)" : "rgba(87,96,106,0.65)",
+				hues: dark ? ["#3987e5", "#d95926", "#199e70"] : ["#2a78d6", "#eb6834", "#1baf7a"] };
+			const changed = next.id !== theme?.id;
+			theme = next;
+			return changed;
+		};
+		readTheme();
+		const hueAt = (group: string) => (group.startsWith("m:") ? 0 : group === "e:person" ? 2 : 1);
 		const shown = (n: GNode) => !hidden.has(n.group) && (n.status === "active" || showPast) && (!onlyLinked || n.deg > 0 || n.opaque > 0);
 		const relayout = () => {
 			discs = layout(g, shown);
@@ -1457,15 +1482,15 @@ export async function dashboardMain(win: any): Promise<void> {
 		// Dots are drawn as one native path per colour (three fills for the whole library), into a cached layer: a frame stamps that one
 		// bitmap (a pan moves it, a wheel zoom in progress scales it) and the dots are drawn again only when the zoom settles, the layout
 		// changes or the pixel ratio does. Zoomed in past the layer's size cap, the dots in view are drawn directly, the same way.
-		const HUES = ["#2a78d6", "#eb6834", "#1baf7a"], LAYER_PIXELS = 16_000_000, PAD = 12;
+		const LAYER_PIXELS = 16_000_000, PAD = 12;
 		const dots = (c: J, k: number, ox: number, oy: number, keep: (n: GNode) => boolean) => {
 			let n = 0;
 			const scale = Math.min(1.6, Math.max(0.6, Math.sqrt(k)));
-			for (const hue of HUES) {
-				c.fillStyle = hue;
+			for (let hue = 0; hue < 3; hue++) {
+				c.fillStyle = theme!.hues[hue];
 				c.beginPath();
 				for (const d of vis) {
-					if (hueOf(d.group) !== hue || !keep(d)) continue;
+					if (hueAt(d.group) !== hue || !keep(d)) continue;
 					const x = d.x * k + ox, y = d.y * k + oy, r = radius(d) * scale;
 					c.moveTo(x + r, y); c.arc(x, y, r, 0, 2 * Math.PI);
 					n++;
@@ -1528,7 +1553,8 @@ export async function dashboardMain(win: any): Promise<void> {
 				return true;
 			};
 			ctx.lineWidth = 1;
-			ctx.strokeStyle = "rgba(87,96,106,0.35)";
+			const t = theme!;
+			ctx.strokeStyle = t.edge;
 			ctx.beginPath();
 			for (const e of g.edges.values()) {
 				if (!e.b || !visIds.has(e.a) || !visIds.has(e.b)) continue;
@@ -1540,7 +1566,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			const focus = selected ? new Set([selected, ...(adj.get(selected) ?? [])]) : null;
 			let count = 0;
 			ctx.globalAlpha = focus || matchSet.size ? 0.35 : 1;
-			const key = `${layoutVersion}:${k}:${dpr}`, settled = Date.now() - zooming > 150;
+			const key = `${layoutVersion}:${k}:${dpr}:${theme!.id}`, settled = Date.now() - zooming > 150;
 			if (layerKey !== key && (settled || !layer)) buildLayer(k, key);
 			if (layer && (layerAt.k === k || !settled)) {
 				const s = k / layerAt.k;
@@ -1552,30 +1578,35 @@ export async function dashboardMain(win: any): Promise<void> {
 			ctx.globalAlpha = 1;
 			const emphasise = (n: GNode, ring: string) => {
 				const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale;
-				ctx.fillStyle = hueOf(n.group); ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
+				ctx.fillStyle = t.hues[hueAt(n.group)]!; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
 				ctx.strokeStyle = ring; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, r + 2, 0, 2 * Math.PI); ctx.stroke();
 			};
-			if (k > 0.6) { ctx.strokeStyle = "#57606a"; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
-			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, "#9a6700"); }
-			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? "#1b1f24" : "#ffffff"); }
+			if (k > 0.6) { ctx.strokeStyle = t.muted; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
+			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, t.match); }
+			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? t.ring : t.bg); }
 			// Record names first, most important first, then group headings where room is left; the legend always names every group.
+			// Text gets a halo in the surface colour, so it stays readable where it crosses a link or a dot.
 			ctx.font = NAME_FONT;
-			ctx.fillStyle = "#1b1f24";
+			ctx.fillStyle = t.ink;
+			ctx.strokeStyle = t.bg;
+			ctx.lineWidth = 3;
+			ctx.lineJoin = "round";
+			const text = (s: string, x: number, y: number) => { ctx.strokeText(s, x, y); ctx.fillText(s, x, y); };
 			const label = (n: GNode) => {
-				const t = n.name.length > 40 ? `${n.name.slice(0, 39)}…` : n.name, w = widthOf(NAME_FONT, t), x = n.x * k + ox, y = n.y * k + oy + 4, r = radius(n) * scale + 4;
+				const name = n.name.length > 40 ? `${n.name.slice(0, 39)}…` : n.name, w = widthOf(NAME_FONT, name), x = n.x * k + ox, y = n.y * k + oy + 4, r = radius(n) * scale + 4;
 				// Right of the dot, or left of it near the right edge.
-				for (const lx of [x + r, x - r - w]) if (place(lx, y, w, 12)) { ctx.fillText(t, lx, y); return; }
+				for (const lx of [x + r, x - r - w]) if (place(lx, y, w, 12)) { text(name, lx, y); return; }
 			};
 			const important = [...new Set([...(selected ? [selected] : []), ...(hover ? [hover] : []), ...(focus ?? []), ...[...matchSet].slice(0, 50)])];
 			for (const id of important) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) label(n); }
 			if (k >= 1.4) { let shownLabels = 0; for (const n of vis) { if (shownLabels >= 150) break; if (inView(n)) { label(n); shownLabels++; } } }
 			ctx.font = GROUP_FONT;
-			ctx.fillStyle = "#57606a";
+			ctx.fillStyle = t.muted;
 			for (const d of [...discs].sort((a, b) => b.ids.length - a.ids.length)) {
 				const full = `${GROUP_NAME.get(d.group)} (${d.ids.length})`, w = widthOf(GROUP_FONT, full), cx = d.x * k + ox;
 				// Centred over the disc, kept inside the canvas; below it if the top is taken; left out if neither fits.
 				const lx = Math.min(Math.max(cx - w / 2, 4), cw - 4 - w);
-				for (const y of [(d.y - d.r) * k + oy - 6, (d.y + d.r) * k + oy + 16]) if (place(lx, y, w, 14)) { ctx.fillText(full, lx, y); break; }
+				for (const y of [(d.y - d.r) * k + oy - 6, (d.y + d.r) * k + oy + 16]) if (place(lx, y, w, 14)) { text(full, lx, y); break; }
 			}
 			if (count !== drawn) { drawn = count; canvas.setAttribute("data-drawn", String(count)); }
 		};
@@ -1584,7 +1615,13 @@ export async function dashboardMain(win: any): Promise<void> {
 			frame = true;
 			if (win.requestAnimationFrame) win.requestAnimationFrame(draw); else setTimeout(draw, 0);
 		};
-		const resized = () => { if (version === pageVersion && measure()) schedule(); };
+		const scheme = win.matchMedia?.("(prefers-color-scheme: dark)");
+		const resized = () => {
+			if (version !== pageVersion) { win.removeEventListener?.("resize", resized); scheme?.removeEventListener?.("change", resized); return; }
+			const sized = measure(), themed = readTheme();
+			if (sized || themed) schedule();
+		};
+		scheme?.addEventListener?.("change", resized);
 		win.addEventListener("resize", resized);
 		if (win.ResizeObserver) { const ro = new win.ResizeObserver(() => { if (version !== pageVersion) ro.disconnect(); else resized(); }); ro.observe(canvas); }
 
