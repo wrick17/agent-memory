@@ -186,6 +186,23 @@ it("daily private closed HTTP seam sends retained bytes with redirect refusal an
 		await assert.rejects(server.refresh("https://other.invalid", body), /operation/);
 		await assert.rejects(server.refresh("part", {}), /bytes_required/);
 		await server.refresh("status", { profile: "work", day: "2026-10-30", claim_id: "synthetic" }); assert.equal(calls[1].options.method, "GET");
+		await server.refresh("markers", { profile: "work" }); assert.equal(calls[2].url, "https://synthetic.invalid/v1/markers?profile=work");
+		await server.refresh("markers", { profile: "personal", refresh_scope: "1" }); assert.equal(calls[3].url, "https://synthetic.invalid/v1/markers?profile=personal&refresh_scope=1");
+		const uncredentialed = httpServer({ ...config, token_file: path.join(f.h, "does-not-exist") });
+		for (const q of [{ profile: "work", refresh_scope: false }, { profile: "work", refresh_scope: "0" }, { profile: "work", refresh_scope: "1", extra: "x" }, { refresh_scope: "1" }]) await assert.rejects(uncredentialed.refresh("markers", q), /refresh_query/);
+		assert.equal(calls.length, 4);
+		for (const profile of ["me", "", "Work", "a_b", "a.b", "a/b", "a b", "a?", "a#", "a\n", "1x", "-x", "a".repeat(13), "é", "a$", "a:"]) {
+			await assert.rejects(uncredentialed.refresh("markers", { profile, refresh_scope: "1" }), /refresh_query/);
+			await assert.rejects(server.refresh("markers", { profile, refresh_scope: "1" }), /refresh_query/);
+		}
+		assert.equal(calls.length, 4);
+		for (const profile of ["work", "personal", "test", "a1-z"]) {
+			await server.refresh("markers", { profile, refresh_scope: "1" });
+			assert.equal(new URL(calls.at(-1).url).searchParams.get("profile"), profile);
+		}
+		for (const profile of ["me", "Work"]) await server.refresh("markers", { profile });
+		await server.refresh("status", { profile: "me", day: "2026-10-30", claim_id: "synthetic" });
+		assert.equal(calls.length, 11);
 	} finally { globalThis.fetch = original; dropLock(); }
 });
 

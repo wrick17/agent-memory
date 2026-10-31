@@ -3,16 +3,12 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { assertMachineLock, redact } from "./agent-memory.mjs";
 import { dailyStorage } from "./daily-refresh.mjs";
-import { accountFor, preparePRObservation } from "./pr-upload.mjs";
+import { accountFor, preparePRObservation, ghReader } from "./pr-upload.mjs";
 import { JIRA_ACCOUNT, prepareTicketObservation } from "./jira-upload.mjs";
 
 // Exact canonicalJson convention from domain/ids.ts, shared by all agreed hash domains.
-export function canonicalJson(value) { return JSON.stringify(sortKeys(value)); }
-function sortKeys(value) {
-	if (Array.isArray(value)) return value.map(sortKeys);
-	if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => [k, sortKeys(value[k])]));
-	return value;
-}
+import { canonicalJson, inventoryScope, inventoryResolution, inventoryRequest } from "./daily-inventory.mjs";
+export { canonicalJson };
 const C = canonicalJson, sha = (s) => createHash("sha256").update(s).digest("hex"), H = (v) => sha(C(v));
 const HEX = /^[0-9a-f]{64}$/, PROFILE = /^[a-z][a-z0-9-]{0,11}$/, REPO = /^[a-z0-9][\w.-]*\/[\w.-]+$/;
 const need = (ok, code = "daily_acquisition_invalid") => { if (!ok) throw new Error(code); };
@@ -104,7 +100,8 @@ export function observedAcquisition({ profile, origin, sources, io = fs } = {}) 
 	function prepareRefresh({ binding, requiredSources, as_of } = {}) {
 		assertMachineLock(); need(validBinding(binding, profile), "daily_acquisition_binding");
 		const active = disk.load().attempt;
-		need(active && active.phase !== "claim" && same(active.binding, binding) && active.origin === origin && active.as_of === as_of && same(active.requiredSources, requiredSources), "daily_claim_ack_required");
+		need(active && active.phase !== "claim" && same(active.binding, binding) && active.origin === origin && active.as_of === as_of
+			&& (active.inventory ? same(inventoryResolution(disk, active).requiredSources, requiredSources) : same(active.requiredSources, requiredSources)), "daily_claim_ack_required");
 		if (hydrationError) throw hydrationError;
 		if (cache || hydrate(binding)) {
 			need(same(cache.binding, binding) && cache.as_of === as_of && same(cache.requiredSources, requiredSources), "daily_acquisition_binding");
@@ -188,4 +185,102 @@ export function observedAcquisition({ profile, origin, sources, io = fs } = {}) 
 			&& receipts.length === cache.plan.frames.length && acks.length === receipts.length && receipts.every((h, i) => h === acks[i]);
 	}
 	return { canonicalJson, prepareRefresh, checkReceipt, acknowledge, complete };
+}
+
+/** Trusted application dependencies only. No installed caller or Office constructor exists yet. */
+export function defaultAcquisition({ profile, origin, server, io = fs, github = {} } = {}) {
+	assertMachineLock(); need(typeof profile === "string" && PROFILE.test(profile) && profile !== "me" && server && typeof server.refresh === "function");
+	const url = new URL(origin); need(url.protocol === "https:" && url.origin === origin, "daily_acquisition_origin");
+	need(github && Object.keys(github).every((k) => ["bin", "env", "exec"].includes(k)), "daily_inventory_invalid");
+	const disk = dailyStorage(io, origin, profile); let inner = null, resolution = null;
+	const current = disk.load().attempt;
+	const optional = (name) => { try { return disk.read(name); } catch (e) { if (e.code !== "ENOENT") throw e; return null; } };
+	const hydrate = (a) => {
+		resolution = inventoryResolution(disk, a);
+		inner = observedAcquisition({ profile, origin, io, sources: resolution.sources });
+	};
+	if (current?.inventory && optional(`${current.name}/inventory.sources.json`) !== null) hydrate(current);
+	// Retained explicit Work seals remain replayable. Fresh Work cannot omit its mandatory unavailable Office reader.
+	if (current && !current.inventory && current.plan) inner = observedAcquisition({ profile, origin, io });
+	if (profile === "work" && !inner) throw new Error("daily_office_unavailable");
+	let started = false;
+	async function prepareRefresh({ binding, requiredSources, as_of }) {
+		assertMachineLock(); const a = disk.load().attempt;
+		need(a && a.inventory && a.requiredSources === null && requiredSources === null && a.phase !== "claim" && same(a.binding, binding) && a.as_of === as_of && a.origin === origin, "daily_claim_ack_required");
+		if (inner) return inner.prepareRefresh({ binding, requiredSources: resolution.requiredSources, as_of });
+		const prefix = `${a.name}/`, f = (name) => prefix + name;
+		need(!started && optional(f("inventory.context.json")) === null, "daily_inventory_preparation_uncertain"); started = true;
+		const scope = inventoryScope({ scope: disk.json(f("inventory.scope.json")), scope_hash: a.inventory.scope_sha256 }, { origin, profile });
+		need(scope.issued_at === as_of && scope.utc_day === binding.day && scope.device_id === binding.device_id && scope.generation === binding.generation);
+		const context = { version: 1, binding, origin, scope_sha256: H(scope), as_of, reader_policy: 1 };
+		disk.put(f("inventory.context.json"), C(context));
+		const claim_body = disk.read(f("claim.body")), claim_receipt = disk.json(f("claim.receipt.json"));
+		const repoIds = new Set();
+		const pages = [], principals = new Map(), repos = new Map(), observations = new Map(); let calls = 0, candidates = 0;
+		const guard = () => {
+			assertMachineLock();
+			const active = disk.load().attempt;
+			need(active && active.phase === "acquire" && active.plan === null && same(active.binding, binding) && active.origin === origin && active.as_of === as_of
+				&& active.inventory?.scope_sha256 === H(scope) && disk.read(f("inventory.scope.json")) === C(scope) && disk.read(f("inventory.context.json")) === C(context)
+				&& disk.read(f("claim.body")) === claim_body && disk.read(f("claim.receipt.json")) === C(claim_receipt), "daily_claim_ack_required");
+		};
+		async function authority() {
+			guard();
+			const markers = await server.refresh("markers", { profile, refresh_scope: "1" });
+			guard();
+			need(markers.refresh_context && markers.profile === profile, "daily_inventory_binding");
+			const fresh = inventoryScope(markers.refresh_scope, { origin, profile, context: markers.refresh_context });
+			need(markers.profile === profile && ["origin", "profile", "generation", "device_id", "policy_version"].every((k) => fresh[k] === scope[k]) && same(fresh.github, scope.github) && fresh.jira === scope.jira, "daily_inventory_binding");
+			guard();
+		}
+		async function read(reader, operation, namespace, after = null, principal = null) {
+			assertMachineLock(); need(calls + (operation === "identity" ? 2 : 1) <= 256, "daily_inventory_limit");
+			// Re-sync the complete retained chain before each effect, including a failed publication with a new storage reader.
+			need(disk.read(f("inventory.context.json")) === C(context));
+			for (let i = 0; i < pages.length; i++) { const text = disk.read(f(`inventory.page-${i}.json`)); need(sha(text) === pages[i] && sha(disk.read(f(`inventory.intent-${i}.json`))) === parse(text).intent_sha256); }
+			await authority(); guard();
+			// Keep space for maximal bounded response copies plus all native part receipts and local delivery records.
+			disk.capacity(64 * 10 + 12, 2 * 8000000 + 2 * 64 * 262144 + 65536);
+			const ordinal = pages.length, args = inventoryRequest(operation, namespace, after);
+			const intent = { version: 1, context_sha256: H(context), ordinal, reader: "github", principal_sha256: principal ? H(principal) : null, operation, args, previous_page_sha256: pages.at(-1) ?? null };
+			disk.put(f(`inventory.intent-${ordinal}.json`), C(intent));
+			need(disk.read(f(`inventory.intent-${ordinal}.json`)) === C(intent)); calls += operation === "identity" ? 2 : 1;
+			const result = await reader.defaultPage({ operation, namespace, after });
+			await authority(); guard();
+			need(disk.read(f(`inventory.intent-${ordinal}.json`)) === C(intent));
+			const record = { version: 1, context_sha256: H(context), intent_sha256: H(intent), ...result };
+			disk.put(f(`inventory.page-${ordinal}.json`), C(record)); pages.push(H(record));
+			principals.set(H(result.principal), result.principal);
+			return result;
+		}
+		for (const selector of scope.github) {
+			const reader = ghReader(selector.name, { ...github, io, server, inventory: { scope, binding, as_of, selector, claim_body, claim_receipt } });
+			const principal = (await read(reader, "identity", reader.account)).principal;
+			const names = [];
+			if (selector.kind === "owner") {
+				let after = null;
+				do { const page = await read(reader, "ownerRepos", selector.name, after, principal);
+					for (const r of page.page.members) { need(!repos.has(r.name) && !repoIds.has(r.id), "daily_inventory_duplicate"); repoIds.add(r.id); repos.set(r.name, r); names.push(r.name); }
+					need(repos.size <= 64, "daily_inventory_limit"); after = page.page.hasNextPage ? page.page.endCursor : null;
+				} while (after !== null);
+			} else { need(!repos.has(selector.name)); repos.set(selector.name, null); names.push(selector.name); need(repos.size <= 64, "daily_inventory_limit"); }
+			for (const namespace of names) {
+				let after = null; const rows = [];
+				do { const page = await read(reader, "repoOpen", namespace, after, principal); if (repos.get(namespace) === null) { need(!repoIds.has(page.connection.object_id), "daily_inventory_duplicate"); repoIds.add(page.connection.object_id); repos.set(namespace, { id: page.connection.object_id }); } candidates += page.page.members.length; need(candidates <= 10000, "daily_inventory_limit"); rows.push(...page.observations);
+					after = page.page.hasNextPage ? page.page.endCursor : null;
+				} while (after !== null);
+				rows.sort((a, b) => String(a.number) < String(b.number) ? -1 : String(a.number) > String(b.number) ? 1 : 0);
+				observations.set(namespace, { kind: "pr", namespace, principal_sha256: H(principal), requested: rows.map((r) => r.number), observations_sha256: H(rows) });
+			}
+		}
+		const eof = { ...context, principals: [...principals.keys()], page_sha256: pages, selected: [...observations.values()].sort((a, b) => a.namespace < b.namespace ? -1 : 1) };
+		disk.put(f("inventory.eof.json"), C(eof));
+		const declarations = eof.selected.map((s) => ({ source_id: H({ kind: s.kind, namespace: s.namespace }), kind: s.kind, namespace: s.namespace,
+			selector_hash: H({ version: 1, policy: "default-open-v1", scope_sha256: H(scope), eof_sha256: H(eof), kind: s.kind, namespace: s.namespace, principal_sha256: s.principal_sha256 }) })).sort((a, b) => a.source_id < b.source_id ? -1 : 1);
+		disk.put(f("inventory.sources.json"), C({ version: 1, binding, origin, scope_sha256: H(scope), as_of, eof_sha256: H(eof), requiredSources: declarations }));
+		hydrate(a);
+		return inner.prepareRefresh({ binding, requiredSources: resolution.requiredSources, as_of });
+	}
+	return { canonicalJson, prepareRefresh, checkReceipt: (v) => !!inner && inner.checkReceipt(v), acknowledge: (v) => { need(inner); const a = disk.load().attempt; if (a?.inventory) inventoryResolution(disk, a); return inner.acknowledge(v); },
+		complete: (v) => !!inner && inner.complete(v) };
 }

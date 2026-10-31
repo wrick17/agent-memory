@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { takeLock, dropLock, home } from "./agent-memory.mjs";
+import { takeLock, dropLock, home, httpServer, LIMITS } from "./agent-memory.mjs";
 import { refreshDaily } from "./daily-refresh.mjs";
-import { observedAcquisition, canonicalJson as C } from "./daily-acquisition.mjs";
+import { observedAcquisition, defaultAcquisition, canonicalJson as C } from "./daily-acquisition.mjs";
+import { inventoryQueries } from "./daily-inventory.mjs";
+import { ghReader } from "./pr-upload.mjs";
 
 const sha = (s) => createHash("sha256").update(s).digest("hex"), H = (v) => sha(C(v));
 const origin = "https://synthetic.invalid", as_of = "2026-10-30T12:00:00.000Z";
@@ -61,7 +63,7 @@ function fixture(sources = selected(), profile = "work") {
 	} };
 	let acquisition = observedAcquisition({ profile, origin, sources });
 	const requiredSources = sources?.map((s) => s.source) ?? [prSource, jiraSource];
-	return { s, state, statePath, namespace, get acquisition() { return acquisition; },
+	return { s, state, statePath, namespace, server, get acquisition() { return acquisition; },
 		restart: (nextSources, io) => { acquisition = observedAcquisition({ profile, origin, sources: nextSources, ...(io ? { io } : {}) }); },
 		call: (extra = {}) => refreshDaily({ profile, requiredSources, as_of, acquisition, server, config: { server: origin }, ...extra }) };
 }
@@ -223,5 +225,294 @@ test("daily acquisition matches server cleaning after clipping PR and Jira title
 			assert(fs.existsSync(f.statePath("part-0.receipt.json"))); assert(fs.existsSync(f.statePath("acq.ack-0.json")));
 			assert.equal(f.s.sent.filter((x) => x.op === "part").length, 1);
 		} finally { dropLock(); }
+	}
+});
+
+function defaultFixture() {
+	process.env.AGENT_MEMORY_HOME = path.join(root, `default-home-${serial++}`); assert(takeLock());
+	const h = home(), profile = "personal", token_file = path.join(h, "fixture-token"), bin = path.join(h, "owned-fake-gh");
+	fs.writeFileSync(token_file, "synthetic-only", { mode: 0o600 }); fs.writeFileSync(bin, "synthetic executor only", { mode: 0o700 });
+	const ns = path.join(h, "pending/work-refresh", sha(JSON.stringify([origin, profile]))), state = () => JSON.parse(fs.readFileSync(path.join(ns, "state.json"), "utf8"));
+	const s = { calls: [], sent: [], binding: null, manifest: null, state: "pending", mutation: null, loss: null, day: "2026-10-30", generation: "g1", device: "d1", unknown: false };
+	const file = (name) => path.join(ns, `${s.binding.day}.${s.binding.claim_id}`, name);
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (input, options) => {
+		const u = new URL(input); assert.equal(u.origin, origin); assert.equal(options.redirect, "error"); assert(options.signal); s.calls.push(u.pathname);
+		if (u.pathname === "/v1/markers") {
+			const ctx = { profile, generation: s.generation, device_id: s.device, utc_day: s.day };
+			const scope = { version: 1, origin, ...ctx, issued_at: `${s.day}T12:00:00.000Z`, policy_version: H("fixture policy"), github: [{ kind: "owner", name: "synthetic" }], jira: null };
+			if (s.scopeChange && s.binding) scope.policy_version = H("different policy");
+			if (s.onMarkers) await s.onMarkers();
+			return { ok: true, json: async () => ({ profile, refresh_context: ctx, ...(u.searchParams.get("refresh_scope") === "1" ? { refresh_scope: { scope, scope_hash: H(scope) } } : {}) }) };
+		}
+		if (u.pathname.endsWith("/status")) return s.unknown ? { ok: false, status: 404, json: async () => ({ error: {} }) }
+			: { ok: true, json: async () => ({ operation: "status", utc_day: s.day, claim: { ...s.binding, state: s.state }, progress: null }) };
+		const body = JSON.parse(options.body), op = u.pathname.endsWith("/claim") ? "claim" : u.pathname.endsWith("/plan") ? "plan" : u.pathname.endsWith("/finish") ? "finish" : "part";
+		if (op === "claim") s.binding = { profile, generation: s.generation, device_id: s.device, day: body.day, claim_id: body.claim_id };
+		assert.equal(fs.readFileSync(file(op === "part" ? `part-${body.refresh.part}.body` : `${op}.body`), "utf8"), options.body);
+		s.sent.push({ op, bytes: options.body }); if (op === "plan") s.manifest = body.manifest_hash;
+		if (s.loss === op) { s.loss = null; throw new Error("fixture lost response"); }
+		if (op === "part") {
+			assert(fs.existsSync(file("plan.receipt.json")));
+			const proof = { version: 1, operation: "part", binding: s.binding, manifest_hash: s.manifest, part: body.refresh.part, part_hash: body.refresh.part_hash, body_sha256: sha(options.body),
+				items: body.prs.map((w, index) => ({ index, kind: "pr", key: `github:${body.repo.remote.slice("https://github.com/".length)}#${w.number}`, source_revision: w.updated_at, item_hash: H(w), request_id: `upload:${profile}:github:${body.repo.remote.slice("https://github.com/".length)}#${w.number}:${w.updated_at}`,
+					payload_hash: H({ operation: "upload_pr", arguments: { item: "pr", repo: body.repo.remote.slice("https://github.com/".length), ...w } }), original_result_hash: H("fixture stored"), original_action: "stored", disposition: "stored", unknown: w.unknown })) };
+			return { ok: true, json: async () => ({ refresh: { status: "acknowledged", proof, receipt_hash: H(proof) } }) };
+		}
+		if (op === "finish") { assert(state().attempt.receipts.length === 0 || fs.existsSync(file("acq.ack-0.json")) || body.outcome !== "done"); s.state = body.outcome; }
+		const proof = { version: 1, operation: op, binding: s.binding, request_id: body.request_id, body_sha256: sha(options.body), manifest_hash: op === "claim" ? null : s.manifest, outcome: op === "finish" ? body.outcome : null };
+		return { ok: true, json: async () => ({ operation: op, profile, claim: { ...s.binding, state: s.state }, refresh_receipt: { proof, receipt_hash: H(proof) } }) };
+	};
+	const server = httpServer({ server: origin, token_file });
+	const exec = async (executable, args, env) => {
+		assert.equal(executable, bin); assert(fs.existsSync(file("claim.receipt.json"))); assert.notEqual(state().attempt.phase, "claim");
+		s.calls.push(args[0] === "auth" ? "gh-token" : "gh-read");
+		if (s.onExec) await s.onExec(args);
+		const attemptDir = path.dirname(file("claim.receipt.json")), intents = fs.readdirSync(attemptDir).filter((n) => /^inventory.intent-\d+\.json$/.test(n)); assert(intents.length > 0);
+		if (args[0] === "auth") { assert.deepEqual(args, ["auth", "token", "--hostname", "github.com", "--user", "wrick17"]); assert.equal(env.GH_TOKEN, undefined); return "fixture-token"; }
+		assert.equal(env.GH_TOKEN, "fixture-token");
+		if (args.at(-1) === ".login") return "wrick17\n";
+		const wrap = (v) => `HTTP/2.0 200 OK\r\nX-OAuth-Scopes: repo, read:org\r\n\r\n${JSON.stringify(v)}`;
+		if (args[1] === "user") return wrap({ id: 1, node_id: "U1", login: "wrick17" });
+		let response;
+		const viewer = { id: "U1", login: "wrick17" };
+		if (args.includes(`query=${inventoryQueries.OWNER_REPOS}`)) response = { data: { viewer, repositoryOwner: { id: "O1", login: "synthetic", __typename: "Organization", viewerIsAMember: true,
+			repositories: { totalCount: 1, nodes: [{ id: "R1", nameWithOwner: "synthetic/repo", owner: { id: "O1", login: "synthetic" }, viewerPermission: "READ" }], pageInfo: { hasNextPage: false, endCursor: "repo-end" } } } } };
+		else { assert(args.includes(`query=${inventoryQueries.REPO_OPEN}`)); const r = prRow(); r.id = "P1"; r.createdAt = "2026-10-29T00:00:00Z"; r.author.id = "U1"; r.reviewRequests.totalCount = 1; r.reviewRequests.nodes[0].requestedReviewer.id = "U1";
+			response = { data: { viewer, repository: { id: "R1", nameWithOwner: "synthetic/repo", owner: { id: "O1", login: "synthetic" }, viewerPermission: "READ",
+				pullRequests: { totalCount: 1, nodes: [r], pageInfo: { hasNextPage: false, endCursor: "pr-end" } } } } };
+		}
+		if (s.mutation) s.mutation(response, args); if (s.readLoss) throw new Error("fixture source lost");
+		return wrap(response);
+	};
+	let acquisition;
+	const restart = (io = fs) => { acquisition = defaultAcquisition({ profile, origin, server, io, github: { bin, env: { GH_TOKEN: "ambient-not-allowed", GITHUB_TOKEN: "ambient-not-allowed" }, exec } }); };
+	restart();
+	return { s, file, ns, state, restart, server, exec, bin, acquisition: () => acquisition,
+		call: (extra = {}) => refreshDaily({ profile, inventory: "default-v1", acquisition, server, config: { server: origin }, ...extra }),
+		close: () => { globalThis.fetch = originalFetch; dropLock(); } };
+}
+
+test("default personal actual GH reader, HTTP markers and native client reach durable source ack and done", async () => {
+	const f = defaultFixture(); try {
+		assert.equal((await f.call()).status, "done"); assert.deepEqual(f.s.sent.map((x) => x.op), ["claim", "plan", "part", "finish"]);
+		assert(f.s.calls.indexOf("gh-token") > f.s.calls.indexOf("/v1/refresh/claim"));
+		const ack = JSON.parse(fs.readFileSync(f.file("acq.ack-0.json"), "utf8")); assert.equal(ack.native_receipt_sha256, sha(fs.readFileSync(f.file("part-0.receipt.json"), "utf8")));
+		const text = fs.readdirSync(path.dirname(f.file("inventory.sources.json"))).filter((n) => n.endsWith(".json")).map((n) => fs.readFileSync(f.file(n), "utf8")).join();
+		assert.doesNotMatch(text, /bob@example|syntheticPrivate|never retained|ambient-not-allowed|X-OAuth-Scopes|fixture-token/);
+		assert.equal(f.state().attempt, null);
+	} finally { f.close(); }
+});
+
+test("default personal sealed replay keeps original bytes across midnight without any source reader", async () => {
+	const f = defaultFixture(); try {
+		f.s.loss = "part"; await assert.rejects(f.call(), /lost response/); const seal = fs.readFileSync(f.file("acq.seal.json"), "utf8");
+		const reads = f.s.calls.filter((c) => c.startsWith("gh-")).length; f.s.day = "2026-11-01";
+		f.restart(); assert.equal((await f.call()).status, "done"); assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, reads);
+		const sends = f.s.sent.filter((x) => x.op === "part"); assert.equal(sends[0].bytes, sends[1].bytes); assert.equal(fs.readFileSync(f.file("acq.seal.json"), "utf8"), seal);
+	} finally { f.close(); }
+});
+
+test("default personal EOF, identity, predicate, partial and policy errors never seal a prefix", async () => {
+	const changes = [
+		(r) => r.errors = [{ message: "partial" }],
+		(r) => r.data.viewer.id = "other",
+		(r) => { if (r.data.repositoryOwner) r.data.repositoryOwner.viewerIsAMember = false; },
+		(r) => { if (r.data.repository) r.data.repository.pullRequests.totalCount = 2; },
+		(r) => { if (r.data.repository) r.data.repository.pullRequests.pageInfo.hasNextPage = true; },
+		(r) => { if (r.data.repository) r.data.repository.pullRequests.nodes[0].updatedAt = "2026-11-01T00:00:00Z"; },
+		(r) => { if (r.data.repository) { const row = r.data.repository.pullRequests.nodes[0]; row.author = null; row.reviewRequests.nodes = []; row.reviewRequests.totalCount = 101; row.reviewRequests.pageInfo.hasNextPage = true; } },
+		(r) => { if (r.data.repository) r.data.repository.pullRequests.nodes.push(r.data.repository.pullRequests.nodes[0]); },
+	];
+	for (const change of changes) { const f = defaultFixture(); try {
+		f.s.mutation = change; await assert.rejects(f.call()); assert.deepEqual(f.s.sent.map((x) => x.op), ["claim"]);
+		assert(!fs.existsSync(f.file("inventory.sources.json"))); const reads = f.s.calls.length; f.s.mutation = null; f.restart();
+		await assert.rejects(f.call(), /preparation_uncertain/); assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, reads === 0 ? 0 : f.s.calls.slice(0, reads).filter((c) => c.startsWith("gh-")).length);
+	} finally { f.close(); } }
+	const f = defaultFixture(); try { f.s.scopeChange = true; await assert.rejects(f.call(), /inventory_binding/); assert(!f.s.calls.includes("gh-token")); } finally { f.close(); }
+});
+
+test("default personal lost read and unknown old claim hold the same context without refetch or reselection", async () => {
+	for (const phase of ["read", "claim"]) {
+		const f = defaultFixture(); try {
+			if (phase === "read") f.s.readLoss = true; else f.s.loss = "claim";
+			await assert.rejects(f.call()); const scope = fs.readFileSync(f.file("inventory.scope.json"), "utf8"), reads = f.s.calls.filter((c) => c.startsWith("gh-")).length;
+			f.s.readLoss = false; f.s.day = "2026-11-01"; f.restart();
+			if (phase === "claim") { f.s.unknown = true; assert.equal((await f.call()).status, "pending"); }
+			else await assert.rejects(f.call(), /preparation_uncertain/);
+			assert.equal(fs.readFileSync(f.file("inventory.scope.json"), "utf8"), scope); assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, reads); assert.equal(f.s.sent.length, 1);
+		} finally { f.close(); }
+	}
+});
+
+test("default Work is unavailable before fresh claim, while retained explicit Work seals still replay", async () => {
+	const f = defaultFixture(); try {
+		assert.throws(() => defaultAcquisition({ profile: "work", origin, server: f.server }), /office_unavailable/);
+		await assert.rejects(refreshDaily({ profile: "work", inventory: "default-v1", acquisition: f.acquisition(), server: f.server, config: { server: origin } }), /office_unavailable/);
+		assert.equal(f.s.calls.length, 0);
+	} finally { f.close(); }
+	const g = fixture(); try {
+		g.s.loss = "part"; await assert.rejects(g.call());
+		const acquisition = defaultAcquisition({ profile: "work", origin, server: g.server });
+		assert.equal((await refreshDaily({ profile: "work", inventory: "default-v1", acquisition, server: g.server, config: { server: origin } })).status, "done");
+	} finally { dropLock(); }
+});
+
+test("default personal limits, missing authority and scope/EOF corruption refuse before further effects", async () => {
+	for (const corrupt of ["scope", "eof", "sources", "symlink", "generation", "device", "quota"]) {
+		const f = defaultFixture(); const beforeLimit = LIMITS.spoolBytes;
+		try {
+			f.s.loss = "part"; await assert.rejects(f.call()); const sends = f.s.sent.length;
+			if (["scope", "eof", "sources"].includes(corrupt)) fs.appendFileSync(f.file(`inventory.${corrupt}.json`), " ");
+			if (corrupt === "symlink") { const p = f.file("inventory.eof.json"); fs.renameSync(p, p + ".retained"); fs.symlinkSync(p + ".retained", p); }
+			if (corrupt === "generation") f.s.generation = "other"; if (corrupt === "device") f.s.device = "other";
+			if (corrupt === "quota") LIMITS.spoolBytes = 1000;
+			await assert.rejects((async () => { f.restart(); return f.call(); })()); assert.equal(f.s.sent.length, sends);
+		} finally { LIMITS.spoolBytes = beforeLimit; f.close(); }
+	}
+});
+
+test("default GH guards complete arguments before token lookup and rejects insufficient coverage", async () => {
+	const f = defaultFixture(); try {
+		f.s.readLoss = true; await assert.rejects(f.call());
+		const scope = JSON.parse(fs.readFileSync(f.file("inventory.scope.json"), "utf8"));
+		const inventory = { scope, binding: f.s.binding, as_of, selector: scope.github[0], claim_body: fs.readFileSync(f.file("claim.body"), "utf8"), claim_receipt: JSON.parse(fs.readFileSync(f.file("claim.receipt.json"), "utf8")) };
+		let calls = 0; const reader = ghReader("synthetic", { inventory, server: f.server, bin: f.bin, exec: async () => { calls++; throw new Error("should not dispatch"); } });
+		for (const input of [{ operation: "mutation", namespace: "synthetic", after: null }, { operation: "repoOpen", namespace: "foreign/repo", after: null }, { operation: "identity", namespace: "wrick17", after: "cursor" }, { operation: "identity", namespace: "wrick17", after: null, query: "mutation" }]) await assert.rejects(reader.defaultPage(input));
+		assert.equal(calls, 0);
+		for (const header of ["X-OAuth-Scopes: public_repo", "X-OAuth-Scopes: repo, read:org\r\nX-GitHub-SSO: partial-results; organizations=1"]) {
+			const r = ghReader("synthetic", { inventory, server: f.server, bin: f.bin, exec: async (_bin, args) => args[0] === "auth" ? "synthetic" : args.at(-1) === ".login" ? "wrick17\n" : `HTTP/2.0 200 OK\r\n${header}\r\n\r\n${JSON.stringify({ id: 1, node_id: "U1", login: "wrick17" })}` });
+			await assert.rejects(r.defaultPage({ operation: "identity", namespace: "wrick17", after: null }), /gh_inventory_unavailable/);
+		}
+	} finally { f.close(); }
+});
+
+test("default personal direct-owner filtering, explicit cursor EOF and verified empty owner are truthful", async () => {
+	for (const empty of [false, true]) {
+		const f = defaultFixture(); try {
+			f.s.mutation = (r, args) => {
+				if (empty && r.data.repositoryOwner) { const c = r.data.repositoryOwner.repositories; c.totalCount = 0; c.nodes = []; }
+				if (!empty && r.data.repository) {
+					const c = r.data.repository.pullRequests, next = args.includes("after=cursor-1"); c.totalCount = 2;
+					const row = c.nodes[0]; row.number = next ? 2 : 1; row.id = next ? "P2" : "P1"; row.author = { __typename: "User", id: "OTHER", login: "other" };
+					if (!next) { row.reviewRequests.nodes = [{ requestedReviewer: { __typename: "Team" } }]; row.reviewRequests.totalCount = 1; }
+					c.pageInfo = { hasNextPage: !next, endCursor: next ? "end" : "cursor-1" };
+				}
+			};
+			assert.equal((await f.call()).status, "done"); const plan = JSON.parse(f.s.sent.find((x) => x.op === "plan").bytes).parts;
+			assert.equal(plan.sources.length, empty ? 0 : 1); assert.equal(plan.frames.length, empty ? 0 : 1);
+			if (!empty) assert.equal(JSON.parse(f.s.sent.find((x) => x.op === "part").bytes).prs[0].number, 2);
+		} finally { f.close(); }
+	}
+});
+
+test("default personal new authority publication failures fence every phase and a fresh reader", async () => {
+	for (const name of ["inventory.scope", "inventory.context", "inventory.intent-0", "inventory.page-0", "inventory.eof", "inventory.sources"]) {
+		for (const phase of ["file", "directory"]) {
+			const f = defaultFixture(); const descriptors = new Map(); let published = false, failed = false, sourceReads = 0, sends = 0;
+			const io = { ...fs, openSync(p, ...args) { const fd = fs.openSync(p, ...args); descriptors.set(fd, String(p)); return fd; },
+				linkSync(from, to) { const r = fs.linkSync(from, to); if (String(to).endsWith(`${name}.json`)) published = true; return r; },
+				fsyncSync(fd) { const p = descriptors.get(fd) ?? "";
+					if (!failed && (phase === "file" ? p.includes(`${name}.json.`) && p.endsWith(".tmp") : published && fs.fstatSync(fd).isDirectory())) { failed = true; sourceReads = f.s.calls.filter((c) => c.startsWith("gh-")).length; sends = f.s.sent.length; throw new Error("new authority fsync fault"); }
+					return fs.fsyncSync(fd); } };
+			try { f.restart(io); await assert.rejects(f.call({ io }), /fsync fault/); assert(failed);
+				assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, sourceReads); assert.equal(f.s.sent.length, sends);
+				assert.throws(() => f.restart(), /publication_failed/); assert.equal(f.s.sent.length, sends);
+			} finally { f.close(); }
+		}
+	}
+});
+
+test("default personal quota and 65-repository overflow never become empty or prefix success", async () => {
+	for (const limit of ["bytes", "files", "sources"]) {
+		const f = defaultFixture(), bytes = LIMITS.spoolBytes, files = LIMITS.spoolFiles;
+		try {
+			if (limit === "bytes") LIMITS.spoolBytes = 40 * 1024 * 1024; if (limit === "files") LIMITS.spoolFiles = 500;
+			if (limit === "sources") f.s.mutation = (r, args) => { if (r.data.repositoryOwner) {
+				const c = r.data.repositoryOwner.repositories, next = args.includes("after=repo-next"); c.totalCount = 65;
+				c.nodes = Array.from({ length: next ? 15 : 50 }, (_, i) => ({ id: `R${i + (next ? 50 : 0)}`, nameWithOwner: `synthetic/repo-${i + (next ? 50 : 0)}`, owner: { id: "O1", login: "synthetic" }, viewerPermission: "READ" }));
+				c.pageInfo = { hasNextPage: !next, endCursor: next ? "end" : "repo-next" };
+			} };
+			await assert.rejects(f.call(), /storage_full|inventory_limit/); assert.deepEqual(f.s.sent.map((x) => x.op), ["claim"]);
+			if (limit !== "sources") assert(!f.s.calls.includes("gh-token"));
+			assert(!fs.existsSync(f.file("inventory.sources.json")));
+		} finally { LIMITS.spoolBytes = bytes; LIMITS.spoolFiles = files; f.close(); }
+	}
+});
+
+test("default personal compound publication/fence failure cannot authorize effects in a fresh failed reader", async () => {
+	for (const name of ["inventory.page-0", "inventory.sources"]) {
+		const f = defaultFixture(), descriptors = new Map(); let published = false, failed = false;
+		const io = { ...fs, openSync(p, ...args) { if (failed && String(p).includes("FAILED.")) throw new Error("fence unavailable"); const fd = fs.openSync(p, ...args); descriptors.set(fd, String(p)); return fd; },
+			linkSync(from, to) { const r = fs.linkSync(from, to); if (String(to).endsWith(`${name}.json`)) published = true; return r; },
+			fsyncSync(fd) { if (!failed && published && fs.fstatSync(fd).isDirectory()) { failed = true; throw new Error("compound directory failure"); } return fs.fsyncSync(fd); } };
+		try {
+			f.restart(io); await assert.rejects(f.call({ io }), /compound/); assert(failed); const sends = f.s.sent.length, reads = f.s.calls.filter((c) => c.startsWith("gh-")).length;
+			assert.throws(() => f.restart({ ...fs, fsyncSync() { throw new Error("fresh sync unavailable"); } }), /fresh sync/);
+			assert.equal(f.s.sent.length, sends); assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, reads);
+			// A healthy reader may re-establish an entire published resolution, but may never refetch an incomplete chain.
+			f.restart();
+			if (name === "inventory.sources") assert.equal((await f.call()).status, "done");
+			else await assert.rejects(f.call(), /preparation_uncertain/);
+			assert.equal(f.s.calls.filter((c) => c.startsWith("gh-")).length, reads);
+		} finally { f.close(); }
+	}
+});
+
+test("default personal resolved-source pointer failure stops before plan and fences a fresh reader", async () => {
+	for (const phase of ["file", "directory"]) {
+		const f = defaultFixture(), descriptors = new Map(), resolutionWrites = new Set(); let published = false, failed = false;
+		const io = { ...fs, openSync(p, ...args) { const fd = fs.openSync(p, ...args); descriptors.set(fd, String(p)); return fd; },
+			writeSync(fd, buffer, ...args) { if ((descriptors.get(fd) ?? "").includes("state.json.") && /"sources_sha256":"[0-9a-f]{64}"/.test(String(buffer))) resolutionWrites.add(fd); return fs.writeSync(fd, buffer, ...args); },
+			renameSync(from, to) { const r = fs.renameSync(from, to); if (String(to).endsWith("state.json") && JSON.parse(fs.readFileSync(to, "utf8")).attempt?.inventory?.sources_sha256) published = true; return r; },
+			fsyncSync(fd) { if (!failed && (phase === "file" ? resolutionWrites.has(fd) : published && fs.fstatSync(fd).isDirectory())) { failed = true; throw new Error("resolution pointer fsync"); } return fs.fsyncSync(fd); } };
+		try { f.restart(io); await assert.rejects(f.call({ io }), /pointer fsync/); assert(failed); assert.deepEqual(f.s.sent.map((x) => x.op), ["claim"]);
+			const reads = f.s.calls.length; assert.throws(() => f.restart(), /publication_failed/); assert.equal(f.s.calls.length, reads);
+		} finally { f.close(); }
+	}
+});
+
+test("default personal credential and page awaits recheck authentic policy and actual lock before further effects", async () => {
+	for (const when of ["token", "login", "identity", "owner"]) {
+		for (const loss of ["policy", "lock"]) {
+			const f = defaultFixture(); let triggered = false;
+			try {
+				f.s.onExec = async (args) => {
+					const matches = when === "token" ? args[0] === "auth" : when === "login" ? args.at(-1) === ".login" : when === "identity" ? args[1] === "user" && args.includes("--include") : args.includes(`query=${inventoryQueries.OWNER_REPOS}`);
+					if (!triggered && matches) { triggered = true; await Promise.resolve(); if (loss === "lock") dropLock(); else f.s.scopeChange = true; }
+				};
+				await assert.rejects(f.call(), loss === "lock" ? /lock_required/ : /daily_inventory_binding/); assert(triggered);
+				const reads = f.s.calls.filter((c) => c === "gh-read").length;
+				assert.equal(reads, ["token", "login", "identity", "owner"].indexOf(when));
+				assert(!fs.existsSync(f.file(when === "owner" ? "inventory.page-1.json" : "inventory.page-0.json")));
+				assert(fs.existsSync(f.file(when === "owner" ? "inventory.intent-1.json" : "inventory.intent-0.json")));
+				assert(!fs.existsSync(f.file("inventory.sources.json"))); assert.deepEqual(f.s.sent.map((s) => s.op), ["claim"]);
+				const binding = f.state().attempt.binding, scope = fs.readFileSync(f.file("inventory.scope.json"), "utf8");
+				if (loss === "lock") assert(takeLock());
+				f.s.onExec = null; f.s.scopeChange = false; f.s.day = "2026-11-01"; f.restart();
+				await assert.rejects(f.call(), /preparation_uncertain/);
+				assert.equal(f.s.calls.filter((c) => c === "gh-read").length, reads); assert.deepEqual(f.state().attempt.binding, binding);
+				assert.equal(fs.readFileSync(f.file("inventory.scope.json"), "utf8"), scope);
+			} finally { f.close(); }
+		}
+	}
+});
+
+test("default personal loses no lock, claim or credential authority through an awaited scope check", async () => {
+	for (const loss of ["check-lock", "claim", "credential"]) {
+		const f = defaultFixture(); let triggered = false;
+		try {
+			f.s.onExec = async (args) => {
+				if (!triggered && args[0] === "auth") {
+					triggered = true; await Promise.resolve();
+					if (loss === "check-lock") f.s.onMarkers = async () => { await Promise.resolve(); dropLock(); };
+					if (loss === "claim") { const p = path.join(f.ns, "state.json"), held = f.state(); held.attempt.phase = "finish"; fs.writeFileSync(p, JSON.stringify(held), { mode: 0o600 }); }
+					if (loss === "credential") throw new Error("synthetic credential unavailable");
+				}
+			};
+			await assert.rejects(f.call()); assert(triggered); assert.equal(f.s.calls.filter((c) => c === "gh-read").length, 0);
+			assert(!fs.existsSync(f.file("inventory.page-0.json"))); assert(!fs.existsSync(f.file("inventory.sources.json")));
+			assert.deepEqual(f.s.sent.map((s) => s.op), ["claim"]);
+		} finally { f.close(); }
 	}
 });

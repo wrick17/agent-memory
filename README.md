@@ -12,7 +12,13 @@ A private Work migration planning checkpoint has been accepted; reconciliation a
 
 Automatic capture is not running. The dashboard, work and project corpus, self-host setup, backups, and multi-machine use are not ready. BothQ will remain running and readable after the eventual caller transition.
 
-## Progress
+## Completed development milestones
+
+- [x] Lifecycle, daily server and observed-count source delivered with local verification.
+- [x] Personal acquisition, exact retry and durable acknowledgements verified with synthetic data against a local Worker. The client is unwired and uninstalled.
+- [x] Private plan for 1,370 Work records accepted. Migration has not run.
+
+## Feature acceptance
 
 A checked item works for the stated scope. **Owner trial** means it was exercised in the isolated trial, not yet adopted for everyday use. The [feature manifest](docs/feature-manifest.md) and [trial evidence](docs/import-verification.md#isolated-core-trial-2026-10-30) contain the detailed status.
 

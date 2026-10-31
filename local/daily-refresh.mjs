@@ -1,3 +1,4 @@
+import { inventoryScope, inventoryResolution } from "./daily-inventory.mjs";
 // PRIVATE daily adapter. No ordinary caller, discovery, model or activation. See the detached caller contract.
 import fs from "node:fs";
 import path from "node:path";
@@ -89,7 +90,7 @@ function storage(io, origin, profile) {
  * prepareRefresh (exact claim/cutoff replay), checkReceipt (pure), acknowledge (idempotent) and complete (pure) operations.
  * No actual provider is available or wired. An unavailable provider must throw, never return an empty successful plan.
  */
-export async function refreshDaily({ profile, requiredSources, as_of, acquisition, server, config = loadConfig(), io = fs, outcome, reason } = {}) {
+export async function refreshDaily({ profile, requiredSources, as_of, inventory, acquisition, server, config = loadConfig(), io = fs, outcome, reason } = {}) {
 	assertMachineLock();
 	need(typeof profile === "string" && /^[a-z][a-z0-9-]{0,11}$/.test(profile) && profile !== "me", "refresh_profile");
 	const url = new URL(config.server);
@@ -97,7 +98,10 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 	const origin = url.origin;
 	need(acquisition && ["canonicalJson", "prepareRefresh", "checkReceipt", "acknowledge", "complete"].every((k) => typeof acquisition[k] === "function"), "refresh_acquisition_unavailable");
 	const C = acquisition.canonicalJson, H = (v) => sha(C(v)), equal = (a, b) => C(a) === C(b);
-	need(Array.isArray(requiredSources) && requiredSources.length <= 64 && typeof as_of === "string" && Number.isFinite(Date.parse(as_of)), "refresh_selection");
+	let inventoryMode = inventory === "default-v1";
+	need(inventory === undefined || inventoryMode, "refresh_selection");
+	if (inventoryMode) { need(requiredSources === undefined && as_of === undefined, "refresh_selection"); requiredSources = null; }
+	else need(Array.isArray(requiredSources) && requiredSources.length <= 64 && typeof as_of === "string" && Number.isFinite(Date.parse(as_of)), "refresh_selection");
 	if (outcome !== undefined) need(["failed", "abandoned"].includes(outcome) && typeof reason === "string" && /^[a-z_]{1,64}$/.test(reason), "refresh_outcome");
 	server ??= httpServer(config);
 	const disk = storage(io, origin, profile); let state = disk.load();
@@ -109,6 +113,9 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 	const save = () => { assertMachineLock(); disk.save(state); };
 	const readServer = async (op, input) => { assertMachineLock(); return server.refresh(op, input); };
 	let a = state.attempt;
+	if (inventoryMode && a && !a.inventory && a.plan) { inventoryMode = false; requiredSources = a.requiredSources; as_of = a.as_of; }
+	if (!a && inventoryMode && profile === "work") throw new Error("daily_office_unavailable");
+	let selectedSources = requiredSources;
 	const responseBinding = (claim) => need(claim && equal(B(claim), a.binding), "refresh_binding_drift");
 	const result = (status, why) => ({ status, day: a?.binding.day ?? null, claim_id: a?.binding.claim_id ?? null, ...(why ? { reason: why } : {}) });
 	const close = (evidence, disposition) => {
@@ -116,14 +123,15 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 		state.attempt = null; save(); return result(disposition);
 	};
 	if (a) {
-		need(keys(a, "name binding origin as_of requiredSources phase plan pending receipts delivered") && a.origin === origin && a.binding.profile === profile
+		need(keys(a, inventoryMode ? "name binding origin as_of requiredSources phase plan pending receipts delivered inventory" : "name binding origin as_of requiredSources phase plan pending receipts delivered") && a.origin === origin && a.binding.profile === profile
 			&& DAY.test(a.binding.day) && ID.test(a.binding.claim_id) && a.name === `${a.binding.day}.${a.binding.claim_id}` && equal(a.requiredSources, requiredSources), "refresh_binding_drift");
 		need(Array.isArray(a.receipts) && Number.isInteger(a.delivered) && a.delivered >= 0 && a.delivered <= a.receipts.length && a.receipts.length <= 64 && a.receipts.every((h) => HEX.test(h))
 			&& ["claim", "acquire", "plan", "parts", "finish", "terminal"].includes(a.phase) && (!a.plan || HEX.test(a.plan)));
+		if (inventoryMode) need(keys(a.inventory, "version scope_sha256 sources_sha256") && a.inventory.version === 1 && HEX.test(a.inventory.scope_sha256) && (a.inventory.sources_sha256 === null || HEX.test(a.inventory.sources_sha256)), "refresh_binding_drift");
 		// Exact status precedes every replay. An unknown old claim is never absence or closure.
 		let s;
 		try { s = await readServer("status", { profile, day: a.binding.day, claim_id: a.binding.claim_id }); }
-		catch (e) { if (e.status !== 404 || a.phase !== "claim") return result("pending", "refresh_terminal_unconfirmed"); }
+		catch (e) { if (inventoryMode || e.status !== 404 || a.phase !== "claim") return result("pending", "refresh_terminal_unconfirmed"); }
 		if (s) {
 			need(s.operation === "status" && DAY.test(s.utc_day), "refresh_status"); responseBinding(s.claim);
 			if (terminal(s.claim.state)) return close({ operation: "status", utc_day: s.utc_day, claim: { ...B(s.claim), state: s.claim.state } }, s.claim.state);
@@ -131,18 +139,23 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 		}
 	}
 	// Exact old terminal is checked before current-generation context, permitting old-generation external closure.
-	const m = await readServer("markers", { profile }), ctx = m.refresh_context;
+	const m = await readServer("markers", inventoryMode && !a ? { profile, refresh_scope: "1" } : { profile }), ctx = m.refresh_context;
 	need(m.profile === profile && ctx && ctx.profile === profile && typeof ctx.generation === "string" && ctx.generation.length > 0
 		&& typeof ctx.device_id === "string" && ctx.device_id.length > 0 && DAY.test(ctx.utc_day), "refresh_context_unavailable");
 	if (a) need(ctx.generation === a.binding.generation && ctx.device_id === a.binding.device_id, "refresh_binding_drift");
 	else {
 		if (state.last?.binding.day === ctx.utc_day) return result("skipped", "refresh_day_consumed");
+		const scope = inventoryMode ? inventoryScope(m.refresh_scope, { origin, profile, context: ctx }) : null;
+		if (scope) as_of = scope.issued_at;
 		const binding = { profile, generation: ctx.generation, device_id: ctx.device_id, day: ctx.utc_day, claim_id: id() };
 		a = { name: `${binding.day}.${binding.claim_id}`, binding, origin, as_of, requiredSources, phase: "claim", plan: null, pending: null, receipts: [], delivered: 0 };
-		disk.attempt(a.name); disk.put(`${a.name}/context.json`, C({ binding, origin, as_of, requiredSources })); state.attempt = a; save();
+		disk.attempt(a.name);
+		if (scope) { a.inventory = { version: 1, scope_sha256: H(scope), sources_sha256: null }; disk.put(`${a.name}/inventory.scope.json`, C(scope)); }
+		disk.put(`${a.name}/context.json`, C({ binding, origin, as_of, requiredSources, ...(scope ? { inventory_scope_sha256: H(scope) } : {}) })); state.attempt = a; save();
 	}
 	const file = (name) => `${a.name}/${name}`;
-	need(equal(disk.json(file("context.json")), { binding: a.binding, origin, as_of: a.as_of, requiredSources: a.requiredSources }), "refresh_binding_drift");
+	need(equal(disk.json(file("context.json")), { binding: a.binding, origin, as_of: a.as_of, requiredSources: a.requiredSources, ...(inventoryMode ? { inventory_scope_sha256: a.inventory.scope_sha256 } : {}) }), "refresh_binding_drift");
+	if (inventoryMode && a.plan) selectedSources = inventoryResolution(disk, a).requiredSources;
 	if (a.phase === "finish" && a.pending?.operation === "finish") {
 		const retained = parse(disk.read(file("finish.body")));
 		if (retained.outcome !== "done") {
@@ -151,15 +164,15 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 	}
 	let prepared;
 	const verifyPlan = (p) => {
-		need(keys(p, "parts manifest_hash frames") && keys(p.parts, "version selection_hash as_of sources frames") && p.parts.version === 1 && p.parts.as_of === a.as_of && p.parts.selection_hash === H(a.requiredSources)
-			&& Array.isArray(p.parts.sources) && p.parts.sources.length === a.requiredSources.length && p.parts.sources.length <= 64
+		need(keys(p, "parts manifest_hash frames") && keys(p.parts, "version selection_hash as_of sources frames") && p.parts.version === 1 && p.parts.as_of === a.as_of && p.parts.selection_hash === H(selectedSources)
+			&& Array.isArray(p.parts.sources) && p.parts.sources.length === selectedSources.length && p.parts.sources.length <= 64
 			&& Array.isArray(p.parts.frames) && p.parts.frames.length <= 64 && Array.isArray(p.frames) && p.frames.length === p.parts.frames.length
 			&& Buffer.byteLength(C(p.parts)) <= 65536 && p.manifest_hash === H({ version: 1, operation: "plan", binding: a.binding, parts: p.parts }), "refresh_plan");
 		for (const [i, s] of p.parts.sources.entries()) {
 			need(keys(s, "source_id kind namespace selector_hash enumeration_hash observed_items") && /^[A-Za-z0-9._:-]{1,64}$/.test(s.source_id)
 				&& (!i || p.parts.sources[i - 1].source_id < s.source_id) && HEX.test(s.enumeration_hash) && HEX.test(s.selector_hash) && typeof s.namespace === "string" && s.namespace.length <= 128
 				&& (s.kind === "pr" ? /^[a-z0-9][\w.-]*\/[\w.-]+$/.test(s.namespace) : s.kind === "ticket" && profile === "work")
-				&& equal({ source_id: s.source_id, kind: s.kind, namespace: s.namespace, selector_hash: s.selector_hash }, a.requiredSources[i])
+				&& equal({ source_id: s.source_id, kind: s.kind, namespace: s.namespace, selector_hash: s.selector_hash }, selectedSources[i])
 				&& Number.isInteger(s.observed_items) && s.observed_items >= 0, "refresh_source");
 		}
 		let last = -1; const seen = new Set();
@@ -218,6 +231,7 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 	if ((a.phase === "parts" || (["finish", "terminal"].includes(a.phase) && !outcome)) && a.plan) controlProof("plan", disk.read(file("plan.body")), { operation: "plan", profile, claim: { ...a.binding, state: "pending" }, refresh_receipt: disk.json(file("plan.receipt.json")) });
 	need(a.phase === "claim" || a.phase === "acquire" || prepared || outcome, "refresh_plan_missing");
 	const mutation = async (op, body, index = null) => {
+		if (inventoryMode && a.plan) need(equal(inventoryResolution(disk, a).requiredSources, selectedSources), "refresh_binding_drift");
 		if (op !== "part") {
 			const v = parse(body);
 			need(v.profile === profile && v.day === a.binding.day && v.claim_id === a.binding.claim_id && ID.test(v.request_id), "refresh_control_body");
@@ -253,12 +267,15 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 		catch (e) {
 			// These two authenticated server refusals occur only before reservation. Generic errors never retire an intent.
 			if (!["day_mismatch", "prior_refresh_pending"].includes(e.noReservation)) throw e;
+			if (inventoryMode) return result("pending", e.noReservation);
 			disk.put(file("unreserved.json"), C({ binding: a.binding, body_sha256: a.pending.body_sha256, reason: e.noReservation }));
 			state.attempt = null; save(); return result("pending", e.noReservation);
 		}
 	}
 	if (a.phase === "acquire") {
-		prepared = verifyPlan(await acquisition.prepareRefresh({ binding: a.binding, requiredSources: a.requiredSources, as_of: a.as_of }));
+		const p = await acquisition.prepareRefresh({ binding: a.binding, requiredSources: a.requiredSources, as_of: a.as_of });
+		if (inventoryMode) { const resolution = inventoryResolution(disk, a); selectedSources = resolution.requiredSources; a.inventory.sources_sha256 = resolution.sources_sha256; save(); }
+		prepared = verifyPlan(p);
 		const text = C(prepared); disk.put(file("plan.json"), text);
 		for (const [i, f] of prepared.frames.entries()) disk.put(file(`part-${i}.body`), f.wire_bytes);
 		a.plan = sha(text); a.phase = "plan"; save();

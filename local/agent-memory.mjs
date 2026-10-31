@@ -421,8 +421,11 @@ export function httpServer(config) {
 			if (origin.protocol !== "https:" || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") throw new Error("refresh_origin");
 			const read = operation === "markers" || operation === "status", url = new URL(paths[operation], origin);
 			if (read) {
-				const keys = operation === "markers" ? ["profile"] : ["profile", "day", "claim_id"];
+				const scoped = operation === "markers" && input && Object.hasOwn(input, "refresh_scope");
+				if (scoped && input.refresh_scope !== "1") throw new Error("refresh_query");
+				const keys = operation === "markers" ? (scoped ? ["profile", "refresh_scope"] : ["profile"]) : ["profile", "day", "claim_id"];
 				if (!input || Object.keys(input).sort().join() !== keys.sort().join() || keys.some((k) => typeof input[k] !== "string")) throw new Error("refresh_query");
+				if (scoped && (input.profile === "me" || !/^[a-z][a-z0-9-]{0,11}$/.test(input.profile))) throw new Error("refresh_query");
 				url.search = new URLSearchParams(input).toString();
 			} else if (typeof input !== "string") throw new Error("refresh_bytes_required");
 			const res = await fetch(url, { method: read ? "GET" : "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" },
