@@ -10,7 +10,7 @@ The [dashboard](https://memory.wrick17.com/) opens the Work graph with 1,379 rec
 
 In [Review](https://memory.wrick17.com/#/review/work), the owner can review captured suggestions and promote or dismiss them. Migration review queues remain open.
 
-Move and wipe preview, and copying selected current text to another profile, have reviewed source and local checks. Browser acceptance remains open. Copy creates a new memory without history or links and excludes unsupported, inactive, archived, unreadable or oversized items. [Evidence](docs/combined-verification-2026-10-30.md#move-wipe-preview-and-copy-source-verification-2026-10-31).
+Move, wipe preview and copying eligible current text to another profile are deployed; public TLS and control checks passed. Browser acceptance remains open. Copy creates a new memory without history or links and excludes unsupported, inactive, archived, unreadable or oversized items. [Evidence](docs/combined-verification-2026-10-30.md#move-wipe-preview-and-copy-source-verification-2026-10-31).
 
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
