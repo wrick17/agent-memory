@@ -587,6 +587,7 @@ describe("dashboard memories and drafts", () => {
 	it("keeps the previewed payload and request id through a lost response, so an unchanged retry replays instead of writing twice", async () => {
 		const saved = new Map<string, unknown>();
 		const b = browser({ signedIn: true, hash: "#/draft/work", api: (path, _method, body) => {
+			if (path.startsWith("/api/profiles/work/map?")) return Response.json({ center: null, starts: ["p1"], depth: 1, nodes: [{ id: "p1", kind: "project", name: "Existing project", status: "active" }], links: [], truncated: false, limits: { nodes: 300 } });
 			if (path !== "/api/profiles/work/save") return;
 			const { request_id: id, name } = body as { request_id: string; name: string };
 			if (saved.has(id)) return Response.json(saved.get(id));
@@ -604,6 +605,18 @@ describe("dashboard memories and drafts", () => {
 		expect(byId(b.view(), "draft-name").value).toBe("Retry control");
 		expect(button(b.view(), "Save").disabled).toBe(false); // the same preview stays ready; nothing was retried by itself
 		expect(b.seen.posted).toHaveLength(1);
+		b.go("#/map/work");
+		await settle();
+		click(find(b.view(), "button").find((e) => e.attrs.class === "node")!);
+		typeIn(byId(b.view(), "whatif-name"), "A different draft");
+		submit(b.view(), 1);
+		await settle();
+		click(button(b.view(), "Make a draft"));
+		expect(text(b.view())).toContain("There is an unsaved draft in this profile");
+		expect(b.seen.posted).toHaveLength(1);
+		b.go("#/draft/work");
+		expect(byId(b.view(), "draft-name").value).toBe("Retry control");
+		expect(byId(b.view(), "draft-desc").value).toBe("Description");
 		submit(b.view()); // previewing the unchanged body again keeps its request id
 		click(button(b.view(), "Save"));
 		await settle();
@@ -958,6 +971,45 @@ describe("dashboard knowledge graph", () => {
 			for (const key of ["ArrowLeft", "ArrowUp", "ArrowRight"]) { canvas.on.keydown!({ key, preventDefault() {} } as never); await settle(); }
 			expect(reads).toBe(before); // frames read no computed style
 		}
+	});
+
+	it("draws an unsaved what-if apart from the saved graph, compares only loaded facts, resets, keeps it to its profile and sends nothing", async () => {
+		const b = browser({ signedIn: true, api: graphApi((path) => path === "/api/profiles/work/nodes/r13" ? Response.json({ node: { name: "Record 13" }, history: { items: [] } }) : undefined) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		const saved = status(b).textContent;
+		typeIn(byId(b.view(), "graph-q"), "Record 13");
+		click(button(b.view(), "Record 13"));
+		const whatIfForm = () => find(b.view(), "form").find((f) => find(f, "input").some((i) => i.attrs.id === "graph-whatif"))!;
+		typeIn(byId(b.view(), "graph-whatif"), "Try caching");
+		whatIfForm().on.submit!({ preventDefault() {} });
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		expect(flat()).toContain("What-if (not saved)");
+		expect(flat()).toContain("Records 1,377 saved → 1,378 with what-if Links 2 → 3 Records with links 3 → 5");
+		expect(flat()).toContain("Try caching, linked to “Record 13” (its links 0 → 1)");
+		expect(status(b).textContent).toBe(saved); // the saved graph's own counts do not move
+		const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
+		canvas.ctx.texts = [];
+		click(button(b.view(), "Zoom in"));
+		await settle();
+		expect(canvas.ctx.texts.some((x) => x.t === "What-if: Try caching")).toBe(true);
+		// Another profile's graph shows none of it; back in work it is still there, in this tab only.
+		b.go("#/graph/personal");
+		await settle();
+		expect(flat()).not.toContain("Try caching");
+		b.go("#/graph/work");
+		await settle();
+		expect(flat()).toContain("Try caching, linked to “Record 13”");
+		click(button(b.view(), "Clear all what-if items"));
+		expect(flat()).not.toContain("What-if (not saved)");
+		canvas.ctx.texts = [];
+		const now = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
+		now.ctx.texts = [];
+		click(button(b.view(), "Zoom in"));
+		await settle();
+		expect(now.ctx.texts.some((x) => x.t.startsWith("What-if"))).toBe(false);
+		expect(b.seen.posted).toEqual([]);
+		expect(b.seen.fetched.some((x) => x.includes("/save") || x.includes("/move") || x.includes("/review"))).toBe(false);
 	});
 });
 

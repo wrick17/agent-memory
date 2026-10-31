@@ -12,6 +12,8 @@ In [Review](https://memory.wrick17.com/#/review/work), the owner can review capt
 
 Move, wipe preview and copying eligible current text to another profile are deployed; public TLS and control checks passed. Browser acceptance remains open. Copy creates a new memory without history or links and excludes unsupported, inactive, archived, unreadable or oversized items. [Evidence](docs/combined-verification-2026-10-30.md#move-wipe-preview-and-copy-source-verification-2026-10-31).
 
+The graph includes an unsaved what-if view with local draft items and a metadata comparison. It is deployed with public TLS and control checks; browser acceptance remains open. [Evidence](docs/combined-verification-2026-10-30.md#what-if-graph-deployment-2026-11-01).
+
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
 Automatic capture source is adopted, but capture is off and not installed; runtime acceptance remains blocked. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. The project corpus, self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced.

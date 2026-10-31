@@ -642,7 +642,17 @@ export async function dashboardMain(win: any): Promise<void> {
 	type Draft = { memory_id?: string; expected_revision?: number; name: string; type: string; scope: string; description: string; content: string; target: string; targetName: string; reason: string;
 		companyFree?: boolean; preview?: Record<string, unknown>; sent?: Record<string, unknown>; copyOf?: { profile: string; id: string; name: string; kind: string; back?: string } };
 	const drafts = new Map<string, Draft>();
-	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>();
+	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>(); // per profile, this tab only; never sent
+	/** A what-if item becomes an ordinary Write draft (a new memory linked to its record), reviewed and saved only there. */
+	const draftFromWhatIf = (profile: string, w: { name: string; target: string; targetName: string }, out: Node) => {
+		if (drafts.has(profile)) {
+			note(out, "There is an unsaved draft in this profile; save or discard it first.");
+			link(out, `#/draft/${enc(profile)}`, "Open existing draft");
+			return;
+		}
+		drafts.set(profile, { name: w.name, type: "project", scope: "", description: "", content: "", target: w.target, targetName: w.targetName, reason: "" });
+		win.location.hash = `#/draft/${enc(profile)}`;
+	};
 	const pendingOps = new Map<string, { id: string; cursor: string; label: string }>(); // staged archive restores not finished
 	const SIZE = 640;
 	const mapPage = (view: Node, p: Profile, center?: string) => {
@@ -758,10 +768,7 @@ export async function dashboardMain(win: any): Promise<void> {
 				const wl = el("ul", out);
 				items.forEach((w, i) => {
 					const li = el("li", wl, `${w.name}, linked to “${w.targetName}”${pos.has(w.target) ? "" : " (its record is not on this map)"} `);
-					btn(li, "Make a draft", () => {
-						drafts.set(p.name, { name: w.name, type: "project", scope: "", description: "", content: "", target: w.target, targetName: w.targetName, reason: "" });
-						win.location.hash = `#/draft/${enc(p.name)}`;
-					}, `Make a draft from ${w.name}`);
+					btn(li, "Make a draft", () => draftFromWhatIf(p.name, w, li), `Make a draft from ${w.name}`);
 					btn(li, "Remove", () => { items.splice(i, 1); load(); }, `Remove ${w.name}`);
 				});
 				btn(out, "Clear all what-if items", () => { whatIf.delete(p.name); load(); });
@@ -1419,6 +1426,8 @@ export async function dashboardMain(win: any): Promise<void> {
 		const matches = el("ul", side);
 		matches.setAttribute("class", "matches");
 		matches.setAttribute("aria-label", "Matching records");
+		const scenario = el("section", side);
+		scenario.setAttribute("aria-label", "What-if changes, not saved");
 		const detail = el("section", side);
 		detail.setAttribute("aria-label", "Selected record");
 
@@ -1541,6 +1550,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			return w;
 		};
 		let drawn = -1; // records drawn in the last frame, kept on the canvas for measurement
+		const whatIfAt: [number, number, string][] = []; // this frame's what-if positions, labelled after the real ones are drawn
 		const GROUP_FONT = "600 13px system-ui, sans-serif", NAME_FONT = "12px system-ui, sans-serif";
 		const draw = () => {
 			frame = false;
@@ -1598,6 +1608,24 @@ export async function dashboardMain(win: any): Promise<void> {
 			if (k > 0.6) { ctx.strokeStyle = t.muted; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
 			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, t.match); }
 			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? t.ring : t.bg); }
+			// What-if items (this tab only, never saved): a dashed ring and a dashed line from their real record, outside the dot layer.
+			const items = whatIf.get(p.name) ?? [];
+			if (items.length) {
+				ctx.save?.();
+				ctx.setLineDash?.([4, 3]);
+				ctx.strokeStyle = t.match;
+				ctx.lineWidth = 1.5;
+				items.forEach((w, i) => {
+					const n = g.nodes.get(w.target);
+					if (!n || !visIds.has(w.target) || !inView(n)) return;
+					const x = n.x * k + ox, y = n.y * k + oy, a = -Math.PI / 4 + i * 0.9, hx = x + 34 * Math.cos(a), hy = y + 34 * Math.sin(a);
+					ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(hx, hy); ctx.stroke();
+					ctx.beginPath(); ctx.arc(hx, hy, 6, 0, 2 * Math.PI); ctx.stroke();
+					whatIfAt.push([hx, hy, w.name]);
+				});
+				ctx.restore?.();
+				ctx.setLineDash?.([]);
+			}
 			// Record names first, most important first, then group headings where room is left; the legend always names every group.
 			// Text gets a halo in the surface colour, so it stays readable where it crosses a link or a dot.
 			ctx.font = NAME_FONT;
@@ -1613,6 +1641,8 @@ export async function dashboardMain(win: any): Promise<void> {
 			};
 			const important = [...new Set([...(selected ? [selected] : []), ...(hover ? [hover] : []), ...(focus ?? []), ...[...matchSet].slice(0, 50)])];
 			for (const id of important) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) label(n); }
+			// What-if labels next, so a hypothetical item stays named, ahead of the bulk of names shown when zoomed in.
+			for (const [hx, hy, name] of whatIfAt.splice(0)) { const s2 = `What-if: ${name.length > 32 ? `${name.slice(0, 31)}…` : name}`, w = widthOf(NAME_FONT, s2); for (const lx of [hx + 9, hx - 9 - w]) if (place(lx, hy + 4, w, 12)) { text(s2, lx, hy + 4); break; } }
 			if (k >= 1.4) { let shownLabels = 0; for (const n of vis) { if (shownLabels >= 150) break; if (inView(n)) { label(n); shownLabels++; } } }
 			ctx.font = GROUP_FONT;
 			ctx.fillStyle = t.muted;
@@ -1640,6 +1670,29 @@ export async function dashboardMain(win: any): Promise<void> {
 		if (win.ResizeObserver) { const ro = new win.ResizeObserver(() => { if (version !== pageVersion) ro.disconnect(); else resized(); }); ro.observe(canvas); }
 
 		const count = (n: number | null) => (n === null ? "?" : n.toLocaleString("en"));
+		// The what-if comparison: only facts the loaded metadata gives, before and after the unsaved items; nothing else is inferred.
+		const renderScenario = () => {
+			scenario.replaceChildren();
+			const items = whatIf.get(p.name) ?? [];
+			if (!items.length) return;
+			el("h3", scenario, "What-if (not saved)");
+			note(scenario, "These exist only in this tab and are never sent. Make a draft to review and save one through Write; the saved graph above them is unchanged.");
+			const links = [...g.edges.values()].filter((e) => e.b).length, linked = [...g.nodes.values()].filter((n) => n.deg > 0).length;
+			const per = new Map<string, number>();
+			for (const w of items) per.set(w.target, (per.get(w.target) ?? 0) + 1);
+			const newlyLinked = [...per.keys()].filter((id) => g.nodes.get(id)?.deg === 0).length;
+			facts(scenario, [["Records", `${count(g.nodes.size)} saved → ${count(g.nodes.size + items.length)} with what-if`], ["Links", `${count(links)} → ${count(links + items.length)}`],
+				["Records with links", `${count(linked)} → ${count(linked + newlyLinked + items.length)}`]]);
+			if (!g.parts.nodes.done || !g.parts.edges.done) note(scenario, "Counted over what has loaded so far.");
+			const ul = el("ul", scenario);
+			items.forEach((w, i) => {
+				const n = g.nodes.get(w.target);
+				const li = el("li", ul, `${w.name}, linked to “${w.targetName}”${n ? ` (its links ${n.deg} → ${n.deg + (per.get(w.target) ?? 0)})` : " (its record is not in this graph)"} `);
+				btn(li, "Make a draft", () => draftFromWhatIf(p.name, w, li), `Make a draft from ${w.name}`);
+				btn(li, "Remove", () => { items.splice(i, 1); if (!items.length) whatIf.delete(p.name); renderScenario(); schedule(); }, `Remove ${w.name}`);
+			});
+			btn(scenario, "Clear all what-if items", () => { whatIf.delete(p.name); renderScenario(); schedule(); });
+		};
 		const refresh = () => {
 			if (version !== pageVersion) return;
 			const nodes = g.parts.nodes, edges = g.parts.edges, links = [...g.edges.values()].filter((e) => e.b).length;
@@ -1670,6 +1723,7 @@ export async function dashboardMain(win: any): Promise<void> {
 				el("span", l, ` ${name} (${n.toLocaleString("en")})`);
 			}
 			runSearch(false);
+			renderScenario();
 			schedule();
 		};
 		const retry = btn(tools, "Retry loading", () => { for (const ph of Object.values(g.parts)) ph.error = null; pump(p, g); refresh(); });
@@ -1726,6 +1780,22 @@ export async function dashboardMain(win: any): Promise<void> {
 			link(actions, `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline");
 			el("span", actions, " · ");
 			link(actions, `#/path/${enc(p.name)}/${enc(id)}`, "Find a path");
+			if (n) {
+				// A local, unsaved what-if: a new memory linked to this record, drawn on the graph and compared beside it.
+				const wf = el("form", detail);
+				const wn = input(wf, "graph-whatif", `What-if: a new memory linked to “${n.name}” (not saved)`);
+				wn.setAttribute("maxlength", "512");
+				el("button", el("p", wf), "Add to the graph (not saved)").setAttribute("type", "submit");
+				wf.addEventListener("submit", (event) => {
+					event.preventDefault();
+					const nm = wn.value.trim();
+					if (!nm) { wn.focus(); return; }
+					whatIf.set(p.name, [...(whatIf.get(p.name) ?? []), { name: nm, target: id, targetName: n.name }]);
+					wn.value = "";
+					renderScenario();
+					schedule();
+				});
+			}
 			const more = el("div", detail);
 			note(more, "Loading details…");
 			(async () => {
