@@ -159,3 +159,6 @@ export async function uploadTickets({ keys, stateFile, connector, ownerAccountId
  writePrivate(stateFile,JSON.stringify(state));
  return { status: "acknowledged", tickets: tickets.length, ...report };
 }
+
+// Pure metadata preparation for selected observations; missing/invalid keys remain the caller's read disposition.
+export { normalize as prepareTicketObservation };

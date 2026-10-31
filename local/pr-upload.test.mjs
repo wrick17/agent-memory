@@ -258,3 +258,6 @@ test("ghReader accepts only the uploader's two argument shapes before reading cr
 	await pending;
 	assert.deepEqual(actual, [searchArgs]);
 });
+
+// Selected-observation preparation/ack extraction remains reachable through this existing local test entry.
+await import("./daily-acquisition.test.mjs");

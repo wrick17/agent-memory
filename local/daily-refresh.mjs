@@ -281,3 +281,6 @@ export async function refreshDaily({ profile, requiredSources, as_of, acquisitio
 	controlProof("finish", disk.read(file("finish.body")), { operation: "finish", profile, claim: { ...a.binding, state: "done" }, refresh_receipt: finalReceipt });
 	return close(finalReceipt, "done");
 }
+
+// PRIVATE helper overlay: provider records share the reviewed daily ownership, quota and durability implementation.
+export { storage as dailyStorage };

@@ -231,3 +231,6 @@ export async function uploadPRs({ repo, profile, since, stateFile, gh, ownerLogi
  writePrivate(stateFile, JSON.stringify({ repo, profile, cursor, recent, incomplete }));
 	return { status: "acknowledged", prs: p.total, incomplete: (state.incomplete??[]).map(h=>`github:${repo}#${h.slice(0,h.indexOf("@"))}`) };
 }
+
+// Pure metadata preparation for selected observations; no read, send or ordinary cursor change.
+export { fromGraphql as preparePRObservation };
