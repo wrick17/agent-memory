@@ -290,3 +290,7 @@ The corrected local source passed the [final combined check](combined-verificati
 ## Daily schema upgrade check, 2026-10-31
 
 Selected synthetic populated profile v6-to-v7 and account v4-to-v5 upgrades preserved the checked old state through migration, repeat and reopen. [Scope and limits](combined-verification-2026-10-30.md#daily-server-local-verification-2026-10-31). This does not establish live-fixture preservation. Owner 454 directs legacy sources to Work; the 30 holds, two collisions, 31 missing and 104 vanished entries and old 1,155/1,330 artifacts remain. No real export, roster or upload followed.
+
+## Current private Work planning checkpoint, 2026-10-31
+
+The accepted private checkpoint plans 1,370 Work records from 1,489 present sources, including 11 D4 archives; 119 remain held. It contains eight links and 64 batches. The 104 absent sources and 31 old missing bindings remain accounted for; the 1,359 held-base diagnostic and old 1,155/1,330 artifacts remain unchanged. This is planning only: fresh reconciliation and actual import, target and runtime gates remain open. [Counts and limits](module-contracts.md#current-private-work-planning-checkpoint-2026-10-31); [parent acceptance](/private/tmp/am-pm-work1370-accept-orioboq1/acceptance.json).

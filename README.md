@@ -8,6 +8,8 @@ Your everyday agents still use BothQ. Agent Memory has a private owner trial whe
 
 The current source groups, including the daily server, have passed local combined and self-host package checks; this does not establish everyday readiness. [Verification](docs/combined-verification-2026-10-30.md#final-local-combined-check-2026-10-31).
 
+A private Work migration planning checkpoint has been accepted; reconciliation and migration are still pending. [Scope](docs/module-contracts.md#current-private-work-planning-checkpoint-2026-10-31).
+
 Automatic capture is not running. The dashboard, work and project corpus, self-host setup, backups, and multi-machine use are not ready. BothQ will remain running and readable after the eventual caller transition.
 
 ## Progress
