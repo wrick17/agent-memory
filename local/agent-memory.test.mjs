@@ -287,9 +287,11 @@ describe("confined runtime", () => {
 		assert.equal(missing.classification, "indeterminate");
 	});
 
-	const codex = spawnSync("codex", ["--version"], { encoding: "utf8" });
-	const real = process.platform === "darwin" && codex.status === 0 && fs.existsSync(path.join(os.homedir(), ".codex", "auth.json"));
-	it("proves the denial on this Mac with the real `codex sandbox`, and classifies weakened, missing and DNS probes", { skip: !real && "codex sandbox not available" }, async () => {
+	it("proves the denial on this Mac with the real `codex sandbox`, and classifies weakened, missing and DNS probes", async (t) => {
+		// Resolve the native dependency only when this test actually runs, so filtered synthetic checks launch no child.
+		const codex = spawnSync("codex", ["--version"], { encoding: "utf8" });
+		const real = process.platform === "darwin" && codex.status === 0 && fs.existsSync(path.join(os.homedir(), ".codex", "auth.json"));
+		if (!real) { t.skip("codex sandbox not available"); return; }
 		const r = await am.confinedRunner({});
 		assert.deepEqual([r.available, r.classification], [true, "denied"], r.reason);
 		r.cleanup();
@@ -538,3 +540,6 @@ describe("general confined executor", () => {
 		assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith(".schema.json")).length, 0);
 	});
 });
+
+// Daily cases remain reachable through the existing permanent local test entry.
+await import("./daily-refresh.test.mjs");

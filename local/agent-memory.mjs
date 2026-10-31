@@ -106,6 +106,13 @@ export function takeLock() {
 	}
 	return false;
 }
+/** The daily adapter must share this module instance and the actual lock entry, never a caller boolean. */
+export function assertMachineLock() {
+	if (!ownLock || fs.readdirSync(lockDir()).join() !== ownLock) throw new Error("refresh_lock_required");
+	const st = fs.lstatSync(path.join(lockDir(), ownLock));
+	if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o777) !== 0o600) throw new Error("refresh_lock_required");
+}
+
 export const dropLock = () => {
 	if (ownLock) fs.rmSync(path.join(lockDir(), ownLock), { force: true });
 	ownLock = null;
@@ -406,6 +413,28 @@ export function httpServer(config) {
 		return res.json();
 	};
 	return {
+		/** Closed daily transport: retained UTF-8 bytes, the configured origin and existing job credential only. */
+		refresh: async (operation, input) => {
+			const paths = { claim: "/v1/refresh/claim", plan: "/v1/refresh/plan", part: "/v1/ingest", finish: "/v1/refresh/finish", markers: "/v1/markers", status: "/v1/refresh/status" };
+			if (!Object.hasOwn(paths, operation)) throw new Error("refresh_operation");
+			const origin = new URL(config.server);
+			if (origin.protocol !== "https:" || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") throw new Error("refresh_origin");
+			const read = operation === "markers" || operation === "status", url = new URL(paths[operation], origin);
+			if (read) {
+				const keys = operation === "markers" ? ["profile"] : ["profile", "day", "claim_id"];
+				if (!input || Object.keys(input).sort().join() !== keys.sort().join() || keys.some((k) => typeof input[k] !== "string")) throw new Error("refresh_query");
+				url.search = new URLSearchParams(input).toString();
+			} else if (typeof input !== "string") throw new Error("refresh_bytes_required");
+			const res = await fetch(url, { method: read ? "GET" : "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" },
+				...(read ? {} : { body: input }), redirect: "error", signal: AbortSignal.timeout(30_000) });
+			if (!res.ok) {
+				const error = await res.json().then((r) => r.error, () => null);
+				const noReservation = operation === "claim" && ((res.status === 400 && error?.code === "validation" && error?.details?.reason === "day_mismatch")
+					|| (res.status === 409 && error?.code === "busy" && error?.details?.reason === "prior_refresh_pending"));
+				throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, ...(noReservation ? { noReservation: error.details.reason } : {}) });
+			}
+			return res.json();
+		},
 		ingest: (batch) => post("/v1/ingest", batch).then((r) => r.results),
 		work: (batch) => post("/v1/ingest", batch, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		state: (ids, repo) => post("/v1/capture", { range_ids: ids, ...(repo ? { repo } : {}) }).then((r) => r.ranges),
