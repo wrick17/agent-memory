@@ -60,7 +60,7 @@ export async function settingsMain(win: any): Promise<void> {
 		tbody.replaceChildren();
 		for (const d of await call("/api/devices")) {
 			const tr = doc.createElement("tr");
-			[d.name, d.kind, d.scopes.join(", "), d.profiles.join(", "), d.default_profile || "", d.last_used_at || "never", d.revoked_at ? "revoked" : "active"].forEach((t: string) => cell(tr, t));
+			[d.name, d.kind, d.scopes.join(", "), d.profiles.join(", "), d.default_profile || "", d.last_used_at || "never", d.revoked_at ? "revoked" : d.enabled === false ? "disabled" : "active"].forEach((t: string) => cell(tr, t));
 			const td = cell(tr, "");
 			if (!d.revoked_at) {
 				const b = doc.createElement("button");

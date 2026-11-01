@@ -16,7 +16,7 @@ The graph includes an unsaved what-if view with local draft items and a metadata
 
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-Personal Claude and Codex capture hooks are enabled. A synthetic Work digest upload and native capture-context recall passed; automatic session capture remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data, independent setup and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
+Personal Claude and Codex capture hooks are enabled. A real Work Claude SessionEnd capture and native context recall passed at a bounded scope; automatic capture across triggers and machines remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data, independent setup and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
 
 ## Completed development milestones
 
@@ -36,7 +36,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 - [x] Find a memory by searching and read its history (owner trial).
 - [x] Explore a simple connection between two items (owner trial).
 - [x] Find memories as they were at a chosen point in time (canonical owner flow). [Evidence](docs/combined-verification-2026-10-30.md#canonical-owner-point-in-time-find-2026-11-01).
-- [ ] Manage a memory's full lifecycle, including renaming, moving, retiring, and restoring it.
+- [x] Manage a memory's full lifecycle, including renaming, moving, retiring, and restoring it (canonical synthetic flow).
 - [x] Review captured suggestions and turn them into memories (canonical owner flow).
 
 ### Bring existing memory
