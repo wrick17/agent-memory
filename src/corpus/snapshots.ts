@@ -238,12 +238,52 @@ export const SNAPSHOT_SETS_V5: Record<string, string[]> = {
 	judgment: ["validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties", "ownership", "predecessor_links", "journey_edges"],
 };
 
+// Migration 6: remaining section-14 release, policy, workflow and delivery patterns stay dated snapshots.
+// Original builders are unavailable; importing their exact approved projections avoids inventing statistical semantics or feeds.
+export const SNAPSHOTS_V6: Record<string, SnapshotFamily> = {
+	pattern_release_batches: {
+		ddl: "CREATE TABLE pattern_release_batches(\n  tag_name TEXT,\n  first_at TEXT,\n  last_at TEXT,\n  span_hours REAL,\n  repo_count INT,\n  release_count INT,\n  authors_json TEXT,\n  targets_json TEXT,\n  confidence TEXT\n)",
+		columns: {"rowid": "integer", "tag_name": "text", "first_at": "text", "last_at": "text", "span_hours": "real", "repo_count": "integer", "release_count": "integer", "authors_json": "text", "targets_json": "text", "confidence": "text"},
+		omit: {}, repos: [], people: [], peopleJson: ["authors_json"],
+	},
+	pattern_release_batch_repos: {
+		ddl: "CREATE TABLE pattern_release_batch_repos(\n  tag_name TEXT,\n  repo TEXT,\n  published_at TEXT,\n  target_commitish TEXT,\n  author TEXT,\n  url TEXT\n)",
+		columns: {"rowid": "integer", "tag_name": "text", "repo": "text", "published_at": "text", "target_commitish": "text", "author": "text", "url": "text"},
+		omit: {}, repos: ["repo"], people: ["author"], peopleJson: [],
+	},
+	pattern_release_actor_yearly: {
+		ddl: "CREATE TABLE pattern_release_actor_yearly(\n  year TEXT,\n  actor TEXT,\n  release_count INT,\n  repo_count INT,\n  tag_count INT,\n  first_at TEXT,\n  last_at TEXT\n)",
+		columns: {"rowid": "integer", "year": "text", "actor": "text", "release_count": "integer", "repo_count": "integer", "tag_count": "integer", "first_at": "text", "last_at": "text"},
+		omit: {}, repos: [], people: ["actor"], peopleJson: [],
+	},
+	pattern_branch_strategy_yearly: {
+		ddl: "CREATE TABLE pattern_branch_strategy_yearly(\n  year TEXT,\n  lane TEXT,\n  pr_count INT,\n  merged_count INT\n)",
+		columns: {"rowid": "integer", "year": "text", "lane": "text", "pr_count": "integer", "merged_count": "integer"},
+		omit: {}, repos: [], people: [], peopleJson: [],
+	},
+	pattern_current_repo_policies: {
+		ddl: "CREATE TABLE pattern_current_repo_policies(\n  repo TEXT,\n  default_branch TEXT,\n  merge_commit_allowed INT,\n  rebase_merge_allowed INT,\n  squash_merge_allowed INT,\n  delete_branch_on_merge INT,\n  observed_branch_protections INT,\n  observation_caveat TEXT\n)",
+		columns: {"rowid": "integer", "repo": "text", "default_branch": "text", "merge_commit_allowed": "integer", "rebase_merge_allowed": "integer", "squash_merge_allowed": "integer", "delete_branch_on_merge": "integer", "observed_branch_protections": "integer", "observation_caveat": "text"},
+		omit: {}, repos: ["repo"], people: [], peopleJson: [],
+	},
+	pattern_workflow_dependencies: {
+		ddl: "CREATE TABLE pattern_workflow_dependencies(\n  uses_ref TEXT,\n  repo_count INT,\n  workflow_count INT,\n  invocation_count INT,\n  source_repo_present INT,\n  confidence TEXT\n)",
+		columns: {"rowid": "integer", "uses_ref": "text", "repo_count": "integer", "workflow_count": "integer", "invocation_count": "integer", "source_repo_present": "integer", "confidence": "text"},
+		omit: {}, repos: [], people: [], peopleJson: [],
+	},
+	delivery_clusters: {
+		ddl: "CREATE TABLE delivery_clusters(\n  kind TEXT,\n  cluster_key TEXT,\n  confidence TEXT,\n  first_at TEXT,\n  last_at TEXT,\n  repo_count INT,\n  pr_count INT,\n  evidence_json TEXT\n)",
+		columns: {"rowid": "integer", "kind": "text", "cluster_key": "text", "confidence": "text", "first_at": "text", "last_at": "text", "repo_count": "integer", "pr_count": "integer", "evidence_json": "text"},
+		omit: {}, repos: [], people: [], peopleJson: [],
+	},};
+export const SNAPSHOT_SETS_V6: Record<string, string[]> = { delivery_patterns: ["pattern_release_batches", "pattern_release_batch_repos", "pattern_release_actor_yearly", "pattern_branch_strategy_yearly", "pattern_current_repo_policies", "pattern_workflow_dependencies", "delivery_clusters"] };
+
 /** Snapshot sets: the tables one cut replaces together. */
 /** The frozen v4 `patterns` set in its migration-4 order: its DDL, migration bytes, cut ids and receipt ids never change. */
 const PATTERNS = Object.keys(PATTERN_FAMILIES);
 /** The active registry: the v4 patterns and the v5 record-type families, in disjoint sets. */
-export const SNAPSHOTS: Record<string, SnapshotFamily> = { ...PATTERN_FAMILIES, ...SNAPSHOTS_V5 };
-export const SNAPSHOT_SETS: Record<string, string[]> = { patterns: PATTERNS, ...SNAPSHOT_SETS_V5 };
+export const SNAPSHOTS: Record<string, SnapshotFamily> = { ...PATTERN_FAMILIES, ...SNAPSHOTS_V5, ...SNAPSHOTS_V6 };
+export const SNAPSHOT_SETS: Record<string, string[]> = { patterns: PATTERNS, ...SNAPSHOT_SETS_V5, ...SNAPSHOT_SETS_V6 };
 export const setOf = (table: string): string | null => Object.entries(SNAPSHOT_SETS).find(([, ts]) => ts.includes(table))?.[0] ?? null;
 export const snapshotSchemaSha = (table: string) => sha256(SNAPSHOTS[table]!.ddl);
 /** The cut identity: fixed tuple of set, source, as_of (normalized ISO) and every member's DDL hash in set order. */
@@ -279,6 +319,8 @@ export const SNAPSHOT_MIGRATION: string[] = [
 
 /** Migration 5 (store.ts CORPUS_MIGRATIONS): each live table with its original indexes, then its stage (no indexes); the cut ledger already exists. */
 export const SNAPSHOT_MIGRATION_5: string[] = Object.entries(SNAPSHOTS_V5).flatMap(([t, f]) => [f.ddl, ...(f.indexes ?? []), stageOf(t, f.ddl)]);
+
+export const SNAPSHOT_MIGRATION_6: string[] = Object.entries(SNAPSHOTS_V6).flatMap(([t, f]) => [f.ddl, stageOf(t, f.ddl)]);
 
 /**
  * The work guard terms a checked snapshot chunk introduces (the chunkTerms rule): each repo column value as a project, each person

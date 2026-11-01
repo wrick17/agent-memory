@@ -8,6 +8,7 @@
     "local/setup.mjs",
     "local/corpus-cli.mjs",
     "local/corpus-git.mjs",
+    "local/corpus-judgment.mjs",
     "local/corpus-scan.mjs",
     "local/corpus-refresh.mjs",
     "local/corpus-upload.mjs",

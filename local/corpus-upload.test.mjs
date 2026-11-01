@@ -442,3 +442,177 @@ describe("corpus session metadata names (uploader)", () => {
 		assert.equal(statuses, 1);
 	});
 });
+
+describe("curated judgment refresh", () => {
+	// Exact existing schemas; the workflow row ensures a whole-set copy preserves the reserved trigger column too.
+	const FACT_DDL = "CREATE TABLE frontend_business_facts(\n  fact_id TEXT,\n  repo_key TEXT,\n  domain TEXT,\n  fact_type TEXT,\n  statement TEXT,\n  confidence REAL,\n  snapshot_id TEXT,\n  evidence_json TEXT,\n  notes TEXT\n)";
+	const FLOW_DDL = "CREATE TABLE frontend_workflows(\n  workflow_id TEXT,\n  repo_key TEXT,\n  domain TEXT,\n  name TEXT,\n  actor TEXT,\n  \"trigger\" TEXT,\n  steps_json TEXT,\n  outcomes_json TEXT,\n  confidence REAL,\n  snapshot_id TEXT,\n  evidence_json TEXT,\n  notes TEXT\n)";
+	const git = (dir, args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+	async function fixture({ evidence = [{ path: "src/rule.ts" }], touched = "src/rule.ts", repo = "acme/web", body = "export const total = 2; // ping fixture@example.invalid\n", facts = [evidence], remove = [] } = {}) {
+		const dir = fs.mkdtempSync(path.join(tmp, "judgment-")), checkout = path.join(dir, "checkout");
+		execFileSync("git", ["init", "-q", "-b", "main", checkout]);
+		git(checkout, ["remote", "add", "origin", "git@github.com:acme/web.git"]);
+		fs.mkdirSync(path.join(checkout, "src"));
+		fs.writeFileSync(path.join(checkout, "src/rule.ts"), "export const total = 1;\n");
+		for (const p of remove) fs.writeFileSync(path.join(checkout, p), "export const gone = 1;\n");
+		const commit = () => { git(checkout, ["add", "."]); git(checkout, ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Synthetic evidence"]); return git(checkout, ["rev-parse", "HEAD"]); };
+		const before = commit();
+		fs.writeFileSync(path.join(checkout, touched), body);
+		for (const p of remove) fs.rmSync(path.join(checkout, p));
+		const head = commit();
+		// A dirty working tree must never enter the model prompt.
+		fs.writeFileSync(path.join(checkout, "src/rule.ts"), "WORKTREE_SHOULD_NOT_BE_READ");
+		const dbfile = path.join(dir, "base.sqlite"), db = new DatabaseSync(dbfile);
+		db.exec(FACT_DDL); db.exec(FLOW_DDL); db.exec("CREATE TABLE repos(full_name TEXT, head_sha TEXT)");
+		db.prepare("INSERT INTO repos VALUES (?, ?)").run("acme/web", before);
+		for (const [i, ev] of facts.entries()) db.prepare("INSERT INTO frontend_business_facts VALUES (?, ?, 'totals', 'rule', 'total is 2', 0.9, 'acme/web', ?, NULL)").run(`f${i + 1}`, repo, JSON.stringify(ev));
+		db.exec("INSERT INTO frontend_workflows (workflow_id, repo_key, name, \"trigger\", evidence_json) VALUES ('w1', 'acme/web', 'Retained workflow', 'click pay', '[]')");
+		const members = ["frontend_business_facts", "frontend_workflows"].map((table) => ({ table, set: "judgment", key: ["rowid"],
+			schema_sha256: sha256(table === "frontend_business_facts" ? FACT_DDL : FLOW_DDL), columns: ["rowid", ...db.prepare("SELECT name FROM pragma_table_info(?)").all(table).map((r) => r.name)] }));
+		db.close();
+		const base = await sqliteSource(dbfile), calls = [], sent = [], saves = [], finals = new Set();
+		const ledger = { published: { source_sha256: base.fileSha256, cut_id: "base-cut" }, loading: null };
+		const client = {
+			refuse: false,
+			status: async () => structuredClone({ generation: "g1", families: [], tables: [], snapshot_families: members, snapshots: { judgment: ledger } }),
+			send: async (c) => {
+				sent.push(c);
+				assert.ok(saves.at(-1).judgment.pending, "candidate identity was saved before the first send");
+				if (client.refuse) return { error: { code: "validation", details: { reason: "fixture_refusal" } } };
+				assert.equal(c.sha256, chunkHash(c));
+				if (c.final) finals.add(c.table);
+				if (finals.size === members.length) ledger.published = { source_sha256: c.source.file_sha256, cut_id: snapshotCutOf("judgment", members, c.source.file_sha256, c.as_of) };
+				return { receipt: { status: "stored", sha256: c.sha256, last_key: c.rows.length ? [c.rows.at(-1)[0]] : c.after, complete: c.final } };
+			},
+		};
+		const runner = { available: true, classification: "denied", exec: async (a) => { calls.push(a); return { kind: "ok", part: { supported: true } }; } };
+		const options = { checkouts: [checkout], profile: "test", client, base, runner, state: {}, save: (s) => saves.push(structuredClone(s)), openSource: sqliteSource,
+			candidateFile: path.join(dir, "prepared.sqlite"), writePrivate: (file, data) => fs.writeFileSync(file, data, { mode: 0o600 }), now: new Date("2026-11-01T10:00:00Z") };
+		return { options, calls, sent, saves, head, close: () => { base.close(); fs.rmSync(dir, { recursive: true }); } };
+	}
+
+	it("selects only touched explicit evidence and refuses foreign, unknown or unsafe mappings without invoking a model", async () => {
+		const { evidencePaths, refreshJudgment } = await import("./corpus-judgment.mjs");
+		assert.deepEqual(evidencePaths('[{"path":"src/rule.ts"},{"path":"src/rule.ts"}]', "acme/web"), ["src/rule.ts"]);
+		for (const evidence of [[{ path: "src/rule.ts", repo: "other/web" }], [{ path: "../rule.ts" }], [{ path: "src/rule.ts" }, { path: "auth.json" }],
+			[{ path: "sessions/rollout.jsonl" }], [{ path: "/tmp/rule.ts" }], [{ path: ".env.json" }], [{ file: "src/rule.ts" }]]) {
+			assert.deepEqual(evidencePaths(JSON.stringify(evidence), "acme/web"), []);
+		}
+		for (const args of [{ touched: "src/unrelated.ts" }, { repo: "other/web" }, { evidence: [{ path: "src/rule.ts", repo: "other/web" }] }, { evidence: [{ path: "auth.json" }] }]) {
+			const f = await fixture(args);
+			try {
+				const r = await refreshJudgment(f.options);
+				assert.equal(r.status, args.evidence ? "pending" : "unchanged");
+				assert.equal(f.calls.length, 0); assert.equal(f.sent.length, 0);
+			} finally { f.close(); }
+		}
+	});
+
+	it("keeps facts pending for unproven runtimes and false, malformed or tool results", async () => {
+		const { refreshJudgment } = await import("./corpus-judgment.mjs");
+		const f = await fixture();
+		try {
+			for (const runner of [null, { ...f.options.runner, available: false }, { ...f.options.runner, classification: "indeterminate" }]) {
+				assert.equal((await refreshJudgment({ ...f.options, state: {}, runner })).reason, "runtime_unavailable");
+			}
+			assert.equal(f.calls.length, 0);
+			let attempted = 0;
+			for (const result of [{ kind: "ok", part: { supported: false } }, { kind: "ok", part: { supported: "true" } },
+				{ kind: "ok", part: { supported: true, extra: "injected" } }, { kind: "tool_event" }]) {
+				const state = {};
+				const runner = { ...f.options.runner, exec: async () => { attempted++; return result; } };
+				assert.equal((await refreshJudgment({ ...f.options, runner, state })).reason, "fact_needs_review");
+				assert.deepEqual(state.judgment.checked, {}); assert.equal(state.judgment.pending, undefined);
+			}
+			assert.equal(attempted, 4); assert.equal(f.sent.length, 0);
+		} finally { f.close(); }
+	});
+
+	it("durably prepares a supported fact, resumes refused publication without a second model call, and advances its head only after whole-set publication", async () => {
+		const { FACT_SCHEMA, refreshJudgment } = await import("./corpus-judgment.mjs");
+		const f = await fixture();
+		try {
+			f.options.client.refuse = true;
+			assert.equal((await refreshJudgment(f.options)).reason, "fixture_refusal");
+			assert.equal(f.calls.length, 1); assert.equal(f.calls[0].model, "gpt-6.1-terra"); assert.equal(f.calls[0].effort, "high"); assert.deepEqual(f.calls[0].schema, FACT_SCHEMA);
+			assert.match(f.calls[0].prompt, /total = 2/); assert.doesNotMatch(f.calls[0].prompt, /WORKTREE_SHOULD_NOT_BE_READ|fixture@example/);
+			assert.deepEqual(f.options.state.judgment.checked, {});
+			assert.equal(f.options.state.judgment.pending.head, f.head);
+			assert.equal(fs.statSync(f.options.candidateFile).mode & 0o777, 0o600);
+			// Simulate a new process: only the private saved state/candidate survive, and the runner is unavailable.
+			const state = structuredClone(f.saves.at(-1));
+			f.options.client.refuse = false;
+			assert.deepEqual(await refreshJudgment({ ...f.options, state, runner: null }), { group: "judgment", status: "published", checked: 1 });
+			assert.equal(f.calls.length, 1); assert.equal(state.judgment.pending, null);
+			assert.deepEqual(Object.values(state.judgment.checked), [f.head]);
+			assert.deepEqual(f.sent.slice(1).map((c) => c.table), ["frontend_business_facts", "frontend_workflows"]);
+			const flow = f.sent.at(-1);
+			assert.equal(flow.rows[0][flow.columns.indexOf("trigger")], "click pay");
+			assert.equal((await refreshJudgment({ ...f.options, state })).status, "unchanged");
+			assert.equal(f.calls.length, 1);
+		} finally { f.close(); }
+	});
+
+	it("removes quoted, prefixed and camelCase credential values before the prompt, and refuses a nested secret config without a model call", async () => {
+		const { refreshJudgment } = await import("./corpus-judgment.mjs");
+		const body = `${JSON.stringify({ total: 2, password: "opaque-a1", db_password: "opaque-b2", "x-api-key": "opaque-c3", nested: { clientSecret: "opaque-d4", authToken: 12345678 } }, null, 2)}\n`;
+		const f = await fixture({ evidence: [{ path: "config.json" }], touched: "config.json", body });
+		try {
+			await refreshJudgment(f.options);
+			assert.equal(f.calls.length, 1);
+			assert.doesNotMatch(f.calls[0].prompt, /opaque|12345678/);
+			assert.match(f.calls[0].prompt, /db_password/); assert.match(f.calls[0].prompt, /\\"total\\": 2/);
+		} finally { f.close(); }
+		const g = await fixture({ evidence: [{ path: "config.json" }], touched: "config.json", body: `${JSON.stringify({ secrets: { stripe: "opaque-e5" } }, null, 2)}\n` });
+		try {
+			assert.equal((await refreshJudgment(g.options)).reason, "evidence_sensitive");
+			assert.equal(g.calls.length, 0); assert.deepEqual(g.options.state.judgment.checked, {});
+		} finally { g.close(); }
+	});
+
+	it("redacts bare YAML and wrapped source secrets, and refuses TOML secret sections and multi-line nested secrets without a model call", async () => {
+		const { refreshJudgment } = await import("./corpus-judgment.mjs");
+		for (const [file, body, keep] of [
+			["config.yaml", "db_password: opaque-y1\nadmin_pwd: opaque-y2 # rotated\nretries: 3\n", /retries: 3/],
+			["src/config.ts", 'export const api = { clientSecret: wrap("opaque-s1"), retries: 3 };\nexport const total = 2;\n', /total = 2/],
+			["config.toml", 'retries = 3\n[secrets]\nstripe = "opaque-t1"\n', null],
+			["config.yml", "credentials:\n  stripe: opaque-y3\n", null],
+			["deploy.yaml", 'stripe_secret_key: >\n  opaque-y4\nwebhook_token: "opaque-y5\n  continued"\n', null],
+			["src/keys.ts", 'export const config = {\n  secrets: {\n    stripe: "opaque-s2",\n  },\n};\n', null],
+			["src/list.ts", 'export const apiKeys = [\n  "opaque-s3",\n];\n', null],
+			// Bare keys the shared redactor also matches: its scalar replacement must not hide the block or brace opener.
+			["app.yaml", "password: |\n  opaque-y6\n", null],
+			["src/secret.ts", 'export const secret = {\n  stripe: "opaque-s4",\n};\n', null],
+		]) {
+			const f = await fixture({ evidence: [{ path: file }], touched: file, body });
+			try {
+				const r = await refreshJudgment(f.options);
+				if (keep) {
+					assert.equal(f.calls.length, 1, file); assert.match(f.calls[0].prompt, keep, file); assert.doesNotMatch(f.calls[0].prompt, /opaque/, file);
+				} else {
+					assert.equal(r.reason, "evidence_sensitive", file); assert.equal(f.calls.length, 0, file); assert.deepEqual(f.options.state.judgment.checked, {}, file);
+				}
+			} finally { f.close(); }
+		}
+	});
+
+	it("persists a deleted-evidence fact as deferred so the next run rechecks a later eligible fact, without checking or retrying the deferred one", async () => {
+		const { refreshJudgment } = await import("./corpus-judgment.mjs");
+		const f = await fixture({ facts: [[{ path: "src/gone.ts" }], [{ path: "src/rule.ts" }]], remove: ["src/gone.ts"] });
+		try {
+			assert.equal((await refreshJudgment(f.options)).reason, "evidence_unavailable");
+			assert.equal(f.calls.length, 0); assert.deepEqual(f.options.state.judgment.checked, {});
+			// A new process sees only the saved state: the failed fact/head is durable and the later fact is selected.
+			const state = structuredClone(f.saves.at(-1));
+			assert.deepEqual(Object.values(state.judgment.deferred), [f.head]);
+			assert.deepEqual(await refreshJudgment({ ...f.options, state }), { group: "judgment", status: "published", checked: 1 });
+			assert.equal(f.calls.length, 1); assert.match(f.calls[0].prompt, /total = 2/);
+			assert.deepEqual(Object.values(state.judgment.checked), [f.head]);
+			assert.equal(Object.keys(state.judgment.deferred).some((id) => id in state.judgment.checked), false);
+			// The deferred fact stays pending and unchecked until its evidence changes again.
+			assert.equal((await refreshJudgment({ ...f.options, state })).reason, "fact_needs_review");
+			assert.equal(f.calls.length, 1); assert.equal(Object.keys(state.judgment.checked).length, 1);
+		} finally { f.close(); }
+	});
+});

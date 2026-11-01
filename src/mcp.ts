@@ -373,7 +373,7 @@ async function recall(c: ToolContext, a: RecallInput): Promise<Outcome<unknown>>
 	const semantic = embeddingsOn(c.env) && !a.as_of;
 	const diagnostics: Record<string, unknown> = semantic ? {} : { embedding: a.as_of ? "off:as_of" : "off" };
 	const deadline = Date.now() + SEMANTIC_MS;
-	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, semantic, deadline, expand: a.expand !== false })));
+	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, includeCaptures: a.include_captures === true && ref.profile === rs.value.primary, semantic, deadline, expand: a.expand !== false })));
 	const merged = new Map<string, { hit: RecallHit; score: number }>();
 	for (const [i, page] of pages.entries()) {
 		if (!page.ok) return page;
@@ -407,10 +407,11 @@ async function inventory(c: ToolContext, a: RecallInput, names: string[], refs: 
 	common: { type: (typeof MEMORY_TYPES)[number] | "all"; includeHistory: boolean; kinds?: (typeof MEMORY_KINDS)[number][]; scope?: string; asOf?: string }, envelope: Record<string, unknown>): Promise<Outcome<unknown>> {
 	let pos = { i: 0, after: 0 };
 	if (a.cursor) {
-		let cur: { rs?: string[]; i?: number; a?: number; t?: string };
+		let cur: { rs?: string[]; i?: number; a?: number; t?: string; c?: boolean };
 		try { cur = unb64(a.cursor) as typeof cur; } catch { return fail("validation", "cursor is not valid"); }
 		if (JSON.stringify(cur.rs) !== JSON.stringify(names)) return fail("validation", "cursor belongs to another read set; start again without it");
 		if (cur.t !== a.as_of) return fail("validation", "cursor belongs to another as_of; start again without it");
+		if ((cur.c === true) !== (a.include_captures === true)) return fail("validation", "cursor belongs to another include_captures setting; start again without it");
 		pos = { i: Number(cur.i) || 0, after: Number(cur.a) || 0 };
 	}
 	const rows: RecallHit[] = [];
@@ -418,7 +419,7 @@ async function inventory(c: ToolContext, a: RecallInput, names: string[], refs: 
 	while (rows.length < limit) {
 		if (i >= refs.length) { exhausted = true; break; }
 		const want = limit - rows.length;
-		const page = await profileStub(c.env, refs[i]!).read(refs[i]!, { kind: "inventory", after, limit: want, ...common });
+		const page = await profileStub(c.env, refs[i]!).read(refs[i]!, { kind: "inventory", after, limit: want, ...common, includeCaptures: a.include_captures === true && i === 0 });
 		if (!page.ok) return page;
 		const hits = page.value as RecallHit[];
 		rows.push(...hits);
@@ -438,7 +439,7 @@ async function inventory(c: ToolContext, a: RecallInput, names: string[], refs: 
 		last = at;
 	}
 	const done = exhausted && selected.length === rows.length;
-	const next = done ? null : b64({ rs: names, i: (last ?? at).i, a: (last ?? at).after, ...(a.as_of ? { t: a.as_of } : {}) });
+	const next = done ? null : b64({ rs: names, i: (last ?? at).i, a: (last ?? at).after, ...(a.include_captures ? { c: true } : {}), ...(a.as_of ? { t: a.as_of } : {}) });
 	return ok({ ...envelope, results: selected, estimated_tokens: used, truncated: !done, lexical_only: true, diagnostics: { mode: "inventory" }, next_cursor: next });
 }
 

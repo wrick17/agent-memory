@@ -136,7 +136,7 @@ export async function writeSnapshot(rows, ddl = DDL) {
 				db.exec(create);
 				if (!rows[t].length) continue;
 				const cols = Object.keys(rows[t][0]);
-				const insert = db.prepare(`INSERT INTO ${t} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`);
+				const insert = db.prepare(`INSERT INTO ${t} (${cols.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`);
 				for (const r of rows[t]) insert.run(...cols.map((c) => r[c]));
 			}
 			db.exec("COMMIT");

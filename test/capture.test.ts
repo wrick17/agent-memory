@@ -2,8 +2,11 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { RecallHit } from "../src/domain/types";
 import { sha256 } from "../src/domain/ids";
 import { call, contextFor, deviceToken, outcome } from "./helpers";
+
+type CaptureRecall = { results: RecallHit[]; next_cursor: string | null; estimated_tokens: number; lexical_only: boolean };
 
 const origin = new URL(env.RESOURCE_URL).origin;
 const session = { client: "codex" as const, id: "thr_fixture1" };
@@ -51,8 +54,82 @@ describe("capture ingest", () => {
 		});
 		const recall = await call<{ results: unknown[] }>(c, "recall_memories", { keyword: "Use the other timeout", profile: "test" });
 		expect(recall.results).toHaveLength(0);
+		const opted = await call<CaptureRecall>(c, "recall_memories", { keyword: "Use the other timeout", profile: "test", include_captures: true });
+		expect(opted.results).toHaveLength(1);
+		expect(opted.results[0]).toMatchObject({ profile: "test", kind: "session", type: null, name: "session:codex:thr_fixture1",
+			trust: "untrusted", instruction_authority: false, provenance: { source_hash: a.sha256 } });
+		expect(opted.results[0]!.passage).toContain("Use the other timeout.");
+		expect(opted.results[0]!.passage.length).toBeLessThanOrEqual(706);
+		expect(opted.results[0]!.matched_by).toContain("fulltext");
+		const exact = await call<CaptureRecall>(c, "recall_memories", { keyword: "session:codex:thr_fixture1", profile: "test", include_captures: true });
+		expect(exact.results.map((r) => r.memory_id)).toEqual([opted.results[0]!.memory_id]);
+		for (const filter of [{ type: "feedback" }, { kinds: ["document"] }, { scope: "another-scope" }]) {
+			expect((await call<CaptureRecall>(c, "recall_memories", { keyword: "other timeout", profile: "test", include_captures: true, ...filter })).results).toEqual([]);
+		}
+		const capped = await call<CaptureRecall>(c, "recall_memories", { keyword: "other timeout", profile: "test", include_captures: true, token_budget: 64 });
+		expect(capped.results).toEqual([]);
+		expect(capped.estimated_tokens).toBeLessThanOrEqual(64);
 		const inventory = await call<{ results: { name: string }[] }>(c, "recall_memories", { keyword: "", profile: "test" });
 		expect(inventory.results.some((r) => r.name.startsWith("session:"))).toBe(false);
+	});
+
+	it("recalls only digest context stored by the historical cutoff, including a superseded heuristic", async () => {
+		const c = await contextFor(undefined, { EMBEDDINGS: "off" });
+		const { token } = await deviceToken("capture-recall-history", ["ingest"], ["test"], "test");
+		// Storage lasts for the whole file, so this case owns its session and range instead of the first case's fixture.
+		const session = { client: "codex" as const, id: "thr_history" }, range = "codex:thr_history:0a1b2c3d:0-5000";
+		const tick = async () => { await new Promise((r) => setTimeout(r, 5)); const at = new Date().toISOString(); await new Promise((r) => setTimeout(r, 5)); return at; };
+		const before = await tick();
+		const early = part("-", digest({ asks: [], decisions: [], corrections: [{ text: "earlykestrel uses the old timeout.", pos: 1 }] }), "heuristic", range);
+		expect((await post(token, "/v1/ingest", { session, digests: [early] })).data.results![0]!.status).toBe("stored");
+		const heuristicCut = await tick();
+		const late = part("0-5000", digest({ asks: [], decisions: [], corrections: [{ text: "latekestrel uses the corrected timeout.", pos: 1 }] }), "consolidated", range);
+		expect((await post(token, "/v1/ingest", { session, digests: [late], manifests: [{ range_id: range, parts: [{ part_id: late.part_id, sha256: late.sha256 }] }] })).data.results!.map((r) => r.status)).toEqual(["stored", "stored"]);
+		const completedCut = await tick();
+		const recallAt = (keyword: string, as_of: string) => call<CaptureRecall>(c, "recall_memories", { keyword, as_of, profile: "test", include_captures: true });
+		expect((await recallAt("earlykestrel", before)).results).toEqual([]);
+		// The same instant expressed with an offset must retain the earlier heuristic after consolidation.
+		const offsetCut = new Date(Date.parse(heuristicCut) + 330 * 60_000).toISOString().replace("Z", "+05:30");
+		const historical = await recallAt("earlykestrel", offsetCut);
+		expect(historical.lexical_only).toBe(true);
+		expect(historical.results).toHaveLength(1);
+		expect(historical.results[0]).toMatchObject({ passage: expect.stringContaining("earlykestrel uses the old timeout."), provenance: { source_hash: early.sha256 }, as_of: { content_known: true } });
+		expect((await recallAt("latekestrel", heuristicCut)).results).toEqual([]);
+		expect((await recallAt("earlykestrel", completedCut)).results).toEqual([]);
+		const completed = await recallAt("latekestrel", completedCut);
+		expect(completed.results).toHaveLength(1);
+		expect(completed.results[0]).toMatchObject({ passage: expect.stringContaining("latekestrel uses the corrected timeout."), provenance: { source_hash: late.sha256 } });
+		expect((await call<CaptureRecall>(c, "recall_memories", { keyword: "earlykestrel", profile: "test", include_captures: true })).results).toEqual([]);
+	});
+
+	it("paginates opted-in inventory without duplicates and binds its cursor to the capture flag", async () => {
+		const c = await contextFor(undefined, { EMBEDDINGS: "off" });
+		const { token } = await deviceToken("capture-recall-inventory", ["ingest"], ["test"], "test");
+		// Storage lasts for the whole file: this case owns its session and range, and earlier cases' sessions list before its own.
+		const session = { client: "codex" as const, id: "thr_inventory" }, range = "codex:thr_inventory:0a1b2c3d:0-5000";
+		const args = { keyword: "", profile: "test", limit: 1 };
+		const walk = async () => {
+			const pages = [await call<CaptureRecall>(c, "recall_memories", { ...args, include_captures: true })];
+			while (pages.at(-1)!.next_cursor) pages.push(await call<CaptureRecall>(c, "recall_memories", { ...args, include_captures: true, cursor: pages.at(-1)!.next_cursor }));
+			return pages;
+		};
+		const prior = (await walk()).flatMap((p) => p.results.map((r) => r.memory_id));
+		const a = part("0-2500", digest(), "consolidated", range), b = part("2500-5000", digest({ decisions: [], corrections: [] }), "consolidated", range);
+		expect((await post(token, "/v1/ingest", { session, digests: [a, b], manifests: [{ range_id: range, parts: [a, b].map(({ part_id, sha256 }) => ({ part_id, sha256 })) }] })).data.results!.every((r) => r.status === "stored")).toBe(true);
+		const saved = await call(c, "save_memory", { name: "Ordinary inventory note", type: "reference", description: "ordinary", content: "saved memory", profile: "test" });
+		const pages = await walk(), first = pages[0]!, listed = pages.flatMap((p) => p.results);
+		expect(pages.slice(0, -1).every((p) => p.results.length === 1 && typeof p.next_cursor === "string")).toBe(true);
+		expect(pages.at(-1)).toMatchObject({ results: [], next_cursor: null });
+		expect(listed.at(-2)).toMatchObject({ kind: "session", name: "session:codex:thr_inventory", trust: "untrusted", instruction_authority: false });
+		expect(listed.map((r) => r.memory_id)).toEqual([...prior, listed.at(-2)!.memory_id, saved.memory_id]);
+		expect(new Set(listed.map((r) => r.memory_id)).size).toBe(listed.length);
+		expect(await outcome(c, "recall_memories", { ...args, cursor: first.next_cursor })).toMatchObject({ ok: false, error: { code: "validation" } });
+		const ordinary = await call<CaptureRecall>(c, "recall_memories", args);
+		expect(ordinary.results.map((r) => r.memory_id)).toEqual([saved.memory_id]);
+		expect(await outcome(c, "recall_memories", { ...args, include_captures: true, cursor: ordinary.next_cursor })).toMatchObject({ ok: false, error: { code: "validation" } });
+		const ordinaryEnd = await call<CaptureRecall>(c, "recall_memories", { ...args, include_captures: false, cursor: ordinary.next_cursor });
+		expect(ordinaryEnd.results).toEqual([]);
+		expect(ordinaryEnd.next_cursor).toBeNull();
 	});
 
 	it("links the session to the PR, ticket and commit references its digest names, keeping the literal URLs and context", async () => {
@@ -161,6 +238,10 @@ describe("capture_memory and review_candidates", () => {
 		const c = await contextFor();
 		const cap = await call(c, "capture_memory", { content: "Prefer the staging bucket for zeppelin uploads.", kind: "correction", name: "Bucket note", source: { session: "thr_x" }, profile: "test", request_id: "cap-1" });
 		expect(cap).toMatchObject({ status: "candidate", profile: "test" });
+		const captured = await call<CaptureRecall>(c, "recall_memories", { keyword: "zeppelin uploads", profile: "test", include_captures: true });
+		expect(captured.results).toHaveLength(1);
+		expect(captured.results[0]).toMatchObject({ memory_id: cap.capture_id, kind: "other", status: "candidate", trust: "untrusted", instruction_authority: false,
+			passage: "Prefer the staging bucket for zeppelin uploads.", provenance: { source_hash: sha256("Prefer the staging bucket for zeppelin uploads.") } });
 		expect(await call(c, "capture_memory", { content: "Prefer the staging bucket for zeppelin uploads.", kind: "correction", name: "Bucket note", source: { session: "thr_x" }, profile: "test", request_id: "cap-1" })).toMatchObject({ action: "replayed", capture_id: cap.capture_id });
 		expect((await call<{ results: unknown[] }>(c, "recall_memories", { keyword: "zeppelin uploads", profile: "test" })).results).toHaveLength(0);
 		const listed = await call<{ candidates: { capture_id: string; status: string; content: string }[] }>(c, "review_candidates", { action: "list", profile: "test" });

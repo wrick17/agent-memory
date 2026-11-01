@@ -16,7 +16,7 @@ The graph includes an unsaved what-if view with local draft items and a metadata
 
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-Personal Claude and Codex capture hooks are enabled, but a positive Work capture remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). A fresh native Work corpus read returned zero repositories, with no as-of timestamp or truncation ([receipt](/private/tmp/am-hosted-corpus-read-parent-20261101/receipt.json)). The hosted corpus is enabled with a new SQLite namespace but has not been loaded or accepted; self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
+Personal Claude and Codex capture hooks are enabled. A synthetic Work digest upload and native capture-context recall passed; automatic session capture remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). A fresh native Work corpus read returned zero repositories, with no as-of timestamp or truncation ([receipt](/private/tmp/am-hosted-corpus-read-parent-20261101/receipt.json)). The hosted corpus is enabled with a new SQLite namespace but has not been loaded or accepted; self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
 
 ## Completed development milestones
 
@@ -55,7 +55,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 
 ### Work and project context
 
-- [ ] Remember project, commit, pull request and Jira references encountered during work, including IDs, URLs and useful context, so they can be found later. Do not read or manage PR or Jira feeds.
+- [x] Remember encountered project, commit, pull request and Jira references through the verified synthetic upload and graph/context flow. No PR or Jira feeds are collected.
 - [ ] Search and explore the project corpus; the hosted namespace is enabled but has not been loaded or accepted.
 - [ ] Provide current work boards and regular project reviews.
 

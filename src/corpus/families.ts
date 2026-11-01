@@ -216,6 +216,7 @@ export const HELD: Record<string, string> = {
 		"pattern_release_batch_repos", "pattern_bus_factor", "pattern_revert_stats", "pattern_cherry_pick_edges", "pattern_lineage_edges", "pattern_release_actor_yearly",
 		"pattern_branch_strategy_yearly", "pattern_current_repo_policies", "pattern_workflow_dependencies", "pattern_delivery_clusters"]),
 	...group(DERIVED_VIEW, Object.keys(VIEWS)),
+	...group("snapshot: loads only as the complete dated delivery_patterns set", ["pattern_release_batches", "pattern_release_batch_repos", "pattern_release_actor_yearly", "pattern_branch_strategy_yearly", "pattern_current_repo_policies", "pattern_workflow_dependencies", "delivery_clusters"]),
 	// Loaded only as the dated per-profile snapshot set `patterns` (snapshots.ts), which the route checks before this list.
 	...group("snapshot: loads only as the dated per-profile snapshot set patterns, whole and replaced by a newer cut", ["pattern_coordinated_changes",
 		"pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges", "pattern_findings", "pattern_finding_repos"]),

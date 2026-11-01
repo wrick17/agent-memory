@@ -700,7 +700,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
-		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended);
+		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
 			results.batch = await batch({ runner, config, clock });
@@ -716,14 +716,14 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
  * checkout scans) of each checkout whose session ended, through the corpus CLI with its own import config (corpus_config, default
  * migration/upload.json) and optional corpus_base, never the job token. Unchanged checkouts send nothing; failures stay here.
  */
-async function corpusAfterSessions(config, cwds) {
+async function corpusAfterSessions(config, cwds, runner) {
 	const roots = [...new Set([...cwds].map((c) => spawnSync("git", ["-C", c, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5000 }).stdout?.trim()).filter(Boolean))];
 	const out = { status: "ok", checkouts: roots.length };
 	try {
 		const { main } = await import("./corpus-cli.mjs");
 		for (const root of roots) {
 			const code = await main(["--git", root, "--profile", config.corpus_profile, ...(config.corpus_scans === true ? ["--scans"] : []),
-				...(typeof config.corpus_base === "string" ? ["--base", config.corpus_base] : []), ...(typeof config.corpus_config === "string" ? ["--config", config.corpus_config] : [])], "agent-memory run (corpus)");
+				...(typeof config.corpus_base === "string" ? ["--base", config.corpus_base] : []), ...(typeof config.corpus_config === "string" ? ["--config", config.corpus_config] : [])], "agent-memory run (corpus)", { runner, judgment: config.corpus_judgment === true, judgmentModel: config.batch_terra_model });
 			if (code !== 0) out.status = "incomplete";
 		}
 	} catch { out.status = "error"; }
@@ -917,7 +917,7 @@ export function parseEvents(stdout) {
  * `corpus-upload` runs the copied corpus CLI and its imports, laid out as in the source tree.
  */
 // corpus-upload's import closure in the source layout: its modules beside this CLI, and their domain imports at ../src/domain.
-const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
+const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
 const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
 
 export function install({ server = "https://memory.wrick17.com" } = {}) {

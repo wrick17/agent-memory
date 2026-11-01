@@ -277,8 +277,8 @@ function history(sql: SqlStorage, n: NodeRow, h: { limit: number; beforeRevision
 	return { revisions: kept.reverse(), next_before_revision: more ? kept[0]!.revision : null };
 }
 
-export interface RecallQuery { keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; asOf?: string }
-type Filter = { type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; asOf?: string };
+export interface RecallQuery { keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; includeCaptures?: boolean; asOf?: string }
+type Filter = { includeCaptures?: boolean; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; asOf?: string };
 
 /**
  * The record filters, over nodes `n`. With as_of they are a superset by the current row (type and kind never change; a scope may
@@ -294,7 +294,36 @@ export function filters(q: Filter): { where: string; params: SqlStorageValue[] }
 	if (q.type !== "all") { parts.push("n.memory_type = ?"); params.push(q.type); }
 	if (q.kinds?.length) { parts.push(`n.kind IN (${q.kinds.map(() => "?").join(",")})`); params.push(...q.kinds); }
 	if (q.scope !== undefined) { parts.push(q.asOf ? "(n.scope = ? OR n.revision > 1 OR n.origin = 'import')" : "n.scope = ?"); params.push(normalizeScope(q.scope)); }
-	return { where: parts.join(" AND "), params };
+	const capture = captureFilter(q);
+	return capture ? { where: `((${parts.join(" AND ")}) OR (${capture.where}))`, params: [...params, ...capture.params] }
+		: { where: parts.join(" AND "), params };
+}
+
+const isCapture = (n: NodeRow & { other_label?: string }) => n.kind === "session" || (n.kind === "other" && n.other_label === "capture");
+
+/** Only stored capture text, never manifests. A superseded heuristic is visible before its manifest was stored. */
+function captureVisible(at?: string): { where: string; params: SqlStorageValue[] } {
+	return at ? { where: `t.part = 'capture' AND t.lane = 'capture' AND t.capture_part IS NOT 'manifest'
+		AND coalesce(julianday(t.created_at) <= julianday(?), 0)
+		AND (t.live = 1 OR (t.capture_status = 'heuristic' AND EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id
+			AND m.capture_part = 'manifest' AND julianday(m.created_at) > julianday(?))))
+		AND (t.capture_status IS NOT 'heuristic' OR NOT EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id
+			AND m.capture_part = 'manifest' AND coalesce(julianday(m.created_at) <= julianday(?), 0)))`, params: [at, at, at] }
+		: { where: "t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.capture_part IS NOT 'manifest'", params: [] };
+}
+
+function captureFilter(q: Filter): { where: string; params: SqlStorageValue[] } | null {
+	// Captures have no memory type or memory kind. Explicit memory filters keep their existing meaning.
+	if (!q.includeCaptures || q.type !== "all" || q.kinds?.length) return null;
+	const v = captureVisible(q.asOf), params: SqlStorageValue[] = [];
+	const status = q.includeHistory ? "n.status IN ('candidate','dismissed','retired')" : "n.status = 'candidate'";
+	const candidate = q.asOf ? `(${status} OR (n.status IN ('dismissed','retired') AND n.revision = 2 AND julianday(n.updated_at) > julianday(?)))` : status;
+	if (q.asOf) params.push(q.asOf);
+	const parts = [`(n.kind = 'session' AND n.status = 'active' OR n.kind = 'other' AND n.other_label = 'capture' AND ${candidate})`];
+	if (q.asOf) { parts.push("coalesce(julianday(n.created_at) <= julianday(?), 0)"); params.push(q.asOf); }
+	if (q.scope !== undefined) { parts.push("n.scope = ?"); params.push(normalizeScope(q.scope)); }
+	parts.push(`EXISTS (SELECT 1 FROM texts t WHERE t.node_id = n.id AND ${v.where})`);
+	return { where: parts.join(" AND "), params: [...params, ...v.params] };
 }
 
 /** The ids among `ids` that pass the filters, so vector hits and graph neighbours meet the lexical channels' rule. */
@@ -308,7 +337,7 @@ export function filterIds(sql: SqlStorage, q: Filter, ids: string[]): Set<string
  * asked scope then (its current scope only where no snapshot names one). Without as_of every record the filters pass shows.
  */
 function admit(sql: SqlStorage, n: NodeRow, q: Filter): Past | null | undefined {
-	if (!q.asOf) return undefined;
+	if (!q.asOf || isCapture(n)) return undefined;
 	const p = pastOf(sql, n, q.asOf, false);
 	if (!p?.started || (!q.includeHistory && (p.status !== "active" || !p.valid))) return null;
 	if (q.scope !== undefined) {
@@ -321,7 +350,7 @@ interface Candidate { id: string; chunk?: number }
 
 /** The lexical channels, each a ranked list of distinct nodes with the chunk that matched. */
 export function lexicalChannels(sql: SqlStorage, q: RecallQuery, diagnostics: Record<string, string>): Record<string, Candidate[]> {
-	const f = filters(q);
+	const f = filters({ ...q, includeCaptures: false });
 	const keyword = q.keyword.trim();
 	const norm = normalizeName(keyword);
 	const exact = sql.exec<{ id: string }>(`SELECT n.id FROM nodes n WHERE (n.norm_name = ? OR n.key = ?) AND ${f.where} ORDER BY n.rowid LIMIT 20`, norm, keyword, ...f.params).toArray();
@@ -353,7 +382,28 @@ export function lexicalChannels(sql: SqlStorage, q: RecallQuery, diagnostics: Re
 	diagnostics.exact = exact.length ? `hits:${exact.length}` : "no_results";
 	diagnostics.literal ??= literals.length ? `hits:${literals.length}` : "no_results";
 	diagnostics.fulltext ??= fulltext.length ? `hits:${fulltext.length}` : "no_results";
-	return { exact, literal: literals, fulltext };
+	const capture = captureFilter(q);
+	if (!capture) return { exact, literal: literals, fulltext };
+	const v = captureVisible(q.asOf);
+	// The live FTS index cannot answer a historical cut, especially after heuristic supersession.
+	const textMatches = q.asOf ? sql.exec<{ id: string; chunk: number }>(`SELECT n.id, t.rowid AS chunk FROM texts t JOIN nodes n ON n.id = t.node_id
+		WHERE ${v.where} AND ${capture.where} AND (n.norm_name = ? OR n.key = ? OR EXISTS
+			(SELECT 1 FROM json_each(?) term WHERE instr(lower(t.body), lower(term.value)) > 0)) ORDER BY t.rowid LIMIT 200`,
+		...v.params, ...capture.params, norm, keyword, JSON.stringify([keyword, ...tokens])).toArray()
+		: fts ? sql.exec<{ id: string; chunk: number }>(`SELECT n.id, t.rowid AS chunk FROM captures_fts JOIN texts t ON t.rowid = captures_fts.rowid JOIN nodes n ON n.id = t.node_id
+			WHERE captures_fts MATCH ? AND ${v.where} AND ${capture.where} ORDER BY captures_fts.rank LIMIT 200`, fts, ...v.params, ...capture.params).toArray() : [];
+	const exactCaptures = sql.exec<{ id: string; chunk: number }>(`SELECT n.id, t.rowid AS chunk FROM nodes n JOIN texts t ON t.node_id = n.id
+		WHERE (n.norm_name = ? OR n.key = ?) AND ${capture.where} AND ${v.where} ORDER BY n.rowid, t.rowid LIMIT 20`,
+		norm, keyword, ...capture.params, ...v.params).toArray();
+	const captures = dedupe([...exactCaptures, ...textMatches]).slice(0, 200);
+	diagnostics.captures = captures.length ? `hits:${captures.length}` : "no_results";
+	// Share the existing 200-hit full-text cap, so opting in does not grow the 520-candidate fusion budget.
+	const combined: Candidate[] = [];
+	for (let i = 0; i < Math.max(fulltext.length, captures.length); i++) {
+		if (fulltext[i]) combined.push(fulltext[i]!);
+		if (captures[i]) combined.push(captures[i]!);
+	}
+	return { exact, literal: literals, fulltext: dedupe(combined).slice(0, 200) };
 }
 
 function dedupe(rows: Candidate[]): Candidate[] {
@@ -369,9 +419,10 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, all: Record<stri
 		// Each candidate's state at as_of; the exact channel is the records whose name or key then is the keyword.
 		const rows = sql.exec<NodeRow & { key: string | null }>("SELECT rowid, * FROM nodes WHERE id IN (SELECT value FROM json_each(?)) ORDER BY rowid",
 			JSON.stringify([...new Set(Object.values(all).flat().map((c) => c.id))])).toArray();
-		const then = new Map(rows.flatMap((n) => { const p = admit(sql, n, q); return p ? [[n.id, p] as const] : []; }));
+		const captures = new Set(rows.filter(isCapture).map((n) => n.id));
+		const then = new Map(rows.filter((n) => !isCapture(n)).flatMap((n) => { const p = admit(sql, n, q); return p ? [[n.id, p] as const] : []; }));
 		const exact = rows.filter((n) => then.has(n.id) && (normalizeName(str(then.get(n.id)!.snap, "name") ?? "") === norm || n.key === q.keyword.trim())).slice(0, 20).map((n) => ({ id: n.id }));
-		channels = { ...Object.fromEntries(Object.entries(all).map(([channel, list]) => [channel, list.filter((c) => then.has(c.id))])), exact };
+		channels = { ...Object.fromEntries(Object.entries(all).map(([channel, list]) => [channel, list.filter((c) => then.has(c.id) || captures.has(c.id))])), exact };
 		past = then;
 	}
 	const score = new Map<string, number>(), matched = new Map<string, Set<string>>(), chunk = new Map<string, number>();
@@ -399,7 +450,7 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, all: Record<stri
 	const full = new Map<string, Past>(), then = (n: NodeRow) => full.get(n.id) ?? full.set(n.id, pastOf(sql, n, q.asOf!, true)!).get(n.id)!;
 	const lower = q.keyword.trim().toLowerCase(), tokens = [...new Set((lower.match(TOKEN_RE) ?? []).filter((t) => t.length > 1))];
 	const shown = (x: { n: NodeRow }) => {
-		if (!past || ["exact", "graph"].some((c) => matched.get(x.n.id)!.has(c))) return true;
+		if (isCapture(x.n) || !past || ["exact", "graph"].some((c) => matched.get(x.n.id)!.has(c))) return true;
 		const p = then(x.n), s = p.snap;
 		const text = [p.content ?? "", ...["name", "description", "why", "how_to_apply", "objective"].map((k) => str(s, k) ?? ""), JSON.stringify(s.steps ?? [])].join("\n").toLowerCase();
 		return text.includes(lower) || tokens.some((t) => text.includes(t));
@@ -416,7 +467,8 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, all: Record<stri
 		pos++;
 	}
 	return [...head, ...below].map((x: { n: NodeRow; s: number; rank?: number }) =>
-		({ ...(past ? hitAt(who, x.n, then(x.n), x.s, [...matched.get(x.n.id)!].sort(), q.keyword)
+		({ ...(isCapture(x.n) ? captureHit(sql, who, x.n, q, x.s, [...matched.get(x.n.id)!].sort(), chunk.get(x.n.id))
+			: past ? hitAt(who, x.n, then(x.n), x.s, [...matched.get(x.n.id)!].sort(), q.keyword)
 			: hit(sql, who, x.n, x.s, [...matched.get(x.n.id)!].sort(), q.keyword, chunk.get(x.n.id))), ...(x.rank !== undefined ? { rank: x.rank } : {}) }));
 }
 
@@ -446,6 +498,24 @@ export function hit(sql: SqlStorage, who: Who, n: NodeRow, score: number, matche
 		provenance: { source_platform: n.source_platform, updated_source_platform: n.updated_source_platform, source_hash: policyOf(n.attrs)?.source_head.content_hash ?? n.content_hash, ...(policyOf(n.attrs) ? {hosted_view_hash:n.content_hash} : {}) },
 		freshness: { created_at: n.created_at, updated_at: n.updated_at, valid_from: n.valid_from, valid_until: n.valid_to },
 		row: n.rowid,
+	};
+}
+
+/** Captures are evidence, with no instruction authority or invented memory revision history. */
+function captureHit(sql: SqlStorage, who: Who, n: NodeRow, q: Filter & { keyword: string }, score: number, matchedBy: string[], chunk?: number): RecallHit {
+	const v = captureVisible(q.asOf);
+	const t = sql.exec<{ body: string; sha256: string | null; created_at: string }>(`SELECT t.body, t.sha256, t.created_at FROM texts t
+		WHERE t.node_id = ? AND ${v.where} ORDER BY (t.rowid = ?) DESC, t.rowid LIMIT 1`, n.id, ...v.params, chunk ?? -1).one();
+	const changed = q.asOf !== undefined && Date.parse(n.updated_at) > Date.parse(q.asOf);
+	const pending = changed && n.kind === "other" && n.revision === 2;
+	return {
+		memory_id: n.id, profile: who.profile, kind: n.kind, type: null, name: changed && !pending ? null : n.name, scope: changed && !pending ? null : n.scope, origin: n.origin,
+		status: pending ? "candidate" : changed ? null : n.status, revision: pending ? 1 : changed ? 0 : n.revision,
+		trust: "untrusted", instruction_authority: false,
+		passage: passage([t.body], q.keyword), matched_by: matchedBy, score: Math.round(score * 1e8) / 1e8, objective: null, step_count: 0,
+		provenance: { source_platform: n.source_platform, updated_source_platform: n.source_platform, source_hash: t.sha256 ?? sha256(t.body) },
+		freshness: { created_at: n.created_at, updated_at: t.created_at, valid_from: null, valid_until: null },
+		...(q.asOf ? { as_of: { recorded_at: t.created_at, valid: true, content_known: true } } : {}), row: n.rowid,
 	};
 }
 
@@ -485,7 +555,7 @@ export function inventory(sql: SqlStorage, who: Who, q: { after: number; limit: 
 		for (const n of rows) {
 			const p = admit(sql, n, q);
 			if (p === null) continue;
-			out.push(p ? hitAt(who, n, pastOf(sql, n, q.asOf!, true)!, 0, [], "") : hit(sql, who, n, 0, [], "", undefined));
+			out.push(isCapture(n) ? captureHit(sql, who, n, { ...q, keyword: "" }, 0, []) : p ? hitAt(who, n, pastOf(sql, n, q.asOf!, true)!, 0, [], "") : hit(sql, who, n, 0, [], "", undefined));
 			if (out.length === q.limit) return out;
 		}
 		if (rows.length < q.limit) return out;

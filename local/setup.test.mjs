@@ -633,8 +633,8 @@ describe("self-host setup", () => {
 		delete lock.version; delete lock.packages[""].version; delete lock.packages[""].engines;
 		assert.deepEqual(lock, sourceLock, "packaging preserves the pinned dependency graph");
 		assert.deepEqual(manifest.scripts, { setup: "node local/setup.mjs" });
-		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-cli.mjs", "corpus-git.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs", "setup.mjs"]);
-		assert.deepEqual(manifest.files, ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc", "npm-shrinkwrap.json"]);
+		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs", "setup.mjs"]);
+		assert.deepEqual(manifest.files, ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-judgment.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc", "npm-shrinkwrap.json"]);
 		for (const file of ["wrangler.jsonc", "agent-memory.setup.json", RECEIPTS_FILE, "agent-memory.setup.lock", ".dev.vars", "research", "test"])
 			assert.equal(fs.existsSync(path.join(stage, file)), false, file);
 		const readme = fs.readFileSync(path.join(stage, "README.md"), "utf8");

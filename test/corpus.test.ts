@@ -66,9 +66,9 @@ async function syntheticSource(fill: (sql: SqlStorage) => void = seed) {
 		source: {
 			schema: (t: string) => inSource((sql) => { const r = sql.exec<{ type: string; sql: string }>("SELECT type, sql FROM sqlite_master WHERE name = ?", t).toArray()[0]; return r?.type === "table" ? r.sql : null; }),
 			columns: (t: string) => inSource((sql) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?)", t).toArray().map((r) => r.name)),
-			rows: (t: string, cols: string[], key: string[], after: unknown[] | null, limit: number) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t}${after ? ` WHERE (${key.join(", ")}) > (${after.map(() => "?").join(", ")})` : ""} ORDER BY ${key.join(", ")} LIMIT ?`,
+			rows: (t: string, cols: string[], key: string[], after: unknown[] | null, limit: number) => inSource((sql) => [...sql.exec(`SELECT ${cols.map((c) => `"${c}"`).join(", ")} FROM ${t}${after ? ` WHERE (${key.join(", ")}) > (${after.map(() => "?").join(", ")})` : ""} ORDER BY ${key.join(", ")} LIMIT ?`,
 				...(after ?? []) as SqlStorageValue[], limit).raw()]),
-			repoRows: (t: string, cols: string[], repo: string, column?: string) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${column ?? (t === "repos" ? "full_name" : "repo")} = ?`, repo).raw()]),
+			repoRows: (t: string, cols: string[], repo: string, column?: string) => inSource((sql) => [...sql.exec(`SELECT ${cols.map((c) => `"${c}"`).join(", ")} FROM ${t} WHERE ${column ?? (t === "repos" ? "full_name" : "repo")} = ?`, repo).raw()]),
 		},
 	};
 }
@@ -86,6 +86,8 @@ function seed(sql: SqlStorage) {
 }
 
 const TABLES = ["repos", "commits", "refs", "commit_paths", "contributors"];
+const DELIVERY = ["pattern_release_batches", "pattern_release_batch_repos", "pattern_release_actor_yearly", "pattern_branch_strategy_yearly",
+	"pattern_current_repo_policies", "pattern_workflow_dependencies", "delivery_clusters"];
 
 describe("corpus main flow", () => {
 	it("loads a synthetic sample through the uploader and answers get, search and sql with as_of over /mcp", async () => {
@@ -304,7 +306,7 @@ describe("corpus read-only SQL", () => {
 		const dated = ["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges",
 			"pattern_findings", "pattern_finding_repos", "pull_requests", "pr_tickets", "pr_commit_links", "releases", "github_tags", "tickets", "ticket_episodes", "codex_sessions",
 			"session_commit_links", "session_ticket_links", "validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties",
-			"ownership", "predecessor_links", "journey_edges"];
+			"ownership", "predecessor_links", "journey_edges", ...DELIVERY];
 		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_partitions", "corpus_refresh", "corpus_refresh_parts", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos", ...SCAN_ORDER,
 			"corpus_snapshots", ...dated.flatMap((t) => [t, `corpus_stage_${t}`])].sort());
 		expect(tables).toContain("corpus_search_fts");
@@ -1095,7 +1097,8 @@ describe("corpus v5 record snapshots", () => {
 		expect(snapshotRequestId("c".repeat(64), "pattern_findings", [2])).toBe(`corpus:snapshot:${"c".repeat(64)}:pattern_findings:2`);
 		expect(SNAPSHOT_SETS.patterns).toEqual(["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits",
 			"pattern_lineage_edges", "pattern_findings", "pattern_finding_repos"]);
-		expect(CORPUS_MIGRATIONS).toHaveLength(5);
+		expect(CORPUS_MIGRATIONS).toHaveLength(6);
+		expect(SNAPSHOT_SETS.delivery_patterns).toEqual(DELIVERY);
 	});
 
 	it("pages, replays and restarts WITHOUT ROWID tickets by composite key; answers pr, ticket and session gets and explore; restores exact-NULL pr_key:1", async () => {
@@ -1156,7 +1159,7 @@ describe("corpus v5 record snapshots", () => {
 		expect((await explore("github:acme/web#12")).corpus).toMatchObject({ kind: "pr", key: "acme/web#12", counts: { pull_requests: 1, pr_tickets: 1, pr_commit_links: 1 } });
 		expect((await explore("jira:XP-1")).corpus).toMatchObject({ kind: "ticket", key: "XP-1", counts: { tickets: 3, ticket_episodes: 1, pr_tickets: 1, session_ticket_links: 1 } });
 
-		// Export/restore at schema 5: the never-uploaded pr_key:1 exports NULL and restores; a non-NULL value there refuses the restore.
+		// Export/restore at the current schema: the never-uploaded pr_key:1 exports NULL and restores; a non-NULL value there refuses the restore.
 		const admin = (cmd: Json) => accountStub(env, OWNER).admin(cmd as never) as Promise<Json>;
 		const onAccount = (f: (sql: SqlStorage) => void) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => f(s.storage.sql));
 		const move = (g: string) => onAccount((sql) => {
@@ -1196,5 +1199,96 @@ describe("corpus v5 record snapshots", () => {
 		expect((await w.terms()).join(" ")).not.toMatch(/@|REDACTED|carol-gh/);
 		const rows = await (w.corpus() as unknown as Rpc).query(w.ref("work"), { action: "sql", sql: "SELECT \"trigger\" FROM frontend_workflows" });
 		expect(rows.value.rows).toEqual([["click pay"]]);
+	});
+});
+
+describe("corpus schema-6 delivery snapshots", () => {
+	const delivery = (tag: string) => (sql: SqlStorage) => {
+		sql.exec("INSERT INTO pattern_release_batches VALUES (?, '2026-07-01', '2026-07-02', 24, 1, 1, '[\"Release Author\"]', '[\"main\"]', 'high')", tag);
+		sql.exec("INSERT INTO pattern_release_batch_repos VALUES (?, 'acme/releases', '2026-07-02', 'main', 'Release Author', 'https://example.invalid/release')", tag);
+		sql.exec("INSERT INTO pattern_release_actor_yearly VALUES ('2026', 'Release Author', 1, 1, 1, '2026-07-01', '2026-07-02')");
+		sql.exec("INSERT INTO pattern_branch_strategy_yearly VALUES ('2026', 'main', 1, 1)");
+		sql.exec("INSERT INTO pattern_current_repo_policies VALUES ('acme/releases', 'main', 1, 0, 1, 1, 1, 'Contact ops@acme.example')");
+		sql.exec("INSERT INTO pattern_workflow_dependencies VALUES ('acme/build/action@v1', 1, 1, 1, 1, 'high')");
+		sql.exec("INSERT INTO delivery_clusters VALUES ('release', ?, 'high', '2026-07-01', '2026-07-02', 1, 1, '[]')", tag);
+	};
+
+	it("publishes all seven tables together with dates, privacy and work guards; no partial or stage reads escape", async () => {
+		const w = await workAccount(), { source } = await syntheticSource(delivery("v1"));
+		const rpc = w.corpus() as unknown as { query(who: unknown, q: unknown): Promise<Json> };
+		const sql = async (q: string) => rpc.query(w.ref("work"), { action: "sql", sql: q });
+		const st = await w.client.status("work");
+		expect(st.snapshot_families.filter((f: Json) => f.set === "delivery_patterns").map((f: Json) => f.table)).toEqual(DELIVERY);
+		const { chunkHash } = await import("../src/corpus/families");
+		const f = st.snapshot_families.find((f: Json) => f.table === "pattern_release_batches");
+		for (const authors of ['[{"name":"Unvalidated Person"}]', '["contact@acme.example"]']) {
+			const c = { table: f.table, schema_sha256: f.schema_sha256, source: { file_sha256: FILE }, as_of: AS_OF, columns: f.columns, after: null, final: true,
+				rows: [[1, "v1", null, null, 1, 1, 1, authors, "[]", "high"]] };
+			expect(await w.http("/v1/corpus/import", { profile: "work", generation: st.generation, ...c, sha256: chunkHash(c) }))
+				.toMatchObject({ status: 400, data: { error: { code: "validation" } } });
+		}
+		expect(await uploadCorpus({ source, client: w.client, profile: "work", tables: DELIVERY.slice(0, -1), asOf: AS_OF, fileSha256: FILE }))
+			.toMatchObject({ status: "refused", reason: "snapshot_set_incomplete" });
+		let sends = 0;
+		const stopped = { status: w.client.status, send: async (c: unknown) => { if (++sends === 7) throw new Error("offline"); return w.client.send(c); } };
+		expect(await uploadCorpus({ source, client: stopped, profile: "work", tables: DELIVERY, asOf: AS_OF, fileSha256: FILE })).toMatchObject({ status: "stopped" });
+		for (const t of DELIVERY) expect((await sql(`SELECT count(*) FROM ${t}`)).value.rows).toEqual([[0]]);
+		expect(await sql("SELECT * FROM corpus_stage_pattern_release_batches")).toMatchObject({ ok: false, error: { details: { reason: "sql_refused" } } });
+		expect(await uploadCorpus({ source, client: w.client, profile: "work", tables: DELIVERY, asOf: AS_OF, fileSha256: FILE })).toMatchObject({ status: "done" });
+		for (const t of DELIVERY) {
+			const read = (await sql(`SELECT rowid FROM ${t}`)).value;
+			expect(read.rows).toEqual([[1]]);
+			expect(read.as_of[t]).toMatchObject({ as_of: AS_OF, rows: 1, complete: true, source_sha256: FILE });
+		}
+		expect((await sql("SELECT observation_caveat FROM pattern_current_repo_policies")).value.rows).toEqual([["Contact [REDACTED]"]]);
+		expect(await w.terms()).toEqual(expect.arrayContaining(["acme/releases", "Release Author"]));
+		expect((await w.terms()).join(" ")).not.toMatch(/contact@|Unvalidated/);
+		const newer = (await syntheticSource(delivery("v2"))).source;
+		expect(await uploadCorpus({ source: newer, client: w.client, profile: "work", tables: DELIVERY, asOf: CUT, fileSha256: FILE2 })).toMatchObject({ status: "done" });
+		expect((await sql("SELECT tag_name FROM pattern_release_batches")).value).toMatchObject({ rows: [["v2"]], as_of: { pattern_release_batches: { as_of: CUT } } });
+	});
+
+	it("exports and restores all seven tables, refuses a schema-5 manifest, and wipes live, stage and ledger state", async () => {
+		const p = await isolated(), { source } = await syntheticSource(delivery("v1"));
+		expect(await uploadCorpus({ source, client: p.client, profile: p.name, tables: DELIVERY, asOf: AS_OF, fileSha256: FILE })).toMatchObject({ status: "done" });
+		const { accountStub } = await import("../src/mcp");
+		const { exportStore, readManifest } = await import("../src/backup");
+		const { SNAPSHOTS, stageName } = await import("../src/corpus/snapshots");
+		const admin = (cmd: Json) => accountStub(env, OWNER).admin(cmd as never) as Promise<Json>;
+		const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${p.generation}`));
+		// Produce a valid encrypted old-version manifest on synthetic storage to exercise the actual schema gate.
+		const old = await runInDurableObject(store, async (_i, s) => {
+			s.storage.sql.exec("UPDATE corpus_store_meta SET value = '5' WHERE key = 'schema_version'");
+			try { return await exportStore(s.storage, env, { store: `corpus-${p.name}`, userId: OWNER, profile: p.name, generation: p.generation,
+				metaTable: "corpus_store_meta", control: Object.keys(SNAPSHOTS).map(stageName), rowid: true }); }
+			finally { s.storage.sql.exec("UPDATE corpus_store_meta SET value = '6' WHERE key = 'schema_version'"); }
+		});
+		expect(old.ok).toBe(true);
+		if (!old.ok) throw new Error(old.error.message);
+		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: old.value.id })).toMatchObject({ ok: false, error: { code: "validation", message: expect.stringContaining("schema version") } });
+		const exported = await admin({ op: "export", profile: p.name, corpus: true });
+		const id = exported.value[`corpus-${p.name}`].id;
+		const m = await readManifest(env, `corpus-${p.name}`, id, OWNER);
+		expect(m.ok && m.value.schema_version).toBe(6);
+		for (const t of DELIVERY) expect(m.ok && m.value.counts[t]).toBe(1);
+		expect(m.ok && Object.keys(m.value.counts).some((t) => t.startsWith("corpus_stage_"))).toBe(false);
+		const generation = rand();
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => {
+			s.storage.sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", generation, `${OWNER}:${p.name}:${generation}`, p.name);
+			s.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", generation, p.name, new Date().toISOString());
+		});
+		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: id })).toMatchObject({ ok: true });
+		expect(await admin({ op: "restoreStep" })).toMatchObject({ ok: true, value: { state: "ready" } });
+		expect(await admin({ op: "openRestore" })).toMatchObject({ ok: true });
+		const restored = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${generation}`));
+		const counts = () => runInDurableObject(restored, (_i, s) => DELIVERY.map((t) => s.storage.sql.exec<{ n: number }>(`SELECT count(*) AS n FROM ${t}`).one().n));
+		expect(await counts()).toEqual(DELIVERY.map(() => 1));
+		// Also leave one unpublished newer table: wipe must clear both cuts and all stages.
+		let sent = 0;
+		expect(await uploadCorpus({ source, client: { status: p.client.status, send: async (c: unknown) => { if (++sent > 1) throw new Error("offline"); return p.client.send(c); } },
+			profile: p.name, tables: DELIVERY, asOf: CUT, fileSha256: FILE2 })).toMatchObject({ status: "stopped" });
+		expect(await admin({ op: "wipeProfile", profile: p.name, typed: p.name })).toMatchObject({ ok: true });
+		expect(await runInDurableObject(restored, (_i, s) => s.storage.sql.exec("SELECT name FROM sqlite_master").toArray())).toEqual([{ name: "corpus_store_meta" }]);
+		expect(await restored.query({ ...p.who, generation }, { action: "sql", sql: "SELECT 1" })).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
 	});
 });

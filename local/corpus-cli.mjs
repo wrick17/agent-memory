@@ -9,6 +9,7 @@ import path from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { refreshCheckouts } from "./corpus-git.mjs";
+import { refreshJudgment } from "./corpus-judgment.mjs";
 import { refreshCorpus } from "./corpus-refresh.mjs";
 import { uploadCorpus } from "./corpus-upload.mjs";
 
@@ -119,7 +120,7 @@ export function httpClient({ config, fetchImpl = fetch, sleep = (ms) => new Prom
 }
 
 /** The foreground command, also run as `agent-memory corpus-upload`. Resolves to the process exit code. */
-export async function main(args, command = "node local/corpus-cli.mjs") {
+export async function main(args, command = "node local/corpus-cli.mjs", { runner, judgment = false, judgmentModel } = {}) {
 	const opt = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
 	const [db, profile, tables, asOf, repo, checkouts] = [opt("db"), opt("profile"), opt("tables"), opt("as-of"), opt("refresh"), opt("git")?.split(",").filter(Boolean)];
 	const fromGit = checkouts?.length && profile && !db && !tables && !asOf && !args.includes("--remove") && (!repo || checkouts.length === 1);
@@ -139,8 +140,12 @@ export async function main(args, command = "node local/corpus-cli.mjs") {
 				try {
 					let state = {};
 					try { state = JSON.parse(fs.readFileSync(statePath, "utf8")); } catch (e) { if (e.code !== "ENOENT") throw e; }
-					return await refreshCheckouts({ checkouts: checkouts.map((c) => path.resolve(expand(c))), explicit: repo ?? null, profile, client: httpClient({ config }), state,
+					const checkoutsResolved = checkouts.map((c) => path.resolve(expand(c)));
+					const results = await refreshCheckouts({ checkouts: checkoutsResolved, explicit: repo ?? null, profile, client: httpClient({ config }), state,
 						save: (s) => writePrivate(statePath, JSON.stringify(s, null, 2)), base, openSource: sqliteSource, refresh: refreshCorpus, scans });
+					if (judgment) results.push(await refreshJudgment({ checkouts: checkoutsResolved, profile, client: httpClient({ config }), base, runner, state,
+						save: (s) => writePrivate(statePath, JSON.stringify(s, null, 2)), openSource: sqliteSource, candidateFile: `${statePath}.judgment.sqlite`, writePrivate, model: judgmentModel }));
+					return results;
 				} finally { base?.close(); }
 			});
 			process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);

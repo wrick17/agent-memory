@@ -718,6 +718,11 @@ describe("recovery and install", () => {
 		assert.equal(fs.readlinkSync(bin), "agent-memory.mjs");
 		assert.equal(fs.statSync(`${bin}.mjs`).mode & 0o777, 0o700);
 		assert.equal(fs.statSync(path.join(am.home(), "bin", "batch.mjs")).mode & 0o777, 0o600);
+		for (const file of ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"]) {
+			const installed = path.join(path.dirname(bin), file);
+			assert.equal(fs.statSync(installed).mode & 0o777, 0o600);
+			assert.deepEqual(fs.readFileSync(installed), fs.readFileSync(new URL(`./${file}`, import.meta.url)));
+		}
 		for (const d of [am.home(), path.dirname(bin)]) assert.equal(fs.statSync(d).mode & 0o777, 0o700);
 		assert.equal(fs.readFileSync(cfg, "utf8"), "{\"server\":\"https://kept.example\"}");
 		assert.equal(fs.readFileSync(`${bin}.mjs`, "utf8"), fs.readFileSync(new URL("./agent-memory.mjs", import.meta.url), "utf8"));
@@ -726,6 +731,7 @@ describe("recovery and install", () => {
 		const cmd = await import(pathToFileURL(bin).href), mjs = await import(pathToFileURL(`${bin}.mjs`).href);
 		assert.equal(cmd, mjs);
 		await import(pathToFileURL(path.join(path.dirname(bin), "batch.mjs")).href);
+		await import(pathToFileURL(path.join(path.dirname(bin), "corpus-judgment.mjs")).href);
 		assert.ok(cmd.takeLock());
 		try { mjs.assertMachineLock(); } finally { cmd.dropLock(); }
 		const usage = spawnSync(bin, [], { encoding: "utf8", env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
@@ -745,6 +751,10 @@ describe("recovery and install", () => {
 	it("runs corpus-upload from the installed command alone, through the corpus CLI's arguments and uploader to a local fake server", async () => {
 		const { DatabaseSync } = await import("node:sqlite"), http = await import("node:http");
 		const { bin } = am.install();
+		const defaults = am.loadConfig();
+		assert.deepEqual(defaults.batch_profiles, []);
+		assert.equal(Object.hasOwn(defaults, "corpus_profile"), false);
+		assert.equal(Object.hasOwn(defaults, "corpus_judgment"), false);
 		// One synthetic table under its retained original DDL (src/corpus/families.ts); the email column never uploads.
 		const ddl = "CREATE TABLE contributors(\n  repo TEXT,\n  rank INT,\n  commits INT,\n  name TEXT,\n  email TEXT\n)";
 		const dir = fs.mkdtempSync(path.join(tmp, "corpus-")), file = path.join(dir, "sample.sqlite");
@@ -845,16 +855,37 @@ describe("optional corpus refresh after SessionEnd", () => {
 		spawnSync("git", ["init", "-q", repo]);
 		const f = transcript(`corpus-end-${n}`, [claudeLine("user", "hello")]);
 		const trigger = (session, event) => am.hook("claude-code", JSON.stringify({ session_id: session, transcript_path: f, cwd: repo, hook_event_name: event }), { spawnRun: false });
+		let judgmentCalls = 0;
+		const runner = { ...keepAllRunner(), exec: async () => { judgmentCalls++; throw new Error("judgment is disabled"); } };
 		trigger("c1", "SessionEnd");
-		assert.equal((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, undefined, "no config, no corpus work");
+		assert.equal((await am.run({ server: fakeServer(), runner, debounceMs: 0 })).results.corpus, undefined, "no config, no corpus work");
 		const token = path.join(tmp, `corpus-token-${n}`), cfg = path.join(tmp, `corpus-upload-${n}.json`);
 		fs.writeFileSync(token, "am_import_fake", { mode: 0o600 });
 		fs.writeFileSync(cfg, JSON.stringify({ server: "http://127.0.0.1:9", token_file: token }), { mode: 0o600 });
 		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ corpus_profile: "test", corpus_config: cfg }));
 		trigger("c2", "Stop");
-		assert.equal((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, undefined, "only an ended session triggers it");
+		assert.equal((await am.run({ server: fakeServer(), runner, debounceMs: 0 })).results.corpus, undefined, "only an ended session triggers it");
 		trigger("c3", "SessionEnd");
 		// The checkout has no origin, so the corpus CLI refuses it before any request (the configured server is a closed port).
-		assert.deepEqual((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, { status: "incomplete", checkouts: 1 });
+		assert.deepEqual((await am.run({ server: fakeServer(), runner, debounceMs: 0 })).results.corpus, { status: "incomplete", checkouts: 1 });
+		assert.equal(judgmentCalls, 0, "corpus_profile alone never opts into judgment");
+	});
+});
+
+
+describe("self-host corpus judgment closure", () => {
+	it("stages and loads the judgment module with its existing CLI closure", async () => {
+		const { stageSelfHost } = await import("./package.mjs");
+		const { fileURLToPath, pathToFileURL } = await import("node:url");
+		const root = fileURLToPath(new URL("../", import.meta.url));
+		const stage = path.join(fs.mkdtempSync(path.join(tmp, "judgment-package-")), "source");
+		stageSelfHost(root, stage);
+		const file = "local/corpus-judgment.mjs";
+		for (const manifest of [JSON.parse(fs.readFileSync(path.join(root, "package.json"))), JSON.parse(fs.readFileSync(path.join(stage, "package.json")))]) {
+			assert.ok(manifest.files.includes(file));
+		}
+		assert.deepEqual(fs.readFileSync(path.join(stage, file)), fs.readFileSync(path.join(root, file)));
+		assert.equal(fs.statSync(path.join(stage, file)).mode & 0o777, 0o644);
+		assert.equal(typeof (await import(pathToFileURL(path.join(stage, "local/corpus-cli.mjs")).href)).main, "function");
 	});
 });

@@ -1,9 +1,9 @@
 // G4 isolation and the local half of G5 (vector channel, 300 ms fallback, EMBEDDINGS=off), plus generation identities.
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountStore } from "../src/account/store";
-import { requestHash } from "../src/domain/ids";
+import { requestHash, sha256 } from "../src/domain/ids";
 import { redactPayload } from "../src/domain/redact";
 import { accountStub } from "../src/mcp";
 import { call, contextFor, deviceToken, devicePrincipal, OWNER, outcome } from "./helpers";
@@ -40,6 +40,46 @@ describe("G4 isolation", () => {
 		expect(new Set(r.results.map((x) => x.profile))).toEqual(new Set(["work", "me"]));
 		expect(r.results.map((x) => x.memory_id)).toEqual(expect.arrayContaining([work.memory_id, me.memory_id]));
 		expect(await outcome(c, "get_memory", { name: "Lockfile habit", repo: workRepo })).toMatchObject({ ok: false, error: { code: "ambiguous" } });
+	});
+
+	it("opts into only routed Work captures, retaining ordinary me memories and refusing foreign or unreadable routes", async () => {
+		const c = await contextFor(undefined, { EMBEDDINGS: "off" });
+		const { token } = await deviceToken("capture-routing-job", ["ingest"], ["work", "personal", "me"], "work");
+		const origin = new URL(env.RESOURCE_URL).origin;
+		for (const profile of ["work", "personal"]) {
+			const session = { client: "codex", id: `capture-routing-${profile}` };
+			const range_id = `codex:${session.id}:abcdef01:0-100`;
+			const body = JSON.stringify({ asks: [], decisions: [], corrections: [{ text: `recallboundary ${profile} context stays in its profile.`, pos: 1 }],
+				outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			const hash = sha256(body);
+			const response = await exports.default.fetch(new Request(`${origin}/v1/ingest`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+				body: JSON.stringify({ profile, session, digests: [{ range_id, capture_status: "consolidated", part_id: "0-100", sha256: hash, body }], manifests: [{ range_id, parts: [{ part_id: "0-100", sha256: hash }] }] }) }));
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ profile, results: [{ status: "stored" }, { status: "stored" }] });
+		}
+		const me = await call(c, "save_memory", { name: "recallboundary preference", type: "user", description: "a general preference", content: "recallboundary shared preference", profile: "me", company_free: true });
+		type R = { read_set: string[]; results: { memory_id: string; profile: string; kind: string; passage: string; name: string }[] };
+		const args = { keyword: "recallboundary", repo: workRepo, include_captures: true };
+		const work = await call<R>(c, "recall_memories", args);
+		expect(work.read_set).toEqual(["work", "me"]);
+		expect(work.results).toHaveLength(2);
+		expect(work.results).toEqual(expect.arrayContaining([
+			expect.objectContaining({ profile: "work", kind: "session", passage: expect.stringContaining("recallboundary work context") }),
+			expect.objectContaining({ profile: "me", memory_id: me.memory_id }),
+		]));
+		expect(JSON.stringify(work.results)).not.toContain("recallboundary personal context");
+		const plain = await call<R>(c, "recall_memories", { ...args, include_captures: false });
+		expect(plain.results.map((r) => r.memory_id)).toEqual([me.memory_id]);
+		const personal = await call<R>(c, "recall_memories", { keyword: "recallboundary", profile: "personal", include_captures: true });
+		expect(personal.results.filter((r) => r.kind === "session")).toEqual([expect.objectContaining({ profile: "personal", passage: expect.stringContaining("recallboundary personal context") })]);
+		const meOnly = await call<R>(c, "recall_memories", { keyword: "recallboundary", profile: "me", include_captures: true });
+		expect(meOnly.results.map((r) => r.memory_id)).toEqual([me.memory_id]);
+		const { token: readerToken } = await deviceToken("capture-work-reader", ["read"], ["work", "me"], "work");
+		const reader = await contextFor(devicePrincipal(readerToken), { EMBEDDINGS: "off" });
+		expect((await call<R>(reader, "recall_memories", args)).results).toEqual(work.results);
+		expect(await outcome(reader, "recall_memories", { keyword: "recallboundary", profile: "personal", include_captures: true })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+		const ingestOnly = await contextFor(devicePrincipal(token), { EMBEDDINGS: "off" });
+		expect(await outcome(ingestOnly, "recall_memories", args)).toMatchObject({ ok: false, error: { code: "forbidden" } });
 	});
 
 	it("guards every write into me", async () => {

@@ -187,8 +187,8 @@ export interface Identity { memory_id?: string; name?: string; scope?: string; t
 
 export type ReadQuery =
 	| { kind: "get"; target: Identity; includeRetired: boolean; history?: { limit: number; beforeRevision?: number }; content?: { complete: boolean; cursor?: string }; asOf?: string }
-	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; semantic: boolean; deadline: number; expand: boolean; asOf?: string }
-	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; asOf?: string }
+	| { kind: "recall"; keyword: string; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; limit: number; includeHistory: boolean; includeCaptures?: boolean; semantic: boolean; deadline: number; expand: boolean; asOf?: string }
+	| { kind: "inventory"; after: number; limit: number; type: MemoryType | "all"; kinds?: MemoryKind[]; scope?: string; includeHistory: boolean; includeCaptures?: boolean; asOf?: string }
 	| { kind: "has"; id: string }
 	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number; asOf?: string }
 	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" | "texts" }

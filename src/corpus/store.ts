@@ -9,7 +9,7 @@ import { migrate, type Migration } from "../storage";
 import { chunkHash, checkChunk as checkBulkChunk, chunkTerms as bulkTerms, FAMILIES, manifest, named, requestIdOf, SCANS, scanManifest, SEARCH_DDL, VIEWS, type Family, type Key, type Value } from "./families";
 import { get, runSql, search, type CorpusQuery, type Head } from "./query";
 import { addToPartitions, META, MIGRATION, refresh, refreshActive, refreshStatus, type RefreshCommand } from "./refresh";
-import { abandonLoadingCuts, applySnapshotChunk, checkSnapshotChunk, isSnapshot, SNAPSHOT_MIGRATION, SNAPSHOT_MIGRATION_5, SNAPSHOTS, snapshotManifest, snapshotStatus, snapshotTableOf, snapshotTerms, stageName } from "./snapshots";
+import { abandonLoadingCuts, applySnapshotChunk, checkSnapshotChunk, isSnapshot, SNAPSHOT_MIGRATION, SNAPSHOT_MIGRATION_5, SNAPSHOT_MIGRATION_6, SNAPSHOTS, snapshotManifest, snapshotStatus, snapshotTableOf, snapshotTerms, stageName } from "./snapshots";
 
 export { CHUNK_ROWS, FAMILIES, FORBIDDEN, HELD, manifest, refusal, SCAN_ORDER, SCANS, VIEWS } from "./families";
 /** The route's stateless chunk check: dated snapshot tables first (before HELD), every other table by its bulk family. */
@@ -37,7 +37,7 @@ export const CORPUS_MIGRATIONS: Migration[] = [[
 // Dated per-profile snapshot sets: live tables under their original DDL, one stage each, and the cut ledger (snapshots.ts).
 SNAPSHOT_MIGRATION,
 // The v5 record-type sets (PRs, releases, tickets, session metadata, curated judgment): live tables with their original indexes, and stages.
-SNAPSHOT_MIGRATION_5];
+SNAPSHOT_MIGRATION_5, SNAPSHOT_MIGRATION_6];
 
 export interface CorpusChunk { table: string; schema_sha256: string; source: { file_sha256: string }; as_of: string; columns: string[]; after: Key | null; rows: Value[][]; final: boolean; sha256: string }
 export interface ChunkReceipt { status: "stored" | "replayed"; request_id: string; table: string; rows: number; last_key: Key | null; complete: boolean; sha256: string; rows_written?: number }
