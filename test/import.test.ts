@@ -114,17 +114,17 @@ describe("profile schema v3 and v4", () => {
 	});
 });
 
-describe("account schema v2 to v4", () => {
+describe("account schema v1 to v6", () => {
 	it("upgrades a v1 account in place and keeps every modern binding as it was", async () => {
 		await contextFor();
 		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, s) => {
 			const sql = s.storage.sql;
 			// Back to the deployed v1 shape, with a v1 binding, then run the migrations again.
-			for (const q of ["DROP TABLE refresh_days", "DROP TABLE transfers", "DROP TABLE wipes", "ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
+			for (const q of ["DROP TABLE review_items", "DROP TABLE refresh_days", "DROP TABLE transfers", "DROP TABLE wipes", "ALTER TABLE request_index DROP COLUMN pending", "ALTER TABLE request_index DROP COLUMN legacy"]) sql.exec(q);
 			sql.exec("UPDATE account_meta SET value = '1' WHERE key = 'schema_version'");
 			sql.exec("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq) VALUES ('v1-binding', 'personal', 'save_memory', 'hash-v1', ?, 1)", AT);
 			migrate(s.storage, "account_meta", ACCOUNT_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("5");
+			expect(sql.exec("SELECT value FROM account_meta WHERE key = 'schema_version'").one().value).toBe("6");
 			expect(sql.exec("SELECT request_id, profile, op, payload_hash, at, seq, legacy, pending FROM request_index WHERE request_id = 'v1-binding'").one())
 				.toEqual({ request_id: "v1-binding", profile: "personal", op: "save_memory", payload_hash: "hash-v1", at: AT, seq: 1, legacy: 0, pending: 0 });
 			sql.exec("INSERT INTO wipes (profile, generations, wiped_at, node_count, marker_key, report, seq) VALUES ('test', '[]', ?, 0, 'k', '{}', 2)", AT);

@@ -55,6 +55,39 @@ describe("capture ingest", () => {
 		expect(inventory.results.some((r) => r.name.startsWith("session:"))).toBe(false);
 	});
 
+	it("links the session to the PR, ticket and commit references its digest names, keeping the literal URLs and context", async () => {
+		const { token } = await deviceToken("capture-refs", ["ingest"], ["test"], "test");
+		const c = await contextFor();
+		type Link = { rel: string; from?: { id: string; name: string }; to?: { id: string; name: string } };
+		const linkedFrom = async (key: string) => Object.values((await call<{ links: Record<string, Link[]> }>(c, "explore", { node: { key }, profile: "test" })).links).flat()
+			.filter((l) => l.rel === "relates_to").map((l) => l.from?.name);
+		// The PR is already known; the ticket is recorded only after the session mentions it.
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "pr", key: "github:acme/web#42", name: "Fix login timeout" }] });
+		const sessionRefs = { client: "codex" as const, id: "thr_refs" };
+		// The heuristic digest local/agent-memory.test.mjs builds from a synthetic transcript naming these references.
+		const body = JSON.stringify({
+			asks: [{ text: "Fix PROJ-123: the login page times out after 30 seconds.", pos: 0 }], decisions: [], corrections: [],
+			outcomes: { commits: ["Pushed acme/web@0a1b2c3d4e with the shorter retry.", "0a1b2c3d4e"], prs: ["Opened https://github.com/acme/web/pull/42 to fix the login timeout."], tests: [] },
+			entities: ["PROJ-123", "https://acme.atlassian.net/browse/PROJ-123", "https://github.com/acme/web/pull/42", "acme/web@0a1b2c3d4e"], dropped: { asks: 0, decisions: 0, corrections: 0 },
+		});
+		const up = part("-", body, "heuristic", "codex:thr_refs:0a1b2c3d:0-900");
+		expect((await post(token, "/v1/ingest", { session: sessionRefs, digests: [up] })).data.results![0]!.status).toBe("stored");
+		expect(await linkedFrom("github:acme/web#42")).toEqual(["session:codex:thr_refs"]);
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "ticket", key: "jira:PROJ-123", name: "Login page times out" }] });
+		expect(await linkedFrom("jira:PROJ-123")).toEqual(["session:codex:thr_refs"]);
+		// A replay links again without a duplicate; the literal references and their context stay in the capture lane, out of recall.
+		expect((await post(token, "/v1/ingest", { session: sessionRefs, digests: [up] })).data.results![0]!.status).toBe("replayed");
+		expect(await linkedFrom("github:acme/web#42")).toEqual(["session:codex:thr_refs"]);
+		const ref = c.account.profiles.find((p) => p.profile === "test")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, s) => {
+			const sql = s.storage.sql;
+			const node = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'session:codex:thr_refs'").one().id;
+			expect(sql.exec("SELECT kind, ref FROM evidence WHERE owner = ? ORDER BY ref", `n:${node}`).toArray()).toEqual([{ kind: "mention", ref: "git:acme/web@0a1b2c3" }, { kind: "mention", ref: "git:acme/web@0a1b2c3d4e" }]);
+			expect(sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part = 'capture'", node).one().body).toBe(body);
+		});
+		expect((await call<{ results: unknown[] }>(c, "recall_memories", { keyword: "login timeout", profile: "test" })).results.every((r) => !(r as { name: string }).name.startsWith("session:"))).toBe(true);
+	});
+
 	it("refuses lossy, oversized or whole-message parts, foreign ranges, me, and tokens without the ingest scope", async () => {
 		const { token } = await deviceToken("capture-job-2", ["ingest"], ["test", "me"], "test");
 		const range = "codex:thr_fixture2:0a1b2c3d:0-100";

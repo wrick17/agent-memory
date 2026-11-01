@@ -26,6 +26,7 @@ import { commitKey, naturalRequest, putMarker, uploadKey } from "./work-upload";
 import { ackPart, assertRefreshOpen, installMirror, markRegistered, partCheck, progress, receiptSeq, sealPlan, terminal, type Binding, type PartMeta, type PartReply, type Parts, type Payload, type Terminal, type TerminalReply } from "./daily-proof";
 import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
 import { applyRows, exportStore, exportTables, readChunk, readManifest } from "../backup";
+import { recoveryCopy, settleFacts, settleStep, undoPreflight, type RecoveryCopy, type SettleFacts, type TransferScanRow } from "./settle";
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
@@ -35,6 +36,7 @@ export type { OpOutcome } from "./maintenance";
 export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLink, type NodeRef, type NodeSummary } from "./graph";
 export { bundleTexts, type Entry, type TransferOut, type TransferStep } from "./transfer";
 export type { Page, PurgeResult, WipeOut, WipeStep } from "./wipe";
+export { settleRule, type Identity, type RecoveryCopy, type SettleAction, type SettleFacts, type SettlePlan, type TransferScanRow } from "./settle";
 export { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms } from "./work-upload";
 export type { Binding, PartMeta, Parts, Payload, Terminal, TerminalReply } from "./daily-proof";
 
@@ -57,8 +59,10 @@ const PROFILE_CONTROL = ["cursors", "transfer_parts"];
 const RESTORE_SKIP = new Set(["user_id", "profile", "generation", "schema_version", "closed"]);
 export interface RestoredPage {
 	nodes: { id: string; status: string }[];
-	requests: { request_id: string; op: string; payload_hash: string; at: string; legacy_op: string | null; legacy_hash: string | null }[];
+	requests: { request_id: string; op: string; payload_hash: string; at: string; legacy_op: string | null; legacy_hash: string | null; node_id: string | null; node_status: string | null }[];
 	open_transfers: number;
+	/** The first 50 unfinished transfer ids, on the first page only. */
+	open_transfer_ids: string[];
 }
 /** The account or the local closed marker refused this generation during an alarm; `retry` when it was an account recovery. */
 class Stopped { constructor(readonly retry: boolean) {} }
@@ -205,13 +209,14 @@ export class ProfileStore extends DurableObject<Env> {
 	async restoredPage(who: Who, after: { node: string; request: string }): Promise<Outcome<RestoredPage>> {
 		const sql = this.ctx.storage.sql;
 		// A live generation pages too, for an account restore; an unbound one holds nothing. Only another identity or an unfinished restore is refused.
-		if (!this.who()) return ok({ nodes: [], requests: [], open_transfers: 0 });
+		if (!this.who()) return ok({ nodes: [], requests: [], open_transfers: 0, open_transfer_ids: [] });
 		const has = (k: string) => sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", k).toArray().length > 0;
 		if (!this.same(who) || (has("restore_id") && !has("restore_done"))) return fail("validation", "this generation holds no finished restore");
 		return ok({
 			nodes: sql.exec<{ id: string; status: string }>("SELECT id, status FROM nodes WHERE id > ? ORDER BY id LIMIT 200", after.node).toArray(),
-			requests: sql.exec<RestoredPage["requests"][number]>("SELECT request_id, op, payload_hash, at, legacy_op, legacy_hash FROM requests WHERE request_id > ? ORDER BY request_id LIMIT 200", after.request).toArray(),
+			requests: sql.exec<RestoredPage["requests"][number]>("SELECT request_id, op, payload_hash, at, legacy_op, legacy_hash, node_id, (SELECT status FROM nodes n WHERE n.id = requests.node_id) AS node_status FROM requests WHERE request_id > ? ORDER BY request_id LIMIT 200", after.request).toArray(),
 			open_transfers: sql.exec<{ n: number }>("SELECT count(*) AS n FROM transfers WHERE state NOT IN ('committed','aborted')").one().n,
+			open_transfer_ids: after.node === "" && after.request === "" ? sql.exec<{ id: string }>("SELECT id FROM transfers WHERE state NOT IN ('committed','aborted') ORDER BY id LIMIT 50").toArray().map((t) => t.id) : [],
 		});
 	}
 
@@ -220,6 +225,110 @@ export class ProfileStore extends DurableObject<Env> {
 		if (!this.same(who) || this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = 'restore_id'").toArray()[0]?.value !== id) return;
 		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();
+	}
+
+	/** Internal RPC for recovery settlement (section 18, step 4): one page of this generation's transfer rows, read only. */
+	async settleScan(who: Who, q: { after: string; peer: string | null; all: boolean }): Promise<Outcome<TransferScanRow[]>> {
+		if (!this.who()) return ok([]);
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		return ok(this.ctx.storage.sql.exec(`SELECT id, node_id, direction, peer, state FROM transfers WHERE id > ?
+			AND (? OR peer = ? OR state NOT IN ('committed', 'aborted')) ORDER BY id LIMIT 50`, q.after, q.all ? 1 : 0, q.peer ?? "").toArray() as unknown as TransferScanRow[]);
+	}
+
+	/** Internal RPC: one side's facts for one transfer, read only. An unbound generation holds nothing. */
+	async settleFacts(who: Who, q: { id: string; nodeId: string; side: "out" | "in" }): Promise<Outcome<SettleFacts>> {
+		if (!this.who()) return ok({ row: null, node: null, identity: null });
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		return ok(settleFacts(this.ctx.storage.sql, q.id, q.nodeId, q.side));
+	}
+
+	/** Internal RPC: this generation's copy of one node, for the owner's choice in an open recovery; read only. `terms`: the account's current sensitive terms. */
+	async recoveryCopy(who: Who, nodeId: string, terms: string[] = []): Promise<Outcome<RecoveryCopy | null>> {
+		if (!this.who()) return ok(null);
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		return ok(recoveryCopy(this.ctx.storage, who, nodeId, terms));
+	}
+
+	/** Internal RPC, read only: whether undo_move of transfer `id` can restore the whole record here now, guard included. */
+	async undoPreflight(who: Who, a: { id: string; nodeId: string; terms: string[] }): Promise<Outcome<null>> {
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		return undoPreflight(this.ctx.storage, who, a.id, a.nodeId, a.terms);
+	}
+
+	/** Internal RPC, read only: one page of a node's request rows here, so its owner's request bindings can be rebuilt (section 18, step 5). */
+	async nodeRequests(who: Who, nodeId: string, after: string): Promise<Outcome<RestoredPage["requests"]>> {
+		if (!this.who()) return ok([]);
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		return ok(this.ctx.storage.sql.exec<RestoredPage["requests"][number]>(`SELECT request_id, op, payload_hash, at, legacy_op, legacy_hash, node_id, (SELECT status FROM nodes n WHERE n.id = requests.node_id) AS node_status
+			FROM requests WHERE node_id = ? AND request_id > ? ORDER BY request_id LIMIT 100`, nodeId, after).toArray());
+	}
+
+	/** Internal RPC: one settlement action, only for the account's open recovery, repeated in bounded steps for about ten seconds. */
+	async settleTransfer(who: Who, recovery: string, a: Parameters<typeof settleStep>[3]): Promise<Outcome<{ done: boolean }>> {
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "settleAuthority">;
+		const auth = await account.settleAuthority(who, recovery);
+		if (!auth.ok) return auth;
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		const started = Date.now();
+		for (;;) {
+			const r = await settleStep(this.ctx.storage, this.env, who, a);
+			if (!r.ok || r.value.done || Date.now() - started > 10_000) return this.metered(r);
+		}
+	}
+
+	/** This instance's session: a restart, which applies any armed bookmark, always gets a new one. */
+	private readonly session = crypto.randomUUID();
+
+	/**
+	 * Internal RPC from the account's open point-in-time restore (section 18), fail closed. Under blockConcurrencyWhile, so no
+	 * other event of this object writes in between, and with the account closed, so no caller does: it writes `pitr_armed = tag`,
+	 * syncs, and has the account durably record the current bookmark as the fallback and this session before anything is armed.
+	 * Only then it arms the target bookmark, records the undo bookmark the platform returns, and aborts, as documented. A failure
+	 * before arming releases the arm; any failure after it still aborts, because only a restart settles whether the restore applied.
+	 */
+	async pitrArm(who: Who, r: { id: string; tag: string; at?: string; bookmark?: string }): Promise<Outcome<null>> {
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "pitrRecord">;
+		const auth = await account.pitrRecord(who, r.id, r.tag);
+		if (!auth.ok) return auth;
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		const storage = this.ctx.storage;
+		return this.ctx.blockConcurrencyWhile(async (): Promise<Outcome<null>> => {
+			storage.sql.exec("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('pitr_armed', ?)", r.tag);
+			await storage.sync();
+			let fallback: string;
+			try { fallback = await storage.getCurrentBookmark(); } catch (e) { return fail("unavailable", `point-in-time restore is unavailable here: ${(e as Error).message}`); }
+			const prepared = await account.pitrRecord(who, r.id, r.tag, { stage: "prepared", fallback, session: this.session }).catch((e: unknown) => fail("unavailable", (e as Error).message));
+			if (!prepared.ok) return prepared; // nothing is armed
+			let bookmark: string;
+			try { bookmark = r.bookmark ?? await storage.getBookmarkForTime(new Date(r.at!)); } catch (e) {
+				await account.pitrRecord(who, r.id, r.tag, { stage: "released" }).catch(() => undefined);
+				return fail("unavailable", `point-in-time restore is unavailable here: ${(e as Error).message}`);
+			}
+			try {
+				const undo = await storage.onNextSessionRestoreBookmark(bookmark);
+				await account.pitrRecord(who, r.id, r.tag, { stage: "armed", bookmark, undo }).catch(() => undefined);
+			} finally { this.ctx.abort("pitr"); }
+			return ok(null);
+		});
+	}
+
+	/**
+	 * Internal RPC after an arm. In the arming session itself it aborts, which restarts the object as documented; the caller
+	 * steps again. In a later session `restored` says whether the storage went back: the marker no longer names `tag`. A forward
+	 * restore then clears every embedding hash in bounded passes, so each card embeds again under this generation's ids, and arms
+	 * the alarm stages afresh; `done` when that is finished.
+	 */
+	async pitrCheck(who: Who, tag: string, armedIn: string, forward: boolean): Promise<Outcome<{ restarted: boolean; restored: boolean; done: boolean }>> {
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		if (this.session === armedIn) { this.ctx.abort("pitr"); return ok({ restarted: false, restored: false, done: false }); }
+		const sql = this.ctx.storage.sql;
+		if (sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = 'pitr_armed'").toArray()[0]?.value === tag) return ok({ restarted: true, restored: false, done: false });
+		if (!forward) return ok({ restarted: true, restored: true, done: true });
+		const started = Date.now();
+		let left = 1;
+		while (left && Date.now() - started < 10_000) left = sql.exec("UPDATE nodes SET embed_hash = NULL WHERE id IN (SELECT id FROM nodes WHERE embed_hash IS NOT NULL LIMIT 100)").rowsWritten;
+		if (!left) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+		return ok({ restarted: true, restored: true, done: !left });
 	}
 
 	/**

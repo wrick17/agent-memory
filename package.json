@@ -6,6 +6,9 @@
   "files": [
     "src/",
     "local/setup.mjs",
+    "local/corpus-cli.mjs",
+    "local/corpus-git.mjs",
+    "local/corpus-scan.mjs",
     "local/corpus-refresh.mjs",
     "local/corpus-upload.mjs",
     "docs/self-host.md",

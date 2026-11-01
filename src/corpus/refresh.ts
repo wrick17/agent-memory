@@ -3,7 +3,7 @@
 // Every function here runs inside the CorpusStore transaction that called it, so a refusal rolls back all of its writes.
 import { sha256 } from "../domain/ids";
 import { Fail } from "../domain/types";
-import { checkRow, chunkTerms, FAMILIES, FAMILY_ORDER, named, PROJECTION, REFRESH, rowHash, schemaSha, type Family, type SearchDoc, type Value } from "./families";
+import { checkRow, chunkTerms, FAMILIES, FAMILY_ORDER, named, PROJECTION, REFRESH, rowHash, SCAN_ORDER, SCANS, schemaSha, type Family, type SearchDoc, type Value } from "./families";
 
 export const META = "corpus_store_meta";
 export const PART_OPS = 5000;
@@ -16,6 +16,8 @@ export const PAGE_BYTES = 1_000_000;
 export interface Digest { rows: number; sum: string }
 export type Base = { kind: "published"; epoch: number } | { kind: "active"; plan_id: string; next_op: number; chain: string };
 export interface PlanHeader {
+	/** Absent: the five Git-history families. "scans": the checkout-scan families, refreshed under their own plans. */
+	group?: "scans";
 	version: "corpus-refresh/1"; repo: string; intent: "refresh" | "remove"; base: Base;
 	source: { kind: "sqlite-file"; id: string; scope: "complete-repo-projection" }; projection: string; schemas: Record<string, string>;
 	observed: string[]; observed_at: string; targets: Record<string, Digest>; op_count: number; chain: string;
@@ -50,17 +52,24 @@ const bytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v));
 const part = (repo: Value) => JSON.stringify(repo);
 const bad = (reason: string, message: string, details: Record<string, unknown> = {}) => Fail.of("validation", message, { reason, ...details });
 
-/** The key an operation names inside its repo: repos by the plan's repo itself, contributors by rowid (design 3). */
-const LOCAL: Record<string, string[]> = { repos: [], commits: ["sha"], refs: ["refname"], commit_paths: ["sha", "path"], contributors: ["rowid"] };
-const where = (t: string) => (t === "repos" ? "full_name = ?" : `repo = ? AND ${LOCAL[t]!.map((c) => `${c} = ?`).join(" AND ")}`);
+/** The key an operation names inside its repo: repos by the plan's repo itself, contributors and every scan family by rowid (design 3). */
+const LOCAL: Record<string, string[]> = { repos: [], commits: ["sha"], refs: ["refname"], commit_paths: ["sha", "path"], contributors: ["rowid"], ...Object.fromEntries(SCAN_ORDER.map((t) => [t, ["rowid"]])) };
+/** Unkeyed occurrences, matched by row hash: the contributors multiset and every scan family. */
+const multiset = (t: string) => t === "contributors" || Object.hasOwn(SCANS, t);
+const where = (t: string) => (t === "repos" ? "full_name = ?" : `${REFRESH[t]!.repo} = ? AND ${LOCAL[t]!.map((c) => `${c} = ?`).join(" AND ")}`);
 const DELETE_ORDER = ["commit_paths", "commits", "refs", "contributors", "repos"], PUT_ORDER = ["repos", "commits", "commit_paths", "refs", "contributors"];
+/** A plan's tables, in the order every tuple and digest lists them. */
+const orderOf = (h: { group?: string }) => (h.group === "scans" ? SCAN_ORDER : FAMILY_ORDER);
+const deleteOrder = (h: { group?: string }) => (h.group === "scans" ? SCAN_ORDER : DELETE_ORDER);
+const putOrder = (h: { group?: string }) => (h.group === "scans" ? SCAN_ORDER : PUT_ORDER);
 const REPO_KEY: Family = { ...FAMILIES.repos!, columns: { full_name: "text" }, key: ["full_name"] };
 
 // Identity (C15): the seed never contains the terminal chain; the plan id binds the whole final header, chain included.
-const seedTuple = (who: Who, h: PlanHeader) => [who.profile, who.generation, h.version, h.repo, h.intent,
+// The history group's tuple is unchanged; a scan plan's tuple leads with its group, so the two can never share an id.
+const seedTuple = (who: Who, h: PlanHeader) => [...(h.group ? ["group", h.group] : []), who.profile, who.generation, h.version, h.repo, h.intent,
 	h.base.kind === "published" ? ["published", h.base.epoch] : ["active", h.base.plan_id, h.base.next_op, h.base.chain],
-	[h.source.kind, h.source.id, h.source.scope], h.projection, FAMILY_ORDER.map((t) => h.schemas[t]), h.observed, h.observed_at,
-	FAMILY_ORDER.map((t) => [h.targets[t]!.rows, h.targets[t]!.sum]), h.op_count];
+	[h.source.kind, h.source.id, h.source.scope], h.projection, orderOf(h).map((t) => h.schemas[t]), h.observed, h.observed_at,
+	orderOf(h).map((t) => [h.targets[t]!.rows, h.targets[t]!.sum]), h.op_count];
 export const seedOf = (who: Who, h: PlanHeader) => sha256(JSON.stringify(["corpus-refresh/1:seed", ...seedTuple(who, h)]));
 export const planIdOf = (who: Who, h: PlanHeader) => sha256(JSON.stringify(["corpus-refresh/1:plan", ...seedTuple(who, h), h.chain]));
 const step = (chain: string, op: Op) => sha256(JSON.stringify([chain, op]));
@@ -123,19 +132,19 @@ export function refreshStatus(sql: SqlStorage) {
 	const p = id ? plan(sql, id) : undefined;
 	if (!id || !p) return { epoch, refresh: null };
 	return { epoch, refresh: { plan_id: id, repo: p.header.repo, state: p.state, next_op: p.next_op, op_count: p.header.op_count, chain: p.chain, base_epoch: p.base_epoch,
-		unpublished: FAMILY_ORDER.filter((t) => !same(p.running[t]!, published(sql, t, p.header.repo))), begun_at: p.begun_at } };
+		...(p.header.group ? { group: p.header.group } : {}), unpublished: orderOf(p.header).filter((t) => !same(p.running[t]!, published(sql, t, p.header.repo))), begun_at: p.begun_at } };
 }
 
 function inspect(sql: SqlStorage, cmd: { table: string; repo: string; after: Value[] | null; limit?: number }) {
-	if (!loadsComplete(sql)) throw bad("incomplete_load", "refresh waits until all five tables are loaded");
 	const t = cmd.table, f = REFRESH[t]!, cols = Object.keys(f.columns), local = LOCAL[t]!;
+	if (!SCANS[t] && !loadsComplete(sql)) throw bad("incomplete_load", "refresh waits until all five tables are loaded");
 	if (cmd.after && (t === "repos" || cmd.after.length !== local.length)) throw bad("after", `an inspect cursor for ${t} has ${local.length} values`);
 	const id = refreshActive(sql), p = id ? plan(sql, id) : undefined;
 	const binding = p ? { plan_id: id, next_op: p.next_op, chain: p.chain } : { epoch: epochOf(sql) };
 	const prow = partition(sql, t, cmd.repo);
 	const limit = Math.min(cmd.limit ?? PART_OPS, PART_OPS);
 	const after = cmd.after ? ` AND (${local.join(", ")}) > (${local.map(() => "?").join(", ")})` : "";
-	const found = sql.exec(`SELECT ${t === "contributors" ? "rowid, " : ""}${cols.join(", ")} FROM ${t} WHERE ${t === "repos" ? "full_name = ?" : `repo = ?${after}`}
+	const found = sql.exec(`SELECT ${multiset(t) ? "rowid, " : ""}${cols.join(", ")} FROM ${t} WHERE ${t === "repos" ? "full_name = ?" : `${f.repo} = ?${after}`}
 		ORDER BY ${t === "repos" ? "rowid" : local.join(", ")} LIMIT ?`, cmd.repo, ...(cmd.after ?? []), limit + 1).toArray();
 	const page: unknown[] = [];
 	let scanned = ZERO, size = bytes({ binding, partition: prow ?? null, rows: [], next: null, scanned }) + 2_048;
@@ -152,15 +161,16 @@ function inspect(sql: SqlStorage, cmd: { table: string; repo: string; after: Val
 function begin(sql: SqlStorage, who: Who, h: PlanHeader): string {
 	checkRow(REPO_KEY, [h.repo], 0);
 	if (h.version !== "corpus-refresh/1" || h.projection !== PROJECTION) throw bad("projection", `this store applies ${PROJECTION}`);
-	if (FAMILY_ORDER.some((t) => h.schemas[t] !== schemaSha(FAMILIES[t]!))) throw bad("schema_mismatch", "the plan's table DDL is not the retained original");
-	if (!h.observed.length || JSON.stringify(h.observed) !== JSON.stringify(FAMILY_ORDER.filter((t) => h.observed.includes(t)))) throw bad("observed", "observed lists families once each, in family order");
+	const order = orderOf(h);
+	if (order.some((t) => h.schemas[t] !== schemaSha((FAMILIES[t] ?? SCANS[t])!))) throw bad("schema_mismatch", "the plan's table DDL is not the retained original");
+	if (!h.observed.length || JSON.stringify(h.observed) !== JSON.stringify(order.filter((t) => h.observed.includes(t)))) throw bad("observed", "observed lists families once each, in family order");
 	if (Number.isNaN(Date.parse(h.observed_at)) || new Date(h.observed_at).toISOString() !== h.observed_at || Date.parse(h.observed_at) > Date.now() + 300_000) throw bad("observed_at", "observed_at is a normalized UTC time, not in the future");
 	const seed = seedOf(who, h), id = planIdOf(who, h);
 	const prior = plan(sql, id);
 	if (prior) return prior.begin_receipt; // C18: the stored bytes, in any state
 	if (h.op_count === 0 && h.chain !== seed) throw bad("chain", "a plan without operations has its seed as its chain");
-	if (!loadsComplete(sql)) throw bad("incomplete_load", "refresh waits until all five tables are loaded");
-	const pub = Object.fromEntries(FAMILY_ORDER.map((t) => [t, published(sql, t, h.repo)])) as Record<string, Digest>;
+	if (!h.group && !loadsComplete(sql)) throw bad("incomplete_load", "refresh waits until all five tables are loaded");
+	const pub = Object.fromEntries(order.map((t) => [t, published(sql, t, h.repo)])) as Record<string, Digest>;
 	const active = refreshActive(sql);
 	let running: Record<string, Digest>, baseEpoch: number;
 	if (h.base.kind === "published") {
@@ -171,14 +181,15 @@ function begin(sql: SqlStorage, who: Who, h: PlanHeader): string {
 		const old = plan(sql, h.base.plan_id);
 		if (active !== h.base.plan_id || !old || old.state !== "applying" || old.next_op !== h.base.next_op || old.chain !== h.base.chain) throw bad("base_changed", "the active plan moved; read status again");
 		if (old.header.repo !== h.repo) throw bad("repo_mismatch", "a takeover refreshes the exact repo of the plan it replaces"); // C16
+		if ((old.header.group ?? null) !== (h.group ?? null)) throw bad("group_mismatch", "a takeover refreshes the same table group as the plan it replaces");
 		[running, baseEpoch] = [old.running, old.base_epoch];
 	}
 	// C17: an unobserved table must already equal its published partition, physically and as the plan's target.
-	const pending = FAMILY_ORDER.filter((t) => !h.observed.includes(t) && (!same(running[t]!, pub[t]!) || !same(h.targets[t]!, pub[t]!)));
+	const pending = order.filter((t) => !h.observed.includes(t) && (!same(running[t]!, pub[t]!) || !same(h.targets[t]!, pub[t]!)));
 	if (pending.length) throw bad("unobserved_changed", "these tables differ from their published partitions; observe them", { tables: pending });
-	const empty = FAMILY_ORDER.every((t) => same(h.targets[t]!, ZERO));
-	if (h.intent === "refresh" && empty && FAMILY_ORDER.some((t) => pub[t]!.rows > 0)) throw bad("removal_needs_intent", "an empty target for a loaded repo needs the remove intent");
-	if (h.intent === "remove" && (h.observed.length !== FAMILY_ORDER.length || !empty)) throw bad("remove_shape", "a removal observes all five tables with empty targets");
+	const empty = order.every((t) => same(h.targets[t]!, ZERO));
+	if (h.intent === "refresh" && empty && order.some((t) => pub[t]!.rows > 0)) throw bad("removal_needs_intent", "an empty target for a loaded repo needs the remove intent");
+	if (h.intent === "remove" && (h.observed.length !== order.length || !empty)) throw bad("remove_shape", "a removal observes every table of its group with empty targets");
 	for (const t of h.observed) { // C19: zero-row partitions keep the high-water mark
 		const r = partition(sql, t, h.repo);
 		if (r && h.observed_at < r.observed_at) throw bad("stale_observation", `this source cut is older than ${t}'s last observation`, { table: t });
@@ -228,7 +239,7 @@ function applyPart(sql: SqlStorage, cmd: { plan_id: string; start: number; ops: 
 	};
 	const doc = (t: string, values: Value[] | null, key: Value[]) => {
 		if (t === "commit_paths") return affected.add(String(key[1]));
-		if (t === "contributors") return;
+		if (multiset(t)) return; // contributors and scan rows have no search document
 		const fam = REFRESH[t]!, row = values ?? null;
 		const id = t === "repos" ? `repo:repos:${h.repo}` : t === "commits" ? `commit:commits:${h.repo}@${String(key[0])}` : `ref:refs:${h.repo}:${String(key[0])}`;
 		replaceDoc(id, row ? FAMILIES[t]!.search!(named(fam, row)) : null);
@@ -243,14 +254,14 @@ function applyPart(sql: SqlStorage, cmd: { plan_id: string; start: number; ops: 
 		if (values && values[cols.indexOf(f.repo)] !== h.repo) throw bad("repo", `operation ${cmd.start + i} belongs to another repo`);
 		if (values && bytes(values) > ROW_BYTES) throw Fail.of("size_budget", `operation ${cmd.start + i} holds a row over ${ROW_BYTES} bytes`, { reason: "row_bytes" });
 		const key = values ? LOCAL[t]!.filter((c) => c !== "rowid").map((c) => values[cols.indexOf(c)]!) : op[2];
-		if (kind === "d" && (key.length !== LOCAL[t]!.length || key.some((v) => v === null || (t === "contributors" ? !Number.isSafeInteger(v) : typeof v !== "string")))) throw bad("key", `operation ${cmd.start + i} has a malformed ${t} key`);
-		// Fixed group order, then strictly increasing keys by UTF-8 bytes; equal contributor occurrences may repeat (design 3).
-		const at = kind === "d" ? DELETE_ORDER.indexOf(t) : 5 + PUT_ORDER.indexOf(t), order = JSON.stringify(t === "contributors" && values ? values : key);
+		if (kind === "d" && (key.length !== LOCAL[t]!.length || key.some((v) => v === null || (multiset(t) ? !Number.isSafeInteger(v) : typeof v !== "string")))) throw bad("key", `operation ${cmd.start + i} has a malformed ${t} key`);
+		// Fixed group order, then strictly increasing keys by UTF-8 bytes; equal multiset occurrences may repeat (design 3).
+		const dels = deleteOrder(h), at = kind === "d" ? dels.indexOf(t) : dels.length + putOrder(h).indexOf(t), order = JSON.stringify(multiset(t) && values ? values : key);
 		const cmp = last && last[0] === at ? Buffer.compare(Buffer.from(order), Buffer.from(last[1])) : 1;
-		if (last && (at < last[0] || cmp < 0 || (cmp === 0 && !(t === "contributors" && kind === "p")))) throw bad("order", `operation ${cmd.start + i} is out of order`);
+		if (last && (at < last[0] || cmp < 0 || (cmp === 0 && !(multiset(t) && kind === "p")))) throw bad("order", `operation ${cmd.start + i} is out of order`);
 		last = [at, order];
 		const args = t === "repos" ? [h.repo] : [h.repo, ...key];
-		const cur = kind === "p" && t === "contributors" ? undefined : run(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${where(t)}`, ...args)[0] as Record<string, Value> | undefined;
+		const cur = kind === "p" && multiset(t) ? undefined : run(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${where(t)}`, ...args)[0] as Record<string, Value> | undefined;
 		const old = cur ? cols.map((c) => cur[c]!) : null;
 		if (kind === "d") {
 			if (!old || rowHash(t, old) !== op[3]) throw bad("precondition", `operation ${cmd.start + i}: the row is not the one this plan inspected`);
@@ -287,7 +298,7 @@ function applyPart(sql: SqlStorage, cmd: { plan_id: string; start: number; ops: 
 function publish(sql: SqlStorage, id: string): string {
 	const p = plan(sql, id)!, h = p.header;
 	if (p.next_op !== h.op_count || p.chain !== h.chain) throw bad("incomplete", "this plan has operations left or does not end on its chain", { next_op: p.next_op });
-	for (const t of FAMILY_ORDER) {
+	for (const t of orderOf(h)) {
 		if (!same(p.running[t]!, h.targets[t]!)) throw bad("target_mismatch", `${t} does not match the plan's target`, { table: t, expected: h.targets[t], actual: p.running[t] });
 		if (!h.observed.includes(t) && !same(p.running[t]!, published(sql, t, h.repo))) throw bad("unobserved_changed", "an unobserved table changed", { tables: [t] });
 	}
@@ -300,7 +311,10 @@ function publish(sql: SqlStorage, id: string): string {
 			VALUES (?, ?, ?, ?, 'observed', ?, ?, ?, ?, 1, ?) ON CONFLICT (table_name, part) DO UPDATE SET rows = excluded.rows, sum = excluded.sum, basis = 'observed',
 			source_kind = excluded.source_kind, source_id = excluded.source_id, projection = excluded.projection, observed_at = excluded.observed_at,
 			revision = corpus_partitions.revision + 1, plan_id = excluded.plan_id`, t, part(h.repo), d.rows, d.sum, h.source.kind, h.source.id, h.projection, h.observed_at, id);
-		sql.exec("UPDATE corpus_meta SET rows = rows + ?, updated_at = ? WHERE table_name = ?", d.rows - before.rows, now, t);
+		// A scan table's first publication creates its meta row: refreshed, complete, sourced from the plan.
+		sql.exec(`INSERT INTO corpus_meta (table_name, source, as_of, refresh, schema_sha256, rows, last_key, complete, updated_at) VALUES (?, ?, ?, 'refresh', ?, ?, NULL, 1, ?)
+			ON CONFLICT (table_name) DO UPDATE SET rows = rows + excluded.rows, updated_at = excluded.updated_at`,
+			t, JSON.stringify({ file_sha256: h.source.id }), h.observed_at, h.schemas[t]!, d.rows - before.rows, now);
 	}
 	const receipt = JSON.stringify({ status: "published", plan_id: id, epoch: epoch + 1, observed_at: h.observed_at, targets: h.targets });
 	sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('epoch', ?)`, String(epoch + 1));

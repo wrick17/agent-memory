@@ -5,15 +5,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// The corpus CLI with its only local imports (the corpus modules and src/domain); no capture installer, migrate or import files.
+const FILES = ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc"];
+
 export function stageSelfHost(root, target) {
 	fs.mkdirSync(target, { mode: 0o700 });
-	for (const file of ["src", "local/setup.mjs", "local/corpus-refresh.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc"]) {
+	for (const file of FILES) {
 		fs.mkdirSync(path.dirname(path.join(target, file)), { recursive: true, mode: 0o700 });
 		fs.cpSync(path.join(root, file), path.join(target, file), { recursive: true });
 	}
 	fs.copyFileSync(path.join(root, "docs/self-host.md"), path.join(target, "README.md"));
 	const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 	manifest.scripts = { setup: "node local/setup.mjs" };
+	// npm pack keeps only the manifest's files, so the archive's list is this stage's list.
+	manifest.files = [...FILES, "npm-shrinkwrap.json"];
 	fs.writeFileSync(path.join(target, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 	// npm excludes package-lock.json from tarballs; shrinkwrap preserves the same pinned dependency graph for npm ci.
 	const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));

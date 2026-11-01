@@ -336,6 +336,107 @@ describe("owner API", () => {
 		expect(await transfers()).toBe(1);
 	});
 
+	it("keeps a collided move and an unrouted migrated record in the owner's review list until the owner chooses, and never moves or imports by itself", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const http = (path: string, token: string, body?: unknown) => exports.default.fetch(new Request(`${origin}${path}`, body === undefined ? { headers: { authorization: `Bearer ${token}` } }
+			: { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) })).then(async (r) => ({ status: r.status, body: await r.json() as Record<string, any> }));
+		await contextFor();
+		const now = new Date().toISOString(), tag = Date.now().toString(36).slice(-6), [a, b] = [`ra${tag}`, `rb${tag}`];
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(account, (_i, state) => {
+			for (const p of [a, b]) {
+				const g = crypto.randomUUID().slice(0, 8);
+				state.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", p, `${env.OWNER_USER_ID}:${p}:${g}`, g, now);
+				state.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, p, now);
+			}
+		});
+		const c = await contextFor();
+		const moving = String((await call(c, "save_memory", { name: `Clash ${tag}`, type: "reference", description: "source", content: "from a", profile: a })).memory_id);
+		const met = String((await call(c, "save_memory", { name: `Clash ${tag}`, type: "reference", description: "target", content: "already in b", profile: b })).memory_id);
+		const refused = await http(`/api/profiles/${a}/move`, session, { memory_id: moving, to: b, request_id: `review-move-${tag}` });
+		expect(refused).toMatchObject({ status: 400, body: { error: { code: "transfer_collision" } } });
+		// Nothing moved: both records are where they were, with their own text.
+		expect(await call(await contextFor(), "get_memory", { memory_id: moving })).toMatchObject({ profile: a, content: "from a" });
+		expect(await call(await contextFor(), "get_memory", { memory_id: met })).toMatchObject({ profile: b, content: "already in b" });
+		const open = (await http("/api/review?kind=collision&state=open&limit=100", session)).body.items.filter((i: any) => i.payload.memory_id === moving);
+		expect(open).toHaveLength(1);
+		expect(open[0]).toMatchObject({ kind: "collision", profile: b, state: "open", payload: { from: a, to: b, reason: "key_taken", existing_id: met } });
+		// Device tokens never read or decide the owner's list.
+		const { token: device } = await deviceToken(`review-device-${tag}`, ["read", "write"], [a, b], a);
+		expect((await http("/api/review", device)).status).toBe(403);
+		expect((await http(`/api/review/${open[0].id}/resolve`, session, { choice: "deleted" })).status).toBe(400);
+		const kept = await http(`/api/review/${open[0].id}/resolve`, session, { choice: "kept" });
+		expect(kept).toMatchObject({ status: 200, body: { state: "resolved", decision: { choice: "kept" } } });
+		expect((await http(`/api/review/${open[0].id}/resolve`, session, { choice: "kept" })).body.decision.at).toBe(kept.body.decision.at); // a retry replays
+		// A migrated record no rule routed: offered by an import token with its exact route binding, assigned by the owner, pulled as a route.
+		const { token: importer } = await deviceToken(`review-import-${tag}`, ["import"], ["work"], "work");
+		const sha = "a".repeat(64), item = { source: `bothq:review-${tag}`, id: `rv-${tag}`, scope: "bot_hq", source_sha256: "b".repeat(64), name: `Unrouted ${tag}`, reasons: ["unrouted_scope"] };
+		expect((await http("/v1/import/review", device, { export_manifest_sha256: sha, origin: "work", items: [item] })).status).toBe(403);
+		expect((await http("/v1/import/review", importer, { export_manifest_sha256: sha, origin: "work", items: [{ ...item, reasons: ["needs_redaction"] }] })).status).toBe(400);
+		const offered = await http("/v1/import/review", importer, { export_manifest_sha256: sha, origin: "work", items: [item] });
+		expect(offered.status).toBe(200);
+		const mid = String(offered.body.ids[0]);
+		expect((await http(`/v1/import/review?export_manifest_sha256=${sha}`, importer)).body.routes).toEqual([]);
+		expect((await http(`/api/review/${mid}/assign`, session, { profile: "me" })).status).toBe(400);
+		expect((await http(`/api/review/${mid}/assign`, session, { profile: "work" }))).toMatchObject({ status: 200, body: { state: "assigned", decision: { profile: "work" } } });
+		// Offering the same record again keeps the owner's decision.
+		await http("/v1/import/review", importer, { export_manifest_sha256: sha, origin: "work", items: [item] });
+		expect((await http(`/v1/import/review?export_manifest_sha256=${sha}`, importer)).body.routes).toEqual([{ source: item.source, id: item.id, scope: item.scope, profile: "work", source_sha256: item.source_sha256 }]);
+		expect(await outcome(await contextFor(), "get_memory", { memory_id: item.id })).toMatchObject({ ok: false, error: { code: "not_found" } }); // nothing was imported
+	});
+
+	it("binds migrated review metadata to a granted active origin, and a wipe of that origin leaves only content-free identities that never come back", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const http = (path: string, token: string, body?: unknown) => exports.default.fetch(new Request(`${origin}${path}`, body === undefined ? { headers: { authorization: `Bearer ${token}` } }
+			: { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) })).then(async (r) => ({ status: r.status, body: await r.json() as Record<string, any> }));
+		await contextFor();
+		const now = new Date().toISOString(), tag = Date.now().toString(36).slice(-6), [w, keep] = [`rw${tag}`, `rk${tag}`];
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(account, (_i, state) => {
+			for (const p of [w, keep]) {
+				const g = crypto.randomUUID().slice(0, 8);
+				state.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", p, `${env.OWNER_USER_ID}:${p}:${g}`, g, now);
+				state.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, p, now);
+			}
+		});
+		const { token: importer } = await deviceToken(`review-wipe-${tag}`, ["import"], [w, keep], w);
+		const { token: narrow } = await deviceToken(`review-narrow-${tag}`, ["import"], [w], w);
+		const sha = "c".repeat(64), offer = (o: string, name: string, token = importer) => http("/v1/import/review", token, { export_manifest_sha256: sha, origin: o,
+			items: [{ source: `bothq:${name}`, id: name, scope: "bot_hq", source_sha256: "d".repeat(64), name: `Secret ${name}`, reasons: ["unrouted_scope"] }] });
+		expect((await offer("me", `m-${tag}`)).status).toBe(400);
+		expect((await offer(keep, `n-${tag}`, narrow)).status).toBe(403);
+		const gone = String((await offer(w, `g-${tag}`)).body.ids[0]), kept = String((await offer(keep, `k-${tag}`)).body.ids[0]);
+		expect((await offer(keep, `g-${tag}`)).body).toMatchObject({ error: { details: { reason: "origin_changed" } } }); // an item's origin never changes
+		expect((await http(`/api/review/${gone}/assign`, session, { profile: "personal" })).status).toBe(200);
+		const row = (id: string) => runInDurableObject(account, (_i, state) => state.storage.sql.exec<{ state: string; payload: string; decision: string | null; seq: number }>(
+			"SELECT state, payload, decision, seq FROM review_items WHERE id = ?", id).one());
+		const before = await row(gone);
+		// The wipe's own account steps (no profile purge or R2 here): begin closes the origin, finish clears its review metadata.
+		const { wipeAccount } = await import("../src/wipe");
+		await runInDurableObject(account, (_i, state) => {
+			expect(wipeAccount(state.storage, { op: "begin", caller: { kind: "owner", userId: env.OWNER_USER_ID, scopes: ["read", "write"], profiles: "*" } as never, profile: w, typed: w }).ok).toBe(true);
+		});
+		expect((await http(`/api/review/${gone}/assign`, session, { profile: "work" })).body).toMatchObject({ error: { details: { reason: "origin_closed" } } }); // closing: no decisions
+		expect(JSON.stringify((await http("/api/review?kind=migration&limit=100", session)).body)).not.toContain(`Secret g-${tag}`);
+		await runInDurableObject(account, (_i, state) => {
+			const at = state.storage.sql.exec<{ wiped_at: string }>("SELECT wiped_at FROM wipes WHERE profile = ? ORDER BY wiped_at DESC LIMIT 1", w).one().wiped_at;
+			for (let i = 0; i < 20; i++) { const r = wipeAccount(state.storage, { op: "finish", profile: w, at, report: "{}" }); expect(r.ok).toBe(true); if (r.ok && !r.value.after) break; }
+		});
+		const after = await row(gone);
+		expect([after.state, after.payload, JSON.parse(after.decision!).profile]).toEqual(["wiped", "{}", "personal"]); // only identity and the content-free decision stay
+		expect(after.seq).toBeGreaterThan(before.seq); // the account export sees the change
+		expect(JSON.parse((await row(kept)).payload).name).toBe(`Secret k-${tag}`); // unrelated metadata stays
+		expect((await offer(w, `g-${tag}`)).status).toBe(400); // a wiped origin takes no offer, so the name cannot come back
+		await runInDurableObject(account, (_i, state) => state.storage.sql.exec("UPDATE profiles SET status = 'active' WHERE name = ?", w)); // even if the name were active again
+		expect((await offer(w, `g-${tag}`)).status).toBe(400);
+		expect((await row(gone)).payload).toBe("{}");
+		await runInDurableObject(account, (_i, state) => state.storage.sql.exec("UPDATE profiles SET status = 'wiped' WHERE name = ?", w));
+	});
+
 	it("previews a wipe outside the profile read only, and the wipe then plans, keeps and flags exactly what it showed", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
@@ -374,7 +475,32 @@ describe("owner API", () => {
 				st.storage.sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").toArray()[0]?.value ?? null,
 				...["nodes", "texts", "revisions", "archive", "activity", "requests"].map((t) => st.storage.sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
 				st.storage.sql.exec("SELECT count(*) AS n FROM profile_meta WHERE key LIKE 'wipe-image:%'").one().n, await st.storage.getAlarm()])))];
-		const before = await snapshot();
+		// The setup's own writes arm housekeeping and meter alarms in the account's profiles, the previewed one included; one firing,
+		// or still running, inside the walk reports its rows to the account's meter on its own. Every alarm due soon, in the account and
+		// in every one of its profiles, runs to completion first, until the stores are quiet, so the walk alone is measured. Nothing is
+		// disabled, and the comparison below stays exact.
+		const stubs = [account, ...c.account.profiles.map((r) => env.PROFILE.get(env.PROFILE.idFromName(`${r.userId}:${r.profile}:${r.generation}`)))];
+		const quiet = async () => {
+			for (let pass = 0; pass < 10; pass++) {
+				let ran = false;
+				for (const stub of stubs) for (let i = 0; i < 20; i++) {
+					const at = await runInDurableObject(stub, (_i, st) => st.storage.getAlarm());
+					if (at === null || at > Date.now() + 30_000) break;
+					ran = (await runDurableObjectAlarm(stub)) || ran;
+				}
+				if (!ran) return;
+			}
+			throw new Error("the stores did not quiesce");
+		};
+		let before = await snapshot();
+		for (let i = 0; ; i++) {
+			await quiet();
+			await new Promise((r) => setTimeout(r, 200)); // an alarm already running when it was read finishes, and shows
+			const settled = await snapshot();
+			if (JSON.stringify(settled) === JSON.stringify(before)) break;
+			before = settled;
+			if (i === 10) throw new Error("the stores kept changing before the walk");
+		}
 		const seen: Record<string, { purge: { id: string; verdict: string; where: string }[]; handwritten: { id: string }[] }> = {};
 		for (const t of targets) {
 			seen[t] = { purge: [], handwritten: [] };
@@ -1046,4 +1172,29 @@ it("staged archive owner transport preserves start replay bytes, exposes status,
 	expect(undo.status).toBe(200);expect(undo.body.action).toBe("undo_started");expect((await http(`/api/profiles/personal/activity/${removed}/undo`,"POST",{})).body.action).toBe("replayed");
 	const ref=c.account.profiles.find(p=>p.profile === "personal")!;
 	await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(ref.userId)),(_i,s)=>{expect(s.storage.sql.exec("SELECT 1 FROM request_index WHERE request_id=?",refusedId).toArray()).toHaveLength(0);});
+});
+
+it("recovery conflict read and choice are owner only: a device token gets 403 and changes nothing", async () => {
+	await call(await contextFor(), "save_memory", { name: "Recovery gate", type: "reference", description: "g", content: "gate body", profile: "personal" }); // a bound profile has an export
+	serveJwks();
+	const token = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN }), origin = new URL(env.RESOURCE_URL).origin;
+	const http = async (path: string, method = "GET", body?: unknown, t = token) => {
+		const r = await exports.default.fetch(new Request(origin + path, { method, headers: { authorization: `Bearer ${t}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+		return { status: r.status, body: await r.json() as any }; // response bodies are checked field by field
+	};
+	expect((await http("/api/backups/export", "POST", { profile: "personal" })).status).toBe(200);
+	const begun = await http("/api/profiles/personal/restore", "POST", { export: "latest" });
+	expect(begun.status).toBe(200);
+	const id = begun.body.id as string, device = (await deviceToken(`recovery-${crypto.randomUUID().slice(0, 8)}`, ["read", "write"], ["personal"], "personal")).token;
+	const before = (await http("/api/recovery")).body;
+	const choice = { id, node: "n-1", keep: "personal", expect: [{ profile: "personal", generation: null, status: null, revision: null }, { profile: "work", generation: null, status: null, revision: null }], request_id: "device-choice-1" };
+	expect((await http(`/api/recovery/conflicts?id=${id}`, "GET", undefined, device)).status).toBe(403);
+	expect((await http("/api/recovery/conflicts/resolve", "POST", choice, device)).status).toBe(403);
+	expect((await http("/api/recovery")).body).toEqual(before);
+	// The owner reads it, and a choice for a record with no conflict is refused before any change.
+	expect(await http(`/api/recovery/conflicts?id=${id}`)).toMatchObject({ status: 200, body: { recovery: id, conflicts: [] } });
+	expect((await http("/api/recovery/conflicts/resolve", "POST", { ...choice, extra: true })).status).toBe(400);
+	expect((await http("/api/recovery/conflicts/resolve", "POST", choice)).status).toBe(404);
+	expect((await http("/api/recovery")).body).toEqual(before);
+	expect((await http("/api/recovery/abort", "POST", { id })).body).toMatchObject({ state: "aborted" });
 });

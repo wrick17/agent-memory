@@ -406,6 +406,47 @@ async function importAudit(request: Request, env: Env): Promise<Response> {
 	return out.ok ? json({ profile, ...(out.value as Record<string, unknown>) }) : json({ error: out.error }, 400);
 }
 
+/**
+ * The migration review list (sections 15 and 16), for the owner or an `import` device on the production Worker. POST offers a plan's
+ * unrouted records, each with only its name, reasons and the exact binding `plan --routes` checks (source, id, scope, source row
+ * SHA-256, export manifest SHA-256); never content. GET returns the owner's assignments for one export as route-file entries, so
+ * the next local plan imports them through the reviewed routes it already checks. Nothing here imports or routes anything.
+ */
+const sha64 = z.string().regex(/^[0-9a-f]{64}$/);
+const reviewPush = z.object({ export_manifest_sha256: sha64, origin: z.string().regex(PROFILE_NAME), items: z.array(z.object({ source: z.string().min(1).max(1024), id: z.string().min(1).max(128),
+	scope: z.string().min(1).max(512), source_sha256: sha64, name: z.string().max(512).nullable(), reasons: z.array(z.enum(["unrouted_scope", "unrouted_path"])).min(1).max(2) }).strict()).min(1).max(200) }).strict();
+async function importReview(request: Request, env: Env): Promise<Response> {
+	const auth = await authenticate(request, env, "resource", true);
+	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
+	const account = accountStub(env, env.OWNER_USER_ID);
+	const ctx = await account.context(auth.principal);
+	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	const caller = ctx.value.caller;
+	if (caller.kind !== "owner" && !caller.scopes.includes("import")) return json({ error: { code: "forbidden", message: "this token cannot use the migration review list" } }, 403);
+	const res = (r: Awaited<ReturnType<typeof account.admin>>, map: (v: { items: { payload: Record<string, unknown>; decision: Record<string, unknown> | null }[]; next_after: string | null }) => unknown) =>
+		r.ok ? json(map(r.value as never)) : json({ error: r.error }, r.error.code === "busy" ? 503 : 400);
+	if (request.method === "GET") {
+		const q = z.object({ export_manifest_sha256: sha64, after: z.string().min(1).max(80).optional() }).strict().safeParse(Object.fromEntries(new URL(request.url).searchParams));
+		if (!q.success) return json({ error: { code: "validation", message: "export_manifest_sha256 and an optional after" } }, 400);
+		const r = await account.admin({ op: "reviewList", kind: "migration", state: "assigned", exportSha: q.data.export_manifest_sha256, ...(q.data.after ? { after: q.data.after } : {}), limit: 200 });
+		return res(r, (v) => ({ routes: v.items.filter((i) => mayUse(caller, String((i as { profile?: string }).profile))).map(({ payload: p, decision }) => ({ source: p.source, id: p.id, scope: p.scope, profile: decision!.profile, source_sha256: p.source_sha256 })), next_after: v.next_after }));
+	}
+	const raw = await rawJson(request, 1_000_000);
+	if (raw instanceof Response) return raw;
+	const b = reviewPush.safeParse(raw.value);
+	if (!b.success) return invalid(b.error);
+	// The origin is the profile the metadata belongs to (the owner's legacy imports go to work), separate from the destination the
+	// owner later assigns: the caller must be granted it, it must be active, and never me. A wipe of it clears the metadata.
+	const origin = ctx.value.profiles.find((p) => p.profile === b.data.origin);
+	if (b.data.origin === "me" || !origin) return json({ error: { code: "validation", message: "origin must be an active profile other than me", details: { reason: "origin_closed" } } }, 400);
+	if (!mayUse(caller, origin.profile)) return json({ error: { code: "forbidden", message: `this caller may not use profile '${origin.profile}'` } }, 403);
+	const { origin: _o, ...head } = b.data;
+	const items = head.items.map((it) => ({ id: `m:${sha256(canonicalJson([head.export_manifest_sha256, it.source, it.source_sha256])).slice(0, 40)}`, kind: "migration" as const, profile: origin.profile,
+		payload: { export_manifest_sha256: head.export_manifest_sha256, ...it } }));
+	const r = await account.admin({ op: "reviewOffer", items, origin: { profile: origin.profile, generation: origin.generation } });
+	return r.ok ? json({ offered: items.length, ids: items.map((i) => i.id) }) : json({ error: r.error }, r.error.code === "busy" ? 503 : 400);
+}
+
 /** The owner or an `import` device token; corpus loads and status are never open to read or ingest tokens. */
 async function corpusCaller(request: Request, env: Env): Promise<AccountContext | Response> {
 	const auth = await authenticate(request, env, "resource", true);
@@ -628,6 +669,7 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	if ((url.pathname === "/v1/ingest" || url.pathname === "/v1/capture") && request.method === "POST") return capture(request, env, url.pathname);
 	if (url.pathname === "/v1/import" && request.method === "POST") return importBatch(request, env);
 	if (url.pathname === "/v1/import/audit" && request.method === "GET") return importAudit(request, env);
+	if (url.pathname === "/v1/import/review" && (request.method === "GET" || request.method === "POST")) return importReview(request, env);
 	if (url.pathname === "/v1/markers" && request.method === "GET") return markersRead(request, env);
 	if (url.pathname === "/settings" && request.method === "GET") {
 		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
@@ -667,6 +709,26 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		return r.ok ? json({ operation: "finish", profile: abandon[1], ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
 	}
 	const m = /^\/api\/devices\/([a-z2-7]{16})\/(revoke|default)$/.exec(url.pathname);
+	// The owner's review list (section 15): migrated records waiting for a profile and moves a collision stopped. Assign and
+	// resolve record the owner's choice only; renames, merges and moves run through the record, Write and move routes.
+	if (url.pathname === "/api/review" && request.method === "GET") {
+		const q = z.object({ kind: z.enum(["migration", "collision"]).optional(), state: z.enum(["open", "assigned", "resolved"]).optional(), after: z.string().min(1).max(80).optional(),
+			limit: z.coerce.number().int().min(1).max(100).optional() }).strict().safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success) return json({ error: { code: "validation", message: "kind migration or collision; state open, assigned or resolved; after an id; limit 1 to 100" } }, 400);
+		return run({ op: "reviewList", ...(q.data.kind ? { kind: q.data.kind } : {}), ...(q.data.state ? { state: q.data.state } : {}), ...(q.data.after ? { after: q.data.after } : {}), limit: q.data.limit ?? 50 });
+	}
+	const rv = /^\/api\/review\/([a-z]:[0-9a-f]{40})\/(assign|resolve)$/.exec(url.pathname);
+	if (rv && request.method === "POST") {
+		const b = await body(request);
+		if (rv[2] === "assign") {
+			const a = z.object({ profile: z.enum(["work", "personal"]) }).strict().safeParse(b);
+			if (!a.success) return json({ error: { code: "validation", message: "send JSON with profile work or personal; nothing is routed into me" } }, 400);
+			return run({ op: "reviewAssign", id: rv[1]!, profile: a.data.profile });
+		}
+		const c = z.object({ choice: z.enum(["renamed", "merged", "kept", "moved"]) }).strict().safeParse(b);
+		if (!c.success) return json({ error: { code: "validation", message: "send JSON with choice renamed, merged, kept or moved" } }, 400);
+		return run({ op: "reviewResolve", id: rv[1]!, choice: c.data.choice });
+	}
 	if (url.pathname === "/api/profiles" && request.method === "GET") return run({ op: "listProfiles" });
 	if (url.pathname === "/api/devices" && request.method === "GET") return run({ op: "listDevices" });
 	if (url.pathname === "/api/devices" && request.method === "POST") {
@@ -912,7 +974,38 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	// Backups and restore from an export (section 18). One recovery at a time; it closes the account until open or abort.
 	if (url.pathname === "/api/backups/export" && request.method === "POST") {
 		const b = await body(request);
-		return run({ op: "export", ...(typeof b?.profile === "string" ? { profile: b.profile } : {}) });
+		return run({ op: "export", ...(typeof b?.profile === "string" ? { profile: b.profile } : {}), ...(b?.corpus === true ? { corpus: true } : {}) });
+	}
+	// Point-in-time restore of a profile (section 18): to a time in the last 30 days, or the reversal of an opened one by its
+	// recorded undo bookmark. It closes the account, records the bookmarks before the profile restarts, and opens only when reconciled.
+	const pit = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/pitr$/.exec(url.pathname);
+	if (pit && request.method === "POST") {
+		const b = z.union([z.object({ at: z.iso.datetime({ offset: true }) }).strict(), z.object({ undo: z.string().uuid() }).strict()]).safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send JSON with at, an ISO time, or undo, the id of the restore to reverse" } }, 400);
+		return run({ op: "beginPitr", profile: pit[1]!, ...b.data });
+	}
+	// The owner's choice between two copies that the fixed rules leave unresolved (section 18, step 4), bound to the recovery shown.
+	if (url.pathname === "/api/recovery/conflicts" && request.method === "GET") {
+		const q = z.object({ id: z.uuid(), after: z.string().min(1).max(128).optional() }).strict().safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success) return json({ error: { code: "validation", message: "send id, the recovery shown, and optionally after, the last node id of the previous page" } }, 400);
+		return run({ op: "recoveryConflicts", id: q.data.id, ...(q.data.after ? { after: q.data.after } : {}) });
+	}
+	if (url.pathname === "/api/recovery/conflicts/resolve" && request.method === "POST") {
+		const copy = z.object({ profile: z.string().regex(PROFILE_NAME), generation: z.string().min(1).max(64).nullable(), status: z.string().min(1).max(32).nullable(),
+			revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable() }).strict();
+		const b = z.object({ id: z.uuid(), node: z.string().min(1).max(128), keep: z.string().regex(PROFILE_NAME), expect: z.array(copy).length(2),
+			request_id: z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/) }).strict().safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send id, node, keep, expect (both copies as shown) and request_id" } }, 400);
+		return run({ op: "resolveConflict", ...b.data });
+	}
+	const rs = /^\/api\/restores\/([0-9a-f-]{36})$/.exec(url.pathname);
+	if (rs && request.method === "GET") return run({ op: "restoreRecord", id: rs[1]! });
+	// A profile's corpus exports, weekly and kept two, and their restore into the current, empty corpus generation.
+	const cx = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/corpus\/(exports|restore)$/.exec(url.pathname);
+	if (cx && cx[2] === "exports" && request.method === "GET") return run({ op: "listExports", profile: cx[1]!, corpus: true });
+	if (cx && cx[2] === "restore" && request.method === "POST") {
+		const b = await body(request);
+		return run({ op: "beginCorpusRestore", profile: cx[1]!, export: typeof b?.export === "string" ? b.export : "latest" });
 	}
 	const ex = /^\/api\/profiles\/([a-z][a-z0-9-]{0,11})\/(exports|restore)$/.exec(url.pathname);
 	if (ex && ex[2] === "exports" && request.method === "GET") return run({ op: "listExports", profile: ex[1]! });

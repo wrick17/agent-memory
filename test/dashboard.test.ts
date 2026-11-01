@@ -690,6 +690,143 @@ describe("dashboard memories and drafts", () => {
 		expect(b.seen.bodies).toEqual([{ id: "rA" }, { id: "rA" }, { export: "e2" }]); // each recovery action names the recovery shown
 		expect(JSON.stringify(b.seen)).not.toMatch(/BACKUP_KEY/);
 	});
+
+	// Recovery copy choices (section 18, step 4): both copies as the server reads them now, and the owner's explicit choice.
+	const copyOf = (status: string, revision: number, extra: Record<string, unknown> = {}) => ({ status, revision, kind: "document", name: `Copy ${revision}`, description: "", updated_at: "2026-10-31T00:00:00Z",
+		flagged: null, chars: 10, content_hash: "h".repeat(8), transfer: null, incoming: null, rows: [], ...extra });
+	const side = (profile: string, generation: string | null, copy: unknown, keepable: boolean) => ({ profile, generation, copy, keepable });
+	const keepForm = (b: ReturnType<typeof browser>, node: string) => find(b.view(), "form").find((f) => find(f, "select").some((x) => x.attrs.id === `keep-${node}`))!;
+	const preview = (b: ReturnType<typeof browser>, node: string, keep: string) => { const f = keepForm(b, node); find(f, "select")[0]!.value = keep; f.on.submit!({ preventDefault() {} }); };
+	const keepBtn = (b: ReturnType<typeof browser>, node: string) => find(b.view(), "button").find((x) => x.attrs["aria-label"] === `Keep the chosen copy of ${node}`)!;
+	const many = async () => { for (let i = 0; i < 6; i++) await settle(); };
+
+	it("shows both copies as text, keeps only a keepable copy after a preview with the shown expectations, retries a lost answer exactly and rereads a changed copy before a new id", async () => {
+		let n2 = 2, lost = true, changed = true;
+		const resolves: Record<string, unknown>[] = [];
+		const b = browser({ signedIn: true, hash: "#/backups", api: (path, method, body) => {
+			if (path === "/api/recovery") return Response.json({ recovery: { id: "rB", profile: "work", export: "e2", at: "2026-10-31T00:00:00Z", state: "unresolved", conflicts: { total: 3, open: 3 },
+				unresolved: [{ kind: "wipe_not_in_export", id: "t1" }, { kind: "owned_elsewhere", id: "n1" }], unresolved_count: 4 }, last_export: null });
+			if (path.startsWith("/api/recovery/conflicts?")) return Response.json({ recovery: "rB", state: "unresolved", open: 3, next: null, conflicts: [
+				{ node: "n1", kind: "owned_elsewhere", transfer: "t-1", state: "open", copies: [side("work", "g1", copyOf("active", 3, { name: HOSTILE, description: HOSTILE }), true),
+					side("personal", "g2", copyOf("incoming", 1, { incoming: { id: "t-1", from: "work" } }), false)] },
+				{ node: "n2", kind: "transfer_settle_failed", transfer: "t-2", state: "open", copies: [side("work", "g1", copyOf("moved", 4, { transfer: "t-2", restorable: { ok: true } }), true),
+					side("personal", "g2", copyOf("active", n2), true)] },
+				{ node: "n3", kind: "transfer_unmatched", transfer: "t-3", state: "open", copies: [side("work", "g1", copyOf("moved", 6, { transfer: "t-3", restorable: { ok: false, reason: "redacted" } }), false),
+					side("personal", null, null, false)] }] });
+			if (path === "/api/recovery/conflicts/resolve" && method === "POST") {
+				const q = body as Record<string, unknown>;
+				resolves.push(q);
+				if (q.node === "n1" && lost) { lost = false; return Response.json({ error: { code: "unavailable", message: "lost" } }, { status: 503 }); }
+				if (q.node === "n2" && changed) { changed = false; n2 = 5; return Response.json({ error: { code: "busy", message: "a copy changed", details: { reason: "copy_changed", profile: "personal" } } }, { status: 400 }); }
+				return Response.json({ node: q.node, kept: q.keep, tombstoned: q.keep === "work" ? "personal" : "work", recovery: "rB" });
+			}
+		} });
+		await dashboardMain(b.win);
+		await many();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		// Copies are text: a hostile name and description render as text, and nothing is sent by reading them.
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(flat()).toContain(`Name ${HOSTILE}`);
+		expect(flat()).toContain("Unpublished landing from work");
+		expect(flat()).toContain("Restorable from its archive No: redacted");
+		expect(flat()).toContain("Neither copy can be kept as it is; only abort is possible for this record.");
+		expect(flat()).toContain("those that are not copy choices below can only be aborted");
+		expect(b.seen.posted).toEqual([]);
+		// Only keepable copies are offered; an incoming copy is not.
+		expect(find(find(keepForm(b, "n1"), "select")[0]!, "option").map((o) => o.attrs.value)).toEqual(["work"]);
+		expect(keepForm(b, "n3")).toBeUndefined();
+		expect(keepBtn(b, "n1").disabled).toBe(true);
+		preview(b, "n1", "work");
+		expect(flat()).toContain("Preview: keep");
+		expect(flat()).toContain("Nothing in personal is tombstoned");
+		click(keepBtn(b, "n1"));
+		await many();
+		expect(resolves[0]).toEqual({ id: "rB", node: "n1", keep: "work", request_id: expect.stringMatching(/^dashboard:/),
+			expect: [{ profile: "work", generation: "g1", status: "active", revision: 3 }, { profile: "personal", generation: "g2", status: "incoming", revision: 1 }] });
+		expect(flat()).toContain("Result unconfirmed");
+		// One choice at a time: another record cannot be chosen while this one is unconfirmed.
+		preview(b, "n2", "personal");
+		expect(keepBtn(b, "n2").disabled).toBe(true);
+		click(button(b.view(), "Send the same choice again"));
+		await many();
+		expect(resolves[1]).toEqual(resolves[0]);
+		expect(status(b).textContent).toContain("Kept the copy in work; the copy in personal is now a flagged tombstone");
+		// A changed copy: nothing chosen, an explicit reread, then a new preview against the new copy under a new id.
+		preview(b, "n2", "personal");
+		click(keepBtn(b, "n2"));
+		await many();
+		expect(resolves[2]).toMatchObject({ node: "n2", keep: "personal", expect: [{ profile: "work", status: "moved", revision: 4 }, { profile: "personal", status: "active", revision: 2 }] });
+		expect(flat()).toContain("A copy changed since it was shown");
+		expect(keepForm(b, "n2")).toBeUndefined();
+		click(button(b.view(), "Read the copies again"));
+		await many();
+		preview(b, "n2", "personal");
+		click(keepBtn(b, "n2"));
+		await many();
+		expect(resolves[3]).toMatchObject({ node: "n2", expect: [{ profile: "work", revision: 4 }, { profile: "personal", revision: 5 }] });
+		expect(resolves[3]!.request_id).not.toBe(resolves[2]!.request_id);
+		expect(b.seen.posted.every((x) => x === "/api/recovery/conflicts/resolve")).toBe(true);
+	});
+
+	it("continues a lost tab's unfinished choice only from the server's resume body on a click, one at a time, then follows server state through step, open, precheck failure and abort", async () => {
+		let phase = "unresolved";
+		const resume = { id: "rC", node: "n1", keep: "work", request_id: "dashboard:original-choice",
+			expect: [{ profile: "work", generation: "g1", status: "active", revision: 3 }, { profile: "personal", generation: "g2", status: "active", revision: 2 }] };
+		const resolves: unknown[] = [];
+		let progress = true;
+		const b = browser({ signedIn: true, hash: "#/backups", api: (path, method, body) => {
+			if (path === "/api/recovery") return Response.json({ recovery: { id: "rC", kind: "account", export: "a1", at: "2026-10-31T00:00:00Z", state: phase,
+				...(phase === "unresolved" && resolves.length < 2 ? { conflicts: { total: 2, open: 2 }, resolving: "n1" } : {}),
+				unresolved: phase === "unresolved" && resolves.length >= 2 ? [{ kind: "open_precheck_failed", id: "n9" }] : [], unresolved_count: phase === "unresolved" && resolves.length >= 2 ? 1 : 0 }, last_export: null });
+			if (path.startsWith("/api/recovery/conflicts?")) return Response.json({ recovery: "rC", state: "unresolved", open: 2, next: null, conflicts: [
+				// The copies have changed since the choice was made; the resume body stays the original.
+				{ node: "n1", kind: "owned_elsewhere", transfer: "t-1", state: "resolving", keep: "work", resume, copies: [side("work", "g1", copyOf("active", 7), true), side("personal", "g2", copyOf("active", 2), true)] },
+				{ node: "n2", kind: "owned_elsewhere", transfer: "t-2", state: "open", copies: [side("work", "g1", copyOf("active", 1), true), side("personal", "g2", copyOf("active", 1), true)] }] });
+			if (path === "/api/recovery/conflicts/resolve" && method === "POST") {
+				resolves.push(body);
+				if (progress) { progress = false; return Response.json({ progress: "2 of 5 steps; repeat with the same request id" }); }
+				phase = "settling";
+				return Response.json({ node: "n1", kept: "work", tombstoned: "personal", recovery: "rC" });
+			}
+			if (path === "/api/recovery/step" && method === "POST") { phase = "ready"; return Response.json({ state: "ready" }); }
+			if (path === "/api/recovery/open" && method === "POST") { phase = phase === "ready" ? "opening" : "unresolved"; return Response.json({ state: phase, phase: phase === "opening" ? "precheck" : undefined }); }
+			if (path === "/api/recovery/abort" && method === "POST") return Response.json({ state: "rolling_back" });
+		} });
+		await dashboardMain(b.win);
+		await many();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		expect(flat()).toContain("This choice is already recorded and unfinished: keep the copy in work");
+		expect(flat()).toContain("chosen against work active revision 3 and personal active revision 2");
+		expect(flat()).toContain("Revision 7"); // the current copy is shown as current metadata
+		expect(b.seen.posted).toEqual([]);
+		expect(keepForm(b, "n1")).toBeUndefined(); // a recorded choice is continued, never previewed again
+		preview(b, "n2", "personal");
+		expect(keepBtn(b, "n2").disabled).toBe(true);
+		click(button(b.view(), "Send the same choice again"));
+		await many();
+		expect(flat()).toContain("Started, not finished");
+		click(button(b.view(), "Send the same choice again"));
+		await many();
+		expect(resolves).toEqual([resume, resume]);
+		// The server's state decides the controls: settling steps, ready opens, opening cannot abort, a failed precheck can.
+		const has = (label: string) => !!button(b.view(), label);
+		expect([has("Run the next step"), has("Open"), has("Abort")]).toEqual([true, false, true]);
+		click(button(b.view(), "Run the next step"));
+		await many();
+		expect([has("Run the next step"), has("Open"), has("Abort")]).toEqual([false, true, true]);
+		click(button(b.view(), "Open"));
+		await many();
+		expect([has("Run the next step"), has("Open"), has("Abort")]).toEqual([false, true, false]);
+		click(button(b.view(), "Open"));
+		await many();
+		expect(flat()).toContain("open_precheck_failed: n9");
+		expect(find(b.view(), "section").some((x) => x.attrs["aria-label"] === "Copies to choose")).toBe(false);
+		expect([has("Run the next step"), has("Open"), has("Abort")]).toEqual([false, false, true]);
+		typeIn(byId(b.view(), "confirm-abort"), "abort");
+		click(button(b.view(), "Abort"));
+		await many();
+		expect(b.seen.posted).toEqual(["/api/recovery/conflicts/resolve", "/api/recovery/conflicts/resolve", "/api/recovery/step", "/api/recovery/open", "/api/recovery/open", "/api/recovery/abort"]);
+	});
 });
 
 describe("dashboard timeline, journals and paths", () => {
@@ -1011,6 +1148,53 @@ describe("dashboard knowledge graph", () => {
 		expect(b.seen.posted).toEqual([]);
 		expect(b.seen.fetched.some((x) => x.includes("/save") || x.includes("/move") || x.includes("/review"))).toBe(false);
 	});
+
+	it("tries unsaved link and record changes between loaded records, counts their impact, restores and resets, keeps them to the profile, never drafts or sends them", async () => {
+		const b = browser({ signedIn: true, api: graphApi() });
+		await dashboardMain(b.win);
+		await loaded(b);
+		const saved = status(b).textContent, flat = () => text(b.view()).replace(/\s+/g, " ");
+		const labelled = (l: string) => find(b.view(), "button").find((x) => x.attrs["aria-label"] === l)!;
+		const pick = (name: string) => { typeIn(byId(b.view(), "graph-q"), name); click(button(b.view(), name)); };
+		// Add a link between two loaded records: pick one end, then the other.
+		pick("Record 13");
+		click(button(b.view(), "Link to another record (what-if)…"));
+		pick("Record 14");
+		click(button(b.view(), "Link to “Record 13” (what-if)"));
+		expect(flat()).toContain("Records 1,377 saved → 1,377 with what-if Links 2 → 3 Records with links 3 → 5");
+		expect(flat()).toContain("Added link: “Record 13” and “Record 14”");
+		// Remove a loaded record with its loaded link, and one saved link of another record.
+		pick("Owner");
+		click(button(b.view(), "Remove this record (what-if)"));
+		expect(button(b.view(), "Restore this record (what-if)")).toBeDefined();
+		const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
+		canvas.ctx.texts = [];
+		await settle();
+		expect(canvas.ctx.texts.some((x) => x.t === "Removed: Owner")).toBe(true);
+		pick("Record 1");
+		click(labelled("Remove the link part_of with Agent Memory, not saved"));
+		expect(flat()).toContain("Records 1,377 saved → 1,376 with what-if Links 2 → 1 Records with links 3 → 2");
+		expect(flat()).toContain("Removed link: “Record 1” part_of “Agent Memory”");
+		expect(flat()).toContain("Removed record: “Owner” and its 1 loaded link");
+		expect(button(b.view(), "Make a draft")).toBeUndefined(); // link and record changes never become a draft
+		expect(status(b).textContent).toBe(saved); // the saved graph's own counts do not move
+		click(labelled("Restore Owner"));
+		expect(flat()).toContain("Records 1,377 saved → 1,377 with what-if Links 2 → 2 Records with links 3 → 4");
+		// Another profile shows none of it; back in work it is still there, then a reset clears it and the record's own buttons follow.
+		b.go("#/graph/personal");
+		await settle();
+		expect(flat()).not.toContain("What-if (not saved)");
+		b.go("#/graph/work");
+		await settle();
+		expect(flat()).toContain("Added link: “Record 13” and “Record 14”");
+		pick("Record 1");
+		expect(labelled("Restore the link part_of with Agent Memory, not saved")).toBeDefined();
+		click(button(b.view(), "Clear all what-if items"));
+		expect(flat()).not.toContain("What-if (not saved)");
+		expect(labelled("Remove the link part_of with Agent Memory, not saved")).toBeDefined();
+		expect(b.seen.posted).toEqual([]);
+		expect(b.seen.fetched.some((x) => /\/(save|move|review|delete|wipe|forget)/.test(x))).toBe(false);
+	});
 });
 
 describe("dashboard review", () => {
@@ -1052,6 +1236,99 @@ describe("dashboard review", () => {
 		expect(sent[0]).toMatchObject({ action: "promote", candidate_id: "c1", into: { name: "Careful", type: "project" } });
 		expect(status(b).textContent).toContain("Promoted into memory “Careful”.");
 		expect(button(b.view(), "Undo last change")).toBeDefined();
+	});
+
+	it("lists flagged records from the graph read with their reason, unflags only on an explicit click with Undo, and shows an open restore's findings without acting on them", async () => {
+		const posted: string[] = [];
+		const b = browser({ signedIn: true, hash: "#/review", api: (path, method) => {
+			if (path === "/api/profiles/work/review") return Response.json({ profile: "work", candidates: [] });
+			if (path.startsWith("/api/profiles/work/graph?part=nodes")) return Response.json({ part: "nodes", done: true, next_after: null, total: 3, items: [
+				{ id: "f1", kind: "document", type: "project", name: HOSTILE, status: "active", flagged: true }, { id: "ok1", kind: "document", type: "project", name: "Fine", status: "active", flagged: false },
+				{ id: "f2", kind: "decision", type: "reference", name: "Kept twice", status: "active", flagged: true }] });
+			if (path.startsWith("/api/profiles/work/graph?part=edges")) return Response.json({ part: "edges", done: true, next_after: null, items: [] });
+			if (path === "/api/profiles/work/nodes/f2" && method === "GET") return Response.json({ node: { id: "f2", flagged: "dedupe: protected survivor" } });
+			if (path === "/api/profiles/work/nodes/f2/unflag" && method === "POST") { posted.push(path); return Response.json({ ok: true, action: "unflag", activity_id: 41 }); }
+			if (path === "/api/recovery") return Response.json({ recovery: { id: "r1", kind: "profile", profile: "work", state: "unresolved", unresolved_count: 2, unresolved: [{ kind: "two_active", id: "n7" }] }, last_export: null });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 10; i++) await settle();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		expect(flat()).toContain("2 flagged among 3 records read.");
+		expect(button(b.view(), "Read why")).toBeDefined();
+		expect(flat()).not.toContain("Fine");
+		expect(find(b.view(), "img")).toEqual([]); // a hostile name stays text
+		expect(find(b.view(), "a").some((a) => a.attrs.href === "#/memory/work/f2")).toBe(true);
+		// The reason is read only when asked; nothing is written by reading it.
+		click(find(b.view(), "button").find((x) => x.attrs["aria-label"] === "Read why Kept twice is flagged")!);
+		await settle();
+		expect(flat()).toContain("Flagged: dedupe: protected survivor");
+		expect(posted).toEqual([]);
+		// Restore reconciliation shows the open restore's findings and sends the owner to Backups for every action.
+		expect(flat()).toContain("A restore is open (unresolved) with 2 unresolved findings.");
+		expect(flat()).toContain("two_active: n7");
+		expect(flat()).toContain("1 more are not listed.");
+		expect(find(b.view(), "a").some((a) => a.attrs.href === "#/backups")).toBe(true);
+		expect(flat()).toContain("Could not read the review list"); // an unreadable list is said, never shown as empty
+		click(find(b.view(), "button").find((x) => x.attrs["aria-label"] === "Unflag Kept twice")!);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(posted).toEqual(["/api/profiles/work/nodes/f2/unflag"]);
+		expect(status(b).textContent).toContain("Unflagged “Kept twice”.");
+		expect(flat()).toContain("1 flagged among 3 records read.");
+		expect(button(b.view(), "Undo last change")).toBeDefined();
+		// Only the unflag wrote; no recovery step, open or abort, and no move, save or promote.
+		expect(b.seen.posted.filter((x) => !x.endsWith("/review"))).toEqual(["/api/profiles/work/nodes/f2/unflag"]);
+	});
+
+	it("assigns a migrated record only after a preview, and settles a collided move by moving again, merging with Undo or keeping both", async () => {
+		const items = { migration: [{ id: "m:1", kind: "migration", state: "open", payload: { source: "bothq:x", id: "x1", scope: "bot_hq", name: HOSTILE, reasons: ["unrouted_scope"] } }],
+			collision: [{ id: "c:1", kind: "collision", state: "open", updated_at: "2026-11-01T00:00:00Z", payload: { memory_id: "n1", from: "work", to: "personal", reason: "key_taken", existing_id: "n9" } }] };
+		const bodies: Record<string, unknown> = {};
+		const b = browser({ signedIn: true, hash: "#/review", api: (path, method, body) => {
+			if (path === "/api/profiles/work/review") return Response.json({ profile: "work", candidates: [] });
+			if (path.startsWith("/api/review?kind=")) return Response.json({ items: items[path.includes("collision") ? "collision" : "migration"], next_after: null });
+			if (method !== "POST") return;
+			bodies[path] = body;
+			if (path === "/api/profiles/work/move") return Response.json({ error: { code: "transfer_collision", message: "still taken" } }, { status: 400 });
+			if (path.endsWith("/forget")) return Response.json({ ok: true, action: "forget", activity_id: 12 });
+			return Response.json({ ok: true });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 6; i++) await settle();
+		const flat = () => text(b.view()).replace(/\s+/g, " "), labelled = (l: string) => find(b.view(), "button").find((x) => x.attrs["aria-label"] === l)!;
+		expect(find(b.view(), "img")).toEqual([]);
+		expect(flat()).toContain("Why it waits unrouted_scope");
+		expect(flat()).toContain("The destination already has an active record with the same name, scope and type");
+		expect(find(b.view(), "a").some((x) => x.attrs.href === "#/memory/personal/n9")).toBe(true);
+		// Assign: nothing is sent before the preview, and only the chosen profile is sent.
+		expect(button(b.view(), "Assign").disabled).toBe(true);
+		const assignForm = find(b.view(), "form").find((f) => find(f, "select").some((x) => x.attrs.id === "assign-m:1"))!;
+		const pick = find(assignForm, "select")[0]!;
+		pick.value = "personal";
+		pick.on.change?.();
+		assignForm.on.submit!({ preventDefault() {} });
+		expect(flat()).toContain("Nothing is imported now");
+		click(button(b.view(), "Assign"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(bodies["/api/review/m%3A1/assign"]).toEqual({ profile: "personal" });
+		// Move again after a rename: the existing move route; a refusal is shown and the next try gets a fresh request id.
+		click(labelled("Move n1 to personal again"));
+		for (let i = 0; i < 4; i++) await settle();
+		const first = bodies["/api/profiles/work/move"] as Record<string, unknown>;
+		expect(first).toMatchObject({ memory_id: "n1", to: "personal" });
+		expect(flat()).toContain("Refused:");
+		click(labelled("Move n1 to personal again"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect((bodies["/api/profiles/work/move"] as Record<string, unknown>).request_id).not.toBe(first.request_id);
+		// Merge: forget the moving record (Undo offered), and the item is recorded as merged.
+		click(labelled("Forget n1 in work"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.posted).toContain("/api/profiles/work/nodes/n1/forget");
+		expect(bodies["/api/review/c%3A1/resolve"]).toEqual({ choice: "merged" });
+		expect(button(b.view(), "Undo last change")).toBeDefined();
+		click(labelled("Keep both records for the move of n1"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(bodies["/api/review/c%3A1/resolve"]).toEqual({ choice: "kept" });
+		expect(b.seen.posted.filter((x) => x.includes("/save") || x.includes("/wipe") || x.includes("/recovery"))).toEqual([]);
 	});
 });
 

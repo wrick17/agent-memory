@@ -11,7 +11,7 @@ import worker from "../src/worker";
 import { chains, refreshCorpus, seedOf } from "../local/corpus-refresh.mjs";
 // @ts-expect-error local/ is plain JavaScript without declarations
 import { uploadCorpus } from "../local/corpus-upload.mjs";
-import { contextFor, deviceToken, OWNER } from "./helpers";
+import { call, contextFor, deviceToken, OWNER } from "./helpers";
 
 const origin = new URL(env.RESOURCE_URL).origin;
 const AS_OF = "2026-08-12T13:30:59.154Z";
@@ -68,7 +68,7 @@ async function syntheticSource(fill: (sql: SqlStorage) => void = seed) {
 			columns: (t: string) => inSource((sql) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?)", t).toArray().map((r) => r.name)),
 			rows: (t: string, cols: string[], key: string[], after: unknown[] | null, limit: number) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t}${after ? ` WHERE (${key.join(", ")}) > (${after.map(() => "?").join(", ")})` : ""} ORDER BY ${key.join(", ")} LIMIT ?`,
 				...(after ?? []) as SqlStorageValue[], limit).raw()]),
-			repoRows: (t: string, cols: string[], repo: string) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${t === "repos" ? "full_name" : "repo"} = ?`, repo).raw()]),
+			repoRows: (t: string, cols: string[], repo: string, column?: string) => inSource((sql) => [...sql.exec(`SELECT ${cols.join(", ")} FROM ${t} WHERE ${column ?? (t === "repos" ? "full_name" : "repo")} = ?`, repo).raw()]),
 		},
 	};
 }
@@ -126,6 +126,28 @@ describe("corpus main flow", () => {
 		const q = await p.tool({ action: "sql", sql: "SELECT c.sha, count(p.path) AS paths FROM commits c JOIN commit_paths p ON p.repo = c.repo AND p.sha = c.sha GROUP BY c.sha ORDER BY c.sha" });
 		expect(q.value).toMatchObject({ columns: ["sha", "paths"], rows: [[sha(1), 2], [sha(2), 1]], truncated: false, tables_read: ["commit_paths", "commits"] });
 		expect(Object.keys(q.value.as_of)).toEqual(["commit_paths", "commits"]);
+	});
+
+	it("adds corpus counts to explore of a project or commit node, with as_of, only while the corpus is on", async () => {
+		const p = await isolated();
+		const { source } = await syntheticSource();
+		await uploadCorpus({ source, client: p.client, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {} });
+		await call(await contextFor(), "record_knowledge", { profile: p.name, nodes: [{ kind: "project", key: "github:acme/web", name: "acme/web" },
+			{ kind: "commit", key: `git:acme/web@${sha(1)}`, name: "Fix the token refresh loop" }, { kind: "project", key: "github:o'x/y", name: "quoted" }, { kind: "person", name: "Alice" }] });
+		const explore = async (key: string, e?: Env) => {
+			const r = (await p.rpc("tools/call", { name: "explore", arguments: { profile: p.name, node: { key } } }, p.reader, e)).result as { content: { text: string }[]; isError?: boolean };
+			expect(r.isError).not.toBe(true);
+			return JSON.parse(r.content[0]!.text).data as Json;
+		};
+		const repo = await explore("github:acme/web");
+		expect(repo.corpus).toMatchObject({ profile: p.name, kind: "repo", key: "acme/web", counts: { repos: 1, commits: 2, refs: 1, commit_paths: 3, contributors: 2 } });
+		expect(Object.keys(repo.corpus.as_of)).toEqual(["commit_paths", "commits", "contributors", "refs", "repos"]);
+		expect((await explore(`git:acme/web@${sha(1)}`)).corpus).toMatchObject({ kind: "commit", key: `acme/web@${sha(1)}`, counts: { commits: 1, commit_paths: 2 } });
+		// A quote in a stored key stays a literal; it neither escapes nor errors.
+		expect((await explore("github:o'x/y")).corpus).toMatchObject({ key: "o'x/y", counts: { repos: 0, commits: 0, refs: 0, commit_paths: 0, contributors: 0 } });
+		const off = await explore("github:acme/web", env);
+		expect(off).not.toHaveProperty("corpus");
+		expect(off.node).toMatchObject({ key: "github:acme/web" });
 	});
 });
 
@@ -272,7 +294,10 @@ describe("corpus read-only SQL", () => {
 		expect((await p.tool({ action: "sql", sql: "SELECT sha FROM commits ORDER BY sha" })).value.rows).toEqual([[sha(1)], [sha(2)]]);
 		const tables = (await p.tool({ action: "sql", sql: "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name" })).value.rows.flat();
 		expect(tables).not.toContain("nodes");
-		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_partitions", "corpus_refresh", "corpus_refresh_parts", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos"]);
+		const { SCAN_ORDER } = await import("../src/corpus/families");
+		const { SNAPSHOTS, stageName } = await import("../src/corpus/snapshots");
+		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_partitions", "corpus_refresh", "corpus_refresh_parts", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos", ...SCAN_ORDER,
+			"corpus_snapshots", ...Object.keys(SNAPSHOTS).flatMap((t) => [t, stageName(t)])].sort());
 		expect(tables).toContain("corpus_search_fts");
 		// Held kinds and me are refused by the tool; the search index reports its source tables' as_of.
 		expect((await p.tool({ action: "get", kind: "pr", key: "acme/web#1" })).error).toBe(true);
@@ -883,5 +908,149 @@ describe("F1 implementation fix regressions", () => {
 		expect(measured.text).toBe(measured.replay);
 		expect(measured.writes.slice(-2).map(w=>w.statement)).toEqual(["UPDATE corpus_refresh SET next_op","INSERT INTO corpus_refresh_parts (plan_id,"]);
 
+	});
+});
+
+describe("corpus checkout scans and read-time views", () => {
+	const scans = (files: [string, number][]) => (sql: SqlStorage) => {
+		for (const [path, n] of files) sql.exec("INSERT INTO source_files (repo, path, blob_sha, size, scanned, skip_reason) VALUES ('acme/web', ?, ?, 10, 1, NULL)", path, sha(n));
+		sql.exec(`INSERT INTO packages (id, repo, sha, path, role, package, version, scope) VALUES (NULL, 'acme/web', ?, 'package.json', 'dependency', '@acme/api', '1.0.0', 'dependencies'),
+			(NULL, 'acme/api', ?, 'package.json', 'package', '@acme/api', '1.0.0', NULL)`, sha(1), sha(2));
+		sql.exec("INSERT INTO frontend_files (snapshot_id, path, blob_sha, size, language, is_test, top_domain) VALUES ('acme/web', 'src/a.ts', ?, 10, 'typescript', 0, 'src')", sha(1));
+		sql.exec("INSERT INTO env_refs (repo, sha, path, line, name, secret_reference) VALUES ('acme/web', ?, 'src/a.ts', 3, 'API_URL', 0)", sha(1));
+	};
+
+	it("refreshes the scan group per repo beside history: changed rows only, history never touches them, bulk loads refused, views carry as_of", async () => {
+		const p = await refreshable();
+		const sql = async (q: string) => (await p.tool({ action: "sql", sql: q })).value;
+		const run = async (fill: (sql: SqlStorage) => void, repo: string, at: string, state: Json = {}) =>
+			refreshCorpus({ source: (await syntheticSource(fill)).source, client: p.refresher, profile: p.name, repo, observedAt: at, sourceId: FILE2, state, group: "scans" });
+		expect(await run(scans([["src/a.ts", 1], ["src/b.ts", 2], ["src/c.ts", 3]]), "acme/web", CUT)).toMatchObject({ status: "published", receipt: { targets: { source_files: { rows: 3 } } } });
+		expect(await run(scans([]), "acme/api", CUT)).toMatchObject({ status: "published" });
+		const kept = (await sql("SELECT rowid FROM source_files WHERE path = 'src/a.ts'")).rows;
+		// b.ts changed and c.ts was deleted; a.ts keeps its row, so only the changed paths' rows were replaced.
+		expect(await run(scans([["src/a.ts", 1], ["src/b.ts", 9], ["src/d.ts", 4]]), "acme/web", LATER)).toMatchObject({ status: "published" });
+		expect((await sql("SELECT path, blob_sha FROM source_files WHERE repo = 'acme/web' ORDER BY path")).rows).toEqual([["src/a.ts", sha(1)], ["src/b.ts", sha(9)], ["src/d.ts", sha(4)]]);
+		expect((await sql("SELECT rowid FROM source_files WHERE path = 'src/a.ts'")).rows).toEqual(kept);
+		const files = await sql("SELECT count(*) AS n FROM source_files");
+		expect(files.as_of.source_files).toMatchObject({ as_of: LATER, as_of_max: LATER, basis: "observed", refresh: "refresh", complete: true, rows: 3 });
+		// A Git-history refresh of the same repo leaves every scan row and partition alone.
+		expect(await refreshCorpus({ source: (await syntheticSource(nextCut)).source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state: {} }))
+			.toMatchObject({ status: "published" });
+		expect((await sql("SELECT count(*) FROM source_files")).rows).toEqual([[3]]);
+		expect((await sql("SELECT snapshot_id, path FROM frontend_files")).rows).toEqual([["acme/web", "src/a.ts"]]);
+		// Read-time views: derived from loaded rows, with the as_of of the tables they read.
+		const edges = await sql("SELECT consumer_repo, provider_repo, package, confidence FROM package_edges");
+		expect(edges.rows).toEqual([["acme/web", "acme/api", "@acme/api", "declared_name"]]);
+		expect(Object.keys(edges.as_of)).toEqual(["packages"]);
+		const reverts = await sql("SELECT repo, reverts, total_commits FROM pattern_revert_stats ORDER BY repo");
+		expect(reverts.rows.map((r: unknown[]) => r[0])).toEqual(["acme/api", "acme/web"]);
+		expect(Object.keys(reverts.as_of)).toEqual(["commits"]);
+		expect((await sql("SELECT repo, top_author_name, top_author_email, identity_caveat FROM pattern_bus_factor WHERE repo = 'acme/web'")).rows[0]).toMatchObject(["acme/web", expect.any(String), null, "author names; emails are never stored"]);
+		// Scan tables never bulk load, under any source.
+		const refused = await p.http(p.importer, "/v1/corpus/import", await body(p, "source_files", []));
+		expect(refused).toMatchObject({ status: 403, data: { error: { details: { reason: "scan" } } } });
+		const status = (await p.http(p.importer, `/v1/corpus/status?profile=${p.name}`)).data;
+		expect(status.scan_families.map((f: Json) => f.table)).toContain("frontend_files");
+		expect(status.families.map((f: Json) => f.table)).toEqual(TABLES);
+	});
+});
+
+describe("corpus dated snapshots", () => {
+	const SNAP = ["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges",
+		"pattern_findings", "pattern_finding_repos"];
+	/** One synthetic `patterns` cut under the original DDL; `tag` marks which cut a reader sees. Authors: a string array, null, and a contact in text. */
+	const patterns = (tag: string) => (sql: SqlStorage) => {
+		sql.exec(`INSERT INTO pattern_coordinated_changes (rowid, episode_id, ticket, classification, confidence, first_at, last_at, span_days, repo_count, commit_count, non_merge_repos, layers_json)
+			VALUES (3, ?, 'XP-1', 'feature', 'high', '2026-07-01', '2026-07-03', 2.5, 2, 4, 2, '["api","web"]')`, `ep-${tag}`);
+		sql.exec(`INSERT INTO pattern_coordinated_change_repos (rowid, episode_id, repo, layer, first_at, last_at, commits, non_merge_commits, authors_json, subjects_json)
+			VALUES (7, ?, 'acme/web', 'web', '2026-07-01', '2026-07-02', 2, 2, '["Alice Example"]', '[]'), (9, ?, 'acme/api', 'api', '2026-07-02', '2026-07-03', 2, 2, NULL, '[]')`, `ep-${tag}`, `ep-${tag}`);
+		sql.exec(`INSERT INTO pattern_synchronized_migrations (rowid, episode_id, normalized_subject, confidence, first_at, last_at, span_hours, repo_count, commit_count, authors_json, common_paths_json)
+			VALUES (1, ?, 'bump deps', 'high', '2026-07-01', '2026-07-01', 1.5, 2, 2, '["Bo Builder"]', '["package.json"]')`, `mg-${tag}`);
+		sql.exec(`INSERT INTO pattern_migration_commits (rowid, episode_id, repo, sha, committer_at, author_name, author_email, subject, paths_json)
+			VALUES (5, ?, 'acme/web', ?, '2026-07-01', 'Alice Example', 'alice@acme.example', 'Bump deps; ping alice@acme.example', '["package.json"]')`, `mg-${tag}`, sha(5));
+		sql.exec(`INSERT INTO pattern_lineage_edges (rowid, repo_a, repo_b, shared_commits, pct_of_smaller, first_shared_at, last_shared_at, first_unique_a, first_unique_b, last_unique_a, last_unique_b,
+			explicit_cherry_a_to_b, explicit_cherry_b_to_a, confidence, inference) VALUES (1, 'acme/web', 'acme/api', 3, 50.0, '2026-01-01', '2026-02-01', NULL, NULL, NULL, NULL, 0, 1, 'medium', 'fork')`);
+		sql.exec(`INSERT INTO pattern_findings (rowid, finding_id, category, title, confidence, evidence_type, temporal_scope, summary, first_at, last_at, repo_count, commit_count, evidence_json, reproducible_sql)
+			VALUES (2, 'f-1', 'delivery', 'Coordinated releases', 'medium', 'pattern', 'yearly', ?, '2026-01-01', '2026-07-01', 2, 4, '[]', 'SELECT 1')`, `summary ${tag}`);
+		sql.exec("INSERT INTO pattern_finding_repos (rowid, finding_id, repo, role, first_at, last_at, metric, evidence_json) VALUES (4, 'f-1', 'acme/web', 'lead', '2026-01-01', '2026-07-01', 1.0, '[]')");
+	};
+	type Rpc = { query(who: unknown, q: unknown): Promise<Json> };
+
+	it("publishes the whole patterns set atomically in work: rowids, as_of, guard terms and privacy; malformed authors and stage reads refused", async () => {
+		const w = await workAccount();
+		const sql = (q: string) => (w.corpus() as unknown as Rpc).query(w.ref("work"), { action: "sql", sql: q });
+		const st = await w.client.status("work");
+		const fam = st.snapshot_families.find((f: Json) => f.table === "pattern_coordinated_change_repos");
+		const { chunkHash } = await import("../src/corpus/families");
+		const c = { table: fam.table, schema_sha256: fam.schema_sha256, source: { file_sha256: FILE }, as_of: AS_OF, columns: fam.columns, after: null, final: false,
+			rows: [[1, "e", "acme/web", "web", null, null, 1, 1, '[{"name":"Mallory"}]', null]] };
+		expect(await w.http("/v1/corpus/import", { profile: "work", generation: st.generation, ...c, sha256: chunkHash(c) }))
+			.toMatchObject({ status: 400, data: { error: { details: { reason: "people_json" } } } });
+		const { source } = await syntheticSource(patterns("a"));
+		// A run that stops before the last member's final chunk publishes nothing: the live tables stay empty.
+		let sends = 0;
+		const flaky = { status: w.client.status, send: async (x: unknown) => { if (++sends > 6) throw new Error("offline"); return w.client.send(x); } };
+		expect(await uploadCorpus({ source, client: flaky, profile: "work", tables: SNAP, asOf: AS_OF, fileSha256: FILE, state: {} })).toMatchObject({ status: "stopped", reason: "offline" });
+		expect((await sql("SELECT count(*) FROM pattern_coordinated_change_repos")).value).toMatchObject({ rows: [[0]] });
+		expect(await sql("SELECT * FROM corpus_stage_pattern_coordinated_change_repos")).toMatchObject({ ok: false, error: { details: { reason: "sql_refused" } } });
+		expect(await uploadCorpus({ source, client: w.client, profile: "work", tables: SNAP, asOf: AS_OF, fileSha256: FILE, state: {} })).toMatchObject({ status: "done" });
+		const repos = (await sql("SELECT rowid, repo, authors_json FROM pattern_coordinated_change_repos ORDER BY rowid")).value!;
+		expect(repos.rows).toEqual([[7, "acme/web", '["Alice Example"]'], [9, "acme/api", null]]);
+		expect(repos.as_of.pattern_coordinated_change_repos).toMatchObject({ as_of: AS_OF, basis: "declared_snapshot", refresh: "snapshot", complete: true, rows: 2, source_sha256: FILE });
+		expect((await sql("SELECT author_name, author_email, subject FROM pattern_migration_commits")).value!.rows).toEqual([["Alice Example", null, "Bump deps; ping [REDACTED]"]]);
+		expect(await runInDurableObject(w.corpus(), (_i, s) => SNAP.map((t) => s.storage.sql.exec(`SELECT count(*) AS n FROM corpus_stage_${t}`).one().n))).toEqual(SNAP.map(() => 0));
+		expect(await w.terms()).toEqual(expect.arrayContaining(["acme/web", "acme/api", "Alice Example", "Bo Builder"]));
+		expect((await w.terms()).join(" ")).not.toMatch(/@|REDACTED|Mallory/);
+	});
+
+	it("replays published chunks and refuses stale cuts; abandoning clears stage and receipts at once; an abandoned cut restarts; a restored loading cut resends whole", async () => {
+		const p = await isolated();
+		const { cutIdOf } = await import("../src/corpus/snapshots");
+		const { accountStub } = await import("../src/mcp");
+		const { readManifest } = await import("../src/backup");
+		const admin = async (cmd: Json) => { const r = await accountStub(env, OWNER).admin(cmd as never); if (!r.ok) throw new Error(JSON.stringify(r.error)); return r.value as Json; };
+		const load = async (tag: string, file: string, asOf: string, client: Json = p.client) =>
+			uploadCorpus({ source: (await syntheticSource(patterns(tag))).source, client, profile: p.name, tables: SNAP, asOf, fileSha256: file, state: {} });
+		const stopAfter = (n: number) => { let k = 0; return { status: p.client.status, send: async (x: unknown) => { if (++k > n) throw new Error("offline"); return p.client.send(x); } }; };
+		const inStore = <T,>(g: string, f: (sql: SqlStorage) => T) => runInDurableObject(env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${g}`)), (_i, s) => f(s.storage.sql));
+		const receipts = (g: string, id: string) => inStore(g, (sql) => sql.exec<{ n: number }>("SELECT count(*) AS n FROM corpus_requests WHERE substr(request_id, 1, ?) = ?",
+			`corpus:snapshot:${id}:`.length, `corpus:snapshot:${id}:`).one().n);
+		const view = (g: string) => inStore(g, (sql) => ({ ledger: sql.exec<{ cut_id: string; state: string }>("SELECT cut_id, state FROM corpus_snapshots ORDER BY as_of").toArray().map((r) => [r.cut_id, r.state]),
+			live: sql.exec<{ e: string }>("SELECT episode_id AS e FROM pattern_coordinated_changes").toArray().map((r) => r.e), stage: sql.exec<{ n: number }>("SELECT count(*) AS n FROM corpus_stage_pattern_coordinated_changes").one().n }));
+		const C3 = "ef".repeat(32), A = cutIdOf("patterns", FILE, AS_OF), B = cutIdOf("patterns", FILE2, CUT), C = cutIdOf("patterns", C3, LATER);
+		const sent: Json[] = [];
+		expect(await load("a", FILE, AS_OF, { status: p.client.status, send: async (x: Json) => { sent.push(x); return p.client.send(x); } })).toMatchObject({ status: "done" });
+		expect(await p.client.send(sent[0])).toMatchObject({ receipt: { status: "replayed", snapshot: { cut_id: A, state: "published" } } });
+		expect(await load("z", "12".repeat(32), AS_OF)).toMatchObject({ status: "refused", reason: "stale_snapshot" });
+		// B starts; a newer C abandons it in the same transaction: its stage rows and its request receipts go together.
+		expect(await load("b", FILE2, CUT, stopAfter(1))).toMatchObject({ status: "stopped" });
+		expect(await receipts(p.generation, B)).toBe(1);
+		expect(await load("c", C3, LATER, stopAfter(1))).toMatchObject({ status: "stopped" });
+		expect(await receipts(p.generation, B)).toBe(0);
+		expect(await view(p.generation)).toEqual({ ledger: [[A, "published"], [B, "abandoned"], [C, "loading"]], live: ["ep-a"], stage: 1 });
+		// The abandoned B restarts from its first chunk on a reset ledger and publishes whole, abandoning C; A is superseded.
+		expect(await load("b", FILE2, CUT)).toMatchObject({ status: "done" });
+		expect(await view(p.generation)).toEqual({ ledger: [[A, "superseded"], [B, "published"], [C, "abandoned"]], live: ["ep-b"], stage: 0 });
+		expect(await receipts(p.generation, B)).toBe(7);
+		// Export with C loading: stages are not exported; the restored C is abandoned with its receipts before the generation opens.
+		expect(await load("c", C3, LATER, stopAfter(1))).toMatchObject({ status: "stopped" });
+		const exportId = (await admin({ op: "export", profile: p.name, corpus: true }))[`corpus-${p.name}`].id as string;
+		const m = await readManifest(env, `corpus-${p.name}`, exportId, OWNER);
+		expect(m.ok && Object.keys(m.value.counts).filter((t) => t.startsWith("corpus_stage_"))).toEqual([]);
+		expect(m.ok && m.value.counts.corpus_snapshots).toBe(3);
+		const g2 = rand();
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => {
+			s.storage.sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g2, `${OWNER}:${p.name}:${g2}`, p.name);
+			s.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g2, p.name, new Date().toISOString());
+		});
+		await admin({ op: "beginCorpusRestore", profile: p.name, export: exportId });
+		expect(await admin({ op: "restoreStep" })).toMatchObject({ state: "ready" });
+		await admin({ op: "openRestore" });
+		expect(await view(g2)).toEqual({ ledger: [[A, "superseded"], [B, "published"], [C, "abandoned"]], live: ["ep-b"], stage: 0 });
+		expect([await receipts(g2, C), await receipts(g2, B)]).toEqual([0, 7]);
+		// The uploader resends C from its first chunk; B stays live until C publishes whole.
+		expect(await load("c", C3, LATER)).toMatchObject({ status: "done", generation: g2 });
+		expect(await view(g2)).toEqual({ ledger: [[A, "superseded"], [B, "superseded"], [C, "published"]], live: ["ep-c"], stage: 0 });
 	});
 });

@@ -248,7 +248,7 @@ async = true
 [[hooks.SessionEnd.hooks]]
 type = "command"
 command = "~/.agent-memory/bin/agent-memory hook codex"
-timeout = 10
+timeout = 3
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]

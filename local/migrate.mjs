@@ -919,10 +919,15 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			}
 			records.get(it.key).linked = [...linked];
 		}
-		for (const it of items.filter((x) => x.review.length || !x.planned)) {
-			review.push({ key: it.key, source: it.source, id: it.id ?? null, name: it.node.name ?? null, reasons: [...new Set(it.review)], ...(it.route ? { proposed: it.route } : {}),
-				planned: !!it.planned });
-		}
+		const UNROUTED = ["unrouted_scope", "unrouted_path"];
+		items.forEach((it, i) => {
+			if (!it.review.length && it.planned) return;
+			const reasons = [...new Set(it.review)];
+			// Only a record held for no reason but its missing route can be routed by the owner: its exact `plan --routes` binding.
+			const assignable = !rehearsal && !it.route && !it.held && it.id && it.node.scope && reasons.every((r) => UNROUTED.includes(r));
+			review.push({ key: it.key, source: it.source, id: it.id ?? null, name: it.node.name ?? null, reasons, ...(it.route ? { proposed: it.route } : {}),
+				planned: !!it.planned, ...(assignable ? { route_binding: { scope: it.node.scope, source_sha256: sha256(canonicalJson(rows[i])) } } : {}) });
+		});
 		const batches = [];
 		let cur = null;
 		commands.forEach((c, i) => {

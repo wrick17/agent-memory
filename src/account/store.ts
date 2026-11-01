@@ -12,7 +12,9 @@ import { mayUse, refreshSelectors, type RefreshSelector } from "../routing";
 import { BudgetTx, ROW_PAUSE, type ProfileStore, type RestoredPage } from "../profile/store";
 import { PROFILE_MIGRATIONS } from "../profile/schema";
 import { applyRows, dropExportId, dropExports, exportStore, exportTables, hasExports, listExports, readChunk, readManifest, type Manifest } from "../backup";
-import { wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wipe";
+import { scrubReview, wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wipe";
+import { CORPUS_MIGRATIONS, type CorpusStore } from "../corpus/store";
+import { settleRule, type Identity, type RecoveryCopy, type SettleAction, type SettleFacts } from "../profile/store";
 
 export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
@@ -42,25 +44,87 @@ export type AccountCommand =
 	/** Internal to the owner preview route: the targets and terms come back to the Worker, which never returns the terms. */
 	| { op: "wipePlan"; profile: string }
 	// Backups and restore from an export (section 18): owner only, one recovery at a time.
-	| { op: "export"; profile?: string }
-	| { op: "listExports"; profile?: string }
+	/** `corpus` also exports the profiles' corpora now; the nightly run exports each corpus once a week. */
+	| { op: "export"; profile?: string; corpus?: boolean }
+	| { op: "listExports"; profile?: string; corpus?: boolean }
 	| { op: "beginRestore"; profile: string; export: string }
+	/** Point-in-time restore of a profile's current generation to `at`, or the reversal of restore `undo` by its recorded undo bookmark. */
+	| { op: "beginPitr"; profile: string; at?: string; undo?: string }
+	/** Restores a profile's corpus export into its current, empty corpus generation. */
+	| { op: "beginCorpusRestore"; profile: string; export: string }
+	/** The open recovery or a finished one's record, by id. */
+	| { op: "restoreRecord"; id: string }
+	/** The open recovery's copy conflicts, after a node id, with both copies as each profile holds them now. */
+	| { op: "recoveryConflicts"; id: string; after?: string }
+	/** The owner keeps one copy of a conflict; the other becomes a flagged tombstone, its content in that profile's archive. */
+	| { op: "resolveConflict"; id: string; node: string; keep: string; expect: CopyExpectation[]; request_id: string }
 	| { op: "beginAccountRestore"; export: string }
 	| { op: "restoreStatus" }
 	| { op: "restoreStep"; id?: string }
 	| { op: "openRestore"; id?: string }
-	| { op: "abortRestore"; id?: string };
+	| { op: "abortRestore"; id?: string }
+	// The owner's review list (section 15). Offer adds open items and never overwrites a decision; a collision resolved earlier
+	// reopens when the same move collides again. Assign and resolve only record the owner's choice; they write no memory.
+	/** origin: the migrated records' profile and the generation the caller was granted; a collision names its own profiles. */
+	| { op: "reviewOffer"; items: ReviewOffer[]; origin?: { profile: string; generation: string } }
+	| { op: "reviewList"; kind?: ReviewKind; state?: ReviewState; exportSha?: string; after?: string; limit: number }
+	| { op: "reviewAssign"; id: string; profile: "work" | "personal" }
+	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" };
+
+export type ReviewKind = "migration" | "collision";
+export type ReviewState = "open" | "assigned" | "resolved" | "wiped";
+export interface ReviewOffer { id: string; kind: ReviewKind; profile: string; payload: Record<string, unknown> }
+type ReviewRow = { id: string; kind: ReviewKind; profile: string; state: ReviewState; payload: string; decision: string | null; created_at: string; updated_at: string };
+const reviewOut = (r: ReviewRow) => ({ ...r, payload: JSON.parse(r.payload) as Record<string, unknown>, decision: r.decision ? JSON.parse(r.decision) as Record<string, unknown> : null });
 
 /**
  * The open recovery, kept in `recovery_state` while the account is closed. `unresolved` keeps the account closed until the
  * owner aborts; open rebuilds node_index and request_index from the restored generation, then switches the profile to it.
  */
-export interface Recovery {
+export interface Recovery extends Choices {
 	id: string; profile: string; export: string; from: string; to?: string; at: string; export_at: string; export_seq: number;
-	state: "restoring" | "checking" | "ready" | "unresolved" | "opening";
-	after?: { node: string; request: string }; mark?: number; phase?: "index" | "sweep" | "switch";
+	state: "restoring" | "settling" | "checking" | "ready" | "unresolved" | "opening" | PitrState;
+	after?: { node: string; request: string }; mark?: number; phase?: "precheck" | "deferred" | "index" | "sweep" | "switch";
 	restored?: { nodes: number; requests: number }; unresolved: { kind: string; id: string }[]; unresolved_count: number;
+	/** Absent for a restore from an export into a new generation. A point-in-time restore keeps `to` = `from`; a corpus restore owns no records. */
+	kind?: "pitr" | "corpus";
+	/**
+	 * pitr: the target time, or the restore whose undo bookmark this one applies. Then, per arm (`armed` is its tag): the fallback
+	 * bookmark and the arming session, recorded before anything is armed, and the armed bookmark with the platform's undo after.
+	 */
+	target_at?: string; reverses?: string; armed?: string; session?: string; fallback?: string; bookmark?: string; undo?: string;
+	revert_fallback?: string; revert_bookmark?: string; revert_undo?: string; undo_from?: "platform" | "fallback"; rearmed?: number;
+	settle?: Settle; settled?: number;
 }
+/**
+ * requested: open, nothing armed. arming: the fallback bookmark is recorded and a restore may be armed; only a confirmed restart
+ * says whether it applied. armed: the armed bookmark and the platform's undo are recorded too. reverting: an abort after a
+ * restore applied, which applies the undo bookmark (or the fallback) the same way before the recovery closes.
+ */
+type PitrState = "requested" | "arming" | "armed" | "reverting";
+/** Settlement progress (section 18, step 4): which transfer list is being read, and the last id read from it. */
+interface Settle { i: number; after: string }
+/** A finding. A copy conflict also names the two profiles holding its node, and the transfer it came from: that is an owner choice. */
+export type Finding = { kind: string; id: string; transfer?: string; pair?: [string, string] };
+/**
+ * One step of settlement or of an owner's choice: a profile action, or the account's own ownership write. A profile or
+ * point-in-time restore runs the steps on its restored profile at once and keeps every other one, in order, for open: an
+ * abort then leaves the live profiles and the indexes as they were.
+ */
+export type RecoveryStep = { profile: string; action: SettleAction; id: string; nodeId: string; peer: string; identity?: Identity; flag?: string }
+	| { profile: null; node: string; owner: string | null; transfers: { id: string; state: "committed" | "aborted" }[] };
+/**
+ * The owner's choice between two copies of one node (section 18, step 4), kept as `restore:<recovery>:conflict:<node>`. Open
+ * until the owner keeps one copy; `resolving` carries the request id and plan of that choice, so a retry continues or replays.
+ */
+export interface RecoveryConflict {
+	node: string; kind: string; transfer: string | null; profiles: [string, string]; state: "open" | "resolving" | "resolved"; at: string;
+	request_id?: string; payload?: string; keep?: string; expect?: CopyExpectation[]; plan?: RecoveryStep[]; next?: number; result?: Record<string, unknown>;
+}
+/** What the owner saw of each copy; any difference now refuses the choice. A profile without the node is null status and revision. */
+export interface CopyExpectation { profile: string; generation: string | null; status: string | null; revision: number | null }
+/** Owner choices in progress (`resolving` names the node) and the steps kept for open (`deferred`, `deferred_next`). */
+interface Choices { conflicts?: { total: number; open: number }; resolving?: string; deferred?: number; deferred_next?: number }
 
 /**
  * An account restore in place (section 18), kept in `recovery_state`, which the restore never overwrites. `checkpoint` is the
@@ -68,12 +132,13 @@ export interface Recovery {
  * After the snapshot, the R2 generation ledger, the R2 wipe tombstones and the active profiles' own rows rebuild what it is not
  * trusted with; any finding keeps the account closed until the owner aborts.
  */
-export interface AccountRecovery {
+export interface AccountRecovery extends Choices {
 	kind: "account"; id: string; export: string; export_at: string; export_seq: number; at: string;
-	state: "checkpoint" | "applying" | "reconciling" | "ready" | "unresolved" | "rolling_back";
-	checkpoint?: string; phase?: "clear" | "apply" | "ledger" | "tombstones" | "profiles" | "index";
+	state: "checkpoint" | "applying" | "reconciling" | "ready" | "unresolved" | "rolling_back" | "opening";
+	checkpoint?: string; phase?: "clear" | "apply" | "ledger" | "tombstones" | "profiles" | "settle" | "index" | "precheck" | "deferred";
 	next: number; row: number; last?: string; after?: { profile: string; node: string; request: string; done: boolean };
 	unresolved: { kind: string; id: string }[]; unresolved_count: number;
+	settle?: Settle; settled?: number;
 }
 const CHECKPOINT = "account-checkpoint";
 /** A profile's `requests.op` is its write command; the account binds the tool's name (mcp.ts write). Others bind as stored. */
@@ -84,7 +149,7 @@ const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "re
 const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%'";
 /** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. */
 const MERGED = ["counters", "refresh_days", "sensitive_terms"];
-const ADMIN_WHILE_RESTORING = ["listExports", "restoreStatus", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
+const ADMIN_WHILE_RESTORING = ["listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
 const flag = (r: { unresolved: { kind: string; id: string }[]; unresolved_count: number }, found: { kind: string; id: string }[]) => {
 	r.unresolved.push(...found.slice(0, Math.max(0, 50 - r.unresolved.length)));
 	r.unresolved_count += found.length;
@@ -490,7 +555,11 @@ export class AccountStore extends DurableObject<Env> {
 	}
 	private profileAt(ref: ProfileRef) {
 		return this.env.PROFILE.get(this.env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
-			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore">;
+			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests">;
+	}
+	private corpusAt(ref: ProfileRef) {
+		return this.env.CORPUS_STORE!.get(this.env.CORPUS_STORE!.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
+			Pick<CorpusStore, "exportNow" | "restoreStep" | "discardRestore">;
 	}
 
 	private wiping(): boolean {
@@ -508,7 +577,8 @@ export class AccountStore extends DurableObject<Env> {
 	private async replaceExports(wiped: string): Promise<Outcome<{ deleted: Record<string, string[]>; replaced: string[] }>> {
 		const userId = this.meta("user_id")!;
 		try {
-			const deleted: Record<string, string[]> = { [`profile-${wiped}`]: await dropExports(this.env, `profile-${wiped}`, null), [CHECKPOINT]: await dropExports(this.env, CHECKPOINT, null) };
+			const deleted: Record<string, string[]> = { [`profile-${wiped}`]: await dropExports(this.env, `profile-${wiped}`, null), [`corpus-${wiped}`]: await dropExports(this.env, `corpus-${wiped}`, null),
+				[CHECKPOINT]: await dropExports(this.env, CHECKPOINT, null) };
 			const replaced: string[] = [];
 			const stores: { store: string; ref: ProfileRef | null }[] = [
 				...this.sql.exec<{ name: string; generation: string }>("SELECT name, generation FROM profiles WHERE status = 'active' AND name <> ? ORDER BY name", wiped).toArray()
@@ -526,33 +596,89 @@ export class AccountStore extends DurableObject<Env> {
 		} catch (e) { return fail("unavailable", `export replacement failed: ${(e as Error).message}`); }
 	}
 
-	/** Internal RPC: only the open restore may write into its reserved generation. */
-	async restoreAuthority(who: ProfileRef, id: string): Promise<Outcome<null>> {
+	/** Internal RPC: only the open restore may write into its reserved generation; a corpus restore only into its corpus. */
+	async restoreAuthority(who: ProfileRef, id: string, kind?: "corpus"): Promise<Outcome<null>> {
 		const r = this.recovery();
-		return this.meta("user_id") === who.userId && r?.id === id && r.state === "restoring" && r.to === who.generation && r.profile === who.profile
+		return this.meta("user_id") === who.userId && r?.id === id && r.state === "restoring" && r.to === who.generation && r.profile === who.profile && r.kind === kind
 			? ok(null) : fail("forbidden", "no open restore names this generation");
 	}
 
+	/** The generation a settlement reads and writes: the restored one for the restored profile, else the active one. */
+	private settleGeneration(r: Recovery | AccountRecovery, profile: string): string | undefined {
+		if (!("kind" in r && r.kind === "account") && (r as Recovery).profile === profile) return (r as Recovery).to;
+		return this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ? AND status = 'active'", profile).toArray()[0]?.generation;
+	}
+
+	/** Internal RPC: only the open recovery's settlement phase may run a settlement action, and only on the generation it reads. */
+	async settleAuthority(who: ProfileRef, id: string): Promise<Outcome<null>> {
+		const r = this.recovery() as Recovery | AccountRecovery | undefined;
+		// Settlement, an owner's choice being carried out, or the kept steps at open.
+		const settling = !!r && (r.state === "settling" || ("kind" in r && r.kind === "account" && r.state === "reconciling" && r.phase === "settle")
+			|| (r.state === "unresolved" && !!r.resolving) || (r.state === "opening" && r.phase === "deferred"));
+		return this.meta("user_id") === who.userId && r?.id === id && settling && this.settleGeneration(r, who.profile) === who.generation
+			? ok(null) : fail("forbidden", "no open recovery settles this generation");
+	}
+
+	/**
+	 * Internal RPC from the profile's pitrArm, in its stages. Without `marks`, only checks that the open point-in-time restore
+	 * expects this arm. `prepared` durably records the fallback bookmark and the arming session before anything is armed;
+	 * `armed` records the armed bookmark and the platform's undo bookmark; `released` withdraws an arm the profile knows it never
+	 * armed. The profile arms only after `prepared` landed.
+	 */
+	async pitrRecord(who: ProfileRef, id: string, tag: string,
+		marks?: { stage: "prepared"; fallback: string; session: string } | { stage: "armed"; bookmark: string; undo: string } | { stage: "released" }): Promise<Outcome<null>> {
+		const r = this.recovery();
+		const reverting = r?.state === "reverting", expected = !r ? undefined : reverting ? `${r.id}:revert` : r.state === "requested" || r.state === "arming" ? r.id : undefined;
+		if (this.meta("user_id") !== who.userId || r?.kind !== "pitr" || r.id !== id || r.profile !== who.profile || r.from !== who.generation || tag !== expected) {
+			return fail("forbidden", "no open point-in-time restore expects this bookmark");
+		}
+		const fresh = r.armed !== tag;
+		if ((!marks || marks.stage === "prepared") !== fresh) return fail("forbidden", fresh ? "this arm was not prepared" : "this arm is already prepared");
+		if (!marks) return ok(null);
+		const before = JSON.stringify(r);
+		this.write(() => {
+			if (this.meta("recovery_state") !== before) throw Fail.of("busy", "the recovery moved; read its status");
+			if (marks.stage === "prepared") Object.assign(r, { armed: tag, session: marks.session }, reverting ? { revert_fallback: marks.fallback } : { state: "arming", fallback: marks.fallback });
+			else if (marks.stage === "armed") Object.assign(r, reverting ? { revert_bookmark: marks.bookmark, revert_undo: marks.undo } : { state: "armed", bookmark: marks.bookmark, undo: marks.undo });
+			else Object.assign(r, { armed: undefined, session: undefined }, reverting ? { revert_fallback: undefined } : { state: "requested", fallback: undefined });
+			this.saveRecovery(r);
+		});
+		return ok(null);
+	}
+
 	/** Reconciliation checks for one restored page (section 18, steps 2 to 5); read only. Any finding keeps the account closed. */
-	private findings(profile: string, page: RestoredPage): { kind: string; id: string }[] {
-		const out: { kind: string; id: string }[] = [];
+	private findings(r: Recovery, page: RestoredPage): Finding[] {
+		const out: Finding[] = [], profile = r.profile;
 		for (const n of page.nodes) {
 			if (this.meta(`wiped:${n.id}`)) out.push({ kind: "wiped_node", id: n.id });
-			else if (n.status === "incoming" || n.status === "moving") out.push({ kind: "transfer_state", id: n.id });
+			else if (n.status === "incoming" || n.status === "moving") { if (this.decidedOf(r, n.id) === undefined) out.push({ kind: "transfer_state", id: n.id }); }
 			else if (n.status !== "moved") {
-				const owner = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", n.id).toArray()[0]?.profile;
-				if (owner && owner !== profile) out.push({ kind: "owned_elsewhere", id: n.id });
+				// Two copies with no transfer identity: the owner chooses (step 4).
+				const owner = this.ownerOf(r, n.id);
+				if (owner && owner !== profile) out.push({ kind: "owned_elsewhere", id: n.id, pair: [profile, owner] });
 			}
 		}
 		for (const q of page.requests) {
 			const row = this.sql.exec<{ profile: string; op: string }>("SELECT profile, op FROM request_index WHERE request_id = ?", q.request_id).toArray()[0];
 			if (row?.op === "wiped") out.push({ kind: "wiped_request", id: q.request_id });
-			else if (row && row.profile !== profile) out.push({ kind: "request_elsewhere", id: q.request_id });
+			else if (row && row.profile !== profile && ![profile, row.profile].includes(this.requestOwner(r, q, profile) ?? "")) out.push({ kind: "request_elsewhere", id: q.request_id });
 		}
 		return out;
 	}
 
-	private async backup(cmd: Extract<AccountCommand, { op: "export" | "listExports" | "beginRestore" | "beginAccountRestore" | "restoreStatus" | "restoreStep" | "openRestore" | "abortRestore" }>): Promise<Outcome<unknown>> {
+	/** A profile's unfinished transfer rows that this recovery has not planned to end; more than 50 is one finding of its own. */
+	private openTransfers(r: Recovery | AccountRecovery, profile: string, page: RestoredPage): Finding[] {
+		const out: Finding[] = page.open_transfer_ids.filter((id) => !this.planned(r, id, profile)).map((id) => ({ kind: "open_transfer", id }));
+		if (page.open_transfers > page.open_transfer_ids.length) out.push({ kind: "open_transfer", id: `${profile}:more` });
+		return out;
+	}
+
+	/** Step 5: a request id found in two profiles goes with the profile that owns its node; one whose node `profile` holds, there. */
+	private requestOwner(r: Recovery | AccountRecovery, q: RestoredPage["requests"][number], profile: string): string | undefined {
+		return (q.node_id ? this.ownerOf(r, q.node_id) : undefined) ?? (q.node_status && q.node_status !== "moved" && q.node_status !== "incoming" ? profile : undefined);
+	}
+
+	private async backup(cmd: Extract<AccountCommand, { op: "export" | "listExports" | "beginRestore" | "beginAccountRestore" | "beginPitr" | "beginCorpusRestore" | "restoreRecord" | "recoveryConflicts" | "resolveConflict" | "restoreStatus" | "restoreStep" | "openRestore" | "abortRestore" }>): Promise<Outcome<unknown>> {
 		const userId = this.meta("user_id");
 		if (!userId) return fail("unavailable", "the account is not set up");
 		// Checked before any await, so nothing below runs for a recovery other than the one the caller named.
@@ -576,9 +702,7 @@ export class AccountStore extends DurableObject<Env> {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
 				const r: AccountRecovery = { kind: "account", id: crypto.randomUUID(), export: m.value.id, export_at: m.value.at, export_seq: m.value.seq, at: now(),
 					state: "checkpoint", next: 0, row: 0, unresolved: [], unresolved_count: 0 };
-				// A transfer unfinished now, or begun or finished after the export, may have moved a record the snapshot does not know: the owner settles it.
-				flag(r, this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE completed_at IS NULL OR completed_at > ? OR created_at > ? ORDER BY id", m.value.at, m.value.at).toArray()
-					.map((t) => ({ kind: "transfer_after_export", id: t.id })));
+				// A transfer unfinished now, or begun or finished after the export, is settled from both profiles by the fixed rules (phase settle).
 				// Close first (step 1): nothing below changes the account before this lands.
 				this.write(() => this.saveRecovery(r));
 				return ok(r);
@@ -602,14 +726,89 @@ export class AccountStore extends DurableObject<Env> {
 					const a = await this.exportAccount(userId);
 					results.account = a.ok ? a.value : { error: a.error };
 				}
+				// The corpus weekly (section 18), also kept two: once its newest complete export is older than about a week, or when asked.
+				const week = new Date(Date.now() - 6.5 * 86_400_000).toISOString().replace(/[-:.]/g, "");
+				for (const p of this.env.CORPUS_STORE ? rows.filter((x) => x.name !== "me") : []) {
+					if (!cmd.corpus && ((await listExports(this.env, `corpus-${p.name}`)).at(-1) ?? "") >= week) continue;
+					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
+					const ref = { userId, profile: p.name, generation: p.generation };
+					const c = await this.corpusAt(ref).exportNow(ref);
+					results[`corpus-${p.name}`] = c.ok ? c.value : c.error.code === "not_found" ? "empty" : { error: c.error };
+				}
 				const failed = Object.values(results).some((v) => typeof v === "object" && v !== null && "error" in v);
 				this.write(() => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", JSON.stringify({ at: now(), results })));
 				return failed ? fail("unavailable", "an export failed", { results }) : ok(results);
 			}
 			case "listExports":
-				return ok(await listExports(this.env, cmd.profile ? `profile-${cmd.profile}` : "account"));
+				return ok(await listExports(this.env, cmd.profile ? `${cmd.corpus ? "corpus" : "profile"}-${cmd.profile}` : "account"));
 			case "restoreStatus":
 				return ok({ recovery: this.recovery() ?? null, last_export: JSON.parse(this.meta("last_export") ?? "null") as unknown });
+			case "recoveryConflicts":
+				return this.recoveryConflicts(userId, cmd);
+			case "resolveConflict":
+				try { return await this.resolveConflict(userId, cmd); } catch (e) {
+					if (e instanceof Fail) return { ok: false, error: e.failure };
+					return fail("unavailable", `the choice did not finish: ${(e as Error).message}; repeat it with the same request id`);
+				}
+			case "restoreRecord": {
+				const open = this.recovery();
+				if (open?.id === cmd.id) return ok(open);
+				const done = this.meta(`restore:${cmd.id}`);
+				return done ? ok(JSON.parse(done) as unknown) : fail("not_found", "no restore has that id");
+			}
+			case "beginPitr": {
+				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
+				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
+				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
+				if (p.status !== "active") return fail("profile_wiped", "only an active profile can be restored");
+				let target: Pick<Recovery, "target_at" | "bookmark" | "reverses" | "export_at">;
+				if (cmd.undo !== undefined) {
+					// The reversal applies the undo bookmark the reversed restore recorded, to the same generation only.
+					const rec = JSON.parse(this.meta(`restore:${cmd.undo}`) ?? "null") as Recovery | null;
+					if (rec?.kind !== "pitr" || (rec.state as string) !== "opened" || rec.profile !== cmd.profile || rec.from !== p.generation || !rec.undo) {
+						return fail("validation", "only an opened point-in-time restore of this profile's current generation can be reversed");
+					}
+					target = { bookmark: rec.undo, reverses: cmd.undo, export_at: rec.at };
+				} else {
+					const at = Date.parse(cmd.at ?? "");
+					if (!Number.isFinite(at) || at > Date.now() - 1_000 || at < Date.now() - 30 * 86_400_000) return fail("validation", "at must be an ISO time in the past, within the last 30 days");
+					// A bookmark before this generation began would bring back an empty or half-restored object.
+					const g = this.sql.exec<{ reserved_at: string }>("SELECT reserved_at FROM generations WHERE id = ?", p.generation).toArray()[0];
+					if (g && Date.parse(g.reserved_at) > at) return fail("validation", "that time is before this profile's current generation began; restore from an export instead", { reason: "before_generation" });
+					target = { target_at: new Date(at).toISOString(), export_at: new Date(at).toISOString() };
+				}
+				const r: Recovery = { kind: "pitr", id: crypto.randomUUID(), profile: cmd.profile, export: "", from: p.generation, to: p.generation, at: now(), export_seq: 0,
+					state: "requested", unresolved: [], unresolved_count: 0, ...target };
+				// Close first (step 1): every profile call is refused from here until open or abort.
+				this.write(() => this.saveRecovery(r));
+				const first = await this.backup({ op: "restoreStep", id: r.id });
+				// Nothing was armed: the recovery ends here, and the account reopens.
+				if (!first.ok && this.recovery()?.id === r.id && this.recovery()!.state === "requested") {
+					this.endRecovery(this.recovery()!, "aborted");
+					return first;
+				}
+				return first;
+			}
+			case "beginCorpusRestore": {
+				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
+				if (!this.env.CORPUS_STORE) return fail("unavailable", "the corpus is not bound");
+				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
+				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
+				// A wiped profile's corpus is refused (section 18): it owns no records, so this is its only reconciliation.
+				if (p.status !== "active" || cmd.profile === "me") return fail("profile_wiped", "only an active profile other than me has a corpus to restore");
+				const m = await readManifest(this.env, `corpus-${cmd.profile}`, cmd.export, userId);
+				if (!m.ok) return m;
+				if (m.value.profile !== cmd.profile || m.value.schema_version !== CORPUS_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+				const gen = this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ? AND profile = ?", m.value.generation ?? "", cmd.profile).toArray()[0];
+				if (gen?.state === "wiped") return fail("profile_wiped", "this export belongs to a wiped generation");
+				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				const r: Recovery = { kind: "corpus", id: crypto.randomUUID(), profile: cmd.profile, export: m.value.id, from: p.generation, to: p.generation, at: now(),
+					export_at: m.value.at, export_seq: m.value.seq, state: "restoring", unresolved: [], unresolved_count: 0 };
+				this.write(() => this.saveRecovery(r));
+				return ok(r);
+			}
 			case "beginRestore": {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
@@ -641,40 +840,62 @@ export class AccountStore extends DurableObject<Env> {
 			case "restoreStep": {
 				const r = this.recovery();
 				if (!r) return fail("not_found", "no recovery is open");
+				if (r.kind === "corpus") return this.corpusStep(r, userId);
+				if (r.kind === "pitr") {
+					const waiting = await this.pitrStep(r, userId);
+					if (waiting) return waiting;
+				}
 				if (!r.to) return fail("validation", "this recovery has no reserved generation; abort it");
 				const who = { userId, profile: r.profile, generation: r.to }, stub = this.profileAt(who), started = Date.now();
 				if (r.state === "restoring") {
 					const s = await stub.restoreStep(who, { id: r.id, exportId: r.export });
 					if (!s.ok) return s;
 					if (!s.value.done) return ok({ ...r, progress: s.value });
-					Object.assign(r, { state: "checking", after: { node: "", request: "" }, restored: { nodes: 0, requests: 0 } });
-					this.write(() => this.saveRecovery(r));
+					this.advance(r, () => Object.assign(r, { state: "settling", settle: { i: 0, after: "" }, settled: 0 }));
+				}
+				// Transfers by the fixed rules (step 4), before the ownership checks read the settled rows.
+				if (r.state === "settling") {
+					const s = await this.settleTransfers(r, userId, () => Date.now() - started < 20_000);
+					if (!s.ok) return s;
+					if (r.state === "settling") return ok(r);
 				}
 				while (r.state === "checking" && Date.now() - started < 20_000) {
 					const page = await stub.restoredPage(who, r.after!);
 					if (!page.ok) return page;
 					if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status");
-					const found = this.findings(r.profile, page.value);
-					if (r.after!.node === "" && r.after!.request === "" && page.value.open_transfers) found.push({ kind: "open_transfer", id: r.to });
+					const found = this.findings(r, page.value);
+					if (r.after!.node === "" && r.after!.request === "") found.push(...this.openTransfers(r, r.profile, page.value));
 					const done = page.value.nodes.length < 200 && page.value.requests.length < 200;
-					// A transfer still open, or finished after the export, may have moved a record in or out: the owner settles it (step 4).
-					if (done) for (const t of this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE (from_profile = ? OR to_profile = ?) AND (completed_at IS NULL OR completed_at > ?)",
-						r.profile, r.profile, r.export_at).toArray()) found.push({ kind: "transfer_after_export", id: t.id });
-					r.unresolved.push(...found.slice(0, Math.max(0, 50 - r.unresolved.length)));
-					r.unresolved_count += found.length;
-					r.restored!.nodes += page.value.nodes.length; r.restored!.requests += page.value.requests.length;
-					r.after = { node: page.value.nodes.at(-1)?.id ?? r.after!.node, request: page.value.requests.at(-1)?.request_id ?? r.after!.request };
-					if (done) r.state = r.unresolved_count ? "unresolved" : "ready";
-					this.write(() => this.saveRecovery(r));
+					// A transfer the settlement left open stays a finding (step 4).
+					if (done) for (const t of this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE (from_profile = ? OR to_profile = ?) AND completed_at IS NULL",
+						r.profile, r.profile).toArray()) if (!this.planned(r, t.id)) found.push({ kind: "transfer_unfinished", id: t.id });
+					this.advance(r, () => {
+						r.restored!.nodes += page.value.nodes.length; r.restored!.requests += page.value.requests.length;
+						r.after = { node: page.value.nodes.at(-1)?.id ?? r.after!.node, request: page.value.requests.at(-1)?.request_id ?? r.after!.request };
+						this.flagFound(r, found);
+						if (done) r.state = r.unresolved_count ? "unresolved" : "ready";
+					});
 				}
 				return ok(r);
 			}
 			case "openRestore": {
 				const r = this.recovery();
 				if (!r) return fail("not_found", "no recovery is open");
+				if (r.kind === "corpus") {
+					if (r.state !== "ready") return fail("validation", `the recovery is ${r.state}; it opens only when ready`);
+					const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", r.profile).toArray()[0];
+					if (p?.status !== "active" || p.generation !== r.to) return fail("validation", "the profile changed during the corpus restore; abort it");
+					return ok(this.endRecovery(r, "opened"));
+				}
 				if (r.state !== "ready" && r.state !== "opening") return fail("validation", `the recovery is ${r.state}; it opens only when ready`);
 				const to = r.to!, who = { userId, profile: r.profile, generation: to }, stub = this.profileAt(who), started = Date.now();
-				if (r.state === "ready") this.write((seq) => { Object.assign(r, { state: "opening", phase: "index", mark: seq, after: { node: "", request: "" } }); this.saveRecovery(r); });
+				if (r.state === "ready") this.write((seq) => { Object.assign(r, { state: "opening", phase: r.deferred ? "precheck" : "index", deferred_next: 0, mark: seq, after: { node: "", request: "" } }); this.saveRecovery(r); });
+				// The steps settlement and the owner's choices kept for the live profiles: checked, then run in order (abort never runs them).
+				if (r.phase === "precheck" || r.phase === "deferred") {
+					const d = await this.runDeferred(r, userId, () => Date.now() - started < 20_000);
+					if (!d.ok || !d.value) return d.ok ? ok(r) : d;
+					this.advance(r, () => Object.assign(r, { phase: "index" }));
+				}
 				// Ownership from the restored generation (steps 3 and 5): every row it holds is restamped after the mark ...
 				while (r.phase === "index" && Date.now() - started < 20_000) {
 					const page = await stub.restoredPage(who, r.after!);
@@ -692,6 +913,14 @@ export class AccountStore extends DurableObject<Env> {
 						}
 						if (nodes === page.value.nodes.length) for (const q of page.value.requests) {
 							if (tx.spent(0.5)) break;
+							// Step 5: a request whose node another profile owns keeps that owner's binding, rebuilt from its rows; it is never restamped here.
+							const owner = q.node_id ? this.ownerOf(r, q.node_id) : undefined;
+							if (owner && owner !== r.profile) { requests++; continue; }
+							// A request held elsewhere comes here when this profile owns its node.
+							if (q.node_id && this.sql.exec("SELECT 1 FROM node_index WHERE node_id = ? AND profile = ?", q.node_id, r.profile).toArray().length) {
+								tx.run("UPDATE request_index SET profile = ?, op = ?, payload_hash = ?, at = ?, legacy = ?, seq = ? WHERE request_id = ? AND profile <> ? AND op <> 'wiped'",
+									r.profile, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, q.legacy_hash ? 1 : 0, seq, q.request_id, r.profile);
+							}
 							tx.run(`INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy) VALUES (?, ?, ?, ?, ?, ?, ?)
 								ON CONFLICT (request_id) DO UPDATE SET seq = excluded.seq WHERE profile = excluded.profile AND op <> 'wiped'`,
 								q.request_id, r.profile, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, seq, q.legacy_hash ? 1 : 0);
@@ -718,6 +947,8 @@ export class AccountStore extends DurableObject<Env> {
 					});
 				}
 				if (r.phase !== "switch") return ok(r);
+				// A point-in-time restore stays on its own generation; its record keeps the undo bookmark for a reversal.
+				if (r.kind === "pitr") return ok(this.endRecovery(r, "opened"));
 				// The ledger first (section 18, restore step 4): a crash here retries the same idempotent puts while the account stays closed.
 				const old = this.sql.exec<{ purpose: string }>("SELECT purpose FROM generations WHERE id = ?", r.from).toArray()[0]?.purpose ?? "live";
 				await this.ledger(to, r.profile, "restore", "active");
@@ -736,6 +967,21 @@ export class AccountStore extends DurableObject<Env> {
 				const r = this.recovery();
 				if (!r) return fail("not_found", "no recovery is open");
 				if (r.state === "opening") return fail("validation", "an opening restore cannot be aborted; finish it with open");
+				if (r.kind === "corpus") {
+					const who = { userId, profile: r.profile, generation: r.to! };
+					await this.corpusAt(who).discardRestore(who, r.id);
+					return ok(this.endRecovery(r, "aborted"));
+				}
+				if (r.kind === "pitr") {
+					// A possible arm is settled first by a restart: either nothing applied and the recovery ends, or it did and is reversed.
+					if (r.state === "arming" || r.state === "armed") {
+						const waiting = await this.pitrStep(r, userId);
+						if (r.state === "arming" || r.state === "armed") return waiting && !waiting.ok ? waiting : fail("busy", "the profile is still restarting; abort again shortly", { recovery: waiting?.ok ? waiting.value : r });
+					}
+					if (r.state === "requested") return ok(this.endRecovery(r, "aborted"));
+					if (r.state !== "reverting") this.advance(r, () => Object.assign(r, { state: "reverting", armed: undefined, session: undefined }));
+					return (await this.pitrStep(r, userId)) ?? ok(r);
+				}
 				if (r.to) {
 					const who = { userId, profile: r.profile, generation: r.to };
 					await this.ledger(r.to, r.profile, "restore", "retired");
@@ -756,7 +1002,7 @@ export class AccountStore extends DurableObject<Env> {
 	 * Runs one recovery transaction: refuses if another call moved the recovery, then saves `r` with the rows `fn` wrote, inside
 	 * BudgetTx (1,000 physical rows, 1 MB, 100 bound values). On any throw nothing lands and `r` is put back.
 	 */
-	private advance<T>(r: AccountRecovery, fn: (tx: BudgetTx) => T): T {
+	private advance<T>(r: AccountRecovery | Recovery, fn: (tx: BudgetTx) => T): T {
 		const before = JSON.stringify(r);
 		try {
 			return this.write((seq) => {
@@ -767,6 +1013,451 @@ export class AccountStore extends DurableObject<Env> {
 				return out;
 			});
 		} catch (e) { Object.assign(r, JSON.parse(before)); throw e; }
+	}
+
+	/** Ends a profile, point-in-time or corpus recovery in one transaction: the account reopens exactly when its record lands. */
+	private endRecovery(r: Recovery, state: "opened" | "aborted"): Recovery & { state: string } {
+		const end = { ...r, state, [`${state}_at`]: now() } as unknown as Recovery & { state: string }, before = JSON.stringify(r);
+		this.write(() => {
+			if (this.meta("recovery_state") !== before) throw Fail.of("busy", "the recovery moved; read its status");
+			this.sql.exec("DELETE FROM account_meta WHERE key = 'recovery_state'");
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}`, JSON.stringify(end));
+		});
+		return end;
+	}
+
+	/**
+	 * The point-in-time restore's own steps (section 18). Arm through the profile, which records the fallback bookmark here before
+	 * it arms anything, then confirm through a later session whether the storage went back. Nothing assumes that a pending restore
+	 * can be cancelled: a restart that did not apply it withdraws the arm, and the next step arms again the same documented way.
+	 * Null once a forward restore is in place and settlement may run; any other value is this step's answer, with the account
+	 * still closed. A reversal closes the recovery as aborted once the undo bookmark is in place.
+	 */
+	private async pitrStep(r: Recovery, userId: string): Promise<Outcome<unknown> | null> {
+		const who = { userId, profile: r.profile, generation: r.from }, stub = this.profileAt(who);
+		const reverting = r.state === "reverting", tag = reverting ? `${r.id}:revert` : r.id;
+		const reload = () => { const cur = this.recovery(); if (cur?.id !== r.id) return false; Object.assign(r, cur); return true; };
+		if (r.state === "requested" || (reverting && r.armed !== tag)) {
+			const target = reverting ? { bookmark: (r.undo ?? r.fallback)! } : r.reverses ? { bookmark: r.bookmark! } : { at: r.target_at! };
+			let armed: Outcome<null> | undefined;
+			// A recorded arm ends this RPC with the documented abort, so an error here is expected; the recovery says what landed.
+			try { armed = await stub.pitrArm(who, { id: r.id, tag, ...target }); } catch { armed = undefined; }
+			if (!reload()) return fail("busy", "the recovery changed; read its status");
+			if (r.armed !== tag) return armed && !armed.ok ? armed : fail("unavailable", "the profile did not record its fallback bookmark; nothing was armed; step again");
+		}
+		if (r.state !== "arming" && r.state !== "armed" && r.state !== "reverting") return null;
+		let c: Outcome<{ restarted: boolean; restored: boolean; done: boolean }>;
+		// In the arming session the check aborts, which is the documented restart; an error here is that restart.
+		try { c = await stub.pitrCheck(who, tag, r.session!, !reverting); } catch { c = ok({ restarted: false, restored: false, done: false }); }
+		if (!c.ok) return c;
+		if (!c.value.restarted) return ok({ ...r, waiting: "the profile is restarting; step again" });
+		if (!c.value.restored) {
+			// That restart applied nothing, so nothing is pending: withdraw the arm and let the next step arm again.
+			this.advance(r, () => Object.assign(r, { armed: undefined, session: undefined, rearmed: (r.rearmed ?? 0) + 1 },
+				reverting ? { revert_fallback: undefined, revert_bookmark: undefined, revert_undo: undefined }
+					: { state: "requested", fallback: undefined, undo: undefined, ...(r.reverses ? {} : { bookmark: undefined }) }));
+			return ok({ ...r, waiting: "the armed bookmark did not apply at the restart; step again to arm it again" });
+		}
+		if (!c.value.done) return ok({ ...r, progress: "embeddings due again" });
+		if (reverting) return ok(this.endRecovery(r, "aborted"));
+		// The platform's undo if it was recorded, else the fallback taken just before arming, with no write between them.
+		this.advance(r, () => Object.assign(r, { state: "settling", settle: { i: 0, after: "" }, settled: 0, undo: r.undo ?? r.fallback, undo_from: r.undo ? "platform" : "fallback" }));
+		return null;
+	}
+
+	/** A corpus restore (section 18): it owns no records, so after its verified apply it is ready; open rechecks the profile. */
+	private async corpusStep(r: Recovery, userId: string): Promise<Outcome<unknown>> {
+		if (r.state !== "restoring") return ok(r);
+		const who = { userId, profile: r.profile, generation: r.to! };
+		const s = await this.corpusAt(who).restoreStep(who, { id: r.id, exportId: r.export });
+		if (!s.ok) return s;
+		if (!s.value.done) return ok({ ...r, progress: s.value });
+		this.advance(r, () => Object.assign(r, { state: "ready" }));
+		return ok(r);
+	}
+
+	/**
+	 * Settlement (section 18, step 4) of every transfer a restore may have split. A profile or point-in-time restore of P reads all
+	 * of P's transfer rows, the other profiles' rows that name P or are unfinished, and the account's rows for P that are open or
+	 * newer than the restored point; an account restore reads every profile's unfinished rows and the account's open or newer ones.
+	 * Each id is settled from both profiles' own facts by settleRule, target first and source last, as the transfer driver does.
+	 * A wiped id is left to its tombstone, and a pair the rules do not settle is a finding that keeps the account closed.
+	 */
+	private async settleTransfers(r: Recovery | AccountRecovery, userId: string, live: () => boolean): Promise<Outcome<null>> {
+		const account = "kind" in r && r.kind === "account", restored = account ? null : (r as Recovery).profile;
+		const names = this.sql.exec<{ name: string }>("SELECT name FROM profiles WHERE status = 'active' ORDER BY name").toArray().map((p) => p.name);
+		const lists = restored ? [restored, ...names.filter((n) => n !== restored)] : names;
+		const cutoff = account ? (r as AccountRecovery).export_at : (r as Recovery).export_at;
+		while (r.settle && live()) {
+			const { i, after } = r.settle;
+			let items: { id: string; node: string; from: string; to: string }[];
+			if (i < lists.length) {
+				const name = lists[i]!, generation = this.settleGeneration(r, name);
+				const ref = { userId, profile: name, generation: generation ?? "" };
+				const page = generation ? await this.profileAt(ref).settleScan(ref, { after, peer: restored && name !== restored ? restored : null, all: name === restored }) : ok([]);
+				if (!page.ok) return page;
+				items = page.value.map((t) => ({ id: t.id, node: t.node_id, from: t.direction === "out" ? name : t.peer, to: t.direction === "out" ? t.peer : name }));
+			} else if (i === lists.length) {
+				items = this.sql.exec<{ id: string; node_id: string; from_profile: string; to_profile: string }>(`SELECT id, node_id, from_profile, to_profile FROM transfers WHERE id > ?
+					AND (? IS NULL OR from_profile = ? OR to_profile = ?) AND (completed_at IS NULL OR retry_at IS NOT NULL OR completed_at > ? OR created_at > ?) ORDER BY id LIMIT 50`,
+					after, restored, restored, restored, cutoff, cutoff).toArray().map((t) => ({ id: t.id, node: t.node_id, from: t.from_profile, to: t.to_profile }));
+			} else {
+				this.advance(r, () => Object.assign(r, account ? { settle: undefined, phase: "index", after: { profile: "", node: "", request: "", done: true } }
+					: { settle: undefined, state: "checking", after: { node: "", request: "" }, restored: { nodes: 0, requests: 0 } }));
+				break;
+			}
+			for (const t of items) {
+				if (!live()) return ok(null);
+				const done = await this.settleOne(r, userId, t);
+				if (!done.ok) return done;
+				if (!done.value) return ok(null); // a bounded action is unfinished; the next step repeats it
+				if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status");
+			}
+			if (items.length < 50 && live()) this.advance(r, () => Object.assign(r, { settle: { i: i + 1, after: "" } }));
+		}
+		return ok(null);
+	}
+
+	/** One transfer id by the fixed rules; true once settled or flagged, with the cursor moved past it in the same write. */
+	/**
+	 * The owner's read of the open recovery's copy conflicts (section 18, step 4): up to 20 after `after`, each with both copies
+	 * as each profile holds them now, at the generation this recovery reads. Read only.
+	 */
+	private async recoveryConflicts(userId: string, cmd: Extract<AccountCommand, { op: "recoveryConflicts" }>): Promise<Outcome<unknown>> {
+		const r = this.recovery() as Recovery | AccountRecovery | undefined;
+		if (!r || r.id !== cmd.id) return fail("busy", "the recovery changed since it was shown; read its status", { reason: "recovery_changed" });
+		const prefix = `restore:${r.id}:conflict:`;
+		const rows = this.sql.exec<{ value: string }>("SELECT value FROM account_meta WHERE key > ? AND key < ? ORDER BY key LIMIT 21", prefix + (cmd.after ?? ""), `${prefix}￿`).toArray();
+		const conflicts = [];
+		for (const row of rows.slice(0, 20)) {
+			const c = JSON.parse(row.value) as RecoveryConflict;
+			const copies = [];
+			for (const profile of c.profiles) {
+				const generation = this.settleGeneration(r, profile) ?? null, ref = { userId, profile, generation: generation ?? "" };
+				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, c.node, this.termsFor(profile)) : ok(null);
+				if (!copy.ok) return copy;
+				// Keepable: published, and for a moved copy, restorable whole from its archive under the current guard.
+				copies.push({ profile, generation, copy: copy.value, keepable: !!copy.value && copy.value.status !== "incoming" && (copy.value.status !== "moved" || copy.value.restorable?.ok === true) });
+			}
+			const resume = c.state === "resolving" && c.request_id && c.keep && c.expect
+				? { id: r.id, node: c.node, keep: c.keep, expect: c.expect, request_id: c.request_id } : null;
+			conflicts.push({ node: c.node, kind: c.kind, transfer: c.transfer, state: c.state, ...(c.keep ? { keep: c.keep } : {}), ...(c.result ? { result: c.result } : {}), ...(resume ? { resume } : {}), copies });
+		}
+		if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status", { reason: "recovery_changed" });
+		return ok({ recovery: r.id, state: r.state, open: r.conflicts?.open ?? 0, conflicts, next: rows.length > 20 ? conflicts.at(-1)!.node : null });
+	}
+
+	/**
+	 * The owner keeps one copy of a conflict (section 18, step 4); the other becomes a flagged tombstone, with its content and
+	 * history in that profile's archive. Only while the recovery is unresolved, only for copies exactly as the owner saw them
+	 * (generation, status and revision), and one choice at a time. `request_id` makes it replayable: the same request continues an
+	 * unfinished choice or returns its stored result; other arguments under it are refused. Steps on live profiles of a profile or
+	 * point-in-time restore run at open, like settlement's. When every finding was an owner choice and all are made,
+	 * reconciliation runs again from settlement.
+	 */
+	private async resolveConflict(userId: string, cmd: Extract<AccountCommand, { op: "resolveConflict" }>): Promise<Outcome<unknown>> {
+		const r = this.recovery() as Recovery | AccountRecovery | undefined;
+		if (!r || r.id !== cmd.id) return fail("busy", "the recovery changed since it was shown; read its status", { reason: "recovery_changed" });
+		const key = `restore:${r.id}:conflict:${cmd.node}`, payload = sha256(canonicalJson({ node: cmd.node, keep: cmd.keep, expect: cmd.expect }));
+		const found = this.conflictOf(r, cmd.node);
+		if (!found) return fail("not_found", "this recovery has no conflict for that record");
+		const requestKey = `restore:${r.id}:choice_request:${sha256(cmd.request_id)}`, bound = this.meta(requestKey);
+		if (bound && bound !== payload) return fail("idempotency_mismatch", "this request id is bound to another recovery choice payload");
+		if (!bound) this.write(() => this.sql.exec("INSERT INTO account_meta (key, value) VALUES (?, ?)", requestKey, payload));
+		let c: RecoveryConflict = found;
+		if (c.state === "resolved") {
+			if (c.request_id === cmd.request_id) return c.payload === payload ? ok(c.result) : fail("idempotency_mismatch", "this request id resolved the conflict with other arguments");
+			return fail("validation", "the owner already chose a copy", { reason: "already_resolved", result: c.result });
+		}
+		if (r.state !== "unresolved") return fail("validation", `the recovery is ${r.state}; copies are chosen only while it is unresolved`, { reason: "not_unresolved" });
+		if (c.state === "resolving") {
+			if (c.request_id !== cmd.request_id) return fail("busy", "another choice for this record is unfinished; repeat it with its request id", { reason: "resolving", request_id: c.request_id });
+			if (c.payload !== payload) return fail("idempotency_mismatch", "this request id is choosing with other arguments");
+		} else {
+			if (r.resolving && r.resolving !== cmd.node) return fail("busy", "another choice is unfinished; finish it first", { reason: "resolving", node: r.resolving });
+			if (!c.profiles.includes(cmd.keep)) return fail("validation", "keep one of the two profiles holding a copy");
+			// The copies exactly as the owner saw them; anything else is a changed state the owner has not seen.
+			const now: Record<string, { generation: string | null; copy: RecoveryCopy | null }> = {};
+			for (const profile of c.profiles) {
+				const generation = this.settleGeneration(r, profile) ?? null, ref = { userId, profile, generation: generation ?? "" };
+				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, cmd.node, this.termsFor(profile)) : ok(null);
+				if (!copy.ok) return copy;
+				now[profile] = { generation, copy: copy.value };
+				const e = cmd.expect.find((x) => x.profile === profile);
+				if (!e || e.generation !== generation || e.status !== (copy.value?.status ?? null) || e.revision !== (copy.value?.revision ?? null)) {
+					return fail("busy", "a copy changed since it was shown; read the conflicts again", { reason: "copy_changed", profile });
+				}
+			}
+			const lose = c.profiles.find((p) => p !== cmd.keep)!, w = now[cmd.keep]!.copy, l = now[lose]!.copy;
+			if (!w || w.status === "incoming") return fail("validation", "only a published copy can be kept; keep the other copy, or abort the recovery", { reason: "not_keepable" });
+			// A moved copy is kept only if its whole archived image comes back and passes the current guard (undoPreflight).
+			if (w.status === "moved" && !w.restorable?.ok) return fail("validation", "this copy cannot be restored from its archive; keep the other copy, or abort the recovery",
+				{ reason: "not_keepable", detail: w.restorable && !w.restorable.ok ? w.restorable.reason : "no_transfer" });
+			const plan: RecoveryStep[] = [], touched = new Set<string>(c.transfer ? [c.transfer] : []);
+			// Each unfinished local transfer row of the node ends: an outgoing fence is lifted, a published landing is settled, an
+			// unpublished one is aborted. The kept copy's rows and its restore come first; the losing copy is tombstoned last.
+			const end = (profile: string, rows: RecoveryCopy["rows"]) => {
+				for (const row of rows) {
+					touched.add(row.id);
+					if (row.direction === "out") plan.push({ profile, action: "abort_out", id: row.id, nodeId: cmd.node, peer: row.peer });
+					else plan.push({ profile, action: row.state === "published" ? "settle_in" : "abort_in", id: row.id, nodeId: cmd.node, peer: row.peer });
+				}
+			};
+			end(cmd.keep, w.rows);
+			if (w.status === "moved") plan.push({ profile: cmd.keep, action: "undo_move", id: w.transfer!, nodeId: cmd.node, peer: lose });
+			if (l) end(lose, l.rows);
+			if (l && l.status !== "incoming" && l.status !== "moved") {
+				// The losing copy is tombstoned under this choice's own identity, by the transfer commit: content and history go to its archive.
+				const id = `recovery-${r.id}-${cmd.node}`;
+				plan.push({ profile: lose, action: "tombstone_out", id, nodeId: cmd.node, peer: cmd.keep, identity: { id, sha256: sha256(`${r.id}:${cmd.node}:${cmd.keep}`), revision: l.revision } });
+				plan.push({ profile: lose, action: "flag_tombstone", id, nodeId: cmd.node, peer: cmd.keep, flag: `recovery ${r.id}: the owner kept the copy in ${cmd.keep}` });
+			}
+			// The account's rows for those transfers end with the choice: committed where the kept profile was the target, else aborted.
+			const transfers = [...touched].flatMap((id) => this.sql.exec<{ to_profile: string }>("SELECT to_profile FROM transfers WHERE id = ?", id).toArray()
+				.map((t) => ({ id, state: t.to_profile === cmd.keep ? "committed" as const : "aborted" as const })));
+			plan.push({ profile: null, node: cmd.node, owner: cmd.keep, transfers });
+			for (const step of plan) {
+				const pre = await this.preflight(r, userId, step);
+				if (!pre.ok) return pre.error.code === "busy" || pre.error.code === "unavailable" ? pre : fail("validation", "this copy cannot be restored from its archive; keep the other copy, or abort the recovery", { reason: "not_keepable", detail: pre.error.details?.reason ?? pre.error.code });
+			}
+			c = { ...c, state: "resolving", request_id: cmd.request_id, payload, keep: cmd.keep, expect: cmd.expect, plan, next: 0 };
+			const chosen = c;
+			this.advance(r, () => { this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", key, JSON.stringify(chosen)); r.resolving = cmd.node; });
+		}
+		const started = Date.now();
+		while (c.next! < c.plan!.length) {
+			if (Date.now() - started > 20_000) return ok({ ...c, progress: `${c.next} of ${c.plan!.length} steps; repeat with the same request id` });
+			const x = await this.runStep(r, userId, c.plan![c.next!]!);
+			// The choice stays unfinished and the account closed; the same request id continues it.
+			if (!x.ok) return x;
+			if (!x.value) continue;
+			const moved: RecoveryConflict = { ...c, next: c.next! + 1 };
+			this.advance(r, () => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", key, JSON.stringify(moved)));
+			c = moved;
+		}
+		const result = { node: cmd.node, kept: cmd.keep, tombstoned: c.profiles.find((p) => p !== cmd.keep)!, recovery: r.id };
+		const done: RecoveryConflict = { ...c, state: "resolved", result };
+		this.advance(r, () => {
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", key, JSON.stringify(done));
+			r.resolving = undefined;
+			r.conflicts = { total: r.conflicts?.total ?? 0, open: Math.max(0, (r.conflicts?.open ?? 1) - 1) };
+			// The last open choice is made: reconciliation runs again from the start, against the planned state, and keeps only the
+			// findings that are still current. Settlement skips chosen nodes; the checks read the decided owners.
+			if (r.conflicts.open === 0) {
+				const again = { settle: { i: 0, after: "" }, settled: 0, unresolved: [], unresolved_count: 0, conflicts: undefined };
+				if ("kind" in r && r.kind === "account") Object.assign(r, again, { state: "reconciling", phase: "ledger", last: undefined, after: undefined });
+				else Object.assign(r, again, { state: "settling", after: undefined, restored: undefined });
+			}
+		});
+		return ok(result);
+	}
+
+	/**
+	 * The owner's earlier choice that a `recovery-<recovery>-<node>` transfer id stands for, trusted only through the account's own
+	 * durable records: that recovery opened, and its conflict for this node is resolved. Any other id is an ordinary transfer.
+	 */
+	private trustedChoice(transfer: string | null | undefined, node: string): { keep: string; lose: string } | undefined {
+		const m = /^recovery-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-(.+)$/.exec(transfer ?? "");
+		if (!m || m[2] !== node) return undefined;
+		const done = JSON.parse(this.meta(`restore:${m[1]}`) ?? "null") as { state?: string } | null;
+		const c = JSON.parse(this.meta(`restore:${m[1]}:conflict:${node}`) ?? "null") as RecoveryConflict | null;
+		if (done?.state !== "opened" || c?.state !== "resolved" || !c.keep || !c.profiles.includes(c.keep)) return undefined;
+		return { keep: c.keep, lose: c.profiles.find((p) => p !== c.keep)! };
+	}
+
+	/** The restored profile of a profile or point-in-time restore; null for an account restore, whose profiles are all live. */
+	private restoredOf(r: Recovery | AccountRecovery): string | null {
+		return "kind" in r && r.kind === "account" ? null : (r as Recovery).profile;
+	}
+	private conflictOf(r: Recovery | AccountRecovery, node: string): RecoveryConflict | undefined {
+		const raw = this.meta(`restore:${r.id}:conflict:${node}`);
+		return raw ? JSON.parse(raw) as RecoveryConflict : undefined;
+	}
+	/** The owner this recovery decided for a node, kept for open: a profile, "" when it decided that no profile holds it, or undefined. */
+	private decidedOf(r: Recovery | AccountRecovery, node: string): string | undefined {
+		return this.meta(`restore:${r.id}:owner:${node}`);
+	}
+	/** The owner a node will have: the one this recovery decided, else the live index. One rule for every check and for open. */
+	private ownerOf(r: Recovery | AccountRecovery, node: string): string | undefined {
+		const decided = this.decidedOf(r, node);
+		if (decided !== undefined) return decided || undefined;
+		return this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", node).toArray()[0]?.profile;
+	}
+	/** Whether this recovery planned a terminal state for a transfer: the account's row, or one profile's own row. */
+	private planned(r: Recovery | AccountRecovery, transfer: string, profile?: string): boolean {
+		return this.meta(profile === undefined ? `restore:${r.id}:xfer:${transfer}` : `restore:${r.id}:local:${profile}:${transfer}`) !== undefined;
+	}
+	/** The account's current sensitive terms, for a record restored into me (section 5); none elsewhere. */
+	private termsFor(profile: string): string[] {
+		return profile === "me" ? this.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((t) => t.term) : [];
+	}
+
+	/** Inside a write: records findings; a copy conflict also gets, or reopens, its durable record for the owner's choice. */
+	private flagFound(r: Recovery | AccountRecovery, found: Finding[]): void {
+		flag(r, found.map(({ kind, id, transfer }) => ({ kind, id, ...(transfer ? { transfer } : {}) })));
+		for (const f of found) {
+			if (!f.pair) continue;
+			const prev = this.conflictOf(r, f.id);
+			r.conflicts = { total: (r.conflicts?.total ?? 0) + 1, open: r.conflicts?.open ?? 0 };
+			if (prev?.state === "open" || prev?.state === "resolving") continue;
+			const c: RecoveryConflict = { node: f.id, kind: f.kind, transfer: f.transfer ?? null, profiles: f.pair, state: "open", at: now() };
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}:conflict:${f.id}`, JSON.stringify(c));
+			r.conflicts.open++;
+		}
+	}
+
+	/**
+	 * The account's ownership write for one settled or chosen node: its transfer rows end as planned, node_index names the owner,
+	 * and the node's request bindings are rebuilt from the owner's own request rows (step 5), never over a wipe's refusal.
+	 */
+	private async applyOwner(r: Recovery | AccountRecovery, userId: string, step: Extract<RecoveryStep, { profile: null }>): Promise<Outcome<true>> {
+		this.advance(r, (tx) => {
+			for (const t of step.transfers) tx.run("UPDATE transfers SET state = ?, completed_at = coalesce(completed_at, ?), retry_at = NULL, seq = ? WHERE id = ?", t.state, now(), tx.seq, t.id);
+			if (step.owner) tx.run("INSERT OR REPLACE INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", step.node, step.owner, tx.seq);
+		});
+		const generation = step.owner ? this.settleGeneration(r, step.owner) : undefined;
+		if (!step.owner || !generation) return ok(true);
+		const ref = { userId, profile: step.owner, generation };
+		for (let after = ""; ;) {
+			const page = await this.profileAt(ref).nodeRequests(ref, step.node, after);
+			if (!page.ok) return page;
+			if (!page.value.length) return ok(true);
+			this.advance(r, (tx) => {
+				for (const q of page.value) tx.run(`INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy) VALUES (?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT (request_id) DO UPDATE SET profile = excluded.profile, op = excluded.op, payload_hash = excluded.payload_hash, at = excluded.at,
+					legacy = excluded.legacy, seq = excluded.seq WHERE request_index.op <> 'wiped'`, q.request_id, step.owner!, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, tx.seq, q.legacy_hash ? 1 : 0);
+			});
+			after = page.value.at(-1)!.request_id;
+		}
+	}
+
+	/**
+	 * One step now, or kept for open. Nothing that abort cannot undo runs while the account is closed: a step on a live profile
+	 * (every profile of an account restore, every profile but the restored one otherwise) and, for a profile or point-in-time
+	 * restore, the account's own ownership write, are kept in order for open. Every step's planned result is recorded first, so the
+	 * checks read the state the recovery will open with. True once done or kept; false when a bounded action is unfinished.
+	 */
+	private async runStep(r: Recovery | AccountRecovery, userId: string, step: RecoveryStep): Promise<Outcome<boolean>> {
+		const restored = this.restoredOf(r), later = step.profile === null ? restored !== null : step.profile !== restored;
+		this.advance(r, () => {
+			if (step.profile === null) {
+				this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}:owner:${step.node}`, step.owner ?? "");
+				for (const t of step.transfers) this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}:xfer:${t.id}`, t.state);
+			} else this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}:local:${step.profile}:${step.id}`, step.action);
+			if (!later) return;
+			const n = r.deferred ?? 0;
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `restore:${r.id}:defer:${String(n).padStart(6, "0")}`, JSON.stringify(step));
+			r.deferred = n + 1;
+		});
+		if (later) return ok(true);
+		return this.execStep(r, userId, step);
+	}
+
+	/** Runs one step now: the account's write, or the profile action in bounded steps with the current terms for me. */
+	private async execStep(r: Recovery | AccountRecovery, userId: string, step: RecoveryStep): Promise<Outcome<boolean>> {
+		if (step.profile === null) return this.applyOwner(r, userId, step);
+		const generation = this.settleGeneration(r, step.profile);
+		if (!generation) return fail("validation", `profile '${step.profile}' is not active`, { reason: "profile_closed" });
+		const ref = { userId, profile: step.profile, generation };
+		const x = await this.profileAt(ref).settleTransfer(ref, r.id, { action: step.action, id: step.id, nodeId: step.nodeId, peer: step.peer,
+			...(step.identity ? { identity: step.identity } : {}), ...(step.flag ? { flag: step.flag } : {}), ...(step.action === "undo_move" ? { terms: this.termsFor(step.profile) } : {}) });
+		return x.ok ? ok(x.value.done) : x;
+	}
+
+	/** Read only, before anything changes: whether an undo_move step can bring its whole record back, guard included. */
+	private async preflight(r: Recovery | AccountRecovery, userId: string, step: RecoveryStep): Promise<Outcome<null>> {
+		if (step.profile === null || step.action !== "undo_move") return ok(null);
+		const generation = this.settleGeneration(r, step.profile);
+		if (!generation) return fail("validation", `profile '${step.profile}' is not active`, { reason: "profile_closed" });
+		const ref = { userId, profile: step.profile, generation };
+		return this.profileAt(ref).undoPreflight(ref, { id: step.id, nodeId: step.nodeId, terms: this.termsFor(step.profile) });
+	}
+
+	/**
+	 * Open's kept steps (both phases resumable): `precheck` checks every kept undo_move again, read only, and a refusal returns the
+	 * recovery to unresolved, still abortable, with nothing run; `deferred` then runs them in order. True once all ran.
+	 */
+	private async runDeferred(r: Recovery | AccountRecovery, userId: string, live: () => boolean): Promise<Outcome<boolean>> {
+		const at = (n: number) => JSON.parse(this.meta(`restore:${r.id}:defer:${String(n).padStart(6, "0")}`)!) as RecoveryStep;
+		while (r.phase === "precheck" && live()) {
+			const n = r.deferred_next ?? 0;
+			if (n >= (r.deferred ?? 0)) { this.advance(r, () => Object.assign(r, { phase: "deferred", deferred_next: 0 })); break; }
+			const step = at(n), pre = await this.preflight(r, userId, step);
+			if (!pre.ok) {
+				if (["busy", "unavailable"].includes(pre.error.code)) return pre;
+				this.advance(r, () => {
+					Object.assign(r, { state: "unresolved", phase: undefined, deferred_next: undefined });
+					this.flagFound(r, [{ kind: "open_precheck_failed", id: step.profile === null ? step.node : step.nodeId }]);
+				});
+				return ok(false);
+			}
+			this.advance(r, () => { r.deferred_next = n + 1; });
+		}
+		while (r.phase === "deferred" && live()) {
+			const n = r.deferred_next ?? 0;
+			if (n >= (r.deferred ?? 0)) return ok(true);
+			const x = await this.execStep(r, userId, at(n));
+			// Every kept step was checked while closed; one refused now leaves the recovery opening, and open is repeated.
+			if (!x.ok) return x;
+			if (!x.value) return ok(false);
+			this.advance(r, () => { r.deferred_next = n + 1; });
+		}
+		return ok(r.phase === "deferred" && (r.deferred_next ?? 0) >= (r.deferred ?? 0));
+	}
+
+	/** One transfer id by the fixed rules; true once settled or flagged, with the cursor moved past it in the same write. */
+	private async settleOne(r: Recovery | AccountRecovery, userId: string, t: { id: string; node: string; from: string; to: string }): Promise<Outcome<boolean>> {
+		const gs = this.settleGeneration(r, t.from), gt = this.settleGeneration(r, t.to);
+		const passed = (found: Finding[] = []) => {
+			this.advance(r, () => {
+				this.flagFound(r, found);
+				r.settle = { ...r.settle!, after: t.id };
+				r.settled = (r.settled ?? 0) + 1;
+			});
+			return ok(true);
+		};
+		// A wipe tombstone wins (step 2), and a closed or unknown profile is never written: the rules need both sides' own rows.
+		// A node the owner already chose a copy of in this recovery is settled by that choice.
+		if (this.meta(`wiped:${t.node}`) || !gs || !gt || t.from === t.to || this.conflictOf(r, t.node)?.state === "resolved") return passed();
+		const at = (profile: string, generation: string) => ({ userId, profile, generation });
+		const facts = async (ref: ProfileRef, side: "out" | "in") => this.profileAt(ref).settleFacts(ref, { id: t.id, nodeId: t.node, side });
+		const s = await facts(at(t.from, gs), "out"), d = await facts(at(t.to, gt), "in");
+		if (!s.ok) return s;
+		if (!d.ok) return d;
+		// An owner's choice in an earlier, opened recovery settled this node; the fixed rules would not recognize its tombstone.
+		const held = (n: SettleFacts["node"]) => !!n && n.status !== "incoming", live = (n: SettleFacts["node"]) => held(n) && n!.status !== "moved";
+		const own = this.trustedChoice(t.id, t.node);
+		if (own && own.lose === t.from && own.keep === t.to && held(d.value.node)) return passed();
+		const sc = s.value.node?.status === "moved" ? this.trustedChoice(s.value.node.transfer, t.node) : undefined;
+		if (sc && sc.lose === t.from && sc.keep === t.to && held(d.value.node)) return passed();
+		const dc = d.value.node?.status === "moved" ? this.trustedChoice(d.value.node.transfer, t.node) : undefined;
+		if (dc && dc.lose === t.to && dc.keep === t.from && live(s.value.node)) return passed();
+		const plan = settleRule(t.id, s.value, d.value);
+		const pair: Finding = { kind: "", id: t.node, transfer: t.id, pair: [t.from, t.to] };
+		if (plan.unresolved) return passed([{ ...pair, kind: `transfer_${plan.unresolved}` }]);
+		const steps: RecoveryStep[] = [
+			...plan.target.map((action) => ({ profile: t.to, action, id: t.id, nodeId: t.node, peer: t.from })),
+			...plan.source.map((action) => ({ profile: t.from, action, id: t.id, nodeId: t.node, peer: t.to, ...(action === "tombstone_out" && d.value.identity ? { identity: d.value.identity } : {}) }))];
+		// Read only, before either side changes: an undo the rules need must be able to bring the whole record back.
+		for (const step of steps) {
+			const pre = await this.preflight(r, userId, step);
+			if (!pre.ok) return ["busy", "unavailable"].includes(pre.error.code) ? pre : passed([{ ...pair, kind: "transfer_settle_failed" }]);
+		}
+		for (const step of steps) {
+			const x = await this.runStep(r, userId, step);
+			// A refusal is not retried: the pair stays an owner choice, and the account stays closed until it is made or the owner aborts.
+			if (!x.ok) return ["busy", "unavailable"].includes(x.error.code) ? x : passed([{ ...pair, kind: "transfer_settle_failed" }]);
+			if (!x.value) return ok(false);
+		}
+		if (!plan.owner) return passed();
+		// The index names the owner where the record is once the plan has run, not where it was before: an undo or an unfence
+		// leaves the source holding it, a commit or a tombstone does not. A transfer neither side ends up holding just ends aborted.
+		const holds = plan.owner === "target" ? live(d.value.node) && !plan.target.includes("abort_in")
+			: !!s.value.node && (plan.source.includes("undo_move") || plan.source.includes("abort_out")
+				|| (live(s.value.node) && !plan.source.some((a) => a === "tombstone_out" || a === "commit_out")));
+		const owned = await this.runStep(r, userId, { profile: null, node: t.node, owner: holds ? (plan.owner === "target" ? t.to : t.from) : null,
+			transfers: [{ id: t.id, state: plan.owner === "target" ? "committed" : "aborted" }] });
+		return owned.ok ? passed() : owned;
 	}
 
 	private async accountRestore(op: "restoreStep" | "openRestore" | "abortRestore", userId: string, r: AccountRecovery): Promise<Outcome<unknown>> {
@@ -783,10 +1474,17 @@ export class AccountStore extends DurableObject<Env> {
 			return ok(end);
 		};
 		if (op === "openRestore") {
-			if (r.state !== "ready") return fail("validation", `the account restore is ${r.state}; it opens only when ready`);
+			if (r.state !== "ready" && r.state !== "opening") return fail("validation", `the account restore is ${r.state}; it opens only when ready`);
+			// The profile steps kept while closed run only now: checked, then in order. Until then an abort undoes everything.
+			if (r.state === "ready" && r.deferred) this.advance(r, () => Object.assign(r, { state: "opening", phase: "precheck", deferred_next: 0 }));
+			if (r.state === "opening") {
+				const begun = Date.now(), d = await this.runDeferred(r, userId, () => Date.now() - begun < 20_000);
+				if (!d.ok || !d.value) return d.ok ? ok(r) : d;
+			}
 			return close("opened");
 		}
 		if (op === "abortRestore") {
+			if (r.state === "opening") return fail("validation", "an opening account restore cannot be aborted; finish it with open");
 			if (r.state === "checkpoint") return close("aborted");
 			if (r.state !== "rolling_back") this.advance(r, () => Object.assign(r, { state: "rolling_back", phase: "clear", next: 0, row: 0, last: undefined, after: undefined }));
 		}
@@ -830,10 +1528,13 @@ export class AccountStore extends DurableObject<Env> {
 				const cut = o.key.indexOf(".json/"), root = cut < 0 ? o.key : o.key.slice(0, cut + 5);
 				if (!roots.has(root)) roots.set(root, await (await this.env.BACKUPS.get(root))?.json<{ record?: { profile?: unknown; wiped_at?: unknown } }>().then((p) => p.record ?? null).catch(() => null) ?? null);
 				const plan = roots.get(root), list = /\/(ids|requests)\/[^/]+\.json$/.test(o.key) ? await (await this.env.BACKUPS.get(o.key))?.json<unknown>().catch(() => null) : undefined;
+				const last = r.last;
 				this.advance(r, (tx) => {
 					r.last = o.key;
 					if (typeof plan?.profile !== "string" || typeof plan.wiped_at !== "string") return flag(r, [{ kind: "tombstone_unreadable", id: root }]);
 					if (o.key === root) {
+						// Retain content-free refusal identities, and revisit this tombstone until the bounded scrub is complete.
+						if (scrubReview(this.sql, plan.profile, () => tx.seq, now())) { r.last = last; return; }
 						const w = this.sql.exec<{ report: string }>("SELECT report FROM wipes WHERE profile = ? AND wiped_at = ?", plan.profile, plan.wiped_at).toArray()[0];
 						const state = w ? (JSON.parse(w.report) as { state?: string }).state : undefined;
 						// "backups" is a wipe whose account rows are final; only its export replacement is left, which the owner's retry finishes.
@@ -849,11 +1550,15 @@ export class AccountStore extends DurableObject<Env> {
 						ON CONFLICT (request_id) DO UPDATE SET op = 'wiped', profile = excluded.profile, payload_hash = '', legacy = 0, pending = 0, seq = excluded.seq`,
 						plan.profile, plan.wiped_at, tx.seq, JSON.stringify(list));
 				});
+				if (r.last !== o.key) break; // a wiped origin's rows remain: list again from the same tombstone
 			}
 			if (!page.truncated && r.last === (page.objects.at(-1)?.key ?? r.last)) this.advance(r, () => Object.assign(r, { phase: "profiles", last: undefined }));
 		}
 		// Each profile at the generation the ledger marks active; a wiped or retired one is never reactivated, and anything else is a finding.
 		if (r.phase === "profiles") this.advance(r, (tx) => {
+			for (const p of this.sql.exec<{ name: string }>("SELECT name FROM profiles WHERE status IN ('wiping', 'wiped')").toArray()) {
+				if (scrubReview(this.sql, p.name, () => tx.seq, now())) return;
+			}
 			const rows = this.sql.exec<{ name: string; status: string | null; generation: string | null }>(`SELECT n.name, p.status, p.generation FROM
 				(SELECT name FROM profiles UNION SELECT profile FROM generations) n LEFT JOIN profiles p ON p.name = n.name ORDER BY n.name`).toArray();
 			for (const p of rows) {
@@ -864,8 +1569,13 @@ export class AccountStore extends DurableObject<Env> {
 				else if (active.length === 1 && p.generation !== active[0]) tx.run("UPDATE profiles SET generation = ?, object_name = ?, seq = ? WHERE name = ?", active[0]!, `${userId}:${p.name}:${active[0]}`, tx.seq, p.name);
 				else if (!active.length && p.status === "active") flag(r, [{ kind: "no_active_generation", id: p.name }]);
 			}
-			Object.assign(r, { phase: "index", after: { profile: "", node: "", request: "", done: true } });
+			Object.assign(r, { phase: "settle", settle: { i: 0, after: "" }, settled: 0 });
 		});
+		// Transfers by the fixed rules (step 4), from the profiles' own rows, before ownership is rebuilt from them.
+		if (r.phase === "settle") {
+			const s = await this.settleTransfers(r, userId, live);
+			if (!s.ok) return s;
+		}
 		// Ownership from the active profiles' own rows (steps 3 and 5): the snapshot's node_index and request_index were not applied.
 		while (r.phase === "index" && live()) {
 			const a = r.after!;
@@ -881,17 +1591,20 @@ export class AccountStore extends DurableObject<Env> {
 			const page = await this.profileAt(who).restoredPage(who, { node: from.node, request: from.request });
 			if (!page.ok) return page;
 			this.advance(r, (tx) => {
-				const found: { kind: string; id: string }[] = [];
-				if (!from.node && !from.request && page.value.open_transfers) found.push({ kind: "open_transfer", id: p.name });
+				const found: Finding[] = [];
+				if (!from.node && !from.request) found.push(...this.openTransfers(r, p.name, page.value));
 				let nodes = 0, requests = 0;
 				for (const n of page.value.nodes) {
 					if (tx.spent(0.5)) break;
 					nodes++;
 					const owner = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", n.id).toArray()[0]?.profile;
+					const decided = this.decidedOf(r, n.id);
 					if (this.meta(`wiped:${n.id}`)) found.push({ kind: "wiped_node", id: n.id });
+					// Settled or chosen here: its kept steps run at open, and the planned owner is already indexed.
+					else if (decided !== undefined) continue;
 					else if (n.status === "incoming" || n.status === "moving") found.push({ kind: "transfer_state", id: n.id });
 					else if (n.status === "moved") continue;
-					else if (owner && owner !== p.name) found.push({ kind: "owned_elsewhere", id: n.id });
+					else if (owner && owner !== p.name) found.push({ kind: "owned_elsewhere", id: n.id, pair: [owner, p.name] });
 					else if (!owner) tx.run("INSERT INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", n.id, p.name, tx.seq);
 				}
 				if (nodes === page.value.nodes.length) for (const q of page.value.requests) {
@@ -899,11 +1612,16 @@ export class AccountStore extends DurableObject<Env> {
 					requests++;
 					const row = this.sql.exec<{ profile: string; op: string }>("SELECT profile, op FROM request_index WHERE request_id = ?", q.request_id).toArray()[0];
 					if (row?.op === "wiped") continue; // a wipe's refusal stays
-					if (row && row.profile !== p.name) found.push({ kind: "request_elsewhere", id: q.request_id });
-					else if (!row) tx.run("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					if (row && row.profile !== p.name) {
+						// Step 5: it goes with the profile that owns its node.
+						const owner = this.requestOwner(r, q, p.name);
+						if (owner === p.name) tx.run("UPDATE request_index SET profile = ?, op = ?, payload_hash = ?, at = ?, legacy = ?, seq = ? WHERE request_id = ? AND op <> 'wiped'",
+							p.name, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, q.legacy_hash ? 1 : 0, tx.seq, q.request_id);
+						else if (owner !== row.profile) found.push({ kind: "request_elsewhere", id: q.request_id });
+					} else if (!row && [undefined, p.name].includes(this.requestOwner(r, q, p.name))) tx.run("INSERT INTO request_index (request_id, profile, op, payload_hash, at, seq, legacy) VALUES (?, ?, ?, ?, ?, ?, ?)",
 						q.request_id, p.name, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, tx.seq, q.legacy_hash ? 1 : 0);
 				}
-				flag(r, found);
+				this.flagFound(r, found);
 				const finished = nodes === page.value.nodes.length && requests === page.value.requests.length && page.value.nodes.length < 200 && page.value.requests.length < 200;
 				r.after = { profile: p.name, node: page.value.nodes[nodes - 1]?.id ?? from.node, request: page.value.requests[requests - 1]?.request_id ?? from.request, done: finished };
 			});
@@ -973,7 +1691,9 @@ export class AccountStore extends DurableObject<Env> {
 		// The account's own rows are being replaced: only reads and the restore itself run until it opens or rolls back.
 		if (this.accountRecovery() && !ADMIN_WHILE_RESTORING.includes(cmd.op)) return fail("busy", "account is closed for an account restore");
 		switch (cmd.op) {
-			case "export": case "listExports": case "beginRestore": case "beginAccountRestore": case "restoreStatus": case "restoreStep": case "openRestore": case "abortRestore":
+			case "export": case "listExports": case "beginRestore": case "beginAccountRestore": case "beginPitr": case "beginCorpusRestore": case "restoreRecord":
+			case "recoveryConflicts": case "resolveConflict":
+			case "restoreStatus": case "restoreStep": case "openRestore": case "abortRestore":
 				return this.backup(cmd);
 			case "wipeProfile": {
 				const userId = this.meta("user_id");
@@ -987,6 +1707,54 @@ export class AccountStore extends DurableObject<Env> {
 			}
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
+			case "reviewOffer": {
+				// Metadata lands only for an active origin at the generation the caller was granted, never me; an item's origin never changes,
+				// and a wiped item stays wiped, so a re-offer of an old plan cannot bring wiped names back.
+				if (cmd.origin) {
+					const p = this.sql.exec<{ status: string; generation: string }>("SELECT status, generation FROM profiles WHERE name = ?", cmd.origin.profile).toArray()[0];
+					if (cmd.origin.profile === "me" || !p || p.status !== "active" || p.generation !== cmd.origin.generation) return fail("profile_wiped", `profile '${cmd.origin.profile}' is not open for review items`, { reason: "origin_closed" });
+				}
+				const held = new Map(this.sql.exec<{ id: string; profile: string; state: string }>("SELECT id, profile, state FROM review_items WHERE id IN (SELECT value FROM json_each(?))",
+					JSON.stringify(cmd.items.map((i) => i.id))).toArray().map((r) => [r.id, r]));
+				for (const it of cmd.items) {
+					const h = held.get(it.id);
+					if (cmd.origin && it.profile !== cmd.origin.profile) return fail("validation", "every item must name the offered origin");
+					if (h && h.profile !== it.profile) return fail("validation", `review item '${it.id}' belongs to another origin`, { reason: "origin_changed" });
+					if (h?.state === "wiped") return fail("profile_wiped", `review item '${it.id}' was wiped`, { reason: "wiped" });
+				}
+				this.write((seq) => {
+					const at = now();
+					for (const it of cmd.items) this.sql.exec(`INSERT INTO review_items (id, kind, profile, state, payload, decision, created_at, updated_at, seq) VALUES (?, ?, ?, 'open', ?, NULL, ?, ?, ?)
+						ON CONFLICT (id) DO UPDATE SET state = 'open', payload = excluded.payload, decision = NULL, updated_at = excluded.updated_at, seq = excluded.seq
+						WHERE review_items.state = 'resolved' AND review_items.kind = 'collision'`, it.id, it.kind, it.profile, JSON.stringify(it.payload), at, at, seq);
+				});
+				return ok({ offered: cmd.items.length });
+			}
+			case "reviewList": {
+				const rows = this.sql.exec<ReviewRow>(`SELECT id, kind, profile, state, payload, decision, created_at, updated_at FROM review_items
+					WHERE id > ? AND (? IS NULL OR kind = ?) AND (? IS NULL OR state = ?) AND state <> 'wiped' AND (? IS NULL OR json_extract(payload, '$.export_manifest_sha256') = ?)
+						AND profile IN (SELECT name FROM profiles WHERE status = 'active')
+						AND (kind <> 'collision' OR json_extract(payload, '$.from') IN (SELECT name FROM profiles WHERE status = 'active')) ORDER BY id LIMIT ?`,
+					cmd.after ?? "", cmd.kind ?? null, cmd.kind ?? null, cmd.state ?? null, cmd.state ?? null, cmd.exportSha ?? null, cmd.exportSha ?? null, cmd.limit + 1).toArray();
+				const page = rows.slice(0, cmd.limit);
+				return ok({ items: page.map(reviewOut), next_after: rows.length > cmd.limit ? page.at(-1)!.id : null });
+			}
+			case "reviewAssign": case "reviewResolve": {
+				const kind = cmd.op === "reviewAssign" ? "migration" : "collision";
+				const r = this.sql.exec<ReviewRow>("SELECT id, kind, profile, state, payload, decision, created_at, updated_at FROM review_items WHERE id = ?", cmd.id).toArray()[0];
+				if (!r || r.kind !== kind) return fail("not_found", `no ${kind} review item '${cmd.id}'`);
+				// A closing or wiped origin takes no decision; its metadata is being or has been cleared.
+				const open = (name: unknown) => this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND status = 'active'", String(name)).toArray().length > 0;
+				if (r.state === "wiped" || !open(r.profile) || (kind === "collision" && !open((JSON.parse(r.payload) as { from?: string }).from))) return fail("profile_wiped", "this review item's profile is closed or wiped", { reason: "origin_closed" });
+				// A resolved collision keeps its choice: a retry after a lost answer replays it; a different choice needs a new collision.
+				if (r.state === "resolved") return ok(reviewOut(r));
+				const decision = JSON.stringify(cmd.op === "reviewAssign" ? { profile: cmd.profile, at: now() } : { choice: cmd.choice, at: now() });
+				const state = cmd.op === "reviewAssign" ? "assigned" : "resolved";
+				// The same assignment again changes nothing, so a retry replays it; another profile replaces it until the plan uses it.
+				if (cmd.op === "reviewAssign" && r.decision && (JSON.parse(r.decision) as { profile: string }).profile === cmd.profile) return ok(reviewOut(r));
+				this.write((seq) => this.sql.exec("UPDATE review_items SET state = ?, decision = ?, updated_at = ?, seq = ? WHERE id = ?", state, decision, now(), seq, cmd.id));
+				return ok(reviewOut(this.sql.exec<ReviewRow>("SELECT id, kind, profile, state, payload, decision, created_at, updated_at FROM review_items WHERE id = ?", cmd.id).one()));
+			}
 			case "wipePlan": {
 				// Read only, through the wipe engine's own target and term rules; its own profile is left out, as the preview is of the rest.
 				const userId = this.meta("user_id");

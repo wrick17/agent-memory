@@ -56,7 +56,11 @@ function cloudflare({ loggedIn = true, accounts = [ACCOUNT], buckets = [], index
 		if (a === "secret" && b === "list") {
 			const names = state.workers[args[3]];
 			return names ? ok(JSON.stringify(names.map((name) => ({ name, type: "secret_text" }))))
-				: { status: 1, stdout: "", stderr: `✘ [ERROR] Worker "${args[3]}" not found.\n\nIf this is a new Worker, run \`wrangler deploy\` first to create it.` };
+				// Wrangler 4.154's exact output: esbuild-formatted error and notes, then its default log-file footer on exit.
+				: { status: 1, stdout: "\n", stderr: `\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mWorker "${args[3]}" not found.\u001b[0m\n\n  \n` +
+					"  If this is a new Worker, run `wrangler deploy` first to create it.\n" +
+					"  Otherwise, check that the Worker name is correct and you're logged into the right account.\n\n\n" +
+					"🪵  Logs were written to \"/synthetic/.wrangler/logs/wrangler-2026-11-01_00-00-00_000.log\"\n" };
 		}
 		if (a === "secret" && b === "put") { (state.workers[args[4]] ??= []).push(c); state.secrets[c] = input; return ok(`✨ Success! Uploaded secret ${c}\n`); }
 		return { status: 1, stdout: "", stderr: `unexpected command ${args.join(" ")}` };
@@ -629,7 +633,8 @@ describe("self-host setup", () => {
 		delete lock.version; delete lock.packages[""].version; delete lock.packages[""].engines;
 		assert.deepEqual(lock, sourceLock, "packaging preserves the pinned dependency graph");
 		assert.deepEqual(manifest.scripts, { setup: "node local/setup.mjs" });
-		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-refresh.mjs", "corpus-upload.mjs", "setup.mjs"]);
+		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-cli.mjs", "corpus-git.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs", "setup.mjs"]);
+		assert.deepEqual(manifest.files, ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc", "npm-shrinkwrap.json"]);
 		for (const file of ["wrangler.jsonc", "agent-memory.setup.json", RECEIPTS_FILE, "agent-memory.setup.lock", ".dev.vars", "research", "test"])
 			assert.equal(fs.existsSync(path.join(stage, file)), false, file);
 		const readme = fs.readFileSync(path.join(stage, "README.md"), "utf8");

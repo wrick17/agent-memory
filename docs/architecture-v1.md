@@ -147,6 +147,8 @@ Judgment edges need a `reason` and `evidence`. Nodes are referenced by key, by i
 
 ### The end-of-session hook
 
+**Historical example:** The Claude hook example below describes the v1 design. For current hook output use the `agent-memory install` instructions in the current installer; see [self-host setup](self-host.md). Installation does not enable hooks automatically.
+
 Claude Code and Codex run the same script. It returns in under 100 ms and leaves the work to a detached run.
 
 ```jsonc
@@ -161,7 +163,7 @@ Claude Code and Codex run the same script. It returns in under 100 ms and leaves
 [[hooks.SessionEnd.hooks]]
 type = "command"
 command = "~/.agent-memory/bin/agent-memory hook codex"
-timeout = 10
+timeout = 3
 ```
 
 The detached run uploads one bundle per session with a job-scoped device token:

@@ -33,6 +33,19 @@ export function wipeTerms(sql: SqlStorage, profile: string): string[] {
 	return [...new Set([...org, ...sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((t) => t.term)])];
 }
 
+/**
+ * The owner's review list after a wipe of `profile` (section 15): its migrated records, and every collision naming it, keep only
+ * their content-free identity, kind and decision; the payload is cleared and the state becomes `wiped`, so a re-offer of the same
+ * identity is refused instead of bringing names back. One bounded page per call; repeat until 0. Also the seam a restore uses to
+ * filter a permanently wiped origin out of restored review rows.
+ */
+export function scrubReview(sql: SqlStorage, profile: string, stamp: () => number, now: string): number {
+	const ids = sql.exec<{ id: string }>(`SELECT id FROM review_items WHERE state <> 'wiped' AND (profile = ? OR (kind = 'collision' AND json_extract(payload, '$.from') = ?)) LIMIT 100`,
+		profile, profile).toArray().map((r) => r.id);
+	if (ids.length) sql.exec("UPDATE review_items SET state = 'wiped', payload = '{}', updated_at = ?, seq = ? WHERE id IN (SELECT value FROM json_each(?))", now, stamp(), JSON.stringify(ids));
+	return ids.length;
+}
+
 /** Wired as internal AccountStore.wipe; begin is the sole user entry and verifies owner plus exact typed name. */
 export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountCommand): Outcome<WipeAccountResult> {
 	try {
@@ -87,6 +100,8 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 						tx.run("UPDATE request_index SET op = 'wiped', payload_hash = '', legacy = 0, pending = 0, seq = ? WHERE request_id IN (SELECT value FROM json_each(?))", tx.seq, JSON.stringify(requests.map((q) => q.request_id)));
 						return { after: "more" };
 					}
+					// The owner's review list keeps only content-free identities and decisions for this origin, before the clean export.
+					if (scrubReview(sql, cmd.profile, () => tx.seq, tx.now)) return { after: "more" };
 					for (const q of ["DELETE FROM routing_rules WHERE id IN (SELECT id FROM routing_rules WHERE profile = ? LIMIT 40)", "DELETE FROM node_index WHERE node_id IN (SELECT node_id FROM node_index WHERE profile = ? LIMIT 100)"]) {
 						const before = tx.rows; tx.run(q, cmd.profile); if (tx.rows > before) return { after: "more" };
 					}

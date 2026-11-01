@@ -3,6 +3,7 @@
 // POST /v1/import in order and saves an acknowledgement after each batch, so a rerun resumes at the first batch not
 // acknowledged. Every server step is idempotent: a batch the server applied before its response was lost is sent again
 // and replays. A refusal stops the run and is reported; nothing is skipped. The token stays in its private file.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -194,12 +195,53 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 	return { status: report.status, records: report.records, found: report.found, mismatches: Object.fromEntries(Object.entries(mismatches).map(([k, ids]) => [k, ids.length])), drift: drift.length };
 }
 
+/**
+ * The hosted migration review list (sections 15 and 16). `pushReview` offers the plan's route-ready unrouted records (their name,
+ * reasons and exact route binding, never content) under their origin profile (work by default, the owner's legacy-import decision),
+ * so the owner can assign each a destination in the dashboard; `pullRoutes` writes the
+ * owner's assignments for this export as a `plan --routes` file, which the next plan checks again exactly. Neither imports anything.
+ */
+const manifestSha = (exportDir) => createHash("sha256").update(fs.readFileSync(path.join(exportDir, "manifest.json"))).digest("hex");
+async function reviewCall(config, fetchImpl, url, init = {}) {
+	const res = await fetchImpl(url, { ...init, redirect: "manual", headers: { authorization: `Bearer ${fs.readFileSync(config.tokenFile, "utf8").trim()}`, ...(init.body ? { "content-type": "application/json" } : {}) } });
+	if (res.status !== 200) throw new Error(`the server refused the review list request (HTTP ${res.status || "redirect"})`);
+	return res.json();
+}
+export async function pushReview({ exportDir, config, origin = "work", fetchImpl = fetch }) {
+	if (config.rehearsal) throw new Error("the review list belongs to a routed plan on the production server");
+	const items = readJsonl(path.join(exportDir, "plan", "review.jsonl")).filter((r) => r.route_binding)
+		.map((r) => ({ source: r.key, id: r.id, scope: r.route_binding.scope, source_sha256: r.route_binding.source_sha256, name: r.name, reasons: r.reasons }));
+	const sha = manifestSha(exportDir);
+	for (let i = 0; i < items.length; i += 200) {
+		await reviewCall(config, fetchImpl, new URL("/v1/import/review", config.server), { method: "POST", body: JSON.stringify({ export_manifest_sha256: sha, origin, items: items.slice(i, i + 200) }) });
+	}
+	return { status: "done", offered: items.length };
+}
+export async function pullRoutes({ exportDir, config, out, fetchImpl = fetch }) {
+	if (config.rehearsal) throw new Error("the review list belongs to a routed plan on the production server");
+	const sha = manifestSha(exportDir), routes = [];
+	let after = null;
+	do {
+		const url = new URL("/v1/import/review", config.server);
+		url.searchParams.set("export_manifest_sha256", sha);
+		if (after) url.searchParams.set("after", after);
+		const page = await reviewCall(config, fetchImpl, url);
+		routes.push(...page.routes);
+		after = page.next_after;
+	} while (after);
+	if (!routes.length) return { status: "none", routes: 0 };
+	writePrivate(out, JSON.stringify({ version: 1, export_manifest_sha256: sha, routes }, null, 2));
+	return { status: "done", routes: routes.length, file: out };
+}
+
 if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
-	const all = process.argv.slice(2), auditing = all[0] === "audit", rest = auditing ? all.slice(1) : all;
+	const all = process.argv.slice(2), verb = ["audit", "review-push", "review-pull"].includes(all[0]) ? all[0] : null, auditing = verb === "audit", rest = verb ? all.slice(1) : all;
 	const opt = (name) => { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : undefined; };
 	const state = readJson(path.join(migrationDir(), "state.json"));
 	const exportDir = opt("export") ?? state?.exports?.at(-1)?.dir?.replace(/^~/, os.homedir());
-	if (!exportDir) { process.stderr.write("usage: node local/upload.mjs [audit] [--export DIR] [--rehearsal test] [--config FILE]\n"); process.exit(2); }
-	(auditing ? audit : upload)({ exportDir, rehearsal: opt("rehearsal") ?? null, config: loadConfig(opt("config")) })
-		.then((r) => { process.stdout.write(`${JSON.stringify(r, null, 2)}\n`); process.exit(r.status === "done" || r.status === "ok" ? 0 : 1); }, (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
+	if (!exportDir || (verb === "review-pull" && !opt("out"))) { process.stderr.write("usage: node local/upload.mjs [audit | review-push [--origin PROFILE] | review-pull --out FILE] [--export DIR] [--rehearsal test] [--config FILE]\n"); process.exit(2); }
+	const config = loadConfig(opt("config"));
+	(verb === "review-push" ? pushReview({ exportDir, config, ...(opt("origin") ? { origin: opt("origin") } : {}) }) : verb === "review-pull" ? pullRoutes({ exportDir, config, out: opt("out") })
+		: (auditing ? audit : upload)({ exportDir, rehearsal: opt("rehearsal") ?? null, config }))
+		.then((r) => { process.stdout.write(`${JSON.stringify(r, null, 2)}\n`); process.exit(r.status === "done" || r.status === "ok" || r.status === "none" ? 0 : 1); }, (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 }

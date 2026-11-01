@@ -68,6 +68,29 @@ const noSleep = async () => {};
 const firstApply = (s) => [...s.applied.values()].every((x) => x >= 1);
 
 describe("upload", () => {
+	it("offers only route-ready unrouted records to the review list, and the owner's assignments come back as a routes file the next plan imports", async () => {
+		const dir = await plannedExport(3, null, (i) => (i === 0 ? "personal" : "nowhere-routed"));
+		const review = m.readJsonl(path.join(dir, "plan", "review.jsonl"));
+		assert.deepEqual(review.map((r) => [r.reasons, !!r.route_binding]), [[["unrouted_scope"], true], [["unrouted_scope"], true]]);
+		const cfg = u.loadConfig(config({ rehearsal: false })), sent = [];
+		const fetchImpl = async (url, init) => {
+			if (init.method === "POST") { const b = JSON.parse(init.body); sent.push(b); return Response.json({ offered: b.items.length }); }
+			// The owner assigned both to work; the server returns exactly what was offered, as route entries.
+			return Response.json({ routes: sent.flatMap((b) => b.items.map((it) => ({ source: it.source, id: it.id, scope: it.scope, profile: "work", source_sha256: it.source_sha256 }))), next_after: null });
+		};
+		assert.deepEqual(await u.pushReview({ exportDir: dir, config: cfg, fetchImpl }), { status: "done", offered: 2 });
+		assert.deepEqual(sent.map((x) => x.origin), ["work"]); // the owner's legacy imports belong to work unless --origin says otherwise
+		assert.ok(!JSON.stringify(sent).includes("note 1") && !JSON.stringify(sent).includes("SECRET")); // metadata only, never content or the token
+		await assert.rejects(u.pushReview({ exportDir: dir, config: { ...cfg, rehearsal: true }, fetchImpl }), /routed plan/);
+		const out = path.join(m.migrationDir(), "routes.json");
+		assert.deepEqual(await u.pullRoutes({ exportDir: dir, config: cfg, out, fetchImpl }), { status: "done", routes: 2, file: out });
+		assert.equal(fs.statSync(out).mode & 0o077, 0);
+		const r = await m.plan({ exportDir: dir, routes: out });
+		assert.equal(r.manifest.reviewed_routes.routes, 2);
+		assert.deepEqual(m.readJsonl(path.join(dir, "plan", "review.jsonl")), []);
+		assert.deepEqual(m.readJsonl(path.join(dir, "plan", "commands.jsonl")).filter((c) => c.op === "finalize").map((c) => c.profile), ["personal", "work", "work"]);
+	});
+
 	it("resends a batch whose response was lost and finishes with every command applied, keeping the token out of its state", async () => {
 		const dir = await plannedExport();
 		const server = fakeServer({ lose: (b) => b === 1 });

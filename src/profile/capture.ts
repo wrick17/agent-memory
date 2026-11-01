@@ -5,8 +5,10 @@ import { z } from "zod";
 import { canonicalJson, sha256 } from "../domain/ids";
 import { redactText } from "../domain/redact";
 import { nextSeq } from "../storage";
-import { resolveMentionsAlone } from "./extract";
+import { Fail } from "../domain/types";
+import { identifiers, linkIdentifiers, resolveMentionsAlone, type TxLike } from "./extract";
 import { sizeLevel } from "./housekeeping";
+import { assertWritable } from "./transfer";
 import type { Who } from "./write";
 
 export const PART_MAX_BYTES = 8192;
@@ -125,6 +127,7 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 				node, d.body, d.range_id, d.part_id, d.sha256, d.capture_status, now, live, seq);
 			return result("stored");
 		}));
+		if (out[out.length - 1]!.status !== "refused") linkDigest(storage, batch.session, check.body);
 	}
 	for (const m of batch.manifests) {
 		const result = (status: ItemResult["status"], reason?: string): ItemResult => ({ range_id: m.range_id, part_id: "manifest", status, ...(reason ? { reason } : {}) });
@@ -168,6 +171,30 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 	// waiting resolve on the session's next upload.
 	resolveMentionsAlone(storage, sessionKey(batch.session), "upload");
 	return out;
+}
+
+/**
+ * Section 10: the session links by identifier to the projects, commits, PRs and tickets its digest names (mention rows for keys
+ * no node carries yet), so a later record of one shows where it came up. The digest text stays in the capture lane. Its own
+ * transaction after the part is stored, so a link never costs the digest; a replay links again, idempotently.
+ */
+function linkDigest(storage: DurableObjectStorage, s: IngestBatch["session"], body: Body): void {
+	const sql = storage.sql, text = strings(body).join("\n"), found = identifiers(text);
+	if (!found.keys.length && !found.files.length) return;
+	try {
+		storage.transactionSync(() => {
+			const node = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", sessionKey(s)).toArray()[0]?.id;
+			if (!node) return;
+			assertWritable(sql, node);
+			const tx: TxLike = { sql, seq: nextSeq(sql, "profile_meta"), now: new Date().toISOString(), requestId: null, ctx: { actor: "hook" }, rows: 0,
+				run(query, ...params) { const c = sql.exec(query, ...params); this.rows += c.rowsWritten; return c; } };
+			// At most 100 identifiers from an 8 KB part, well inside the 1,000-row write bound.
+			linkIdentifiers(tx, node, text);
+		});
+	} catch (e) {
+		// shortcut: an endpoint mid-transfer or mid-archive skips this part's links until the part is uploaded again, whose replay links them.
+		if (!(e instanceof Fail && e.failure.code === "moving")) throw e;
+	}
 }
 
 /** A manifest acknowledges only the tiled parts still durably held, including after capture TTL or an interrupted restore. */

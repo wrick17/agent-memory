@@ -215,28 +215,42 @@ const sentences = (s) => s.split(/(?<=[.!?])\s+|\n+/).map((x) => x.trim()).filte
 const cut = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 const DECISION = /\b(decided|chose|going with|instead of|because)\b/i;
 const CORRECTION = /\b(don't|do not|never|always|stop|instead|I prefer|that's wrong|that is wrong)\b/i;
-const ENTITY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b|\b[\w.-]+\/[\w.-]+#\d+\b/g;
+// Encountered references, kept literally: GitHub repo, PR, issue and commit URLs, Jira browse URLs, ticket keys, org/repo#N and
+// org/repo@sha. The server finds the same keys (src/profile/extract.ts) and links the session to them. No URL query or fragment.
+const ENTITY = /https?:\/\/(?:www\.)?github\.com\/[\w.-]+\/[\w-]+(?:\.[\w-]+)*(?:\/(?:pull|issues|commit)\/\w+)?|https?:\/\/[\w.-]+\/browse\/[A-Z][A-Z0-9]{1,9}-\d+\b|\b[A-Z][A-Z0-9]{1,9}-\d+\b|\b[\w.-]+\/[\w.-]+(?:#\d+|@[0-9a-f]{7,40})\b/g;
+const PR_REF = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|\b[\w.-]+\/[\w.-]+#\d+\b/, COMMIT_REF = /github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{7,40}|\b[\w.-]+\/[\w.-]+@[0-9a-f]{7,40}\b/;
+/** Assistant sentences kept as PR or commit outcomes, so a reference keeps what was done with it. */
+const REF_CONTEXT = 10;
 
 /** The keyword-based digest, built at once with no model. It is labeled heuristic and never counts as captured. */
 export function heuristicDigest(messages) {
 	const d = { asks: [], decisions: [], corrections: [], outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } };
+	const context = new Set();
 	for (const m of messages) {
 		if (m.role === "owner") {
 			const first = sentences(m.text)[0];
 			if (first) d.asks.push({ text: cut(first, LIMITS.ask), pos: m.pos });
 			for (const s of sentences(m.text)) if (CORRECTION.test(s)) d.corrections.push({ text: cut(s, LIMITS.item), pos: m.pos });
 		} else {
-			for (const s of sentences(m.text)) if (DECISION.test(s)) d.decisions.push({ text: cut(s, LIMITS.item), pos: m.pos });
+			for (const s of sentences(m.text)) {
+				if (DECISION.test(s)) d.decisions.push({ text: cut(s, LIMITS.item), pos: m.pos });
+				const o = PR_REF.test(s) ? "prs" : COMMIT_REF.test(s) ? "commits" : null;
+				if (o && context.size < REF_CONTEXT && !context.has(s)) { context.add(s); d.outcomes[o].push(cut(s, LIMITS.item)); }
+			}
 			for (const sh of m.text.match(/\b[0-9a-f]{7,40}\b/g) ?? []) if (/[a-f]/.test(sh) && /\d/.test(sh)) d.outcomes.commits.push(sh);
 		}
-		for (const e of m.text.match(ENTITY) ?? []) d.entities.push(e);
+		for (const e of m.text.match(ENTITY) ?? []) if (e.length <= LIMITS.item) d.entities.push(e);
 	}
 	d.entities = [...new Set(d.entities)].slice(0, 50);
-	d.outcomes.commits = [...new Set(d.outcomes.commits)].slice(0, 20);
+	d.outcomes.commits = [...new Set(d.outcomes.commits)].slice(0, 20 + REF_CONTEXT);
 	// Shrink to the 8 KB bound by dropping the newest items of the longest list, and count what was dropped.
 	while (bytes(JSON.stringify(d)) > LIMITS.part) {
 		const k = ["asks", "decisions", "corrections"].sort((a, b) => d[b].length - d[a].length)[0];
-		if (!d[k].length) { d.entities = d.entities.slice(0, Math.floor(d.entities.length / 2)); continue; }
+		if (!d[k].length) {
+			if (d.entities.length) d.entities = d.entities.slice(0, Math.floor(d.entities.length / 2));
+			else d.outcomes[d.outcomes.prs.length >= d.outcomes.commits.length ? "prs" : "commits"].pop();
+			continue;
+		}
 		d[k].pop();
 		d.dropped[k]++;
 	}
@@ -624,7 +638,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
 	const qdir = path.join(home(), "queue");
-	const handled = new Map();
+	const handled = new Map(), ended = new Set();
 	try {
 		await replaySpool(server);
 		fs.mkdirSync(claimDir(), { recursive: true, mode: 0o700 });
@@ -647,6 +661,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 				try { fs.renameSync(path.join(qdir, f), claimed); } catch { continue; }
 				const ct = readJson(claimed, t);
 				handled.set(f, genOf(ct));
+				if (ct.event === "SessionEnd" && typeof ct.cwd === "string") ended.add(ct.cwd);
 				progressed = true;
 				let r;
 				try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
@@ -659,6 +674,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
+		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
 			results.batch = await batch({ runner, config, clock });
@@ -667,6 +683,25 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 		runner?.cleanup?.();
 	}
 	return { handled, runtime: runner?.classification ?? "unavailable", reason: runner?.reason ?? null };
+}
+
+/**
+ * Optional, off unless config.corpus_profile is set: after the queue settles, refresh the Git history (and with corpus_scans: true the
+ * checkout scans) of each checkout whose session ended, through the corpus CLI with its own import config (corpus_config, default
+ * migration/upload.json) and optional corpus_base, never the job token. Unchanged checkouts send nothing; failures stay here.
+ */
+async function corpusAfterSessions(config, cwds) {
+	const roots = [...new Set([...cwds].map((c) => spawnSync("git", ["-C", c, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5000 }).stdout?.trim()).filter(Boolean))];
+	const out = { status: "ok", checkouts: roots.length };
+	try {
+		const { main } = await import("./corpus-cli.mjs");
+		for (const root of roots) {
+			const code = await main(["--git", root, "--profile", config.corpus_profile, ...(config.corpus_scans === true ? ["--scans"] : []),
+				...(typeof config.corpus_base === "string" ? ["--base", config.corpus_base] : []), ...(typeof config.corpus_config === "string" ? ["--config", config.corpus_config] : [])], "agent-memory run (corpus)");
+			if (code !== 0) out.status = "incomplete";
+		}
+	} catch { out.status = "error"; }
+	return out;
 }
 
 /** The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. */
@@ -853,17 +888,24 @@ export function parseEvents(stdout) {
  * Writes this CLI, a private config and the probe directory under the Agent Memory home. Never edits client settings.
  * bin/agent-memory.mjs is the one CLI copy; the hook command bin/agent-memory is a relative symlink to it, so the entry and
  * batch.mjs's `./agent-memory.mjs` import load one module instance and one lock owner. Each file is replaced atomically.
+ * `corpus-upload` runs the copied corpus CLI and its imports, laid out as in the source tree.
  */
+// corpus-upload's import closure in the source layout: its modules beside this CLI, and their domain imports at ../src/domain.
+const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
+const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
+
 export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
 	// Home and bin are checked before anything is created inside them: a symlink or a foreign directory is refused.
-	for (const [dir, recursive] of [[home(), true], [path.dirname(bin), false]]) {
+	for (const [dir, recursive] of [[home(), true], [path.dirname(bin), false], [path.join(home(), "src"), false], [path.join(home(), "src", "domain"), false]]) {
 		try { fs.lstatSync(dir); } catch (e) { if (e.code !== "ENOENT") throw e; fs.mkdirSync(dir, { recursive, mode: 0o700 }); }
 		const st = fs.lstatSync(dir);
 		if (!st.isDirectory() || st.uid !== process.getuid()) throw new Error(`install_refused:${dir}`);
 		fs.chmodSync(dir, 0o700);
 	}
 	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
+	for (const f of CORPUS_LOCAL) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+	for (const f of CORPUS_DOMAIN) writePrivate(path.join(home(), "src", "domain", f), fs.readFileSync(new URL(`../src/domain/${f}`, import.meta.url)));
 	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
 	fs.symlinkSync("agent-memory.mjs", link);
@@ -872,7 +914,7 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna", batch_profiles: [], batch_luna_model: "gpt-6-luna", batch_terra_model: "gpt-6.1-terra" }, null, 2));
 	fs.mkdirSync(path.join(home(), "probe"), { recursive: true, mode: 0o700 });
 	return { bin, config: cfg, claude: { hooks: Object.fromEntries(["Stop", "SessionEnd", "SessionStart"].map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...(e === "Stop" ? { async: true } : {}) }] }]])) },
-		codex: ["Stop", "SessionEnd", "SessionStart"].map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${e === "Stop" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 10" : ""}`).join("\n\n") };
+		codex: ["Stop", "SessionEnd", "SessionStart"].map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${e === "Stop" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : ""}`).join("\n\n") };
 }
 
 // ---------- CLI ----------
@@ -887,8 +929,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 	} else if (cmd === "install") {
 		const r = install();
 		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\nClaude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
+	} else if (cmd === "corpus-upload") {
+		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else {
-		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install\n");
+		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
 		process.exit(2);
 	}
 }

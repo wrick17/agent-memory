@@ -9,7 +9,7 @@ import { Fail } from "../domain/types";
 
 export type Value = string | number | null;
 export type Key = Value[];
-type Column = "text" | "integer";
+type Column = "text" | "integer" | "real";
 export interface SearchDoc { evidence_id: string; kind: string; key: string; repo: string; date: string; title: string; detail: string }
 export interface Family {
 	/** The source's CREATE TABLE text, byte for byte; schema_sha256 is its SHA-256. */
@@ -116,6 +116,64 @@ export const FAMILIES: Record<string, Family> = {
 	},
 };
 
+const ID = "builder row id: no loaded table refers to it; derived views use rowid";
+const PATH = "local filesystem path of the scanned checkout (personal-field rule)";
+/** A checkout-scan family: exact original DDL, no bulk load, rows partitioned by `repo` (repo full name; for snapshot tables the snapshot id equals it). */
+const scan = (ddl: string, repo: string, columns: Record<string, Column>, omit: Record<string, string> = {}, indexes: string[] = []): Family =>
+	({ ddl, indexes: [...indexes, `CREATE INDEX corpus_part_${/TABLE (\w+)/.exec(ddl)![1]} ON ${/TABLE (\w+)/.exec(ddl)![1]}(${repo})`], columns, key: [], omit, repo, people: [] });
+
+/**
+ * The checkout-scan group (section 14 "Incremental updates", phase 6 scanners): refreshed per repo from a local checkout's HEAD by
+ * the `scans` refresh group, never bulk loaded, so a Git-history client never touches them. Every row is an unkeyed occurrence:
+ * a refresh deletes the rows whose hash left and inserts the new ones, so changed or deleted paths replace their prior rows.
+ */
+export const SCANS: Record<string, Family> = {
+	source_files: scan("CREATE TABLE source_files(\n  repo TEXT,\n  path TEXT,\n  blob_sha TEXT,\n  size INT,\n  scanned INT,\n  skip_reason TEXT\n)", "repo", { repo: "text", path: "text", blob_sha: "text", size: "integer", scanned: "integer", skip_reason: "text" }),
+	architecture_repos: scan("CREATE TABLE architecture_repos(\n  repo TEXT,\n  name TEXT,\n  category TEXT,\n  archived INT,\n  language TEXT,\n  default_branch TEXT,\n  head_sha TEXT,\n  latest_date TEXT,\n  history_commits INT,\n  history_refs INT,\n  current_files INT,\n  scanned_files INT,\n  scanned_bytes INT,\n  domains TEXT\n)", "repo", { repo: "text", name: "text", category: "text", archived: "integer", language: "text", default_branch: "text", head_sha: "text", latest_date: "text", history_commits: "integer", history_refs: "integer", current_files: "integer", scanned_files: "integer", scanned_bytes: "integer", domains: "text" }),
+	api_endpoints: scan("CREATE TABLE api_endpoints(\n  id INT,\n  repo TEXT,\n  sha TEXT,\n  path TEXT,\n  line INT,\n  method TEXT,\n  route TEXT,\n  normalized_route TEXT,\n  kind TEXT,\n  security_signals TEXT\n)", "repo", { repo: "text", sha: "text", path: "text", line: "integer", method: "text", route: "text", normalized_route: "text", kind: "text", security_signals: "text" }, { id: ID }, ["CREATE INDEX api_endpoints_repo ON api_endpoints(repo)"]),
+	api_callers: scan("CREATE TABLE api_callers(\n  id INT,\n  repo TEXT,\n  sha TEXT,\n  category TEXT,\n  path TEXT,\n  line INT,\n  target TEXT,\n  normalized_target TEXT,\n  base_env_refs TEXT\n)", "repo", { repo: "text", sha: "text", category: "text", path: "text", line: "integer", target: "text", normalized_target: "text", base_env_refs: "text" }, { id: ID }, ["CREATE INDEX api_callers_repo ON api_callers(repo)"]),
+	packages: scan("CREATE TABLE packages(\n  id INT,\n  repo TEXT,\n  sha TEXT,\n  path TEXT,\n  role TEXT,\n  package TEXT,\n  version TEXT,\n  scope TEXT\n)", "repo", { repo: "text", sha: "text", path: "text", role: "text", package: "text", version: "text", scope: "text" }, { id: ID }),
+	external_system_edges: scan("CREATE TABLE external_system_edges(\n  repo TEXT,\n  system TEXT,\n  system_type TEXT,\n  evidence_path TEXT,\n  evidence_line INT,\n  confidence TEXT\n)", "repo", { repo: "text", system: "text", system_type: "text", evidence_path: "text", evidence_line: "integer", confidence: "text" }),
+	env_refs: scan("CREATE TABLE env_refs(\n  repo TEXT,\n  sha TEXT,\n  path TEXT,\n  line INT,\n  name TEXT,\n  secret_reference INT\n)", "repo", { repo: "text", sha: "text", path: "text", line: "integer", name: "text", secret_reference: "integer" }),
+	architecture_workflows: scan("CREATE TABLE architecture_workflows(\n  id INT,\n  repo TEXT,\n  sha TEXT,\n  path TEXT,\n  triggers TEXT,\n  environments TEXT,\n  deploy_targets TEXT,\n  secret_refs TEXT\n)", "repo", { repo: "text", sha: "text", path: "text", triggers: "text", environments: "text", deploy_targets: "text", secret_refs: "text" }, { id: ID }),
+	frontend_repositories: scan("CREATE TABLE frontend_repositories(\n  repo_key TEXT,\n  full_name TEXT,\n  org TEXT,\n  name TEXT,\n  category TEXT\n)", "repo_key", { repo_key: "text", full_name: "text", org: "text", name: "text", category: "text" }),
+	frontend_snapshots: scan("CREATE TABLE frontend_snapshots(\n  snapshot_id TEXT,\n  repo_key TEXT,\n  role TEXT,\n  branch TEXT,\n  sha TEXT,\n  commit_date TEXT,\n  subject TEXT,\n  root_path TEXT,\n  dirty INT\n)", "repo_key", { snapshot_id: "text", repo_key: "text", role: "text", branch: "text", sha: "text", commit_date: "text", subject: "text", dirty: "integer" }, { root_path: PATH }),
+	frontend_branch_refs: scan("CREATE TABLE frontend_branch_refs(\n  repo_key TEXT,\n  ref_name TEXT,\n  sha TEXT,\n  commit_date TEXT,\n  subject TEXT,\n  is_workspace_head INT,\n  is_ancestor_of_workspace INT\n)", "repo_key", { repo_key: "text", ref_name: "text", sha: "text", commit_date: "text", subject: "text", is_workspace_head: "integer", is_ancestor_of_workspace: "integer" }),
+	frontend_branch_deltas: scan("CREATE TABLE frontend_branch_deltas(\n  repo_key TEXT,\n  from_snapshot TEXT,\n  to_snapshot TEXT,\n  merge_base_sha TEXT,\n  ahead INT,\n  behind INT,\n  path TEXT,\n  status TEXT\n)", "repo_key", { repo_key: "text", from_snapshot: "text", to_snapshot: "text", merge_base_sha: "text", ahead: "integer", behind: "integer", path: "text", status: "text" }),
+	frontend_branch_comparisons: scan("CREATE TABLE frontend_branch_comparisons(\n  repo_key TEXT,\n  workspace_snapshot TEXT,\n  ref_name TEXT,\n  ref_sha TEXT,\n  merge_base_sha TEXT,\n  ahead INT,\n  behind INT,\n  changed_paths INT\n)", "repo_key", { repo_key: "text", workspace_snapshot: "text", ref_name: "text", ref_sha: "text", merge_base_sha: "text", ahead: "integer", behind: "integer", changed_paths: "integer" }),
+	frontend_files: scan("CREATE TABLE frontend_files(\n  snapshot_id TEXT,\n  path TEXT,\n  blob_sha TEXT,\n  size INT,\n  language TEXT,\n  is_test INT,\n  top_domain TEXT\n)", "snapshot_id", { snapshot_id: "text", path: "text", blob_sha: "text", size: "integer", language: "text", is_test: "integer", top_domain: "text" }),
+	frontend_evidence: scan("CREATE TABLE frontend_evidence(\n  id INT,\n  snapshot_id TEXT,\n  category TEXT,\n  evidence_key TEXT,\n  value TEXT,\n  path TEXT,\n  line INT,\n  snippet TEXT,\n  confidence REAL,\n  extractor TEXT\n)", "snapshot_id", { snapshot_id: "text", category: "text", evidence_key: "text", value: "text", path: "text", line: "integer", snippet: "text", confidence: "real", extractor: "text" }, { id: ID }),
+	mf_exposes: scan("CREATE TABLE mf_exposes(\n  snapshot_id TEXT,\n  expose_key TEXT,\n  target_path TEXT,\n  path TEXT,\n  line INT,\n  confidence REAL\n)", "snapshot_id", { snapshot_id: "text", expose_key: "text", target_path: "text", path: "text", line: "integer", confidence: "real" }),
+	cross_mfe_imports: scan("CREATE TABLE cross_mfe_imports(\n  snapshot_id TEXT,\n  source_alias TEXT,\n  import_path TEXT,\n  path TEXT,\n  line INT,\n  confidence REAL\n)", "snapshot_id", { snapshot_id: "text", source_alias: "text", import_path: "text", path: "text", line: "integer", confidence: "real" }),
+	frontend_api_endpoints: scan("CREATE TABLE frontend_api_endpoints(\n  snapshot_id TEXT,\n  endpoint TEXT,\n  method_hint TEXT,\n  path TEXT,\n  line INT,\n  snippet TEXT,\n  confidence REAL\n)", "snapshot_id", { snapshot_id: "text", endpoint: "text", method_hint: "text", path: "text", line: "integer", snippet: "text", confidence: "real" }),
+	frontend_routes: scan("CREATE TABLE frontend_routes(\n  snapshot_id TEXT,\n  route_value TEXT,\n  path TEXT,\n  line INT,\n  snippet TEXT,\n  confidence REAL\n)", "snapshot_id", { snapshot_id: "text", route_value: "text", path: "text", line: "integer", snippet: "text", confidence: "real" }),
+	frontend_domain_modules: scan("CREATE TABLE frontend_domain_modules(\n  snapshot_id TEXT,\n  kind TEXT,\n  name TEXT,\n  path TEXT,\n  file_count INT,\n  test_count INT\n)", "snapshot_id", { snapshot_id: "text", kind: "text", name: "text", path: "text", file_count: "integer", test_count: "integer" }),
+	frontend_dependencies: scan("CREATE TABLE frontend_dependencies(\n  snapshot_id TEXT,\n  name TEXT,\n  version TEXT,\n  kind TEXT,\n  path TEXT,\n  line INT\n)", "snapshot_id", { snapshot_id: "text", name: "text", version: "text", kind: "text", path: "text", line: "integer" }),
+};
+export const SCAN_ORDER = Object.keys(SCANS);
+/** What the scan client needs per family; the bulk manifest never lists these. */
+export const scanManifest = () => Object.entries(SCANS).map(([table, f]) => ({ table, schema_sha256: schemaSha(f), columns: Object.keys(f.columns), key: ["rowid"], repo: f.repo }));
+
+/** Read-time views (migration 3) under original table names: derived from loaded rows only, so they carry those rows' as_of. */
+export const VIEWS: Record<string, string> = {
+	package_edges: `CREATE VIEW package_edges AS SELECT DISTINCT c.repo AS consumer_repo, p.repo AS provider_repo, c.package AS package, 'declared_name' AS confidence, c.path AS evidence_path
+		FROM packages c JOIN packages p ON p.package = c.package AND p.role = 'package' AND p.repo <> c.repo WHERE c.role = 'dependency'`,
+	api_endpoint_matches: `CREATE VIEW api_endpoint_matches AS SELECT c.rowid AS caller_id, e.rowid AS endpoint_id, c.repo AS consumer_repo, e.repo AS provider_repo,
+		'exact_normalized_route' AS confidence, 'api_callers.normalized_target = api_endpoints.normalized_route' AS basis
+		FROM api_callers c JOIN api_endpoints e ON e.normalized_route = c.normalized_target AND e.repo <> c.repo WHERE c.normalized_target IS NOT NULL`,
+	pattern_revert_stats: `CREATE VIEW pattern_revert_stats AS SELECT repo, sum(is_revert) AS reverts, count(*) AS total_commits, round(100.0 * sum(is_revert) / count(*), 2) AS revert_pct,
+		min(CASE WHEN is_revert = 1 THEN committer_date END) AS first_at, max(CASE WHEN is_revert = 1 THEN committer_date END) AS last_at FROM commits GROUP BY repo`,
+	pattern_bus_factor: `CREATE VIEW pattern_bus_factor AS WITH a AS (SELECT repo, author_name, count(*) AS n FROM commits WHERE is_merge = 0 AND author_name IS NOT NULL GROUP BY repo, author_name),
+		r AS (SELECT repo, author_name, n, row_number() OVER (PARTITION BY repo ORDER BY n DESC, author_name) AS k, sum(n) OVER (PARTITION BY repo) AS total FROM a),
+		w AS (SELECT repo, min(committer_date) AS s, max(committer_date) AS e, count(*) AS nm FROM commits WHERE is_merge = 0 GROUP BY repo)
+		SELECT w.repo AS repo, w.s AS window_start, w.e AS window_end, w.nm AS non_merge_commits, NULL AS exact_email_authors, t.author_name AS top_author_name,
+		NULL AS top_author_email, t.n AS top_author_commits, round(100.0 * t.n / t.total, 2) AS top1_pct,
+		round(100.0 * (SELECT sum(n) FROM r r3 WHERE r3.repo = w.repo AND r3.k <= 3) / t.total, 2) AS top3_pct, 'author names; emails are never stored' AS identity_caveat
+		FROM w LEFT JOIN r t ON t.repo = w.repo AND t.k = 1`,
+	pattern_cherry_pick_edges: `CREATE VIEW pattern_cherry_pick_edges AS SELECT s.repo AS source_repo, t.repo AS target_repo, count(*) AS transfers, min(s.committer_date) AS first_source_at,
+		max(t.committer_date) AS last_target_at FROM commits t JOIN commits s ON s.sha = t.cherry_pick_source WHERE t.cherry_pick_source IS NOT NULL GROUP BY s.repo, t.repo`,
+};
+
 /** The search index keeps the source's original schema; its rows are rebuilt here from approved families, never uploaded. */
 export const SEARCH_DDL = [
 	`CREATE TABLE corpus_search_documents(
@@ -133,7 +191,8 @@ const BUILDER = "hold: builder metadata with temporary source paths; per-table a
 const DELIVERY = "hold: next family; PR, release and tag text and actor fields are not yet checked against the research";
 const TICKETS = "hold: Jira snapshot; ticket text projection unproved and the refresh of touched tickets is undecided";
 const HISTORY = "hold: derived history tables not yet classified; keys and privacy unchecked";
-const SCANS = "hold: checkout scans; (repo, path) replacement refresh and per-repo analysis_head markers are undecided";
+const SCAN_ONLY = "scan: loads only through a checkout refresh (group scans), never from a bulk file";
+const DERIVED_VIEW = "view: derived at read time from loaded rows; nothing loads under this name";
 const JUDGMENT = "hold: curated judgment text; dated-snapshot semantics and privacy unproved";
 const PATTERNS = "hold: pattern statistics; read-time views versus dated snapshots undecided";
 const group = (reason: string, names: string[]) => Object.fromEntries(names.map((n) => [n, reason]));
@@ -148,7 +207,7 @@ export const HELD: Record<string, string> = {
 	...group(DELIVERY, ["pull_requests", "pr_tickets", "pr_commit_links", "releases", "release_tag_groups", "github_tags", "delivery_workflows", "delivery_repo_snapshots", "delivery_repos", "delivery_clusters"]),
 	...group(TICKETS, ["tickets", "ticket_episodes", "ticket_episode_commits", "ticket_repo_edges"]),
 	...group(HISTORY, ["subject_episodes", "subject_episode_commits", "subject_repo_edges", "branch_families", "shared_history_edges", "author_repo_edges", "author_repos", "repo_scope"]),
-	...group(SCANS, ["source_files", "architecture_repos", "api_endpoints", "api_callers", "api_endpoint_matches", "packages", "package_edges", "external_system_edges", "env_refs",
+	...group(SCAN_ONLY, ["source_files", "architecture_repos", "api_endpoints", "api_callers", "api_endpoint_matches", "packages", "package_edges", "external_system_edges", "env_refs",
 		"architecture_workflows", "frontend_repositories", "frontend_snapshots", "frontend_files", "frontend_evidence", "mf_exposes", "cross_mfe_imports", "frontend_api_endpoints",
 		"frontend_routes", "frontend_domain_modules", "frontend_dependencies", "frontend_branch_refs", "frontend_branch_deltas", "frontend_branch_comparisons"]),
 	...group(JUDGMENT, ["validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties", "pattern_findings", "pattern_finding_repos",
@@ -156,6 +215,10 @@ export const HELD: Record<string, string> = {
 	...group(PATTERNS, ["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_release_batches",
 		"pattern_release_batch_repos", "pattern_bus_factor", "pattern_revert_stats", "pattern_cherry_pick_edges", "pattern_lineage_edges", "pattern_release_actor_yearly",
 		"pattern_branch_strategy_yearly", "pattern_current_repo_policies", "pattern_workflow_dependencies", "pattern_delivery_clusters"]),
+	...group(DERIVED_VIEW, Object.keys(VIEWS)),
+	// Loaded only as the dated per-profile snapshot set `patterns` (snapshots.ts), which the route checks before this list.
+	...group("snapshot: loads only as the dated per-profile snapshot set patterns, whole and replaced by a newer cut", ["pattern_coordinated_changes",
+		"pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges", "pattern_findings", "pattern_finding_repos"]),
 };
 
 export const CHUNK_ROWS = 5000;
@@ -164,11 +227,11 @@ export const schemaSha = (f: Family) => sha256(f.ddl);
 export const FAMILY_ORDER = Object.keys(FAMILIES);
 export const PROJECTION = "corpus-projection/1";
 /** A family as refresh sees it: its projection without rowid, keyed by its natural key (repos by full name, contributors by none). */
-export const REFRESH: Record<string, Family> = Object.fromEntries(Object.entries(FAMILIES).map(([t, f]) => [t, {
+export const REFRESH: Record<string, Family> = { ...SCANS, ...Object.fromEntries(Object.entries(FAMILIES).map(([t, f]) => [t, {
 	...f, columns: Object.fromEntries(Object.entries(f.columns).filter(([c]) => c !== "rowid")), key: t === "repos" ? ["full_name"] : t === "contributors" ? [] : f.key,
-}]));
+}])) };
 /** The row hash both ends compute (design section 3): table, DDL hash, projection version and the approved values without rowid. */
-export const rowHash = (table: string, values: Value[]) => sha256(JSON.stringify([table, schemaSha(FAMILIES[table]!), PROJECTION, values]));
+export const rowHash = (table: string, values: Value[]) => sha256(JSON.stringify([table, schemaSha((FAMILIES[table] ?? SCANS[table])!), PROJECTION, values]));
 // A forbidden table's legacy evidence id (`session:session_messages:…`) inside an uploaded value means copied search payload.
 // Only that exact form: commit text may name the tables themselves.
 const LINEAGE = new RegExp(`\\b(?:session|decision|directive):(?:${FORBIDDEN.join("|")}):`, "i");
@@ -212,7 +275,7 @@ export function checkRow(f: Family, row: unknown, i: number): Value[] {
 		const v = row[c] as unknown;
 		const isKey = f.key.includes(name);
 		if (v === null) { if (isKey) throw Fail.of("validation", `row ${i}: key column ${name} is null`, { reason: "row_key" }); return; }
-		if (type === "integer" ? !Number.isSafeInteger(v) || (name === "rowid" && (v as number) < 1) : typeof v !== "string") throw Fail.of("validation", `row ${i}: ${name} must be ${type === "integer" ? "an integer" : "text"}`, { reason: "row_type" });
+		if (type === "integer" ? !Number.isSafeInteger(v) || (name === "rowid" && (v as number) < 1) : type === "real" ? !Number.isFinite(v) : typeof v !== "string") throw Fail.of("validation", `row ${i}: ${name} must be ${type === "text" ? "text" : type === "integer" ? "an integer" : "a number"}`, { reason: "row_type" });
 		if (typeof v === "string") {
 			if (isKey && (v === "" || v.length > 4096)) throw Fail.of("validation", `row ${i}: key column ${name} must hold 1 to 4096 characters`, { reason: "row_key" });
 			if (LINEAGE.test(v)) throw Fail.of("validation", `row ${i}: ${name} carries a forbidden source tag`, { reason: "forbidden_lineage" });

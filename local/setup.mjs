@@ -338,8 +338,10 @@ export async function setup({ root, argv = [], wrangler, fetch: request = global
 		const metadata = vector ? readJson(["vectorize", "list-metadata-index", index, "--json"]) : [];
 		const secretList = ["secret", "list", "--name", s.worker, "--format", "json"];
 		const listed = run(secretList);
-		// Wrangler reports an absent Worker as an error naming it; any other failure stops setup.
-		const secrets = listed.status !== 0 && tail(listed).includes(`Worker "${s.worker}" not found`) ? null : readJson(secretList, listed).map((x) => x.name);
+		// Wrangler reports an absent Worker as an error naming it; any other failure stops setup. Search all of its output:
+		// the error's notes and Wrangler's default log-file footer push the naming line out of the displayed tail.
+		const absent = listed.status !== 0 && stripVTControlCharacters(`${listed.stderr}\n${listed.stdout}`).includes(`Worker "${s.worker}" not found`);
+		const secrets = absent ? null : readJson(secretList, listed).map((x) => x.name);
 
 		// Pending intent survives a failed create or a crash before the success receipt. Neither proves ownership.
 		const steps = [];

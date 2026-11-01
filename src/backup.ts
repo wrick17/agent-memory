@@ -10,7 +10,8 @@ export const CHUNK_ROWS = 500;
 export const CHUNK_BYTES = 512 * 1024;
 export const KEEP = 2;
 
-export interface StoreSpec { store: string; userId: string; metaTable: string; control: readonly string[]; first?: readonly string[]; profile?: string; generation?: string }
+/** `rowid`: also export each rowid table's own rowid, for stores whose rows are keyed by it (the corpus families). */
+export interface StoreSpec { store: string; userId: string; metaTable: string; control: readonly string[]; first?: readonly string[]; profile?: string; generation?: string; rowid?: boolean }
 export interface ChunkRef { key: string; table: string; rows: number; sha256: string }
 export interface Manifest {
 	version: 1; id: string; store: string; userId: string; profile?: string; generation?: string;
@@ -53,10 +54,11 @@ export function exportTables(sql: SqlStorage, spec: Pick<StoreSpec, "control" | 
 	return [...first.filter((n) => names.includes(n)), ...names.filter((n) => !first.includes(n)).sort()];
 }
 
-function orderOf(sql: SqlStorage, table: string): string {
-	const pk = sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", table).toArray().map((r) => `"${r.name}"`);
+function orderOf(sql: SqlStorage, table: string): { order: string; hidden: boolean } {
+	const pk = sql.exec<{ name: string; type: string }>("SELECT name, type FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", table).toArray();
 	const rowid = !/WITHOUT ROWID\s*$/i.test(sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = ?", table).one().sql);
-	return rowid ? "rowid" : pk.join(", ");
+	// An INTEGER PRIMARY KEY is the rowid itself and is already a column; any other rowid is hidden from SELECT *.
+	return { order: rowid ? "rowid" : pk.map((r) => `"${r.name}"`).join(", "), hidden: rowid && !(pk.length === 1 && /^INTEGER$/i.test(pk[0]!.type)) };
 }
 
 const writeSeq = (sql: SqlStorage, metaTable: string) => Number(sql.exec<{ value: string }>(`SELECT value FROM ${metaTable} WHERE key = 'write_seq'`).toArray()[0]?.value ?? 0);
@@ -78,12 +80,12 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 			chunks.push({ key: k, table: c.table, rows: c.rows.length, sha256: sha256(plain) });
 		};
 		for (const table of exportTables(sql, spec)) {
-			const order = orderOf(sql, table);
+			const { order, hidden } = orderOf(sql, table), cols = spec.rowid && hidden ? "rowid AS rowid, *" : "*";
 			counts[table] = 0;
 			let columns: string[] = [], rows: unknown[][] = [], bytes = 0;
 			// The store is paused, so offset pages over a fixed order read every row exactly once.
 			for (let offset = 0; ; offset += CHUNK_ROWS) {
-				const cur = sql.exec(`SELECT * FROM "${table}" ORDER BY ${order} LIMIT ${CHUNK_ROWS} OFFSET ${offset}`);
+				const cur = sql.exec(`SELECT ${cols} FROM "${table}" ORDER BY ${order} LIMIT ${CHUNK_ROWS} OFFSET ${offset}`);
 				columns = cur.columnNames;
 				const page = [...cur.raw()];
 				for (const row of page) {

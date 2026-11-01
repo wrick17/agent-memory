@@ -1,6 +1,7 @@
 // node --test local/corpus-upload.test.mjs : the corpus CLI's read-only SQLite source and HTTP client, with the uploader core
 // against a fake server. Synthetic files only; the Workers roundtrip is test/corpus.test.ts.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -9,7 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { fileSha256, httpClient, sqliteSource } from "./corpus-cli.mjs";
 import { chains, FAMILIES, planIdOf, planOps, rowHash, seedOf } from "./corpus-refresh.mjs";
-import { chunkHash, uploadCorpus } from "./corpus-upload.mjs";
+import { chunkHash, snapshotCutOf, uploadCorpus } from "./corpus-upload.mjs";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-corpus-test-"));
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
@@ -158,6 +159,25 @@ describe("corpus CLI client", () => {
 });
 
 describe("corpus refresh planner", () => {
+	it("refuses a Git projection without base metadata before replacing an existing repo", async () => {
+		const { refreshCorpus } = await import("./corpus-refresh.mjs");
+		const zero = "0".repeat(64), state = {}, calls = [];
+		const client = {
+			status: async () => ({ generation: "g1", families: FAMILIES.map((table) => ({ table, schema_sha256: sha256(table), columns: [] })) }),
+			refresh: async (cmd) => {
+				calls.push(cmd.command);
+				assert.equal(cmd.command, "inspect");
+				return { page: { binding: { epoch: 1 }, rows: cmd.table === "repos" ? [[[], zero, 1]] : [], partition: { rows: cmd.table === "repos" ? 1 : 0, sum: zero }, next: null } };
+			},
+		};
+		const source = { schema: (table) => table, columns: () => [], repoRows: () => { throw new Error("target_read"); } };
+		const input = { source, client, profile: "test", repo: "acme/web", state, save: () => assert.fail("no plan is saved") };
+		assert.deepEqual(await refreshCorpus({ ...input, requireNewRepo: true }), { status: "refused", reason: "repo_metadata_required" });
+		assert.equal(state.plan, undefined);
+		assert.ok(calls.length > 0 && calls.every((cmd) => cmd === "inspect"));
+		await assert.rejects(refreshCorpus(input), /target_read/);
+	});
+
 	it("reads one repo's rows from the file and plans the server's ordered delta, keeping the smallest matched contributor rowids", async () => {
 		const file = sourceFile();
 		const s = await sqliteSource(file);
@@ -185,5 +205,225 @@ describe("corpus refresh planner", () => {
 		assert.equal(seedOf("test", "g1", { ...header, chain: seed }), seed);
 		assert.notEqual(planIdOf("test", "g1", { ...header, chain: seed }), seed);
 		assert.notEqual(planIdOf("test", "g1", { ...header, chain: seed }), planIdOf("test", "g2", { ...header, chain: seed }));
+	});
+});
+
+describe("corpus Git adapter", () => {
+	const gitAt = (dir, args, env = {}) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", ...env } });
+	const commit = (dir, who, at, msg) => gitAt(dir, ["-c", `user.name=${who}`, "-c", `user.email=${who.toLowerCase()}@acme.example`, "commit", "-q", "-m", msg],
+		{ GIT_AUTHOR_DATE: at, GIT_COMMITTER_DATE: at });
+	/** A scratch checkout: a root commit, a branch commit with a co-author email, a PR merge, a revert, a cherry-pick, both tag kinds. */
+	function scratch() {
+		const dir = path.join(fs.mkdtempSync(path.join(tmp, "git-")), "web");
+		execFileSync("git", ["init", "-q", "-b", "main", dir]);
+		gitAt(dir, ["remote", "add", "origin", "git@github.com:acme/web.git"]);
+		fs.writeFileSync(path.join(dir, "README"), "r"); fs.mkdirSync(path.join(dir, "src")); fs.writeFileSync(path.join(dir, "src", "app.ts"), "a");
+		gitAt(dir, ["add", "."]); commit(dir, "Alice", "2026-07-01T10:00:00+05:30", "Add the app (#12)\n\nCo-authored-by: Bob <bob@acme.example>\ncall +1 415 555 0100");
+		gitAt(dir, ["checkout", "-q", "-b", "feat"]); fs.writeFileSync(path.join(dir, "src", "app.ts"), "b"); gitAt(dir, ["add", "."]); commit(dir, "Bob", "2026-07-02T09:00:00Z", "Tune retries");
+		gitAt(dir, ["checkout", "-q", "main"]); gitAt(dir, ["-c", "user.name=Alice", "-c", "user.email=alice@acme.example", "merge", "-q", "--no-ff", "feat", "-m", "Merge pull request #7 from acme/feat"],
+			{ GIT_AUTHOR_DATE: "2026-07-03T09:00:00Z", GIT_COMMITTER_DATE: "2026-07-03T09:00:00Z" });
+		gitAt(dir, ["tag", "v1"]); gitAt(dir, ["-c", "user.name=Alice", "-c", "user.email=alice@acme.example", "tag", "-a", "v2", "-m", "Release two"], { GIT_COMMITTER_DATE: "2026-07-03T10:00:00Z" });
+		return dir;
+	}
+
+	it("projects a checkout into the five families under the server's exact DDL, without reading any email", async () => {
+		const { DDL, gitRows, repoOfCheckout, writeSnapshot } = await import("./corpus-git.mjs");
+		const families = fs.readFileSync(new URL("../src/corpus/families.ts", import.meta.url), "utf8");
+		for (const [t, ddl] of Object.entries(DDL)) assert.ok(families.includes(ddl), `${t} DDL matches src/corpus/families.ts byte for byte`);
+		const dir = scratch(), repo = repoOfCheckout(dir);
+		assert.equal(repo, "acme/web");
+		const rows = gitRows(dir, repo);
+		assert.deepEqual(rows.commits.map((c) => [c.subject, c.author_date, c.is_merge, c.pr_number, JSON.parse(c.parents).length]).sort(), [
+			["Add the app (#12)", "2026-07-01T04:30:00Z", 0, 12, 0], ["Merge pull request #7 from acme/feat", "2026-07-03T09:00:00Z", 1, 7, 2], ["Tune retries", "2026-07-02T09:00:00Z", 0, null, 1]]);
+		assert.deepEqual(rows.commit_paths.map((p) => [p.path, p.top_component, p.extension]).sort(), [["README", "", ""], ["src/app.ts", "src", "ts"], ["src/app.ts", "src", "ts"]]);
+		assert.deepEqual(rows.refs.map((r) => [r.refname, r.namespace, r.short_name, r.object_type]), [["refs/heads/feat", "heads", "feat", "commit"], ["refs/heads/main", "heads", "main", "commit"],
+			["refs/tags/v1", "tags", "v1", "commit"], ["refs/tags/v2", "tags", "v2", "tag"]]);
+		assert.deepEqual(rows.contributors.map((c) => [c.rank, c.name, c.commits]), [[1, "Alice", 2], [2, "Bob", 1]]);
+		assert.deepEqual(rows.repos, [{ full_name: "acme/web", owner: "acme", name: "web", description: null, archived: 0, private: 1, language: null, default_branch: "main", updated_at: null, url: null,
+			commit_count: 3, ref_count: 4, head_sha: gitAt(dir, ["rev-parse", "HEAD"]).trim(), earliest_date: "2026-07-01", latest_date: "2026-07-03", empty: 0 }]);
+		const snap = await writeSnapshot(rows), s = await sqliteSource(snap.file);
+		try {
+			for (const t of Object.keys(DDL)) assert.equal(s.schema(t), DDL[t]);
+			const dump = new DatabaseSync(snap.file, { readOnly: true });
+			const text = JSON.stringify(Object.keys(DDL).map((t) => dump.prepare(`SELECT * FROM ${t}`).all()));
+			dump.close();
+			assert.doesNotMatch(text.replace("bob@acme.example", ""), /@acme\.example/, "only the co-author trailer carries an email, and the refresh client redacts it");
+		} finally { s.close(); snap.cleanup(); }
+		assert.equal(fs.existsSync(path.dirname(snap.file)), false);
+	});
+
+	it("tracks non-HEAD local branch changes and deletion in refresh identity", async () => {
+		const { refsDigest, gitRows } = await import("./corpus-git.mjs");
+		const dir = scratch(), head = gitAt(dir, ["rev-parse", "HEAD"]).trim(), before = refsDigest(dir);
+		const feature = gitAt(dir, ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit-tree", `${head}^{tree}`, "-p", head, "-m", "Feature-only change"],
+			{ GIT_AUTHOR_DATE: "2026-09-04T09:00:00Z", GIT_COMMITTER_DATE: "2026-09-04T09:00:00Z" }).trim();
+		gitAt(dir, ["update-ref", "refs/heads/feat", feature]);
+		assert.equal(gitAt(dir, ["rev-parse", "HEAD"]).trim(), head);
+		assert.ok(gitRows(dir, "acme/web").commits.some((c) => c.sha === feature));
+		const advanced = refsDigest(dir);
+		assert.notEqual(advanced, before, "a branch-only commit changes the refresh identity");
+		gitAt(dir, ["branch", "-D", "feat"]);
+		assert.notEqual(refsDigest(dir), advanced, "deleting a local branch changes the refresh identity");
+	});
+
+	it("refreshes a changed checkout once a day, keeps an untouched one's as-of, resumes a saved plan, and carries loaded GitHub fields", async () => {
+		const { refreshCheckouts } = await import("./corpus-git.mjs");
+		const dir = scratch(), calls = [], saved = [];
+		let reply = { status: "published", receipt: { status: "published" } };
+		const refresh = async (a) => {
+			calls.push({ repo: a.repo, observedAt: a.observedAt, commits: a.source?.repoRows("commits", ["sha"], a.repo).length ?? null, repos: a.source?.repoRows("repos", ["description", "private"], a.repo) ?? null });
+			if (reply.status === "stopped") { a.state.plan = { header: { repo: a.repo } }; a.save(); }
+			return reply;
+		};
+		const base = { repoRows: (t, cols, repo) => (repo === "acme/web" ? [["The web app", 0, 0, "TypeScript", "2026-08-01T00:00:00Z", "https://github.com/acme/web"]] : []) };
+		const state = {}, run = (now, extra = {}) => refreshCheckouts({ checkouts: [dir], profile: "test", client: {}, state, save: (s) => saved.push(JSON.stringify(s)), now: new Date(now), base,
+			openSource: sqliteSource, refresh, ...extra });
+		assert.deepEqual((await run("2026-09-01T08:00:00Z")).map((r) => r.status), ["published"]);
+		assert.deepEqual(calls.at(-1), { repo: "acme/web", observedAt: "2026-09-01T08:00:00.000Z", commits: 3, repos: [["The web app", 0]] });
+		assert.deepEqual(await run("2026-09-02T08:00:00Z"), [{ checkout: dir, repo: "acme/web", status: "unchanged", as_of: "2026-09-01T08:00:00.000Z" }]);
+		fs.writeFileSync(path.join(dir, "NEW.md"), "n"); gitAt(dir, ["add", "."]); commit(dir, "Cy", "2026-09-02T09:00:00Z", "Add notes");
+		assert.equal((await run("2026-09-02T10:00:00Z", { base: null }))[0].status, "published");
+		assert.equal(calls.at(-1).commits, 4);
+		assert.deepEqual(calls.at(-1).repos, [["The web app", 0]], "later refreshes keep the last published metadata without reopening the base file");
+		fs.writeFileSync(path.join(dir, "NEW.md"), "m"); gitAt(dir, ["add", "."]); commit(dir, "Cy", "2026-09-02T12:00:00Z", "Edit notes");
+		assert.equal((await run("2026-09-02T13:00:00Z"))[0].status, "refreshed_today");
+		assert.equal(calls.length, 2, "unchanged and already-refreshed checkouts make no request");
+		// A stopped refresh keeps the marker and its saved plan; the next run resumes that plan whatever the day or digest.
+		reply = { status: "stopped", reason: "unavailable" };
+		assert.equal((await run("2026-09-03T08:00:00Z"))[0].status, "stopped");
+		const mark = state.repos["acme/web"];
+		assert.equal(mark.observed_at, "2026-09-02T10:00:00.000Z");
+		assert.deepEqual(mark.pending.observed_at, "2026-09-03T08:00:00.000Z");
+		assert.ok(saved.at(-1).includes('"plan"'), "the plan is durable before the run ends");
+		reply = { status: "published", receipt: { status: "published" } };
+		const resumed = await run("2026-09-03T09:00:00Z");
+		assert.equal(resumed[0].status, "published");
+		assert.deepEqual(calls.at(-1), { repo: "acme/web", observedAt: "2026-09-03T08:00:00.000Z", commits: null, repos: null }, "a resume reads no new source");
+		assert.deepEqual([mark.observed_at, mark.day, mark.pending], ["2026-09-03T08:00:00.000Z", "2026-09-03", null]);
+		// Not a checkout, or no origin: refused per checkout, never a request.
+		const plain = fs.mkdtempSync(path.join(tmp, "plain-"));
+		assert.deepEqual((await refreshCheckouts({ checkouts: [plain], profile: "test", client: {}, state: {}, save: () => {}, openSource: sqliteSource, refresh })).map((r) => r.reason), ["no_origin_repo"]);
+		assert.equal(calls.length, 4);
+	});
+});
+
+describe("corpus checkout scans", () => {
+	const g = (dir, args, env = {}) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+		GIT_AUTHOR_NAME: "Alice", GIT_AUTHOR_EMAIL: "alice@acme.example", GIT_COMMITTER_NAME: "Alice", GIT_COMMITTER_EMAIL: "alice@acme.example", ...env } });
+	/** A frontend + API checkout: module federation, a route, API calls and endpoints, env and secret refs, a deploy workflow, a binary, a branch. */
+	function frontend() {
+		const dir = path.join(fs.mkdtempSync(path.join(tmp, "scan-")), "web");
+		execFileSync("git", ["init", "-q", "-b", "main", dir]);
+		const put = (p, body) => { fs.mkdirSync(path.join(dir, path.dirname(p)), { recursive: true }); fs.writeFileSync(path.join(dir, p), body); };
+		put("package.json", JSON.stringify({ name: "@acme/web", version: "1.2.0", dependencies: { react: "^19.0.0", "@acme/api": "2.0.0" } }, null, 2));
+		put("rspack.config.js", "module.exports = { plugins: [new ModuleFederationPlugin({\n  exposes: { './Cart': './src/features/cart/Cart.tsx' },\n  remotes: { checkout: 'checkout@https://cdn.acme-shop.io/remoteEntry.js' } })] };\n");
+		put("src/features/cart/Cart.tsx", "import Pay from 'checkout/Pay';\nconst routes = [{ path: '/cart' }];\nexport const load = () => fetch(`${import.meta.env.VITE_API_URL}/api/cart/${id}`);\n");
+		put("src/features/cart/Cart.test.tsx", "test('x', () => {});\n");
+		put("server/app.js", "app.get('/api/cart/:id', requireAuth, handler);\nconst db = 'postgres://svc:hunter2@db.internal.acme.io:5432/app'; // owner ops@acme.example\n");
+		put(".github/workflows/deploy.yml", "on:\n  push:\n  workflow_dispatch:\njobs:\n  deploy:\n    environment: production\n    steps:\n      - uses: cloudflare/wrangler-action@v3\n        with:\n          apiToken: ${{ secrets.CF_API_TOKEN }}\n");
+		put("node_modules/x/index.js", "x"); put("logo.png", "\0\x01bin");
+		g(dir, ["add", "-A", "-f"]); g(dir, ["commit", "-q", "-m", "Init"], { GIT_AUTHOR_DATE: "2026-07-01T10:00:00Z", GIT_COMMITTER_DATE: "2026-07-01T10:00:00Z" });
+		g(dir, ["checkout", "-q", "-b", "feat"]); put("server/app.js", "app.post('/api/pay', handler);\n"); g(dir, ["commit", "-q", "-am", "Pay"]); g(dir, ["checkout", "-q", "main"]);
+		g(dir, ["remote", "add", "origin", "https://github.com/acme/web.git"]);
+		return dir;
+	}
+
+	it("scans HEAD into the 21 scan families under the server's exact DDL, by the documented extractors, keeping no credential", async () => {
+		const { SCAN_DDL, scanRows } = await import("./corpus-scan.mjs");
+		const { writeSnapshot } = await import("./corpus-git.mjs");
+		const families = fs.readFileSync(new URL("../src/corpus/families.ts", import.meta.url), "utf8");
+		assert.equal(Object.keys(SCAN_DDL).length, 21);
+		for (const [t, ddl] of Object.entries(SCAN_DDL)) assert.ok(families.includes(`${t}: scan(${JSON.stringify(ddl)}`), `${t} DDL matches src/corpus/families.ts SCANS`);
+		const dir = frontend(), rows = scanRows(dir, "acme/web");
+		const pick = (t, ...cols) => rows[t].map((r) => cols.map((c) => r[c]));
+		assert.deepEqual(pick("source_files", "path", "scanned", "skip_reason").sort(), [[".github/workflows/deploy.yml", 1, null], ["logo.png", 0, "binary"], ["node_modules/x/index.js", 0, "vendored_or_built"],
+			["package.json", 1, null], ["rspack.config.js", 1, null], ["server/app.js", 1, null], ["src/features/cart/Cart.test.tsx", 1, null], ["src/features/cart/Cart.tsx", 1, null]]);
+		assert.deepEqual(pick("api_endpoints", "method", "normalized_route", "kind", "security_signals"), [["GET", "/api/cart/:param", "express", '["requireAuth"]']]);
+		assert.deepEqual(pick("api_callers", "category", "normalized_target", "base_env_refs"), [["fetch", "/api/cart/:param", '["VITE_API_URL"]']]);
+		assert.deepEqual(pick("packages", "role", "package", "scope"), [["package", "@acme/web", null], ["dependency", "react", "dependencies"], ["dependency", "@acme/api", "dependencies"]]);
+		assert.deepEqual(pick("env_refs", "name", "secret_reference").sort(), [["CF_API_TOKEN", 1], ["VITE_API_URL", 0]]);
+		assert.deepEqual(pick("external_system_edges", "system", "system_type").sort(), [["cdn.acme-shop.io", "http"], ["db.internal.acme.io", "postgres"]]);
+		assert.deepEqual(pick("architecture_workflows", "triggers", "environments", "deploy_targets", "secret_refs"), [['["push","workflow_dispatch"]', '["production"]', '["cloudflare/wrangler-action"]', '["CF_API_TOKEN"]']]);
+		assert.deepEqual(pick("mf_exposes", "expose_key", "target_path"), [["./Cart", "./src/features/cart/Cart.tsx"]]);
+		assert.deepEqual(pick("cross_mfe_imports", "source_alias", "import_path"), [["checkout", "checkout/Pay"]]);
+		assert.deepEqual(pick("frontend_routes", "route_value"), [["/cart"]]);
+		assert.deepEqual(pick("frontend_domain_modules", "kind", "name", "file_count", "test_count"), [["features", "cart", 2, 1]]);
+		assert.deepEqual(pick("frontend_snapshots", "snapshot_id", "role", "branch", "dirty"), [["acme/web", "workspace", "main", 0]]);
+		assert.deepEqual(pick("frontend_branch_comparisons", "ref_name", "ahead", "behind", "changed_paths"), [["feat", 1, 0, 1]]);
+		assert.deepEqual(pick("frontend_branch_deltas", "to_snapshot", "path", "status"), [["acme/web@feat", "server/app.js", "M"]]);
+		assert.ok(rows.frontend_files.every((f) => f.snapshot_id === "acme/web") && !rows.frontend_files.some((f) => f.path.startsWith("node_modules/")));
+		const snap = await writeSnapshot(rows, SCAN_DDL), s = await sqliteSource(snap.file);
+		try {
+			assert.equal(s.schema("frontend_snapshots"), SCAN_DDL.frontend_snapshots);
+			const dump = new DatabaseSync(snap.file, { readOnly: true });
+			const all = JSON.stringify(Object.keys(SCAN_DDL).map((t) => dump.prepare(`SELECT * FROM ${t}`).all()));
+			assert.deepEqual({ ...dump.prepare("SELECT root_path, id FROM frontend_snapshots, frontend_evidence LIMIT 1").get() }, { root_path: null, id: null });
+			dump.close();
+			assert.doesNotMatch(all, /hunter2|svc:/, "connection credentials are never kept");
+			assert.ok(!all.includes(dir), "no local path");
+		} finally { s.close(); snap.cleanup(); }
+	});
+
+	it("runs the scan group after history only with --scans, once per moved HEAD and UTC day, with its own marker and plan", async () => {
+		const { refreshCheckouts } = await import("./corpus-git.mjs");
+		const dir = frontend(), calls = [];
+		const refresh = async (a) => { calls.push([a.group ?? "history", a.source ? a.source.repoRows(a.group ? "source_files" : "commits", ["sha"].slice(a.group ? 1 : 0).concat(a.group ? ["path"] : []), a.repo).length : null]); return { status: "published", receipt: {} }; };
+		const state = {}, base = { repoRows: () => [["The web app", 0, 1, "TypeScript", null, null]] };
+		const run = (now, scans = true) => refreshCheckouts({ checkouts: [dir], profile: "test", client: {}, state, save: () => {}, now: new Date(now), base, openSource: sqliteSource, refresh, scans });
+		assert.deepEqual((await run("2026-09-01T08:00:00Z", false)).map((r) => r.group ?? "history"), ["history"]);
+		assert.deepEqual((await run("2026-09-02T08:00:00Z")).map((r) => [r.group ?? "history", r.status]), [["history", "unchanged"], ["scans", "published"]]);
+		assert.deepEqual(calls.at(-1), ["scans", 8]);
+		assert.equal(state.scans["acme/web"].analysis_head, g(dir, ["rev-parse", "HEAD"]).trim());
+		assert.deepEqual((await run("2026-09-03T08:00:00Z")).map((r) => r.status), ["unchanged", "unchanged"]);
+		fs.writeFileSync(path.join(dir, "NEW.md"), "n"); g(dir, ["add", "NEW.md"]); g(dir, ["commit", "-q", "-m", "Notes"]);
+		assert.deepEqual((await run("2026-09-03T09:00:00Z")).map((r) => r.status), ["published", "published"]);
+		fs.writeFileSync(path.join(dir, "NEW.md"), "m"); g(dir, ["commit", "-q", "-am", "More notes"]);
+		assert.deepEqual((await run("2026-09-03T10:00:00Z")).map((r) => r.status), ["refreshed_today", "refreshed_today"]);
+		assert.deepEqual((await run("2026-09-04T09:00:00Z")).map((r) => r.status), ["published", "published"]);
+		assert.deepEqual(calls.map((c) => c[0]), ["history", "scans", "history", "scans", "history", "scans"]);
+	});
+});
+
+describe("corpus snapshot sets (uploader)", () => {
+	const AS = "2026-08-12T00:00:00.000Z", FILE = "cd".repeat(32);
+	const LINEAGE = "CREATE TABLE pattern_lineage_edges(\n  repo_a TEXT,\n  repo_b TEXT\n)", FINDINGS = "CREATE TABLE pattern_findings(\n  finding_id TEXT,\n  title TEXT\n)";
+	/** The transport only: the status a server returns for a two-member set, stored receipts, and a publication the test sets. */
+	function snapServer() {
+		const members = [{ table: "pattern_lineage_edges", schema_sha256: sha256(LINEAGE), columns: ["rowid", "repo_a", "repo_b"], key: ["rowid"], set: "patterns" },
+			{ table: "pattern_findings", schema_sha256: sha256(FINDINGS), columns: ["rowid", "finding_id", "title"], key: ["rowid"], set: "patterns" }];
+		const s = { sent: [], members, published: null };
+		s.status = async () => ({ generation: "g1", families: [], held: {}, tables: [], snapshot_families: members, snapshots: { patterns: { loading: null,
+			published: s.published && { cut_id: s.published, tables: Object.fromEntries(members.map((m) => [m.table, { rows: 1, last: [2], final: true }])) } } } });
+		s.send = async (c) => { s.sent.push(c); return { receipt: { status: "stored", sha256: c.sha256, last_key: c.rows.length ? [c.rows.at(-1)[0]] : c.after, complete: c.final } }; };
+		return s;
+	}
+
+	it("sends a set only whole, is done only when the server publishes its exact cut, and leaves the bulk state untouched", async () => {
+		const file = path.join(fs.mkdtempSync(path.join(tmp, "snap-")), "s.sqlite");
+		const db = new DatabaseSync(file);
+		db.exec(LINEAGE); db.exec(FINDINGS);
+		db.exec("INSERT INTO pattern_lineage_edges (rowid, repo_a, repo_b) VALUES (2, 'acme/web', 'acme/api'); INSERT INTO pattern_findings (rowid, finding_id, title) VALUES (2, 'f-1', 'Ask ops@acme.example')");
+		db.close();
+		const source = await sqliteSource(file), server = snapServer();
+		const bulk = { profile: "test", generation: "g1", source: "aa".repeat(32), as_of: "2026-08-01T00:00:00.000Z", tables: { commits: { last_key: ["acme/web", "1"], rows: 3, complete: false } } };
+		const before = JSON.stringify(bulk);
+		let saves = 0;
+		const run = (tables) => uploadCorpus({ source, client: server, profile: "test", tables, asOf: AS, fileSha256: FILE, state: bulk, save: () => saves++ });
+		try {
+			assert.deepEqual(await run(["pattern_lineage_edges"]), { status: "refused", reason: "snapshot_set_incomplete", set: "patterns" });
+			assert.equal(server.sent.length, 0);
+			// Stored (or replayed) receipts for every member are not publication.
+			assert.deepEqual(await run(["pattern_lineage_edges", "pattern_findings"]), { status: "stopped", reason: "snapshot_unpublished", set: "patterns" });
+			assert.deepEqual(server.sent.map((c) => [c.table, c.after, c.final, c.rows]), [["pattern_lineage_edges", null, true, [[2, "acme/web", "acme/api"]]], ["pattern_findings", null, true, [[2, "f-1", "Ask [REDACTED]"]]]]);
+			server.published = "f".repeat(64);
+			assert.equal((await run(["pattern_lineage_edges", "pattern_findings"])).status, "stopped", "another published cut is not this one");
+			// The server publishing this exact cut is done; its members are skipped without sending.
+			server.published = snapshotCutOf("patterns", server.members, FILE, AS);
+			const sent = server.sent.length;
+			assert.equal((await run(["pattern_lineage_edges", "pattern_findings"])).status, "done");
+			assert.equal(server.sent.length, sent);
+			assert.equal(JSON.stringify(bulk), before, "a snapshot-only run never rewrites the bulk load's state");
+			assert.equal(saves, 0);
+		} finally { source.close(); }
 	});
 });

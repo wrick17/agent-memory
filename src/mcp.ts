@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { AccountContext, AccountStore } from "./account/store";
 import { knowledgeTerms, stripPersonal } from "./domain/guard";
-import { requestHash } from "./domain/ids";
+import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { legacyRequestHash } from "./domain/legacy";
 import { redactPayload } from "./domain/redact";
 import { statedFirst } from "./domain/rank";
@@ -14,7 +14,7 @@ import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } fr
 import { contextProfile, mayUse, readSet, routeWrite, type Route } from "./routing";
 import { explore, exploreSchema, GRAPH_TOOL_TEXT, timeline, timelineSchema, trace, traceSchema } from "./graph-tools";
 import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
-import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT } from "./corpus-tools";
+import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT, withCorpusCounts } from "./corpus-tools";
 import { driveTransfer, transferPorts } from "./transfer";
 
 /**
@@ -129,7 +129,7 @@ export const TOOLS = [
 		description: `Read a memory by memory_id or unambiguous name: content up to 100k characters, steps, links and status. Larger content returns complete: false with a cursor; pass content: {complete: true, cursor} to page through it, and restart on revision_conflict. history {limit, before_revision} returns preserved revisions. as_of (valid time; a date alone is 00:00 UTC) returns the stored state then: fields, status and content of the revision in effect and links valid then; content is null when its history cannot rebuild it, and evidence stays current.${DATA_NOTE}` },
 	{ name: "recall_memories", scope: "read" as Scope, schema: recallSchema, run: recall,
 		description: `Rank memories of the routed profile and me using exact, literal, full-text and vector retrieval, packed to token_budget. An empty keyword lists every record in stable order; follow next_cursor. as_of reads the records and stored text of that instant, lexical only.${DATA_NOTE}` },
-	{ name: "explore", scope: "read" as Scope, schema: exploreSchema, run: explore, description: GRAPH_TOOL_TEXT.explore },
+	{ name: "explore", scope: "read" as Scope, schema: exploreSchema, run: async (c: ToolContext, a: z.infer<typeof exploreSchema>) => withCorpusCounts(c, await explore(c, a)), description: GRAPH_TOOL_TEXT.explore },
 	{ name: "trace", scope: "read" as Scope, schema: traceSchema, run: trace, description: GRAPH_TOOL_TEXT.trace },
 	{ name: "timeline", scope: "read" as Scope, schema: timelineSchema, run: timeline, description: GRAPH_TOOL_TEXT.timeline },
 	{ name: "work_board", scope: "read" as Scope, schema: workBoardSchema, run: workBoard, description: BOARD_TOOL_TEXT },
@@ -146,6 +146,28 @@ export const accountStub = (env: Env, userId: string) =>
 	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin" | "bindImport" | "reserveImport" | "finishTransferRequest">;
 
 const refOf = (c: ToolContext, name: string) => c.account.profiles.find((p) => p.profile === name);
+
+/**
+ * A move the target refused with transfer_collision (section 9, step 4) waits in the owner's review list for rename, merge or keep.
+ * The transfer already aborted and unfenced the source; this only names the move and, when it can be read, the record it met.
+ * Best effort: the move's own refusal is returned either way, and the same move colliding again is the same item.
+ */
+async function offerCollision(c: ToolContext, account: Pick<AccountStore, "admin">, t: { nodeId: string; from: string; to: string }, moved: Outcome<unknown>) {
+	if (moved.ok || moved.error.code !== "transfer_collision") return;
+	const reason = String(moved.error.details?.reason ?? "");
+	try {
+		let existing: string | null = reason === "id_taken" ? t.nodeId : null;
+		const from = refOf(c, t.from), to = refOf(c, t.to);
+		if (!existing && from && to) {
+			const src = await profileStub(c.env, from).read(from, { kind: "get", target: { memory_id: t.nodeId }, includeRetired: false });
+			const v = src.ok ? src.value as { name: string; scope: string; type: (typeof MEMORY_TYPES)[number] } : null;
+			const hit = v ? await profileStub(c.env, to).read(to, { kind: "get", target: { name: v.name, scope: v.scope, type: v.type }, includeRetired: false }) : null;
+			if (hit?.ok) existing = String((hit.value as { memory_id: string }).memory_id);
+		}
+		await account.admin({ op: "reviewOffer", items: [{ id: `c:${sha256(canonicalJson([t.nodeId, t.from, t.to])).slice(0, 40)}`, kind: "collision", profile: t.to,
+			payload: { memory_id: t.nodeId, from: t.from, to: t.to, reason, existing_id: existing } }] });
+	} catch { /* the review item is advisory; the refusal above already reached the caller */ }
+}
 
 /** node_index first; if it has no row (a lost index write), probe the caller's profiles and repair the index. */
 export async function ownerOf(c: ToolContext, id: string): Promise<string | null> {
@@ -231,7 +253,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 			if (!mayUse(c.caller, held.input.from) || !mayUse(c.caller, held.input.to)) return fail("forbidden", "this caller may not use both transfer profiles");
 			if (held.result) return ok(held.result);
 			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), held.input, c.caller, c.account.sensitiveTerms);
-			if (!moved.ok) return moved;
+			if (!moved.ok) { await offerCollision(c, account, held.input, moved); return moved; }
 			// A retry of a refused transfer stays refused; only a completed move is stored as this request's result.
 			if (moved.value.state === "aborted") return fail("validation", "this request's transfer was aborted", { reason: "transfer_aborted", transfer_id: held.input.id });
 			return account.finishTransferRequest(args.request_id, payloadHash, { ok: true, action: "transfer_started", memory_id: held.input.nodeId, transfer_id: held.input.id, state: moved.value.state, profile: held.input.to, routed_by: "explicit" });
@@ -243,6 +265,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	} else {
 		if (transfer) {
 			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), { ...transfer, id: crypto.randomUUID() }, c.caller, c.account.sensitiveTerms);
+			await offerCollision(c, account, transfer, moved);
 			return moved.ok ? ok({ ok: true, action: "transfer_started", memory_id: transfer.nodeId, transfer_id: moved.value.id, state: moved.value.state, profile: transfer.to, routed_by: "explicit" }) : moved;
 		}
 		if (!route.ok) return route;

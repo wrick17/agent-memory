@@ -3,13 +3,19 @@
 // by its request id or refused; search documents are rebuilt here from the loaded rows. A wipe closes and then clears the
 // generation, and nothing reopens a cleared one.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, ok, type Outcome, type ProfileRef } from "../domain/types";
+import { Fail, fail, ok, type Outcome, type ProfileRef } from "../domain/types";
+import { applyRows, exportStore, exportTables, readChunk, readManifest } from "../backup";
 import { migrate, type Migration } from "../storage";
-import { chunkHash, checkChunk, FAMILIES, manifest, named, requestIdOf, SEARCH_DDL, type Key, type Value } from "./families";
+import { chunkHash, checkChunk as checkBulkChunk, chunkTerms as bulkTerms, FAMILIES, manifest, named, requestIdOf, SCANS, scanManifest, SEARCH_DDL, VIEWS, type Family, type Key, type Value } from "./families";
 import { get, runSql, search, type CorpusQuery, type Head } from "./query";
 import { addToPartitions, META, MIGRATION, refresh, refreshActive, refreshStatus, type RefreshCommand } from "./refresh";
+import { abandonLoadingCuts, applySnapshotChunk, checkSnapshotChunk, isSnapshot, SNAPSHOT_MIGRATION, SNAPSHOTS, snapshotManifest, snapshotStatus, snapshotTableOf, snapshotTerms, stageName } from "./snapshots";
 
-export { CHUNK_ROWS, checkChunk, chunkTerms, FAMILIES, FORBIDDEN, HELD, manifest, refusal } from "./families";
+export { CHUNK_ROWS, FAMILIES, FORBIDDEN, HELD, manifest, refusal, SCAN_ORDER, SCANS, VIEWS } from "./families";
+/** The route's stateless chunk check: dated snapshot tables first (before HELD), every other table by its bulk family. */
+export const checkChunk = (c: Parameters<typeof checkBulkChunk>[0]) => (isSnapshot(c.table) ? checkSnapshotChunk(c) : checkBulkChunk(c));
+/** The work guard terms of a checked chunk, by the rule of the family checkChunk returned. */
+export const chunkTerms = (f: Family, rows: Value[][]) => { const t = snapshotTableOf(f); return t ? snapshotTerms(SNAPSHOTS[t]!, rows) : bulkTerms(f, rows); };
 export { PART_OPS, refreshTerms } from "./refresh";
 export type { CorpusQuery } from "./query";
 export type { Op, PlanHeader, RefreshCommand } from "./refresh";
@@ -25,7 +31,11 @@ export const CORPUS_MIGRATIONS: Migration[] = [[
 		rows INTEGER NOT NULL, last_key TEXT, complete INTEGER NOT NULL, updated_at TEXT NOT NULL) WITHOUT ROWID`,
 	`CREATE TABLE corpus_requests (request_id TEXT PRIMARY KEY, table_name TEXT NOT NULL, sha256 TEXT NOT NULL, rows INTEGER NOT NULL,
 		last_key TEXT, complete INTEGER NOT NULL, received_at TEXT NOT NULL) WITHOUT ROWID`,
-], MIGRATION];
+], MIGRATION,
+// Checkout scans under their original DDL (plus one partition index each) and the read-time views; additive, no data moves.
+[...Object.values(SCANS).flatMap((f) => [f.ddl, ...f.indexes]), ...Object.values(VIEWS)],
+// Dated per-profile snapshot sets: live tables under their original DDL, one stage each, and the cut ledger (snapshots.ts).
+SNAPSHOT_MIGRATION];
 
 export interface CorpusChunk { table: string; schema_sha256: string; source: { file_sha256: string }; as_of: string; columns: string[]; after: Key | null; rows: Value[][]; final: boolean; sha256: string }
 export interface ChunkReceipt { status: "stored" | "replayed"; request_id: string; table: string; rows: number; last_key: Key | null; complete: boolean; sha256: string; rows_written?: number }
@@ -36,12 +46,16 @@ const closedState = (sql: SqlStorage) => {
 	sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);
 	return sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'closed'`).toArray()[0]?.value;
 };
+/** An unfinished corpus restore: its generation exports nothing until it is done. */
+const restoring = (sql: SqlStorage) => sql.exec(`SELECT 1 FROM ${META} WHERE key = 'restore_id'`).toArray().length > 0 && !sql.exec(`SELECT 1 FROM ${META} WHERE key = 'restore_done'`).toArray().length;
 const assertOpen = (sql: SqlStorage) => { if (closedState(sql)) throw Fail.of("profile_wiped", "this corpus generation is closed"); };
 
 /** One chunk in one transaction: replay or refuse by request id, then check order, source and every row before writing. */
 function applyChunk(sql: SqlStorage, c: CorpusChunk): ChunkReceipt {
 	assertOpen(sql);
 	if (refreshActive(sql)) throw refreshing();
+	// A dated snapshot keeps its own cut ledger, request ids and publication; no partitions, row hashes or search documents.
+	if (isSnapshot(c.table)) return applySnapshotChunk(sql, c, () => sql.databaseSize > SIZE_LIMIT);
 	const { f, rows, keys } = checkChunk(c);
 	const requestId = requestIdOf(c.table, keys[0] ?? null);
 	const hash = chunkHash(c);
@@ -123,7 +137,8 @@ export class CorpusStore extends DurableObject<Env> {
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
-	async status(who: ProfileRef): Promise<Outcome<CorpusStatus & { families: ReturnType<typeof manifest> } & ReturnType<typeof refreshStatus>>> {
+	async status(who: ProfileRef): Promise<Outcome<CorpusStatus & { families: ReturnType<typeof manifest>; scan_families: ReturnType<typeof scanManifest>;
+		snapshot_families: ReturnType<typeof snapshotManifest>; snapshots: ReturnType<typeof snapshotStatus> } & ReturnType<typeof refreshStatus>>> {
 		try {
 			await this.access(who);
 			this.bind(who, true);
@@ -131,7 +146,7 @@ export class CorpusStore extends DurableObject<Env> {
 				"SELECT table_name, rows, last_key, complete, as_of, refresh, source FROM corpus_meta ORDER BY table_name").toArray()
 				.map((m) => ({ table: m.table_name, rows: m.rows, last_key: m.last_key === null ? null : JSON.parse(m.last_key) as Key, complete: m.complete === 1, as_of: m.as_of, refresh: m.refresh,
 					source_sha256: (JSON.parse(m.source) as { file_sha256: string }).file_sha256 }));
-			return ok({ families: manifest(), tables, ...refreshStatus(this.ctx.storage.sql) });
+			return ok({ families: manifest(), scan_families: scanManifest(), snapshot_families: snapshotManifest(), snapshots: snapshotStatus(this.ctx.storage.sql), tables, ...refreshStatus(this.ctx.storage.sql) });
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
@@ -158,6 +173,90 @@ export class CorpusStore extends DurableObject<Env> {
 			this.bind(who);
 			return ok(this.ctx.storage.transactionSync(() => { assertOpen(this.ctx.storage.sql); return refresh(this.ctx.storage.sql, who, cmd); }));
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** Internal RPC from AccountStore: this generation's weekly encrypted export (section 18), under the bounded write pause. */
+	async exportNow(who: ProfileRef): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+		const sql = this.ctx.storage.sql;
+		if (closedState(sql)) return fail("profile_wiped", "this corpus generation is closed");
+		const bound = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray();
+		if (!bound.length) return fail("not_found", "this corpus generation holds nothing to export");
+		const want: Record<string, string> = { user_id: who.userId, profile: who.profile, generation: who.generation };
+		if (bound.some((r) => r.value !== want[r.key])) return fail("validation", "corpus object identity mismatch");
+		if (refreshActive(sql)) return fail("busy", "the corpus is refreshing; export after it publishes", { reason: "corpus_refreshing" });
+		if (restoring(sql)) return fail("busy", "this corpus generation is being restored");
+		// shortcut: the whole-store pause of backup.ts, bounded by blockConcurrencyWhile's 30 s; a corpus too large for it fails and is retried next week.
+		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env,
+			{ store: `corpus-${who.profile}`, userId: who.userId, metaTable: META, control: Object.keys(SNAPSHOTS).map(stageName), profile: who.profile, generation: who.generation, rowid: true }));
+	}
+
+	/**
+	 * Internal RPC from AccountStore's open corpus restore: applies a verified corpus export, one chunk per transaction with its
+	 * progress, into this empty generation, then rebuilds the contentless search index from the restored documents and checks
+	 * every table's row count. Identity, schema version and the closed marker stay this generation's.
+	 */
+	async restoreStep(who: ProfileRef, r: { id: string; exportId: string }): Promise<Outcome<{ applied: number; chunks: number; done: boolean }>> {
+		try {
+			const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "restoreAuthority">;
+			const auth = await account.restoreAuthority(who, r.id, "corpus");
+			if (!auth.ok) return auth;
+			const sql = this.ctx.storage.sql;
+			assertOpen(sql);
+			this.bind(who);
+			const m = await readManifest(this.env, `corpus-${who.profile}`, r.exportId, who.userId);
+			if (!m.ok) return m;
+			if (m.value.profile !== who.profile || m.value.schema_version !== CORPUS_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+			const meta = (k: string) => sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = ?`, k).toArray()[0]?.value;
+			if (!meta("restore_id")) {
+				if (exportTables(sql, { control: [] }).some((t) => t !== META && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a corpus restore needs an empty corpus generation");
+				sql.exec(`INSERT INTO ${META} (key, value) VALUES ('restore_id', ?), ('restore_next', '0'), ('restore_fts', '0')`, r.id);
+			} else if (meta("restore_id") !== r.id) return fail("validation", "this corpus generation belongs to another restore");
+			const adjust = (table: string, cols: string[], row: unknown[]) =>
+				table === META && (["user_id", "profile", "generation", "schema_version", "closed"].includes(String(row[cols.indexOf("key")])) || String(row[cols.indexOf("key")]).startsWith("restore_")) ? null : row;
+			const all = { run: (q: string, ...p: SqlStorageValue[]) => sql.exec(q, ...p).toArray(), spent: () => false };
+			const started = Date.now(), live = () => Date.now() - started < 10_000;
+			// Chunks hold at most 500 rows and 512 KB, the scale of one uploaded corpus chunk, so each applies in one transaction.
+			while (Number(meta("restore_next")) < m.value.chunks.length && live()) {
+				const at = Number(meta("restore_next")), c = await readChunk(this.env, m.value, at);
+				this.ctx.storage.transactionSync(() => {
+					if (Number(meta("restore_next")) !== at) return;
+					applyRows(all, c, 0, c.rows.length, adjust, { n: 0 }, c.table === META);
+					sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('restore_next', ?)`, String(at + 1));
+				});
+			}
+			const applied = Number(meta("restore_next"));
+			if (applied < m.value.chunks.length) return ok({ applied, chunks: m.value.chunks.length, done: false });
+			// The search index is contentless and never exported: it is rebuilt from the restored documents, as an upload builds it.
+			while (meta("restore_fts") !== "done" && live()) this.ctx.storage.transactionSync(() => {
+				const after = Number(meta("restore_fts"));
+				const docs = sql.exec<{ id: number; key: string; repo: string; title: string; detail: string }>("SELECT rowid AS id, key, repo, title, detail FROM corpus_search_documents WHERE rowid > ? ORDER BY rowid LIMIT 200", after).toArray();
+				for (const d of docs) sql.exec("INSERT INTO corpus_search_fts (rowid, key, repo, title, detail) VALUES (?, ?, ?, ?, ?)", d.id, d.key, d.repo, d.title, d.detail);
+				sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('restore_fts', ?)`, docs.length < 200 ? "done" : String(docs.at(-1)!.id));
+			});
+			if (meta("restore_fts") !== "done") return ok({ applied, chunks: m.value.chunks.length, done: false });
+			if (!meta("restore_done")) {
+				for (const [t, n] of Object.entries(m.value.counts)) {
+					if (t !== META && sql.exec<{ n: number }>(`SELECT count(*) AS n FROM "${t}"`).one().n !== n) return fail("validation", `restored ${t} does not match the manifest row count`);
+				}
+				// Stage rows are never exported, so a restored loading cut is abandoned, with its request receipts, before the generation reopens.
+				this.ctx.storage.transactionSync(() => {
+					abandonLoadingCuts(sql);
+					sql.exec(`INSERT INTO ${META} (key, value) VALUES ('restore_done', ?)`, m.value.id);
+				});
+			}
+			return ok({ applied, chunks: m.value.chunks.length, done: true });
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/** Internal RPC from an aborted corpus restore: clears what it wrote and leaves an empty, migrated generation. */
+	async discardRestore(who: ProfileRef, id: string): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		if (closedState(sql) || sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'restore_id'`).toArray()[0]?.value !== id) return;
+		const bound = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray();
+		const want: Record<string, string> = { user_id: who.userId, profile: who.profile, generation: who.generation };
+		if (bound.some((r) => r.value !== want[r.key])) return;
+		await this.ctx.storage.deleteAll();
+		migrate(this.ctx.storage, META, CORPUS_MIGRATIONS);
 	}
 
 	/**

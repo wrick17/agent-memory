@@ -152,7 +152,47 @@ codex mcp add memory --url https://YOUR-DEPLOYMENT.example/mcp
 codex mcp login memory
 ```
 
-For headless use, create a scoped device token on `<public_url>/settings` after you sign in. Adding a connection alone does not switch ordinary memory callers or install capture.
+Adding a connection alone does not switch ordinary memory callers or install capture.
+
+### Headless machines
+
+A machine without a browser uses a device token instead of OAuth sign-in. Use these steps on that machine in place of the commands above.
+
+1. In any browser, sign in at `<public_url>/settings` and create a device with only the scopes and profiles that machine needs. Settings shows the token once.
+2. On the headless machine, store the token in a private file. Paste it at the hidden prompt and press Enter:
+
+	```sh
+	mkdir -p -m 700 ~/.config/agent-memory
+	(umask 077; IFS= read -rs t && printf '%s' "$t" > ~/.config/agent-memory/device-token)
+	```
+
+	The file has mode 0600. Keep the token out of client configuration, command lines, logs and Git.
+3. For Claude Code, add a helper that prints the request header. Claude Code runs it on each connection and reads a JSON object of headers from its output. Add the server at user scope, with the helper's absolute path:
+
+	```sh
+	cat > ~/.config/agent-memory/headers.sh <<'EOF'
+	#!/bin/sh
+	printf '{"Authorization":"Bearer %s"}' "$(cat "$HOME/.config/agent-memory/device-token")"
+	EOF
+	chmod 700 ~/.config/agent-memory/headers.sh
+	claude mcp add-json memory '{"type":"http","url":"https://YOUR-DEPLOYMENT.example/mcp","headersHelper":"'"$HOME"'/.config/agent-memory/headers.sh"}' --scope user
+	```
+
+4. For Codex, add the server to `~/.codex/config.toml` with the name of an environment variable, not the token:
+
+	```toml
+	[mcp_servers.memory]
+	url = "https://YOUR-DEPLOYMENT.example/mcp"
+	bearer_token_env_var = "AGENT_MEMORY_TOKEN"
+	```
+
+	Start Codex with that variable read from the file:
+
+	```sh
+	AGENT_MEMORY_TOKEN="$(cat ~/.config/agent-memory/device-token)" codex
+	```
+
+To retire the machine, revoke its device in Settings. The server refuses the token on its next request.
 
 ## Optional parts
 
@@ -187,4 +227,4 @@ npm run pack:self-host -- /absolute/existing/output-directory
 
 The command stages a new private (0700) directory under the output directory and prints the tarball path. Every packaged file has mode 0644, whatever the maintainer's umask or source file modes. It leaves the staged source for review. It never changes the source README, ordinary client configuration or Wrangler config. Raw `npm pack` in the source repository refuses with this command's instructions.
 
-The archive contains the current Worker `src/`, `local/setup.mjs`, `wrangler.example.jsonc`, this guide at both `README.md` and `docs/self-host.md`, `package.json`, and `npm-shrinkwrap.json`. The guide is self-contained. It does not link to architecture, manifest or verification files omitted from the archive. Capture, migration tools, tests, research, account settings, setup receipts, credentials, and the maintainer's Wrangler config are excluded. The packaged scripts expose only setup. `"private": true` stays set; publication, licensing and a release version require separate review.
+The archive contains the current Worker `src/`, `local/setup.mjs`, the corpus uploader `local/corpus-cli.mjs` with its helper modules `local/corpus-git.mjs`, `local/corpus-refresh.mjs`, `local/corpus-scan.mjs` and `local/corpus-upload.mjs`, `wrangler.example.jsonc`, this guide at both `README.md` and `docs/self-host.md`, `package.json`, and `npm-shrinkwrap.json`. The guide is self-contained. It does not link to architecture, manifest or verification files omitted from the archive. Capture, migration tools, tests, research, account settings, setup receipts, credentials, and the maintainer's Wrangler config are excluded. The packaged scripts expose only setup. `"private": true` stays set; publication, licensing and a release version require separate review.

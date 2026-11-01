@@ -643,6 +643,9 @@ export async function dashboardMain(win: any): Promise<void> {
 		companyFree?: boolean; preview?: Record<string, unknown>; sent?: Record<string, unknown>; copyOf?: { profile: string; id: string; name: string; kind: string; back?: string } };
 	const drafts = new Map<string, Draft>();
 	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>(); // per profile, this tab only; never sent
+	// What-if changes to saved records and links (graph page): added links, removed saved links, removed records. Per profile, this
+	// tab only; never sent and never made into a draft, so nothing about them can be saved by accident.
+	const whatIfEdits = new Map<string, { add: [string, string][]; cut: Set<string>; drop: Set<string> }>();
 	/** A what-if item becomes an ordinary Write draft (a new memory linked to its record), reviewed and saved only there. */
 	const draftFromWhatIf = (profile: string, w: { name: string; target: string; targetName: string }, out: Node) => {
 		if (drafts.has(profile)) {
@@ -975,11 +978,113 @@ export async function dashboardMain(win: any): Promise<void> {
 		return h;
 	};
 
+	// The owner's copy choices of an open recovery (section 18, step 4). Each sent choice keeps its exact body, request id included,
+	// so an unconfirmed answer is sent again unchanged; the server binds the id to that body. A refusal drops it, and a copy that
+	// changed needs an explicit reread before a new preview, which gets a new request id. Nothing is sent by itself.
+	type Choice = { body: { id: string; node: string; keep: string; expect: { profile: string; generation: string | null; status: string | null; revision: number | null }[]; request_id: string };
+		state: "unknown" | "progress" | "changed" | "refused"; text: string };
+	const choices = new Map<string, Choice>(); // `${recovery}:${node}` -> the last choice sent
+	const sendChoice = (c: Choice) => {
+		act(() => call("/api/recovery/conflicts/resolve", "POST", c.body).catch((e: Failure) => {
+			const uncertain = !e.status || e.status >= 500 || e.status === 408 || e.status === 429;
+			Object.assign(c, uncertain ? { state: "unknown", text: "Result unconfirmed: the choice may or may not have been made. Send the same choice again to find out; it cannot be made twice." }
+				: e.reason === "copy_changed" ? { state: "changed", text: "A copy changed since it was shown, so nothing was chosen. Read the copies again before choosing." }
+				: { state: "refused", text: `Refused: ${why(e)}` });
+			throw e;
+		}), `keep the copy in ${c.body.keep}`, undefined, (x) => {
+			if (x?.progress) { Object.assign(c, { state: "progress", text: `Started, not finished: ${String(x.progress)}. Continue it with the same choice.` }); return { text: c.text }; }
+			choices.delete(`${c.body.id}:${c.body.node}`);
+			return { text: `Kept the copy in ${recorded(x?.kept)}; the copy in ${recorded(x?.tombstoned)} is now a flagged tombstone with its content in that profile's archive. The account stays closed: read the status below.` };
+		});
+	};
+	const conflictsView = (parent: Node, r: J) => {
+		const version = pageVersion, sec = el("section", parent);
+		sec.setAttribute("aria-label", "Copies to choose");
+		el("h3", sec, "Choose which copy to keep");
+		note(sec, "The fixed recovery rules could not decide these records: two profiles hold a copy. Keep one copy of each; the other becomes a flagged tombstone, its content and history kept in that profile's archive. Nothing is merged. The account stays closed until the recovery is opened.");
+		if (r.resolving) note(sec, `A choice for record ${String(r.resolving)} is unfinished; finish it before another.`, "warn");
+		const list = el("ul", sec), more = el("p", sec), status = el("p", sec);
+		list.setAttribute("class", "prefs");
+		const busy = () => [...choices.entries()].some(([k, c]) => k.startsWith(`${r.id}:`) && (c.state === "unknown" || c.state === "progress"));
+		const copyFacts = (li: Node, x: J) => {
+			const c = x.copy;
+			el("h4", li, `In ${String(x.profile)}`);
+			if (!c) { el("p", li, "No copy of this record here."); return; }
+			facts(li, [["Name", recorded(c.name)], ["Description", recorded(c.description)], ["Status", recorded(c.status)], ["Revision", recorded(c.revision)], ["Updated", recorded(c.updated_at)],
+				["Characters", recorded(c.chars)], ["Content hash", recorded(c.content_hash)], ["Flag", c.flagged ? String(c.flagged) : "None"],
+				["Transfer", c.transfer ? `${String(c.transfer)}${c.status === "moved" ? " (moved away)" : " (fenced)"}` : "None"],
+				["Unpublished landing", c.incoming ? `from ${String(c.incoming.from)}` : "None"], ["Unfinished transfers here", String(Array.isArray(c.rows) ? c.rows.length : 0)],
+				...(c.status === "moved" ? [["Restorable from its archive", c.restorable?.ok ? "Yes" : `No: ${recorded(c.restorable?.reason)}`]] as [string, string][] : []),
+				["Can be kept", x.keepable ? "Yes" : "No"]]);
+		};
+		const item = (c: J) => {
+			const li = el("li", list), key = `${r.id}:${c.node}`, copies: J[] = Array.isArray(c.copies) ? c.copies : [];
+			let sent = choices.get(key);
+			// An unfinished choice the server already holds (another tab, a reload): its exact original body, sent again only on a click.
+			// A local unconfirmed body under the same request id is that body already; anything else yields to the server's own.
+			const resume = c.state === "resolving" && c.resume && typeof c.resume.request_id === "string" ? c.resume as Choice["body"] : null;
+			if (resume && !((sent?.state === "unknown" || sent?.state === "progress") && sent.body.request_id === resume.request_id)) {
+				const lose = copies.find((x) => x.profile !== resume.keep)?.profile ?? "the other profile";
+				sent = { body: resume, state: "progress", text: `This choice is already recorded and unfinished: keep the copy in ${String(resume.keep)}; the copy in ${String(lose)} becomes a flagged tombstone with its content and history in that profile's archive, and nothing is merged. It was chosen against ${resume.expect.map((e) => `${e.profile} ${e.status ?? "no copy"}${e.revision === null ? "" : ` revision ${e.revision}`}`).join(" and ")}; the copies above are as they are now. Send the same choice again to continue it.` };
+				choices.set(key, sent);
+			}
+			el("h4", li, `Record ${String(c.node)}`);
+			facts(li, [["Why", recorded(c.kind)], ["From transfer", recorded(c.transfer)], ["Choice", c.state === "resolved" ? `Kept in ${recorded(c.result?.kept ?? c.keep)}` : c.state === "resolving" ? `Unfinished: keeping ${recorded(c.keep)}` : "Not made"]]);
+			for (const x of copies) copyFacts(li, x);
+			if (sent) {
+				el("p", li, sent.text).setAttribute("class", "warn");
+				if (sent.state === "unknown" || sent.state === "progress") btn(el("p", li), "Send the same choice again", () => sendChoice(sent), `Send the same choice for ${c.node} again`);
+				if (sent.state === "changed") { btn(el("p", li), "Read the copies again", () => { choices.delete(key); render(false); }, `Read the copies of ${c.node} again`); return; }
+			}
+			if (c.state !== "open" || sent?.state === "unknown" || sent?.state === "progress") return;
+			const keepable = copies.filter((x) => x.keepable);
+			if (!keepable.length) { note(li, "Neither copy can be kept as it is; only abort is possible for this record."); return; }
+			const form = el("form", li), pick = choose(form, `keep-${c.node}`, "Keep the copy in", keepable.map((x) => [String(x.profile), String(x.profile)]));
+			const row = el("p", form), preview = el("p", form);
+			el("button", row, "Preview").setAttribute("type", "submit");
+			let body: Choice["body"] | undefined;
+			const go = btn(row, "Keep this copy", () => {
+				if (!body || busy() || r.resolving) return;
+				const ch: Choice = { body: { ...body, request_id: `dashboard:${crypto.randomUUID()}` }, state: "unknown", text: "Sending…" };
+				choices.set(key, ch);
+				sendChoice(ch);
+			}, `Keep the chosen copy of ${c.node}`);
+			go.disabled = true;
+			pick.addEventListener("change", () => { body = undefined; go.disabled = true; preview.textContent = ""; });
+			form.addEventListener("submit", (event) => {
+				event.preventDefault();
+				const keep = copies.find((x) => x.profile === pick.value), lose = copies.find((x) => x.profile !== pick.value);
+				if (!keep) return;
+				// The copies exactly as shown; the server refuses the choice if either has changed since.
+				body = { id: String(r.id), node: String(c.node), keep: String(keep.profile), request_id: "",
+					expect: copies.map((x) => ({ profile: String(x.profile), generation: x.generation ?? null, status: x.copy?.status ?? null, revision: x.copy?.revision ?? null })) };
+				const l = lose?.copy;
+				preview.textContent = `Preview: keep “${recorded(keep.copy?.name)}” in ${String(keep.profile)} at revision ${recorded(keep.copy?.revision)}${keep.copy?.status === "moved" ? ", brought back from its archive" : ""}. `
+					+ (l && l.status !== "incoming" && l.status !== "moved" ? `The copy in ${String(lose!.profile)} becomes a flagged tombstone; its content and history go to that profile's archive. ` : `Nothing in ${String(lose?.profile ?? "the other profile")} is tombstoned; an unfinished landing there ends. `)
+					+ "Unfinished transfers of this record end. Nothing is merged, and the account stays closed until the recovery is opened.";
+				go.disabled = busy() || !!r.resolving;
+				if (!go.disabled) go.focus();
+			});
+		};
+		const load = async (after?: string) => {
+			more.replaceChildren();
+			status.textContent = "Reading the copies…";
+			let x: J;
+			try { x = await call(`/api/recovery/conflicts?id=${enc(String(r.id))}${after ? `&after=${enc(after)}` : ""}`); if (!Array.isArray(x?.conflicts)) throw new Error("the server sent no list"); }
+			catch (err) { if (version === pageVersion) status.textContent = `Could not read the copies: ${why(err)}`; return; }
+			if (version !== pageVersion) return;
+			status.textContent = `${recorded(x.open)} choice${x.open === 1 ? "" : "s"} still open.`;
+			for (const c of x.conflicts) item(c);
+			if (x.next) btn(more, "Show more records", () => { void load(String(x.next)); });
+		};
+		void load();
+	};
+
 	// Backups and recovery (section 18): exports, restore of one profile or of the account from an export, and the open
 	// recovery's step, open and abort. The backup key stays on the server; this page only asks it to act.
 	const backupsPage = (view: Node) => {
 		const version = pageVersion, h = el("h2", view, "Backups and recovery");
-		note(view, "Restore here uses the server's encrypted exports only. Point-in-time and corpus recovery are not built. Devices and routes stay in Settings.");
+		note(view, "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days. Devices and routes stay in Settings.");
 		link(el("p", view), "/settings", "Open Settings");
 		const { say } = pageStatus(view);
 		const rec = el("section", view);
@@ -1011,11 +1116,13 @@ export async function dashboardMain(win: any): Promise<void> {
 					["Started", recorded(r.at)], ["State", `${recorded(r.state)}${r.phase ? ` (${String(r.phase)})` : ""}`], ["Unresolved findings", recorded(r.unresolved_count)],
 					...(r.restored ? [["Checked so far", `${recorded(r.restored.nodes)} records, ${recorded(r.restored.requests)} requests`]] as [string, string][] : [])]);
 				if (Array.isArray(r.unresolved) && r.unresolved.length) {
-					el("p", rec, "Unresolved findings (an unresolved restore can only be aborted):");
+					el("p", rec, "Unresolved findings (those that are not copy choices below can only be aborted):");
 					const ul = el("ul", rec);
 					for (const u of r.unresolved) el("li", ul, `${recorded(u.kind)}: ${recorded(u.id)}`);
 					if (r.unresolved_count > r.unresolved.length) note(rec, `${r.unresolved_count - r.unresolved.length} more are not listed.`);
 				}
+				// Copy choices exist only while unresolved; after them the server reconciles again and the controls below continue it.
+				if (r.state === "unresolved" && (r.conflicts?.total || r.resolving)) conflictsView(rec, r);
 				// Every action names the recovery shown here; the server refuses it if another recovery has replaced this one.
 				const row = el("p", rec), shownId = { id: String(r.id) }, stepDone = (x: J) => ({ text: `Recovery is now ${recorded(x.state)}${x.phase ? ` (${String(x.phase)})` : ""}.` });
 				if (r.state === "ready") note(rec, "Ready to open. Opening makes the restored copy current; for a profile, its previous copy is retired and changes made after the export are no longer current.", "warn");
@@ -1068,6 +1175,26 @@ export async function dashboardMain(win: any): Promise<void> {
 				"Beginning closes the account and disables every device token; reissue them in Settings afterwards. It replaces the account's own records (devices, routing and the profile list) with the export's; the memories inside profiles are restored separately, per profile.",
 				() => "restore account", (exp) => ["/api/account/restore", { export: exp }]);
 			btn(el("p", acct.sec), "List account exports", () => { acct.load(); });
+
+			// Point-in-time restore of one profile in place, or the reversal of one by the undo bookmark its record keeps.
+			const pitSec = el("section", forms);
+			el("h3", pitSec, "Restore a profile to a point in time");
+			note(pitSec, "Beginning closes the whole account. The profile goes back to the chosen time, within the last 30 days; changes after it are no longer current. Its record keeps an undo, so a restore id below reverses it the same way.", "danger");
+			const pp = choose(pitSec, "pitr-profile", "Profile", active().map((q) => [q.name, q.name]));
+			const when = input(pitSec, "pitr-at", "Time, as ISO (for example 2026-10-27T09:00:00Z)");
+			const undo = input(pitSec, "pitr-undo", "Or the id of a point-in-time restore to reverse");
+			confirmBox(pitSec, "Restore the chosen profile.", "restore in time", "Begin point-in-time restore", () =>
+				act(`/api/profiles/${enc(pp.value)}/pitr`, `restore ${pp.value} in time`, undo.value.trim() ? { undo: undo.value.trim() } : { at: when.value.trim() },
+					(x) => ({ text: `Recovery begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` })));
+
+			// A profile's corpus: exported weekly and kept two; a restore fills the profile's current, empty corpus.
+			btn(el("p", forms), "Export every corpus now", () => act("/api/backups/export", "export every corpus", { corpus: true }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
+			const cp = choose(forms, "corpus-profile", "Corpus to restore", active().filter((q) => q.name !== "me").map((q) => [q.name, q.name]));
+			const corp = restoreForm("Restore a corpus", () => `/api/profiles/${enc(cp.value)}/corpus/exports`, () => `the corpus of ${cp.value}`,
+				"Beginning closes the whole account. The corpus is rebuilt from the export into the profile's current corpus, which must be empty, as after a profile restore. Aborting clears what it wrote.",
+				() => cp.value, (exp) => [`/api/profiles/${enc(cp.value)}/corpus/restore`, { export: exp }]);
+			btn(el("p", corp.sec), "List this corpus's exports", () => { corp.load(); });
+			cp.addEventListener("change", () => corp.pick.replaceChildren());
 		})();
 		return h;
 	};
@@ -1285,7 +1412,7 @@ export async function dashboardMain(win: any): Promise<void> {
 	// owner whole-graph read (metadata only, paged), so loaded and total counts are the server's. A selected record's detail is read
 	// only when it is selected. Cached per profile generation; nothing here writes, and no link is drawn that the server did not send.
 	type GNode = { id: string; name: string; kind: string; label: string | null; type: string | null; scope: string | null; status: string; updated: string | null;
-		group: string; seq: number; x: number; y: number; deg: number; opaque: number };
+		group: string; seq: number; x: number; y: number; deg: number; opaque: number; flagged: boolean };
 	type GEdge = { id: string; a: string; b: string; rel: string };
 	type Phase = { next: string | null; total: number | null; done: boolean; error: string | null };
 	type Graph = { nodes: Map<string, GNode>; edges: Map<string, GEdge>; groups: Map<string, string[]>; pending: Map<string, GEdge[]>; opaque: number;
@@ -1313,7 +1440,7 @@ export async function dashboardMain(win: any): Promise<void> {
 		if (!id || g.nodes.has(id)) return;
 		const kind = str(it.kind) ?? "other", type = str(it.type), group = groupOf(type, kind), list = g.groups.get(group) ?? [];
 		g.nodes.set(id, { id, name: str(it.name) ?? "(no name)", kind, label: str(it.other_label), type, scope: str(it.scope), status: str(it.status) ?? "active",
-			updated: str(it.updated_at), group, seq: list.length, x: 0, y: 0, deg: 0, opaque: 0 });
+			updated: str(it.updated_at), group, seq: list.length, x: 0, y: 0, deg: 0, opaque: 0, flagged: it.flagged === true });
 		list.push(id);
 		g.groups.set(group, list);
 		g.dirty = true;
@@ -1473,6 +1600,20 @@ export async function dashboardMain(win: any): Promise<void> {
 		readTheme();
 		const hueAt = (group: string) => (group.startsWith("m:") ? 0 : group === "e:person" ? 2 : 1);
 		const shown = (n: GNode) => !hidden.has(n.group) && (n.status === "active" || showPast) && (!onlyLinked || n.deg > 0 || n.opaque > 0);
+		// The what-if view over loaded metadata only; the saved graph `g` is never changed. A removed record takes its loaded links with it.
+		let linkFrom: string | null = null; // a record waiting for the other end of a what-if link
+		const editsOf = () => { let e = whatIfEdits.get(p.name); if (!e) whatIfEdits.set(p.name, e = { add: [], cut: new Set(), drop: new Set() }); return e; };
+		const tidy = () => { const e = whatIfEdits.get(p.name); if (e && !e.add.length && !e.cut.size && !e.drop.size) whatIfEdits.delete(p.name); };
+		const scenarioOf = () => {
+			const e = whatIfEdits.get(p.name), items = whatIf.get(p.name) ?? [];
+			const drop = new Set([...(e?.drop ?? [])].filter((id) => g.nodes.has(id))), kept = (id: string) => g.nodes.has(id) && !drop.has(id);
+			const gone = new Set<string>(), delta = new Map<string, number>(), bump = (id: string, d: number) => delta.set(id, (delta.get(id) ?? 0) + d);
+			for (const x of g.edges.values()) if (x.b && (e?.cut.has(x.id) || drop.has(x.a) || drop.has(x.b))) { gone.add(x.id); bump(x.a, -1); bump(x.b, -1); }
+			const added = (e?.add ?? []).filter(([a, b]) => kept(a) && kept(b)), hung = items.filter((w) => kept(w.target)); // new memories whose record stays
+			for (const [a, b] of added) { bump(a, 1); bump(b, 1); }
+			for (const w of hung) bump(w.target, 1);
+			return { e, items, drop, gone, added, hung, delta, kept };
+		};
 		const relayout = () => {
 			discs = layout(g, shown);
 			vis = []; visIds = new Set(); grid = new Map(); adj = new Map();
@@ -1577,11 +1718,11 @@ export async function dashboardMain(win: any): Promise<void> {
 				return true;
 			};
 			ctx.lineWidth = 1;
-			const t = theme!;
+			const t = theme!, sc = whatIf.has(p.name) || whatIfEdits.has(p.name) ? scenarioOf() : null;
 			ctx.strokeStyle = t.edge;
 			ctx.beginPath();
 			for (const e of g.edges.values()) {
-				if (!e.b || !visIds.has(e.a) || !visIds.has(e.b)) continue;
+				if (!e.b || !visIds.has(e.a) || !visIds.has(e.b) || sc?.gone.has(e.id)) continue;
 				const a = g.nodes.get(e.a)!, b = g.nodes.get(e.b)!;
 				if (!inView(a) && !inView(b)) continue;
 				ctx.moveTo(a.x * k + ox, a.y * k + oy); ctx.lineTo(b.x * k + ox, b.y * k + oy);
@@ -1608,20 +1749,32 @@ export async function dashboardMain(win: any): Promise<void> {
 			if (k > 0.6) { ctx.strokeStyle = t.muted; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
 			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, t.match); }
 			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? t.ring : t.bg); }
-			// What-if items (this tab only, never saved): a dashed ring and a dashed line from their real record, outside the dot layer.
-			const items = whatIf.get(p.name) ?? [];
-			if (items.length) {
+			// What-if changes (this tab only, never saved), dashed and outside the dot layer: a new memory is a ring on a line from its real
+			// record, an added link a line in the match colour; a removed link is a muted dashed line and a removed record is crossed out.
+			if (sc) {
 				ctx.save?.();
 				ctx.setLineDash?.([4, 3]);
-				ctx.strokeStyle = t.match;
 				ctx.lineWidth = 1.5;
-				items.forEach((w, i) => {
-					const n = g.nodes.get(w.target);
-					if (!n || !visIds.has(w.target) || !inView(n)) return;
-					const x = n.x * k + ox, y = n.y * k + oy, a = -Math.PI / 4 + i * 0.9, hx = x + 34 * Math.cos(a), hy = y + 34 * Math.sin(a);
+				const xy = (id: string) => { const n = g.nodes.get(id); return n && visIds.has(id) ? [n.x * k + ox, n.y * k + oy, inView(n)] as const : null; };
+				const line = (a: string, b: string) => { const p1 = xy(a), p2 = xy(b); if (p1 && p2 && (p1[2] || p2[2])) { ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke(); } };
+				ctx.strokeStyle = t.muted;
+				for (const id of sc.gone) { const e = g.edges.get(id)!; line(e.a, e.b); }
+				for (const id of sc.drop) {
+					const q = xy(id);
+					if (!q?.[2]) continue;
+					const [x, y] = q, r = radius(g.nodes.get(id)!) * scale + 4;
+					ctx.beginPath(); ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r); ctx.moveTo(x + r, y - r); ctx.lineTo(x - r, y + r); ctx.stroke();
+					whatIfAt.push([x + 6, y + 14, `Removed: ${g.nodes.get(id)!.name}`]);
+				}
+				ctx.strokeStyle = t.match;
+				for (const [a, b] of sc.added) line(a, b);
+				sc.items.forEach((w, i) => {
+					const q = xy(w.target);
+					if (!q?.[2] || sc.drop.has(w.target)) return;
+					const [x, y] = q, a = -Math.PI / 4 + i * 0.9, hx = x + 34 * Math.cos(a), hy = y + 34 * Math.sin(a);
 					ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(hx, hy); ctx.stroke();
 					ctx.beginPath(); ctx.arc(hx, hy, 6, 0, 2 * Math.PI); ctx.stroke();
-					whatIfAt.push([hx, hy, w.name]);
+					whatIfAt.push([hx + 9, hy + 4, `What-if: ${w.name}`]);
 				});
 				ctx.restore?.();
 				ctx.setLineDash?.([]);
@@ -1642,7 +1795,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			const important = [...new Set([...(selected ? [selected] : []), ...(hover ? [hover] : []), ...(focus ?? []), ...[...matchSet].slice(0, 50)])];
 			for (const id of important) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) label(n); }
 			// What-if labels next, so a hypothetical item stays named, ahead of the bulk of names shown when zoomed in.
-			for (const [hx, hy, name] of whatIfAt.splice(0)) { const s2 = `What-if: ${name.length > 32 ? `${name.slice(0, 31)}…` : name}`, w = widthOf(NAME_FONT, s2); for (const lx of [hx + 9, hx - 9 - w]) if (place(lx, hy + 4, w, 12)) { text(s2, lx, hy + 4); break; } }
+			for (const [lx0, ly, s1] of whatIfAt.splice(0)) { const s2 = s1.length > 41 ? `${s1.slice(0, 40)}…` : s1, w = widthOf(NAME_FONT, s2); for (const lx of [lx0, lx0 - 18 - w]) if (place(lx, ly, w, 12)) { text(s2, lx, ly); break; } }
 			if (k >= 1.4) { let shownLabels = 0; for (const n of vis) { if (shownLabels >= 150) break; if (inView(n)) { label(n); shownLabels++; } } }
 			ctx.font = GROUP_FONT;
 			ctx.fillStyle = t.muted;
@@ -1670,28 +1823,44 @@ export async function dashboardMain(win: any): Promise<void> {
 		if (win.ResizeObserver) { const ro = new win.ResizeObserver(() => { if (version !== pageVersion) ro.disconnect(); else resized(); }); ro.observe(canvas); }
 
 		const count = (n: number | null) => (n === null ? "?" : n.toLocaleString("en"));
-		// The what-if comparison: only facts the loaded metadata gives, before and after the unsaved items; nothing else is inferred.
+		// The what-if comparison: only facts the loaded metadata gives, before and after the unsaved changes; nothing else is inferred.
+		let detailSync = () => {}; // keeps the selected record's what-if buttons in step with the list below
+		const nameOf = (id: string) => g.nodes.get(id)?.name ?? "a record not loaded";
+		const changed = () => { tidy(); renderScenario(); schedule(); };
 		const renderScenario = () => {
 			scenario.replaceChildren();
-			const items = whatIf.get(p.name) ?? [];
-			if (!items.length) return;
+			detailSync();
+			const sc = scenarioOf(), { e, items } = sc;
+			if (!items.length && !e) return;
 			el("h3", scenario, "What-if (not saved)");
-			note(scenario, "These exist only in this tab and are never sent. Make a draft to review and save one through Write; the saved graph above them is unchanged.");
-			const links = [...g.edges.values()].filter((e) => e.b).length, linked = [...g.nodes.values()].filter((n) => n.deg > 0).length;
-			const per = new Map<string, number>();
-			for (const w of items) per.set(w.target, (per.get(w.target) ?? 0) + 1);
-			const newlyLinked = [...per.keys()].filter((id) => g.nodes.get(id)?.deg === 0).length;
-			facts(scenario, [["Records", `${count(g.nodes.size)} saved → ${count(g.nodes.size + items.length)} with what-if`], ["Links", `${count(links)} → ${count(links + items.length)}`],
-				["Records with links", `${count(linked)} → ${count(linked + newlyLinked + items.length)}`]]);
+			note(scenario, "These exist only in this tab and are never sent. Make a draft to review and save a new memory through Write; the saved graph above them is unchanged.");
+			const links = [...g.edges.values()].filter((x) => x.b).length;
+			let linked = 0, after = 0;
+			for (const n of g.nodes.values()) { if (n.deg > 0) linked++; if (sc.kept(n.id) && n.deg + (sc.delta.get(n.id) ?? 0) > 0) after++; }
+			facts(scenario, [["Records", `${count(g.nodes.size)} saved → ${count(g.nodes.size - sc.drop.size + items.length)} with what-if`],
+				["Links", `${count(links)} → ${count(links - sc.gone.size + sc.added.length + sc.hung.length)}`], ["Records with links", `${count(linked)} → ${count(after + sc.hung.length)}`]]);
 			if (!g.parts.nodes.done || !g.parts.edges.done) note(scenario, "Counted over what has loaded so far.");
+			const links2 = (id: string) => { const n = g.nodes.get(id); return n ? ` (its links ${n.deg} → ${sc.kept(id) ? n.deg + (sc.delta.get(id) ?? 0) : 0})` : ""; };
 			const ul = el("ul", scenario);
 			items.forEach((w, i) => {
-				const n = g.nodes.get(w.target);
-				const li = el("li", ul, `${w.name}, linked to “${w.targetName}”${n ? ` (its links ${n.deg} → ${n.deg + (per.get(w.target) ?? 0)})` : " (its record is not in this graph)"} `);
+				const li = el("li", ul, `New memory: ${w.name}, linked to “${w.targetName}”${!g.nodes.has(w.target) ? " (its record is not in this graph)" : sc.drop.has(w.target) ? " (its record is removed in this what-if)" : links2(w.target)} `);
 				btn(li, "Make a draft", () => draftFromWhatIf(p.name, w, li), `Make a draft from ${w.name}`);
-				btn(li, "Remove", () => { items.splice(i, 1); if (!items.length) whatIf.delete(p.name); renderScenario(); schedule(); }, `Remove ${w.name}`);
+				btn(li, "Remove", () => { items.splice(i, 1); if (!items.length) whatIf.delete(p.name); changed(); }, `Remove ${w.name}`);
 			});
-			btn(scenario, "Clear all what-if items", () => { whatIf.delete(p.name); renderScenario(); schedule(); });
+			// Link and record changes show their effect only; they have no draft, and the saved records change only through their own pages.
+			e?.add.forEach(([a, b], i) => {
+				btn(el("li", ul, `Added link: “${nameOf(a)}” and “${nameOf(b)}” `), "Remove", () => { e.add.splice(i, 1); changed(); }, `Remove the what-if link between ${nameOf(a)} and ${nameOf(b)}`);
+			});
+			for (const id of e?.cut ?? []) {
+				const x = g.edges.get(id), label = x ? `“${nameOf(x.a)}” ${x.rel} “${nameOf(x.b)}”` : "a link not loaded";
+				btn(el("li", ul, `Removed link: ${label} `), "Restore", () => { e!.cut.delete(id); changed(); }, `Restore the link ${label}`);
+			}
+			for (const id of e?.drop ?? []) {
+				const n = g.nodes.get(id);
+				btn(el("li", ul, `Removed record: “${nameOf(id)}”${n ? ` and its ${n.deg} loaded link${n.deg === 1 ? "" : "s"}` : ""} `), "Restore", () => { e!.drop.delete(id); changed(); }, `Restore ${nameOf(id)}`);
+			}
+			if (e) note(scenario, "Link and record changes cannot be saved or made into a draft from here; they only show the effect.");
+			btn(scenario, "Clear all what-if items", () => { whatIf.delete(p.name); whatIfEdits.delete(p.name); linkFrom = null; changed(); });
 		};
 		const refresh = () => {
 			if (version !== pageVersion) return;
@@ -1753,8 +1922,9 @@ export async function dashboardMain(win: any): Promise<void> {
 		/** Selects a record without moving the graph, unless asked to bring it into view; its detail is read now, once per selection. */
 		const select = (id: string | null, reveal = false) => {
 			selected = id;
-			const req = ++detailRequest;
+			const req = ++detailRequest, syncs: (() => void)[] = [];
 			detail.replaceChildren();
+			detailSync = () => { for (const f of syncs) f(); };
 			schedule();
 			if (!id) return;
 			const n = g.nodes.get(id);
@@ -1770,6 +1940,13 @@ export async function dashboardMain(win: any): Promise<void> {
 					const other = g.nodes.get(e.a === id ? e.b : e.a)!, li = el("li", ul);
 					el("span", li, `${e.a === id ? "to" : "from"} · ${e.rel} · `);
 					btn(li, other.name, () => select(other.id, true), `Select ${other.name}`);
+					el("span", li, " ");
+					const cut = btn(li, "", () => { const c = editsOf().cut; if (c.has(e.id)) c.delete(e.id); else c.add(e.id); changed(); });
+					syncs.push(() => {
+						const on = whatIfEdits.get(p.name)?.cut.has(e.id) ?? false;
+						cut.textContent = on ? "Restore link (what-if)" : "Remove link (what-if)";
+						cut.setAttribute("aria-label", `${on ? "Restore" : "Remove"} the link ${e.rel} with ${other.name}, not saved`);
+					});
 				}
 				if (neighbours.length > 30) note(detail, `${neighbours.length - 30} more links; open the record for all of them.`);
 			} else if (n && g.parts.edges.done) note(detail, n.opaque ? "Its only links go to other profiles." : "No links: this record stands alone.");
@@ -1795,7 +1972,30 @@ export async function dashboardMain(win: any): Promise<void> {
 					renderScenario();
 					schedule();
 				});
+				// Unsaved changes to saved things: remove this record (and its loaded links), or link it to another loaded record.
+				const edit = el("p", detail);
+				const drop = btn(edit, "", () => { const d = editsOf().drop; if (d.has(id)) d.delete(id); else d.add(id); changed(); });
+				el("span", edit, " ");
+				const linking = el("span", edit);
+				syncs.push(() => {
+					const on = whatIfEdits.get(p.name)?.drop.has(id) ?? false;
+					drop.textContent = on ? "Restore this record (what-if)" : "Remove this record (what-if)";
+					drop.setAttribute("aria-label", `${on ? "Restore" : "Remove"} ${n.name} and its loaded links, not saved`);
+					linking.replaceChildren();
+					const from = linkFrom && g.nodes.has(linkFrom) ? linkFrom : null;
+					if (from === id) {
+						el("span", linking, "Select another record to link it to. ");
+						btn(linking, "Cancel linking", () => { linkFrom = null; detailSync(); });
+					} else if (from) {
+						const sc = scenarioOf(), have = (x: GEdge) => x.b && !sc.gone.has(x.id) && ((x.a === from && x.b === id) || (x.a === id && x.b === from));
+						if (!sc.kept(from) || !sc.kept(id)) el("span", linking, "A removed record cannot be linked in this what-if. ");
+						else if ([...g.edges.values()].some(have) || sc.added.some(([a, b]) => (a === from && b === id) || (a === id && b === from))) el("span", linking, `Already linked to “${nameOf(from)}”. `);
+						else btn(linking, `Link to “${nameOf(from)}” (what-if)`, () => { editsOf().add.push([from, id]); linkFrom = null; changed(); });
+						btn(linking, "Cancel linking", () => { linkFrom = null; detailSync(); });
+					} else btn(linking, "Link to another record (what-if)…", () => { linkFrom = id; detailSync(); search.focus?.(); }); // the other end is found through the search
+				});
 			}
+			detailSync();
 			const more = el("div", detail);
 			note(more, "Loading details…");
 			(async () => {
@@ -1955,6 +2155,138 @@ export async function dashboardMain(win: any): Promise<void> {
 		};
 		form.addEventListener("submit", (event) => { event.preventDefault(); load(); });
 		load();
+
+		// Flagged records: housekeeping, a protected record's refused move or promotion flagged them instead of acting. They are found in
+		// the profile's whole-graph read (shared with the graph page); the reason is the record's own read. Unflag is the owner node
+		// action with its Undo; forget, edit and move stay on the record's page.
+		const flags = el("section", view), g = graphOf(p);
+		flags.setAttribute("aria-label", "Flagged records");
+		el("h3", flags, "Flagged records");
+		const fStatus = el("p", flags), fList = el("ul", flags);
+		fList.setAttribute("class", "prefs");
+		btn(flags, "Read the flags again", () => { graphs.delete(`${p.name}:${p.generation ?? ""}`); render(false); });
+		const showFlags = () => {
+			if (version !== pageVersion) return;
+			fList.replaceChildren();
+			const ph = g.parts.nodes;
+			if (g.missing) { fStatus.textContent = "This server does not offer the whole-graph read, so flagged records cannot be listed here."; return; }
+			const flagged = [...g.nodes.values()].filter((n) => n.flagged);
+			fStatus.textContent = `${flagged.length.toLocaleString("en")} flagged among ${g.nodes.size.toLocaleString("en")} records read${ph.done ? "" : ph.error ? `; reading stopped: ${ph.error}` : "; still reading…"}${flagged.length > 50 ? "; the first 50 are listed" : ""}.`;
+			for (const n of flagged.slice(0, 50)) {
+				const li = el("li", fList), node = `/api/profiles/${enc(p.name)}/nodes/${enc(n.id)}`;
+				el("h4", li, n.name);
+				facts(li, [["Kind", `${n.kind}${n.type ? ` (${n.type})` : ""}`], ["Status", n.status], ["Updated", recorded(n.updated)]]);
+				const flagNote = el("p", li), row = el("p", li);
+				btn(row, "Read why", async () => {
+					flagNote.textContent = "Reading…";
+					try {
+						const r: J = await call(node);
+						if (version === pageVersion) flagNote.textContent = r?.node?.flagged ? `Flagged: ${String(r.node.flagged)}` : "It is no longer flagged.";
+					} catch (err) { if (version === pageVersion) flagNote.textContent = `Could not read it: ${why(err)}`; }
+				}, `Read why ${n.name} is flagged`);
+				btn(row, "Unflag", () => act(`${node}/unflag`, `unflag “${n.name}”`, undefined, (r) => { n.flagged = false; return { text: `Unflagged “${n.name}”.`, undo: undoOf(p.name, r) }; }), `Unflag ${n.name}`);
+				el("span", row, " ");
+				link(row, `#/memory/${enc(p.name)}/${enc(n.id)}`, "Open the record");
+			}
+		};
+		g.listener = showFlags;
+		showFlags();
+		pump(p, g);
+
+		// Restore reconciliation: an open restore's unresolved findings, read from the recovery status; running, opening or aborting it
+		// stays on the Backups page. Choosing one copy of an unresolved pair is not offered by the server yet.
+		const recon = el("section", view);
+		recon.setAttribute("aria-label", "Restore reconciliation");
+		el("h3", recon, "Restore reconciliation");
+		const rStatus = el("p", recon, "Reading the recovery status…");
+		(async () => {
+			let s: J;
+			try { s = await call("/api/recovery"); } catch (err) { if (version === pageVersion) rStatus.textContent = `Could not read the recovery status: ${why(err)}`; return; }
+			if (version !== pageVersion) return;
+			const r = s?.recovery;
+			if (!r) { rStatus.textContent = "No restore is open, so nothing waits for reconciliation."; return; }
+			rStatus.textContent = `A restore is open (${recorded(r.state)}) with ${recorded(r.unresolved_count)} unresolved finding${r.unresolved_count === 1 ? "" : "s"}.`;
+			if (Array.isArray(r.unresolved) && r.unresolved.length) {
+				const ul = el("ul", recon);
+				for (const u of r.unresolved) el("li", ul, `${recorded(u.kind)}: ${recorded(u.id)}`);
+				if (r.unresolved_count > r.unresolved.length) note(recon, `${r.unresolved_count - r.unresolved.length} more are not listed.`);
+			}
+			link(el("p", recon), "#/backups", "Run, open or abort it in Backups and recovery");
+		})();
+
+		// The account's review list (section 15): read once per page; every action is an explicit button and its outcome stays on the page.
+		const mig = el("section", view), col = el("section", view);
+		mig.setAttribute("aria-label", "Migrated records waiting for a profile");
+		el("h3", mig, "Migrated records waiting for a profile");
+		note(mig, "The local import plan lists records no rule routes (node local/upload.mjs review-push). Assigning only records your choice: review-pull writes it as a routes file, and the next plan with --routes checks the record again and imports it. Nothing goes to me.");
+		const mStatus = el("p", mig, "Reading the review list…"), mList = el("ul", mig);
+		mList.setAttribute("class", "prefs");
+		col.setAttribute("aria-label", "Moves stopped by a collision");
+		el("h3", col, "Moves stopped by a collision");
+		note(col, "The destination already held this record or one with the same name, scope and type, so nothing moved. Rename it and move it again, merge it into the record it met, or keep both where they are.");
+		const cStatus = el("p", col, "Reading the review list…"), cList = el("ul", col);
+		cList.setAttribute("class", "prefs");
+		const migration = (it: J) => {
+			const x = it.payload ?? {}, id = String(it.id), name = String(x.name ?? x.source), li = el("li", mList);
+			el("h4", li, name);
+			facts(li, [["Source", recorded(x.source)], ["Id", recorded(x.id)], ["Scope", recorded(x.scope)], ["Why it waits", Array.isArray(x.reasons) ? x.reasons.join(", ") : "Not recorded"],
+				["Decision", it.state === "assigned" ? `Goes to ${String(it.decision?.profile)} at the next plan` : "Not assigned"]]);
+			const form = el("form", li), to = choose(form, `assign-${id}`, "Profile", [["work", "Work"], ["personal", "Personal"]]), row = el("p", form), shown = el("p", form);
+			el("button", row, "Preview").setAttribute("type", "submit");
+			const go = btn(row, "Assign", () => act(`/api/review/${enc(id)}/assign`, `assign “${name}” to ${to.value}`, { profile: to.value },
+				() => ({ text: `Recorded: “${name}” goes to ${to.value} at the next plan with the pulled routes.` })), `Assign ${name}`);
+			go.disabled = true;
+			to.addEventListener("change", () => { go.disabled = true; shown.textContent = ""; });
+			form.addEventListener("submit", (event) => {
+				event.preventDefault();
+				shown.textContent = `Preview: “${name}” is to go to ${to.value}. Nothing is imported now; the next plan checks that its exported record is unchanged.`;
+				go.disabled = false;
+				go.focus();
+			});
+		};
+		const REASON: Record<string, string> = { id_taken: "The destination already holds a record with this id.", key_taken: "The destination already has an active record with the same name, scope and type, or the same key.",
+			import_pending: "A record with this identity is still being imported into the destination." };
+		const collision = (it: J) => {
+			const x = it.payload ?? {}, id = String(it.id), from = String(x.from), to = String(x.to), mid = String(x.memory_id), li = el("li", cList);
+			const resolve = (choice: string) => call(`/api/review/${enc(id)}/resolve`, "POST", { choice });
+			el("h4", li, `A move from ${from} to ${to}`);
+			facts(li, [["Why it stopped", REASON[String(x.reason)] ?? recorded(x.reason)], ["Since", recorded(it.updated_at)]]);
+			const links = el("p", li);
+			link(links, `#/memory/${enc(from)}/${enc(mid)}`, "Open the moving record");
+			el("span", links, " · ");
+			if (x.existing_id) link(links, `#/memory/${enc(to)}/${enc(String(x.existing_id))}`, "Open the record it met");
+			else el("span", links, "The record it met was not identified.");
+			// Rename: the record's page edits it as a draft; then the same move flow as Moves, with a fresh request after a refusal.
+			el("p", li, "Rename: open the moving record, choose Edit as a draft and change its name, then move it again.");
+			const key = `${from}:${mid}`, prior = moves.get(key);
+			if (prior) moveView(li, prior);
+			const row = el("p", li);
+			btn(row, "Move it again", () => {
+				const again = prior && (prior.state === "unknown" || prior.state === "progress");
+				const m: Move = again ? prior! : { source: from, id: mid, name: mid, to, state: "sent", text: "",
+					body: { memory_id: mid, to, ...(active().find((q) => q.name === from)?.generation ? { generation: active().find((q) => q.name === from)!.generation } : {}), request_id: `dashboard:${crypto.randomUUID()}` } };
+				moves.set(key, m);
+				sendMove(m);
+			}, `Move ${mid} to ${to} again`);
+			if (prior?.state === "done") btn(row, "Mark it moved", () => act(() => resolve("moved"), "record that it moved", undefined, () => ({ text: "Recorded: it moved." })));
+			// Merge: the record it met is edited to hold both; the moving record then goes to the archive, where Undo brings it back.
+			el("p", li, "Merge: edit the record it met so it holds what you need from both, then forget the moving record.");
+			const mrow = el("p", li);
+			if (x.existing_id) btn(mrow, "Forget the moving record", () => act(async () => { const r = await call(`/api/profiles/${enc(from)}/nodes/${enc(mid)}/forget`, "POST"); await resolve("merged").catch(() => undefined); return r; },
+				`forget the moving record in ${from}`, undefined, (r) => ({ text: "The moving record is in the archive; Undo brings it back.", undo: undoOf(from, r) })), `Forget ${mid} in ${from}`);
+			btn(mrow, "Keep both", () => act(() => resolve("kept"), "keep both records", undefined, () => ({ text: "Recorded: both records stay where they are." })), `Keep both records for the move of ${mid}`);
+		};
+		(async () => {
+			const read = async (kind: string, state: string, status: Node, list: (it: J) => void, none: string) => {
+				let r: J;
+				try { r = await call(`/api/review?kind=${kind}${state}&limit=100`); if (!Array.isArray(r?.items)) throw new Error("the server sent no list"); }
+				catch (err) { if (version === pageVersion) status.textContent = `Could not read the review list: ${why(err)}`; return; }
+				if (version !== pageVersion) return;
+				status.textContent = r.items.length ? `${r.items.length} listed${r.next_after ? "; more exist" : ""}.` : none;
+				for (const it of r.items) list(it);
+			};
+			await Promise.all([read("migration", "", mStatus, migration, "No migrated record waits for a profile."), read("collision", "&state=open", cStatus, collision, "No move is waiting on a collision.")]);
+		})();
 		return h;
 	};
 

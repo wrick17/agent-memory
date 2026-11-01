@@ -96,10 +96,12 @@ export function archiveRows(tx: ArchiveTx, activityId: number, source: ArchiveSo
  * revision_conflict and the transaction rolls back. An integer key SQLite reused meanwhile gets a fresh one instead: a text
  * takes any free rowid, and a restored edge's evidence follows its new id.
  */
+/** Marks an archived evidence row whose edge owner was already rewritten to that edge's restored id. */
+const MOVED_OWNER = "_owner_restored";
 export function restoreArchived(tx: ArchiveTx, archiveIds: number[]): { nodes: string[] } {
 	const wanted = [...new Set(archiveIds)];
-	const rows = tx.sql.exec<{ id: number; source: ArchiveSource; payload: string }>(
-		"SELECT id, source, payload FROM archive WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(wanted)).toArray();
+	const rows = tx.sql.exec<{ id: number; activity_id: number; source: ArchiveSource; payload: string }>(
+		"SELECT id, activity_id, source, payload FROM archive WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(wanted)).toArray();
 	if (rows.length !== wanted.length) throw Fail.of("not_found", "some archived rows are gone: purged after 300 days, or already restored", { reason: "archive_missing" });
 	rows.sort((a, b) => ORDER.indexOf(a.source) - ORDER.indexOf(b.source) || a.id - b.id);
 	tx.guard(rows.map((a) => JSON.parse(a.payload) as Row));
@@ -112,9 +114,18 @@ export function restoreArchived(tx: ArchiveTx, archiveIds: number[]): { nodes: s
 			// Its vector may have been cleaned up lazily while it was archived.
 			if (row.memory_type !== null) row.embed_hash = null;
 		}
-		if (a.source === "evidence" && typeof row.owner === "string" && edgeIds.has(row.owner)) row.owner = `e:${edgeIds.get(row.owner)}`;
+		// An owner already rewritten to its edge's new id (below) is final; any other follows this call's renumbering.
+		if (a.source === "evidence" && row[MOVED_OWNER] !== undefined) delete row[MOVED_OWNER];
+		else if (a.source === "evidence" && typeof row.owner === "string" && edgeIds.has(row.owner)) row.owner = `e:${edgeIds.get(row.owner)}`;
 		const id = putRow(tx, a.source, row);
-		if (a.source === "edges") edgeIds.set(`e:${String(row.id)}`, id!);
+		if (a.source === "edges") {
+			edgeIds.set(`e:${String(row.id)}`, id!);
+			// A renumbered edge's evidence still in the archive, for a later batch, follows it now, in this transaction: the mapping
+			// is durable in the archive rows themselves, never only in this call.
+			if (id !== Number(row.id)) tx.run(`UPDATE archive SET payload = json_set(payload, '$.owner', ?, '$.${MOVED_OWNER}', 1) WHERE activity_id = ? AND source = 'evidence'
+				AND json_extract(payload, '$.owner') = ? AND json_extract(payload, '$.${MOVED_OWNER}') IS NULL AND id NOT IN (SELECT value FROM json_each(?))`,
+				`e:${id}`, a.activity_id, `e:${String(row.id)}`, JSON.stringify(wanted));
+		}
 	}
 	tx.run("DELETE FROM archive WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(wanted));
 	return { nodes };

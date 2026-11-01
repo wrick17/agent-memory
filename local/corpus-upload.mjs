@@ -15,6 +15,9 @@ const bytes = (s) => new TextEncoder().encode(s).length;
 /** The server's chunk hash (src/corpus/families.ts chunkHash): one fixed tuple. */
 export const chunkHash = (c) => sha256(JSON.stringify([c.table, c.schema_sha256, c.source.file_sha256, c.as_of, c.columns, c.after, c.rows, c.final]));
 
+/** The server's snapshot cut identity (src/corpus/snapshots.ts cutIdOf): set, source, normalized as_of and members' DDL hashes in set order. */
+export const snapshotCutOf = (set, members, fileSha256, asOf) => sha256(JSON.stringify(["corpus-snapshot/1:cut", set, fileSha256, new Date(asOf).toISOString(), members.map((m) => m.schema_sha256)]));
+
 /** Both acquisition paths require the original table DDL and every projected column before reading rows. */
 export async function validateSource(source, fam) {
 	const ddl = await source.schema(fam.table);
@@ -37,19 +40,36 @@ export async function uploadCorpus({ source, client, profile, tables, asOf, file
 	if (st.error) return { status: TRANSIENT.includes(st.error.code) ? "stopped" : "refused", reason: st.error.details?.reason ?? st.error.code };
 	// A refresh holds the corpus: never report a completed load (or send a chunk) while one is applying.
 	if (st.refresh) return { status: "stopped", reason: "corpus_refreshing" };
+	// Dated snapshot tables (status snapshot_families) load as whole sets: one cut, replaced only by a newer one, published when every
+	// member's final chunk lands. Progress is the server's ledger for this cut, so a cut the server abandoned restarts from its first chunk.
+	const snaps = st.snapshot_families ?? [];
+	// A snapshot-only run takes all progress from the server's ledger and leaves the bulk load's local state file untouched, so a newer
+	// cut from a newer file never blocks, or is blocked by, an interrupted bulk resume.
+	if (tables.length && tables.every((t) => snaps.some((f) => f.table === t))) { state = {}; save = () => {}; }
 	for (const [k, v] of [["generation", st.generation], ["source", fileSha256], ["as_of", asOf]]) {
 		if (state[k] !== undefined && state[k] !== v) return { status: "refused", reason: k === "generation" ? "generation_changed" : `${k}_changed` };
 	}
+	const cutOf = (set) => snapshotCutOf(set, snaps.filter((f) => f.set === set), fileSha256, asOf);
+	const sets = [...new Set(tables.map((t) => snaps.find((f) => f.table === t)?.set).filter(Boolean))];
+	for (const set of sets) if (snaps.some((f) => f.set === set && !tables.includes(f.table))) return { status: "refused", reason: "snapshot_set_incomplete", set };
 	Object.assign(state, { profile, generation: st.generation, source: fileSha256, as_of: asOf, tables: state.tables ?? {} });
 	save(state);
 	for (const table of tables) {
-		const fam = st.families.find((f) => f.table === table);
+		const snap = snaps.find((f) => f.table === table);
+		const fam = snap ?? st.families.find((f) => f.table === table);
 		if (!fam) return { status: "refused", table, reason: st.held?.[table] ?? "unknown_table" };
 		const invalid = await validateSource(source, fam);
 		if (invalid) return { status: "refused", table, reason: invalid };
-		const progress = st.tables.find((t) => t.table === table);
-		// Identity first: a stored load from another file or as_of is never reported as this upload, complete or not.
-		if (progress && (progress.source_sha256 !== fileSha256 || progress.as_of !== asOf)) return { status: "refused", table, reason: "source_changed" };
+		let progress;
+		if (snap) {
+			const ledger = st.snapshots?.[snap.set], cut = cutOf(snap.set);
+			const t = ledger?.published?.cut_id === cut ? ledger.published.tables[table] : ledger?.loading?.cut_id === cut ? ledger.loading.tables[table] : null;
+			progress = t ? { last_key: t.last, rows: t.rows, complete: t.final } : null;
+		} else {
+			progress = st.tables.find((t) => t.table === table);
+			// Identity first: a stored load from another file or as_of is never reported as this upload, complete or not.
+			if (progress && (progress.source_sha256 !== fileSha256 || progress.as_of !== asOf)) return { status: "refused", table, reason: "source_changed" };
+		}
 		if (progress?.complete) { state.tables[table] = { last_key: progress.last_key, rows: progress.rows, complete: true }; continue; }
 		let after = progress?.last_key ?? null, rows = progress?.rows ?? 0;
 		for (;;) {
@@ -77,6 +97,13 @@ export async function uploadCorpus({ source, client, profile, tables, asOf, file
 			save(state);
 			if (final) break;
 		}
+	}
+	// A replayed final chunk is not proof of publication: each snapshot set is done only when the server publishes this exact cut.
+	if (sets.length) {
+		const now = await client.status(profile);
+		if (now.error) return { status: TRANSIENT.includes(now.error.code) ? "stopped" : "refused", reason: now.error.details?.reason ?? now.error.code };
+		const unpublished = sets.find((set) => now.snapshots?.[set]?.published?.cut_id !== cutOf(set));
+		if (unpublished) return { status: "stopped", reason: "snapshot_unpublished", set: unpublished };
 	}
 	return { status: "done", generation: st.generation, tables: state.tables };
 }

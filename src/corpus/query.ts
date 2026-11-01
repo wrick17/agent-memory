@@ -1,7 +1,8 @@
 // Corpus reads (section 14): search over the rebuilt documents, exact get by key, and read-only SQL. Every answer names the
 // as_of of the tables it read. The SQL runs as one wrapped SELECT inside a transaction that always rolls back.
 import { Fail } from "../domain/types";
-import { FAMILIES, type Value } from "./families";
+import { FAMILIES, SCANS, type Value } from "./families";
+import { SNAPSHOTS } from "./snapshots";
 
 export type CorpusQuery =
 	| { action: "search"; query: string; limit: number }
@@ -182,8 +183,9 @@ export function runSql(storage: DurableObjectStorage, text: string, head: Head =
 			const read = new Set(sql.exec<{ tbl_name: string }>("SELECT tbl_name FROM sqlite_master WHERE rootpage IN (SELECT value FROM json_each(?))", JSON.stringify(pages)).toArray().map((r) => r.tbl_name));
 			if (plan.some((p) => p.opcode === "VOpen")) read.add("corpus_search_fts");
 			const tables = [...read].sort();
+			if (tables.some((t) => t.startsWith("corpus_stage_"))) throw bad("unpublished snapshot tables are not readable");
 			// Read before the statement runs, so nothing it does can shape the reported as_of.
-			const as_of = asOf(sql, tables.flatMap((t) => (SEARCH.includes(t) ? Object.values(SOURCES) : Object.hasOwn(FAMILIES, t) ? [t] : [])));
+			const as_of = asOf(sql, tables.flatMap((t) => (SEARCH.includes(t) ? Object.values(SOURCES) : Object.hasOwn(FAMILIES, t) || Object.hasOwn(SCANS, t) || Object.hasOwn(SNAPSHOTS, t) ? [t] : [])));
 			const cursor = sql.exec(wrapped);
 			const columns = cursor.columnNames;
 			const fits = budget({ ...head, columns, rows: [], tables_read: tables, as_of });

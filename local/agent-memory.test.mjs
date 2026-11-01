@@ -118,6 +118,32 @@ describe("reading", () => {
 		]);
 		assert.deepEqual(am.extract("codex", am.readLines(codex, 0).lines).map((m) => m.text), ["Use pnpm.", "Switched to pnpm."]);
 	});
+
+	it("bounds UTF-8 reference outcomes without hanging when the other lists are empty", () => {
+		const text = "这是一个很长的中文段落用于说明修复登录超时的问题".repeat(20);
+		const messages = Array.from({ length: 10 }, (_, i) => ({ role: "assistant", pos: i, text: `https://github.com/acme/web/pull/${i + 1} ${text}${i}\nsha ${i}a1b2c3d4e5f60718293a4b5c6d7e8f9012345${i}` }));
+		const child = spawnSync(process.execPath, ["--input-type=module", "-e", `import fs from "node:fs"; import { heuristicDigest } from ${JSON.stringify(new URL("./agent-memory.mjs", import.meta.url).href)}; console.log(JSON.stringify(heuristicDigest(JSON.parse(fs.readFileSync(0, "utf8")))));`], { input: JSON.stringify(messages), encoding: "utf8", timeout: 3000 });
+		assert.equal(child.status, 0, child.error?.message ?? child.stderr);
+		const d = JSON.parse(child.stdout);
+		assert.ok(Buffer.byteLength(JSON.stringify(d)) <= am.LIMITS.part);
+		assert.ok(d.outcomes.prs.length > 0 && d.outcomes.prs.length < messages.length);
+		assert.equal(am.bodyProblem(d), null);
+	});
+
+	it("keeps encountered PR, ticket and commit references literally, with the assistant's sentence as context", () => {
+		const f = transcript("refs", [
+			codexLine("user_message", "Fix PROJ-123: the login page times out after 30 seconds. Ticket: https://acme.atlassian.net/browse/PROJ-123?focus=1"),
+			codexLine("agent_message", "Opened https://github.com/acme/web/pull/42 to fix the login timeout. Pushed acme/web@0a1b2c3d4e with the shorter retry."),
+		]);
+		const d = am.heuristicDigest(am.extract("codex", am.readLines(f, 0).lines));
+		// The same body test/capture.test.ts ingests, which links the session to the PR, ticket and commit.
+		assert.deepEqual(d, {
+			asks: [{ text: "Fix PROJ-123: the login page times out after 30 seconds.", pos: 0 }], decisions: [], corrections: [],
+			outcomes: { commits: ["Pushed acme/web@0a1b2c3d4e with the shorter retry.", "0a1b2c3d4e"], prs: ["Opened https://github.com/acme/web/pull/42 to fix the login timeout."], tests: [] },
+			entities: ["PROJ-123", "https://acme.atlassian.net/browse/PROJ-123", "https://github.com/acme/web/pull/42", "acme/web@0a1b2c3d4e"], dropped: { asks: 0, decisions: 0, corrections: 0 },
+		});
+		assert.equal(am.bodyProblem(d), null);
+	});
 });
 
 describe("capture protocol", () => {
@@ -623,6 +649,64 @@ describe("recovery and install", () => {
 		assert.throws(() => am.install(), /install_refused/);
 		assert.deepEqual(fs.readdirSync(outside), []);
 	});
+
+	it("runs corpus-upload from the installed command alone, through the corpus CLI's arguments and uploader to a local fake server", async () => {
+		const { DatabaseSync } = await import("node:sqlite"), http = await import("node:http");
+		const { bin } = am.install();
+		// One synthetic table under its retained original DDL (src/corpus/families.ts); the email column never uploads.
+		const ddl = "CREATE TABLE contributors(\n  repo TEXT,\n  rank INT,\n  commits INT,\n  name TEXT,\n  email TEXT\n)";
+		const dir = fs.mkdtempSync(path.join(tmp, "corpus-")), file = path.join(dir, "sample.sqlite");
+		const db = new DatabaseSync(file);
+		db.exec(ddl);
+		db.exec("INSERT INTO contributors (rowid, repo, rank, commits, name, email) VALUES (3, 'acme/web', 1, 2, 'Alice', 'alice@acme.example')");
+		db.close();
+		const family = { table: "contributors", schema_sha256: sha(ddl), key: ["rowid"], columns: ["rowid", "repo", "rank", "commits", "name"] };
+		const seen = [];
+		const server = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (d) => { body += d; }).on("end", () => {
+				seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: body && JSON.parse(body) });
+				const c = body && JSON.parse(body);
+				res.setHeader("content-type", "application/json");
+				res.end(JSON.stringify(req.url.startsWith("/v1/corpus/status") ? { generation: "g1", families: [family], held: {}, tables: [] }
+					: { receipt: { status: "stored", sha256: c.sha256, last_key: c.rows.length ? [c.rows.at(-1)[0]] : c.after, complete: c.final } }));
+			});
+		});
+		server.listen(0, "127.0.0.1");
+		await once(server, "listening");
+		try {
+			const token = path.join(dir, "import.token"), config = path.join(dir, "upload.json");
+			fs.writeFileSync(token, "am_import_fake", { mode: 0o600 });
+			fs.writeFileSync(config, JSON.stringify({ server: `http://127.0.0.1:${server.address().port}`, token_file: token }), { mode: 0o600 });
+			const child = spawn(bin, ["corpus-upload", "--db", file, "--profile", "test", "--tables", "contributors", "--as-of", "2026-08-12T00:00:00Z", "--config", config],
+				{ cwd: dir, env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
+			let out = "", err = "";
+			child.stdout.on("data", (d) => { out += d; });
+			child.stderr.on("data", (d) => { err += d; });
+			const [code] = await once(child, "close");
+			assert.equal(code, 0, err);
+			assert.deepEqual(JSON.parse(out), { status: "done", generation: "g1", tables: { contributors: { last_key: [3], rows: 1, complete: true } } });
+			assert.deepEqual(seen.map((r) => `${r.method} ${r.url.split("?")[0]}`), ["GET /v1/corpus/status", "POST /v1/corpus/import"]);
+			assert.ok(seen.every((r) => r.auth === "Bearer am_import_fake"));
+			assert.deepEqual(seen[1].body.rows, [[3, "acme/web", 1, 2, "Alice"]]);
+			assert.ok(fs.existsSync(path.join(am.home(), "migration", `corpus-test-127.0.0.1:${server.address().port}.json`)), "resume state is kept");
+		} finally { server.close(); }
+		const usage = spawnSync(bin, ["corpus-upload"], { encoding: "utf8", env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
+		assert.equal(usage.status, 2);
+		assert.match(usage.stderr, /^usage: agent-memory corpus-upload --db FILE/);
+		// --git reaches the Git adapter: a directory without an origin is refused per checkout, with no request (the fake server is closed).
+		const plain = fs.mkdtempSync(path.join(tmp, "plain-"));
+		const viaGit = spawnSync(bin, ["corpus-upload", "--git", plain, "--profile", "test", "--config", path.join(dir, "upload.json")], { encoding: "utf8", env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
+		assert.equal(viaGit.status, 1, viaGit.stderr);
+		assert.deepEqual(JSON.parse(viaGit.stdout), [{ checkout: plain, status: "refused", reason: "no_origin_repo" }]);
+		assert.equal(spawnSync(bin, ["corpus-upload", "--git", plain, "--profile", "test", "--tables", "repos"], { encoding: "utf8" }).status, 2);
+		// migrate.mjs's run lock excludes a corpus run too, before any source read or request.
+		fs.writeFileSync(path.join(am.home(), "migration", "run.lock"), "{\"pid\":1}", { mode: 0o600 });
+		const locked = spawnSync(bin, ["corpus-upload", "--db", path.join(tmp, "absent.sqlite"), "--profile", "test", "--tables", "contributors", "--as-of", "2026-08-12T00:00:00Z", "--config", path.join(dir, "upload.json")],
+			{ encoding: "utf8", env: { ...process.env, AGENT_MEMORY_HOME: am.home() } });
+		assert.equal(locked.status, 1);
+		assert.match(locked.stderr, /another migrate run holds/);
+	});
 });
 
 describe("general confined executor", () => {
@@ -662,3 +746,23 @@ describe("general confined executor", () => {
 
 // Daily cases remain reachable through the existing permanent local test entry.
 await import("./daily-refresh.test.mjs");
+
+describe("optional corpus refresh after SessionEnd", () => {
+	it("runs only when corpus_profile is set, for checkouts whose session ended, through the import config, after the queue settles", async () => {
+		const repo = fs.mkdtempSync(path.join(tmp, "corpus-cwd-"));
+		spawnSync("git", ["init", "-q", repo]);
+		const f = transcript(`corpus-end-${n}`, [claudeLine("user", "hello")]);
+		const trigger = (session, event) => am.hook("claude-code", JSON.stringify({ session_id: session, transcript_path: f, cwd: repo, hook_event_name: event }), { spawnRun: false });
+		trigger("c1", "SessionEnd");
+		assert.equal((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, undefined, "no config, no corpus work");
+		const token = path.join(tmp, `corpus-token-${n}`), cfg = path.join(tmp, `corpus-upload-${n}.json`);
+		fs.writeFileSync(token, "am_import_fake", { mode: 0o600 });
+		fs.writeFileSync(cfg, JSON.stringify({ server: "http://127.0.0.1:9", token_file: token }), { mode: 0o600 });
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ corpus_profile: "test", corpus_config: cfg }));
+		trigger("c2", "Stop");
+		assert.equal((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, undefined, "only an ended session triggers it");
+		trigger("c3", "SessionEnd");
+		// The checkout has no origin, so the corpus CLI refuses it before any request (the configured server is a closed port).
+		assert.deepEqual((await am.run({ server: fakeServer(), runner: keepAllRunner(), debounceMs: 0 })).results.corpus, { status: "incomplete", checkouts: 1 });
+	});
+});

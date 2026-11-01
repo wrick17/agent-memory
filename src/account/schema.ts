@@ -49,4 +49,13 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 		claim_receipt TEXT NOT NULL, plan_receipt TEXT, finish_receipt TEXT, created_at TEXT NOT NULL, closed_at TEXT, seq INTEGER NOT NULL,
 		PRIMARY KEY (profile, day)) WITHOUT ROWID`,
 	"CREATE UNIQUE INDEX refresh_days_open ON refresh_days (profile) WHERE state IN ('claiming','pending')",
+], [
+	// v6 (section 15 Review): the owner's review list. A migrated record waiting for a profile (metadata and its exact plan --routes
+	// binding, never content) or a move a collision refused. `profile` is the metadata's origin (a collision's destination); a wipe of
+	// that origin clears the payload and leaves the row `wiped` (wipe.ts scrubReview). Rows are never deleted; a decision only records a choice.
+	`CREATE TABLE review_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('migration','collision')), profile TEXT NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('open','assigned','resolved','wiped')), payload TEXT NOT NULL, decision TEXT,
+		created_at TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID`,
+	"CREATE INDEX review_items_seq ON review_items (seq, id)",
+	...tombstoneTriggers("account_meta", "review_items", pk("id")),
 ]];
