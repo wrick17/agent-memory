@@ -805,6 +805,11 @@ The owner approved fresh isolated Agent Memory ChatGPT registration and exactly 
 
 HTTP was 200 with missing Content-Type, plan_unknown_event and no terminal observed before refusal. The [offline diagnosis](/private/tmp/am-r8-diagnosis-opus-EweXJI9r/FINDINGS.md) confirms missing MIME as an actual Node transport fact. The reviewed diagnostic exception parsed missing MIME; the strict production gate refuses earlier. The event is unmatched in 185 explicit public constants, so neither a fix nor guard weakening is justified. Capture remains OFF/UNINSTALLED/RUNTIME-UNACCEPTED and batch own-app runtime unavailable. Capture v3's accepted 46 offline cases and incomplete/nonzero combined limits retain their scopes; acceptance stays 10 of 25. Earlier six/seven-request checkpoints are historical, not current authority.
 
+### Native synthetic PART checkpoint, 2026-11-01
+
+One separately approved synthetic native invocation passed the PART check. Driver `5077d64a` ran source `ea8e6a31` once and exited 0. The [verified receipt](/private/tmp/am-native-accept-receipt-7946509b3fcc4c3cb7fa4f3e780d731d/receipt.json), SHA-256 `913129b9f8d4`, records factory available with classification `denied`, exec `ok`, PART rejection `null` with the literal kept, one native invocation and zero leftover auth links. The existing Codex session worked without a login for this step; credential contents and rotation were not inspected.
+
+An earlier external preflight refused before launch because an old canary was absent. Its correction left existing canaries untouched; only the resulting authorized launch ran. Fresh home/tmp were cleaned, and source, capsule, modes and canaries were preserved. This separate native grant is spent. Own-app 8/8 remains spent/blocked; no ninth own-app request or extra inference is authorized. Capture stays OFF/UNINSTALLED/RUNTIME-UNACCEPTED, batch own-app runtime remains unavailable, and OPS, tool inventory and real parity remain unverified. Capture v3's 46 offline cases and incomplete/nonzero combined limits retain their scope. Checklist stays 11 of 25.
 
 ## First profile backup and restore source adoption, 2026-10-31
 
