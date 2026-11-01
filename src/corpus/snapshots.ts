@@ -10,7 +10,7 @@
 // - Load: the existing bulk route and chunk body (POST /v1/corpus/import: table, schema_sha256, source.file_sha256, as_of, columns, after,
 //   rows, final, sha256), with the same generation pin, import grant, work guard terms, redaction-before-hash, row/byte budgets, key order
 //   and checkRow privacy (contact, personal, forbidden lineage). For a snapshot table the store derives the cut from the chunk, appends
-//   rows in rowid order to that table's STAGE table, and keys replays as `corpus:snapshot:<cut_id>:<table>:<first rowid>`, so two cuts
+//   rows in key order (rowid, or the declared WITHOUT ROWID key) to that table's STAGE table, and keys replays as `corpus:snapshot:<cut_id>:<table>:<first key>`, so two cuts
 //   never collide. A chunk for a cut other than the set's loading cut starts that cut only if its as_of is strictly newer than the
 //   published cut's (an older or equal cut is refused stale_snapshot). Abandoning a cut atomically deletes its stage rows AND
 //   corpus_requests entries with the `corpus:snapshot:<cut_id>:` prefix. Restarting an eligible abandoned cut resets its existing
@@ -31,7 +31,7 @@ import { sha256 } from "../domain/ids";
 import { knowledgeTerms } from "../domain/guard";
 import { REDACTED } from "../domain/redact";
 import { Fail } from "../domain/types";
-import { CHUNK_ROWS, checkRow, chunkHash, type Family, type Key, type Value } from "./families";
+import { CHUNK_ROWS, checkRow, chunkHash, compareKeys, type Family, type Key, type Value } from "./families";
 
 const CONTACT = "contact field: emails never upload (personal-field rule, section 4)";
 
@@ -44,9 +44,13 @@ export interface SnapshotFamily {
 	omit: Record<string, string>;
 	/** Columns naming one repo (work guard project terms), one person, or a JSON array of person names. */
 	repos: string[]; people: string[]; peopleJson: string[];
+	/** Paging and replay key: ["rowid"] when absent, else the original WITHOUT ROWID primary key in order. */
+	key?: string[];
+	/** Original indexes, byte for byte, created on the live table only. */
+	indexes?: string[];
 }
 
-export const SNAPSHOTS: Record<string, SnapshotFamily> = {
+const PATTERN_FAMILIES: Record<string, SnapshotFamily> = {
 	pattern_coordinated_changes: {
 		ddl: "CREATE TABLE pattern_coordinated_changes(\n  episode_id TEXT,\n  ticket TEXT,\n  classification TEXT,\n  confidence TEXT,\n  first_at TEXT,\n  last_at TEXT,\n  span_days REAL,\n  repo_count INT,\n  commit_count INT,\n  non_merge_repos INT,\n  layers_json TEXT\n)",
 		columns: { rowid: "integer", episode_id: "text", ticket: "text", classification: "text", confidence: "text", first_at: "text", last_at: "text", span_days: "real", repo_count: "integer", commit_count: "integer", non_merge_repos: "integer", layers_json: "text" },
@@ -91,33 +95,190 @@ export const SNAPSHOTS: Record<string, SnapshotFamily> = {
 	},
 };
 
+// ---------- v5 record-type families (migration 5), active in SNAPSHOTS beside the frozen v4 patterns ----------
+//
+// Per-profile dated snapshot sets for the record types the corpus tool must answer by exact get (section 14 query tools): PRs, tickets
+// and sessions, plus release/tag metadata and the curated judgment tables. Source: the retained local corpus file only, through the
+// existing bulk route and every snapshot protection above; no PR, Jira or session feed. Each set publishes on its own, so one publish
+// transaction is bounded by its set. Exact DDL and index SQL come from the inventory corpus-schema.json (4575c22a…).
+// Consumers (wired): the active SNAPSHOTS/SNAPSHOT_SETS compose these beside the frozen v4 registry; migration 5 creates them; paging, replay
+// and stage continuation use `key` (rowid or the WITHOUT ROWID primary key: after = the stage's greatest key, replay id hashes a composite first key like
+// requestIdOf); every column identifier is quoted (frontend_workflows has "trigger"); answer
+//   get pr      key "owner/repo#number"  -> pull_requests row, its pr_tickets and pr_commit_links;
+//   get ticket  key "KEY-1"              -> its ticket_episodes and tickets commit links (500-row cap, truncated flag);
+//   get session key session_id           -> codex_sessions metadata, its session_commit_links and session_ticket_links;
+// with explore corpus counts for pr (`github:owner/repo#n`), ticket (`jira:KEY`) and session (`session:codex:<id>`) nodes.
+// Search documents are not built for these rows. Raw session text, session_reference_index and pattern_session_* stay held.
+const BUILDER_KEY = "builder key: untyped duplicate of the row's natural key; never uploaded";
+const LOCAL_PATH = "local filesystem path or store location on the owner's machine (personal-field rule)";
+const UNPROVED = "relevance content unproved by privacy-lineage; may carry session text";
+
+export const SNAPSHOTS_V5: Record<string, SnapshotFamily> = {
+	pull_requests: {
+		ddl: "CREATE TABLE pull_requests(\n  pr_key,\n  repo TEXT,\n  number INT,\n  title TEXT,\n  body TEXT,\n  state TEXT,\n  is_draft INT,\n  author TEXT,\n  created_at TEXT,\n  updated_at TEXT,\n  closed_at TEXT,\n  merged_at TEXT,\n  merged_by TEXT,\n  base_ref TEXT,\n  base_sha TEXT,\n  head_ref TEXT,\n  head_sha TEXT,\n  head_repo TEXT,\n  merge_sha TEXT,\n  commit_count INT,\n  labels_json TEXT,\n  milestone_json TEXT,\n  requested_reviewers_json TEXT,\n  requested_teams_json TEXT,\n  tickets_json TEXT,\n  url TEXT,\n  rest_present INT,\n  \"pr_key:1\" TEXT\n)",
+		columns: { rowid: "integer", repo: "text", number: "integer", title: "text", body: "text", state: "text", is_draft: "integer", author: "text", created_at: "text", updated_at: "text", closed_at: "text", merged_at: "text", merged_by: "text", base_ref: "text", base_sha: "text", head_ref: "text", head_sha: "text", head_repo: "text", merge_sha: "text", commit_count: "integer", labels_json: "text", milestone_json: "text", requested_reviewers_json: "text", requested_teams_json: "text", tickets_json: "text", url: "text", rest_present: "integer" },
+		omit: { "pr_key": BUILDER_KEY, "pr_key:1": BUILDER_KEY },
+		repos: ["repo","head_repo"], people: ["author","merged_by"], peopleJson: [],
+		indexes: ["CREATE INDEX pull_requests_repo_number ON pull_requests(repo,number)"],
+	},
+	pr_tickets: {
+		ddl: "CREATE TABLE pr_tickets(repo TEXT,number INT,ticket TEXT)",
+		columns: { rowid: "integer", repo: "text", number: "integer", ticket: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+	},
+	pr_commit_links: {
+		ddl: "CREATE TABLE pr_commit_links(\n  repo TEXT,\n  number INT,\n  relation TEXT,\n  sha TEXT\n)",
+		columns: { rowid: "integer", repo: "text", number: "integer", relation: "text", sha: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+		indexes: ["CREATE INDEX pr_commit_links_sha ON pr_commit_links(repo,sha)"],
+	},
+	releases: {
+		ddl: "CREATE TABLE releases(\n  release_key,\n  repo TEXT,\n  id INT,\n  tag_name TEXT,\n  target_commitish TEXT,\n  name TEXT,\n  body TEXT,\n  draft INT,\n  prerelease INT,\n  author TEXT,\n  created_at TEXT,\n  published_at TEXT,\n  url TEXT,\n  assets_json TEXT\n)",
+		columns: { rowid: "integer", repo: "text", id: "integer", tag_name: "text", target_commitish: "text", name: "text", body: "text", draft: "integer", prerelease: "integer", author: "text", created_at: "text", published_at: "text", url: "text", assets_json: "text" },
+		omit: { "release_key": BUILDER_KEY },
+		repos: ["repo"], people: ["author"], peopleJson: [],
+	},
+	github_tags: {
+		ddl: "CREATE TABLE github_tags(\n  repo TEXT,\n  refname TEXT,\n  short_name TEXT,\n  target_sha TEXT,\n  object_type TEXT,\n  creator_date TEXT,\n  author_name TEXT,\n  author_email TEXT,\n  subject TEXT\n)",
+		columns: { rowid: "integer", repo: "text", refname: "text", short_name: "text", target_sha: "text", object_type: "text", creator_date: "text", author_name: "text", subject: "text" },
+		omit: { "author_email": CONTACT },
+		repos: ["repo"], people: ["author_name"], peopleJson: [],
+	},
+	tickets: {
+		ddl: "CREATE TABLE tickets (\n    ticket TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL,\n    PRIMARY KEY (ticket, repo, sha)\n  ) WITHOUT ROWID",
+		columns: { ticket: "text", repo: "text", sha: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+		key: ["ticket","repo","sha"],
+		indexes: ["CREATE INDEX tickets_repo ON tickets(repo, ticket)"],
+	},
+	ticket_episodes: {
+		ddl: "CREATE TABLE ticket_episodes (\n    episode_id TEXT PRIMARY KEY,ticket TEXT,episode_no INTEGER,repo_count INTEGER,\n    commit_count INTEGER,unique_sha_count INTEGER,non_merge_repos INTEGER,\n    first_date TEXT,last_date TEXT,span_days REAL,classification TEXT,confidence TEXT\n  )",
+		columns: { rowid: "integer", episode_id: "text", ticket: "text", episode_no: "integer", repo_count: "integer", commit_count: "integer", unique_sha_count: "integer", non_merge_repos: "integer", first_date: "text", last_date: "text", span_days: "real", classification: "text", confidence: "text" },
+		omit: {  },
+		repos: [], people: [], peopleJson: [],
+		indexes: ["CREATE INDEX ticket_episode_ticket ON ticket_episodes(ticket)"],
+	},
+	codex_sessions: {
+		ddl: "CREATE TABLE codex_sessions(session_id TEXT PRIMARY KEY,source_file TEXT,store TEXT,created_at TEXT,cwd TEXT,\n    originator TEXT,cli_version TEXT,git_repo TEXT,git_branch TEXT,git_commit TEXT,events INTEGER,relevant INTEGER,relevance_json TEXT)",
+		columns: { rowid: "integer", session_id: "text", created_at: "text", originator: "text", cli_version: "text", git_branch: "text", git_commit: "text", events: "integer", relevant: "integer" },
+		omit: { "source_file": LOCAL_PATH, "store": LOCAL_PATH, "cwd": LOCAL_PATH, "git_repo": LOCAL_PATH, "relevance_json": UNPROVED },
+		repos: [], people: [], peopleJson: [],
+	},
+	session_commit_links: {
+		ddl: "CREATE TABLE session_commit_links(session_id TEXT,commit_ref TEXT,repo TEXT,sha TEXT,resolution TEXT,\n          PRIMARY KEY(session_id,commit_ref,repo,sha))",
+		columns: { rowid: "integer", session_id: "text", commit_ref: "text", repo: "text", sha: "text", resolution: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+		indexes: ["CREATE INDEX session_commit_links_sha ON session_commit_links(repo,sha)"],
+	},
+	session_ticket_links: {
+		ddl: "CREATE TABLE session_ticket_links(session_id TEXT,ticket TEXT,PRIMARY KEY(session_id,ticket))",
+		columns: { rowid: "integer", session_id: "text", ticket: "text" },
+		omit: {  },
+		repos: [], people: [], peopleJson: [],
+	},
+	validated_contracts: {
+		ddl: "CREATE TABLE validated_contracts(\n        key TEXT PRIMARY KEY,name TEXT,journey TEXT,repository TEXT,sha TEXT,confidence TEXT,\n        auth_contract_json TEXT,failure_boundaries_json TEXT,provenance_json TEXT)",
+		columns: { rowid: "integer", key: "text", name: "text", journey: "text", repository: "text", sha: "text", confidence: "text", auth_contract_json: "text", failure_boundaries_json: "text", provenance_json: "text" },
+		omit: {  },
+		repos: ["repository"], people: [], peopleJson: [],
+	},
+	frontend_business_facts: {
+		ddl: "CREATE TABLE frontend_business_facts(\n  fact_id TEXT,\n  repo_key TEXT,\n  domain TEXT,\n  fact_type TEXT,\n  statement TEXT,\n  confidence REAL,\n  snapshot_id TEXT,\n  evidence_json TEXT,\n  notes TEXT\n)",
+		columns: { rowid: "integer", fact_id: "text", repo_key: "text", domain: "text", fact_type: "text", statement: "text", confidence: "real", snapshot_id: "text", evidence_json: "text", notes: "text" },
+		omit: {  },
+		repos: ["repo_key"], people: [], peopleJson: [],
+	},
+	frontend_workflows: {
+		ddl: "CREATE TABLE frontend_workflows(\n  workflow_id TEXT,\n  repo_key TEXT,\n  domain TEXT,\n  name TEXT,\n  actor TEXT,\n  \"trigger\" TEXT,\n  steps_json TEXT,\n  outcomes_json TEXT,\n  confidence REAL,\n  snapshot_id TEXT,\n  evidence_json TEXT,\n  notes TEXT\n)",
+		columns: { rowid: "integer", workflow_id: "text", repo_key: "text", domain: "text", name: "text", actor: "text", trigger: "text", steps_json: "text", outcomes_json: "text", confidence: "real", snapshot_id: "text", evidence_json: "text", notes: "text" },
+		omit: {  },
+		repos: ["repo_key"], people: [], peopleJson: [],
+	},
+	frontend_relationships: {
+		ddl: "CREATE TABLE frontend_relationships(\n  relationship_id TEXT,\n  source_kind TEXT,\n  source_key TEXT,\n  relation TEXT,\n  target_kind TEXT,\n  target_key TEXT,\n  confidence REAL,\n  evidence_json TEXT,\n  notes TEXT\n)",
+		columns: { rowid: "integer", relationship_id: "text", source_kind: "text", source_key: "text", relation: "text", target_kind: "text", target_key: "text", confidence: "real", evidence_json: "text", notes: "text" },
+		omit: {  },
+		repos: [], people: [], peopleJson: [],
+	},
+	frontend_uncertainties: {
+		ddl: "CREATE TABLE frontend_uncertainties(\n  uncertainty_id TEXT,\n  repo_key TEXT,\n  statement TEXT,\n  reason TEXT,\n  resolution TEXT,\n  severity TEXT\n)",
+		columns: { rowid: "integer", uncertainty_id: "text", repo_key: "text", statement: "text", reason: "text", resolution: "text", severity: "text" },
+		omit: {  },
+		repos: ["repo_key"], people: [], peopleJson: [],
+	},
+	ownership: {
+		ddl: "CREATE TABLE ownership(\n  repo TEXT,\n  sha TEXT,\n  path TEXT,\n  line INT,\n  pattern TEXT,\n  owners TEXT\n)",
+		columns: { rowid: "integer", repo: "text", sha: "text", path: "text", line: "integer", pattern: "text", owners: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+	},
+	predecessor_links: {
+		ddl: "CREATE TABLE predecessor_links(\n  archived_repo TEXT,\n  current_repo TEXT,\n  confidence TEXT,\n  basis TEXT,\n  evidence TEXT\n)",
+		columns: { rowid: "integer", archived_repo: "text", current_repo: "text", confidence: "text", basis: "text", evidence: "text" },
+		omit: {  },
+		repos: ["archived_repo","current_repo"], people: [], peopleJson: [],
+	},
+	journey_edges: {
+		ddl: "CREATE TABLE journey_edges(\n  journey TEXT,\n  repo TEXT,\n  confidence TEXT,\n  basis TEXT\n)",
+		columns: { rowid: "integer", journey: "text", repo: "text", confidence: "text", basis: "text" },
+		omit: {  },
+		repos: ["repo"], people: [], peopleJson: [],
+	},
+};
+
+export const SNAPSHOT_SETS_V5: Record<string, string[]> = {
+	pull_requests: ["pull_requests", "pr_tickets", "pr_commit_links"],
+	releases: ["releases", "github_tags"],
+	tickets: ["tickets", "ticket_episodes"],
+	sessions: ["codex_sessions", "session_commit_links", "session_ticket_links"],
+	judgment: ["validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties", "ownership", "predecessor_links", "journey_edges"],
+};
+
 /** Snapshot sets: the tables one cut replaces together. */
-export const SNAPSHOT_SETS: Record<string, string[]> = { patterns: Object.keys(SNAPSHOTS) };
+/** The frozen v4 `patterns` set in its migration-4 order: its DDL, migration bytes, cut ids and receipt ids never change. */
+const PATTERNS = Object.keys(PATTERN_FAMILIES);
+/** The active registry: the v4 patterns and the v5 record-type families, in disjoint sets. */
+export const SNAPSHOTS: Record<string, SnapshotFamily> = { ...PATTERN_FAMILIES, ...SNAPSHOTS_V5 };
+export const SNAPSHOT_SETS: Record<string, string[]> = { patterns: PATTERNS, ...SNAPSHOT_SETS_V5 };
 export const setOf = (table: string): string | null => Object.entries(SNAPSHOT_SETS).find(([, ts]) => ts.includes(table))?.[0] ?? null;
 export const snapshotSchemaSha = (table: string) => sha256(SNAPSHOTS[table]!.ddl);
 /** The cut identity: fixed tuple of set, source, as_of (normalized ISO) and every member's DDL hash in set order. */
 export const cutIdOf = (set: string, sourceSha256: string, asOf: string) =>
 	sha256(JSON.stringify(["corpus-snapshot/1:cut", set, sourceSha256, new Date(asOf).toISOString(), SNAPSHOT_SETS[set]!.map(snapshotSchemaSha)]));
-export const snapshotRequestId = (cutId: string, table: string, firstRowid: number | null) => `corpus:snapshot:${cutId}:${table}:${firstRowid ?? "end"}`;
+/** A single-value key (rowid) keeps its plain form, so v4 receipt ids are unchanged; a composite key is hashed as requestIdOf hashes it. */
+export const snapshotRequestId = (cutId: string, table: string, first: Key | null) =>
+	`corpus:snapshot:${cutId}:${table}:${first === null ? "end" : first.length === 1 ? String(first[0]) : `k${sha256(JSON.stringify(first)).slice(0, 32)}`}`;
+/** A family's paging, replay and stage-continuation key. */
+export const keyOf = (table: string) => SNAPSHOTS[table]!.key ?? ["rowid"];
+const q = (c: string) => (c === "rowid" ? c : `"${c}"`);
 /** A table's stage: the original DDL under `corpus_stage_<table>`, so staged rows keep the exact column set and types. */
 export const stageName = (table: string) => `corpus_stage_${table}`;
-const stageDdl = (table: string) => SNAPSHOTS[table]!.ddl.replace(`CREATE TABLE ${table}(`, `CREATE TABLE ${stageName(table)}(`);
+// Only the leading name changes, so the stage keeps the exact columns, types and any WITHOUT ROWID key (migration 4 output unchanged).
+const stageOf = (table: string, ddl: string) => ddl.replace(new RegExp(`^CREATE TABLE ${table}\\b`), `CREATE TABLE ${stageName(table)}`);
+const stageDdl = (table: string) => stageOf(table, SNAPSHOTS[table]!.ddl);
 
 /** What the uploader needs per snapshot family (status `snapshot_families`): projection, paging key, hash and set. */
-export const snapshotManifest = () => Object.entries(SNAPSHOTS).map(([table, f]) => ({ table, schema_sha256: snapshotSchemaSha(table), columns: Object.keys(f.columns), key: ["rowid"], set: setOf(table)! }));
+export const snapshotManifest = () => Object.entries(SNAPSHOTS).map(([table, f]) => ({ table, schema_sha256: snapshotSchemaSha(table), columns: Object.keys(f.columns), key: keyOf(table), set: setOf(table)! }));
 
 /**
  * Migration 4 (store.ts CORPUS_MIGRATIONS): the live tables under their exact DDL, one stage per table, and the cut ledger.
  * `tables` holds {table: {schema_sha256, rows, sum, final}} per cut; state moves loading → published → superseded, or loading → abandoned.
  */
 export const SNAPSHOT_MIGRATION: string[] = [
-	...Object.keys(SNAPSHOTS).flatMap((t) => [SNAPSHOTS[t]!.ddl, stageDdl(t)]),
+	...PATTERNS.flatMap((t) => [SNAPSHOTS[t]!.ddl, stageDdl(t)]),
 	`CREATE TABLE corpus_snapshots (set_name TEXT NOT NULL, cut_id TEXT NOT NULL, source_sha256 TEXT NOT NULL, as_of TEXT NOT NULL,
 		state TEXT NOT NULL CHECK (state IN ('loading', 'published', 'superseded', 'abandoned')), tables TEXT NOT NULL, begun_at TEXT NOT NULL,
 		published_at TEXT, PRIMARY KEY (set_name, cut_id)) WITHOUT ROWID`,
 	"CREATE UNIQUE INDEX corpus_snapshots_one_published ON corpus_snapshots(set_name) WHERE state = 'published'",
 	"CREATE UNIQUE INDEX corpus_snapshots_one_loading ON corpus_snapshots(set_name) WHERE state = 'loading'",
 ];
+
+/** Migration 5 (store.ts CORPUS_MIGRATIONS): each live table with its original indexes, then its stage (no indexes); the cut ledger already exists. */
+export const SNAPSHOT_MIGRATION_5: string[] = Object.entries(SNAPSHOTS_V5).flatMap(([t, f]) => [f.ddl, ...(f.indexes ?? []), stageOf(t, f.ddl)]);
 
 /**
  * The work guard terms a checked snapshot chunk introduces (the chunkTerms rule): each repo column value as a project, each person
@@ -143,7 +304,7 @@ export function snapshotTerms(f: SnapshotFamily, rows: Value[][]): string[] {
 const bad = (reason: string, message: string, details: Record<string, unknown> = {}) => Fail.of("validation", message, { reason, ...details });
 export const isSnapshot = (table: string) => Object.hasOwn(SNAPSHOTS, table);
 /** checkRow's view of a snapshot family: its projection, keyed by rowid; one object per table, so chunkTerms can tell it apart. */
-const ADAPTED = new Map(Object.entries(SNAPSHOTS).map(([t, f]) => [t, { ddl: f.ddl, indexes: [], columns: f.columns, key: ["rowid"], omit: f.omit, repo: "", people: f.people } as Family]));
+const ADAPTED = new Map(Object.entries(SNAPSHOTS).map(([t, f]) => [t, { ddl: f.ddl, indexes: [], columns: f.columns, key: keyOf(t), omit: f.omit, repo: "", people: f.people } as Family]));
 export const snapshotFamily = (table: string) => ADAPTED.get(table)!;
 export const snapshotTableOf = (f: Family) => [...ADAPTED].find(([, v]) => v === f)?.[0] ?? null;
 
@@ -157,10 +318,13 @@ export function checkSnapshotChunk(c: { table: string; schema_sha256: string; co
 	if (JSON.stringify(c.columns) !== JSON.stringify(Object.keys(f.columns))) throw bad("columns", `columns must be exactly ${Object.keys(f.columns).join(", ")}`);
 	if (c.rows.length > CHUNK_ROWS) throw Fail.of("size_budget", `a chunk holds at most ${CHUNK_ROWS} rows`, { reason: "chunk_rows" });
 	if (!c.rows.length && !c.final) throw bad("empty_chunk", "only the final chunk may be empty");
-	if (c.after !== null && (c.after.length !== 1 || !Number.isSafeInteger(c.after[0]))) throw bad("after", "a snapshot cursor is [rowid]");
+	const key = keyOf(c.table), cols = Object.keys(f.columns);
+	if (c.after !== null && (c.after.length !== key.length || c.after.some((v, i) => (key[i] === "rowid" ? !Number.isSafeInteger(v) : typeof v !== "string"))))
+		throw bad("after", `a snapshot cursor is [${key.join(", ")}]`);
 	const rows = c.rows.map((r, i) => checkRow(f, r, i));
-	const keys = rows.map((r) => [r[0]!] as Key);
-	keys.forEach((k, i) => { const prev = i ? keys[i - 1]! : c.after; if (prev && (k[0] as number) <= (prev[0] as number)) throw bad("order", "rows must be in strictly increasing rowid order after `after`"); });
+	const keys = rows.map((r) => key.map((k) => r[cols.indexOf(k)]!) as Key);
+	// SQLite BINARY order over the whole key (integers numerically, text by UTF-8 bytes), strictly increasing.
+	keys.forEach((k, i) => { const prev = i ? keys[i - 1]! : c.after; if (prev && compareKeys(k, prev) <= 0) throw bad("order", `rows must be in strictly increasing ${key.join(", ")} order after \`after\``); });
 	snapshotTerms(SNAPSHOTS[c.table]!, rows);
 	return { f, rows, keys };
 }
@@ -197,7 +361,7 @@ export function applySnapshotChunk(sql: SqlStorage, c: { table: string; schema_s
 	const hash = chunkHash(c);
 	if (hash !== c.sha256) throw bad("hash_mismatch", "the chunk does not match its sha256");
 	const set = setOf(c.table)!, asOf = new Date(c.as_of).toISOString(), cutId = cutIdOf(set, c.source.file_sha256, asOf);
-	const requestId = snapshotRequestId(cutId, c.table, keys.length ? keys[0]![0] as number : null);
+	const requestId = snapshotRequestId(cutId, c.table, keys[0] ?? null);
 	const stateOf = () => cuts(sql, "set_name = ? AND cut_id = ?", set, cutId)[0]?.state ?? "unknown";
 	const prior = sql.exec<{ sha256: string; rows: number; last_key: string | null; complete: number }>("SELECT sha256, rows, last_key, complete FROM corpus_requests WHERE request_id = ?", requestId).toArray()[0];
 	if (prior) {
@@ -220,12 +384,12 @@ export function applySnapshotChunk(sql: SqlStorage, c: { table: string; schema_s
 	const tables = existing?.state === "loading" ? existing.tables : {};
 	const entry: TableState = tables[c.table] ?? { schema_sha256: snapshotSchemaSha(c.table), rows: 0, last: null, final: false };
 	if (entry.final) throw bad("table_complete", "this table's part of the cut is complete");
-	const stage = stageName(c.table), cols = Object.keys(SNAPSHOTS[c.table]!.columns);
-	const max = sql.exec<{ m: number | null }>(`SELECT max(rowid) AS m FROM ${stage}`).one().m;
-	const expected = max === null ? null : [max];
-	if (JSON.stringify(c.after) !== JSON.stringify(expected)) throw bad("out_of_order", "chunks load in order; resume after the stored last rowid", { expected_after: expected });
-	// The projection leads with rowid, so every row keeps its source rowid explicitly.
-	for (const r of rows) run(`INSERT INTO ${stage} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, ...r);
+	const stage = stageName(c.table), cols = Object.keys(SNAPSHOTS[c.table]!.columns), key = keyOf(c.table);
+	const top = sql.exec(`SELECT ${key.map(q).join(", ")} FROM ${stage} ORDER BY ${key.map((k) => `${q(k)} DESC`).join(", ")} LIMIT 1`).raw().next();
+	const expected = top.done ? null : (top.value as Value[]);
+	if (JSON.stringify(c.after) !== JSON.stringify(expected)) throw bad("out_of_order", "chunks load in order; resume after the stage's greatest key", { expected_after: expected });
+	// A rowid family's projection leads with rowid, so every row keeps its source rowid explicitly; a keyed family keeps its key columns.
+	for (const r of rows) run(`INSERT INTO ${stage} (${cols.map(q).join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, ...r);
 	Object.assign(entry, { rows: entry.rows + rows.length, last: keys.at(-1) ?? entry.last, final: c.final });
 	tables[c.table] = entry;
 	run("UPDATE corpus_snapshots SET tables = ? WHERE set_name = ? AND cut_id = ?", JSON.stringify(tables), set, cutId);
@@ -239,9 +403,9 @@ export function applySnapshotChunk(sql: SqlStorage, c: { table: string; schema_s
 /** One transaction: every member's live rows become its stage rows (rowids kept), the old cut is superseded before the new one publishes. */
 function publish(run: (q: string, ...p: SqlStorageValue[]) => void, set: string, cutId: string, source: string, asOf: string, tables: Record<string, TableState>, now: string) {
 	for (const t of SNAPSHOT_SETS[set]!) {
-		const cols = Object.keys(SNAPSHOTS[t]!.columns).join(", ");
+		const cols = Object.keys(SNAPSHOTS[t]!.columns).map(q).join(", ");
 		run(`DELETE FROM ${t}`);
-		run(`INSERT INTO ${t} (${cols}) SELECT ${cols} FROM ${stageName(t)} ORDER BY rowid`);
+		run(`INSERT INTO ${t} (${cols}) SELECT ${cols} FROM ${stageName(t)} ORDER BY ${keyOf(t).map(q).join(", ")}`);
 		run(`DELETE FROM ${stageName(t)}`);
 	}
 	run("UPDATE corpus_snapshots SET state = 'superseded' WHERE set_name = ? AND state = 'published'", set);

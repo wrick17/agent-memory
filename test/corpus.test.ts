@@ -227,11 +227,16 @@ describe("corpus refusals by lineage", () => {
 	it("refuses forbidden, derived, held and renamed tables by name, before any read, and copied evidence ids by value", async () => {
 		const p = await isolated();
 		const names = ["session_messages", "session_decisions", "user_directives", "Session_Messages", "safe_session_messages", "session_messages_v2", "main.session_messages", "user directives",
-			"directive_relations", "corpus_search_documents", "corpus_search_fts", "corpus_search_fts_docsize", "corpus_search_fts_data", "codex_sessions", "session_reference_index", "corpus_metadata",
-			"corpus_search_manifest", "sqlite_stat1", "pull_requests", "tickets", "commits; DROP TABLE commits", "__proto__", "constructor", "sqlite_master", "corpus_meta", "corpus_requests"];
+			"directive_relations", "corpus_search_documents", "corpus_search_fts", "corpus_search_fts_docsize", "corpus_search_fts_data", "session_reference_index", "corpus_metadata",
+			"corpus_search_manifest", "sqlite_stat1", "commits; DROP TABLE commits", "__proto__", "constructor", "sqlite_master", "corpus_meta", "corpus_requests"];
 		for (const table of names) {
 			const r = await p.http(p.importer, "/v1/corpus/import", await body(p, table, []));
 			expect([table, r.status, r.data.error.code]).toEqual([table, 403, "forbidden"]);
+		}
+		// The v5 record tables load only as dated snapshots under their exact DDL; a chunk without it is refused by the snapshot check.
+		for (const table of ["codex_sessions", "pull_requests", "tickets"]) {
+			const r = await p.http(p.importer, "/v1/corpus/import", await body(p, table, []));
+			expect([table, r.status, r.data.error.details.reason]).toEqual([table, 400, "schema_mismatch"]);
 		}
 		expect((await p.http(p.importer, "/v1/corpus/import", await body(p, "session_messages", []))).data.error.details.reason).toBe("never_import");
 		expect((await p.http(p.importer, "/v1/corpus/import", await body(p, "corpus_search_documents", []))).data.error.details.reason).toBe("session_derived");
@@ -252,8 +257,8 @@ describe("corpus refusals by lineage", () => {
 		const doc = await p.http(p.importer, "/v1/corpus/import", await body(p, "commits", [row(commit(1, "session:session_messages:019a-uuid:12 raw prefix"))]));
 		expect(doc.data.error.details.reason).toBe("forbidden_lineage");
 		expect(await p.inCorpus((sql) => sql.exec<{ n: number }>("SELECT (SELECT count(*) FROM corpus_meta) + (SELECT count(*) FROM corpus_search_documents) AS n").one().n)).toBe(0);
-		// Search documents come only from approved rows: none is ever stored for a held kind.
-		expect(await p.inCorpus((sql) => sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_messages','session_decisions','user_directives','directive_relations','codex_sessions')").toArray())).toEqual([]);
+		// Raw session tables stay absent; v5 creates only the approved session metadata table.
+		expect(await p.inCorpus((sql) => sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_messages','session_decisions','user_directives','directive_relations','codex_sessions')").toArray())).toEqual([{ name: "codex_sessions" }]);
 	});
 });
 
@@ -295,12 +300,16 @@ describe("corpus read-only SQL", () => {
 		const tables = (await p.tool({ action: "sql", sql: "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name" })).value.rows.flat();
 		expect(tables).not.toContain("nodes");
 		const { SCAN_ORDER } = await import("../src/corpus/families");
-		const { SNAPSHOTS, stageName } = await import("../src/corpus/snapshots");
+		// The intended snapshot tables by name (migration 4 patterns, migration 5 records), each with its stage.
+		const dated = ["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges",
+			"pattern_findings", "pattern_finding_repos", "pull_requests", "pr_tickets", "pr_commit_links", "releases", "github_tags", "tickets", "ticket_episodes", "codex_sessions",
+			"session_commit_links", "session_ticket_links", "validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties",
+			"ownership", "predecessor_links", "journey_edges"];
 		expect(tables.filter((t: string) => !t.startsWith("corpus_search_fts"))).toEqual(["commit_paths", "commits", "contributors", "corpus_meta", "corpus_partitions", "corpus_refresh", "corpus_refresh_parts", "corpus_requests", "corpus_search_documents", "corpus_store_meta", "refs", "repos", ...SCAN_ORDER,
-			"corpus_snapshots", ...Object.keys(SNAPSHOTS).flatMap((t) => [t, stageName(t)])].sort());
+			"corpus_snapshots", ...dated.flatMap((t) => [t, `corpus_stage_${t}`])].sort());
 		expect(tables).toContain("corpus_search_fts");
-		// Held kinds and me are refused by the tool; the search index reports its source tables' as_of.
-		expect((await p.tool({ action: "get", kind: "pr", key: "acme/web#1" })).error).toBe(true);
+		// A PR get answers from the (empty) pull_requests snapshot; me is refused by the tool; the search index reports its source tables' as_of.
+		expect((await p.tool({ action: "get", kind: "pr", key: "acme/web#1" })).value).toMatchObject({ kind: "pr", found: false, pull_requests: [] });
 		const me = (await p.rpc("tools/call", { name: "corpus", arguments: { profile: "me", action: "sql", sql: "SELECT 1" } })).result;
 		expect(me.isError).toBe(true);
 		expect(Object.keys((await p.tool({ action: "sql", sql: "SELECT count(*) FROM corpus_search_documents" })).value.as_of).sort()).toEqual(["commit_paths", "commits", "refs", "repos"]);
@@ -1052,5 +1061,140 @@ describe("corpus dated snapshots", () => {
 		// The uploader resends C from its first chunk; B stays live until C publishes whole.
 		expect(await load("c", C3, LATER)).toMatchObject({ status: "done", generation: g2 });
 		expect(await view(g2)).toEqual({ ledger: [[A, "superseded"], [B, "superseded"], [C, "published"]], live: ["ep-c"], stage: 0 });
+	});
+});
+
+describe("corpus v5 record snapshots", () => {
+	const TICKETS = ["tickets", "ticket_episodes"], PRS = ["pull_requests", "pr_tickets", "pr_commit_links"], SESSIONS = ["codex_sessions", "session_commit_links", "session_ticket_links"];
+	const JUDGMENT = ["validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties", "ownership", "predecessor_links", "journey_edges"];
+	/** Tiny record fixtures under the original DDL; builder keys, local paths and relevance text sit in columns that never upload. */
+	const records = (tag = "a") => (sql: SqlStorage) => {
+		for (const [i, repo] of [[1, "acme/api"], [2, "acme/web"], [3, "acme/web"]] as const) sql.exec("INSERT INTO tickets (ticket, repo, sha) VALUES ('XP-1', ?, ?)", repo, sha(i));
+		for (let i = 0; i < 501; i++) sql.exec("INSERT INTO tickets (ticket, repo, sha) VALUES ('XP-9', 'acme/web', ?)", sha(100 + i));
+		sql.exec(`INSERT INTO ticket_episodes (rowid, episode_id, ticket, episode_no, repo_count, commit_count, unique_sha_count, non_merge_repos, first_date, last_date, span_days, classification, confidence)
+			VALUES (4, ?, 'XP-1', 1, 2, 3, 3, 2, '2026-07-01', '2026-07-03', 2.0, 'feature', 'high')`, `ep-${tag}`);
+		sql.exec(`INSERT INTO pull_requests (rowid, pr_key, repo, number, title, body, state, is_draft, author, created_at, updated_at, closed_at, merged_at, merged_by, base_ref, base_sha, head_ref,
+			head_sha, head_repo, merge_sha, commit_count, labels_json, milestone_json, requested_reviewers_json, requested_teams_json, tickets_json, url, rest_present, "pr_key:1")
+			VALUES (6, 'acme/web#12', 'acme/web', 12, 'Fix XP-1', 'Body; ping ops@acme.example', 'merged', 0, 'alice-gh', '2026-07-01', '2026-07-02', '2026-07-02', '2026-07-02', 'bob-gh',
+			'main', ?, 'fix', ?, 'acme/web', ?, 1, '[]', NULL, '["carol-gh"]', '[]', '["XP-1"]', 'https://github.com/acme/web/pull/12', 1, 'builder')`, sha(1), sha(2), sha(3));
+		sql.exec("INSERT INTO pr_tickets (rowid, repo, number, ticket) VALUES (1, 'acme/web', 12, 'XP-1')");
+		sql.exec("INSERT INTO pr_commit_links (rowid, repo, number, relation, sha) VALUES (1, 'acme/web', 12, 'head', ?)", sha(2));
+		sql.exec(`INSERT INTO codex_sessions (rowid, session_id, source_file, store, created_at, cwd, originator, cli_version, git_repo, git_branch, git_commit, events, relevant, relevance_json)
+			VALUES (2, 's-1', '/Users/owner/.codex/s-1.jsonl', 'codex', '2026-07-01T00:00:00Z', '/Users/owner/code/web', 'codex_cli', '0.9', '/Users/owner/code/web', 'main', ?, 10, 1, '{"text":"private prose"}')`, sha(2));
+		sql.exec("INSERT INTO session_commit_links (rowid, session_id, commit_ref, repo, sha, resolution) VALUES (1, 's-1', 'abc1234', 'acme/web', ?, 'exact')", sha(2));
+		sql.exec("INSERT INTO session_ticket_links (rowid, session_id, ticket) VALUES (1, 's-1', 'XP-1')");
+	};
+	type Rpc = { query(who: unknown, q: unknown): Promise<Json> };
+
+	it("keeps the v4 patterns identity and migration 4 bytes under migration 5", async () => {
+		const { cutIdOf, snapshotRequestId, SNAPSHOT_SETS } = await import("../src/corpus/snapshots");
+		const { CORPUS_MIGRATIONS } = await import("../src/corpus/store");
+		// Pinned from the ROOT v4 module (snapshots.ts 32644075) before migration 5 existed.
+		expect(cutIdOf("patterns", FILE, AS_OF)).toBe("30fe79fb4f277c2ec29013f34fef9247bb9eba86280ec3bc0885b445a5e53006");
+		expect(sha256(JSON.stringify(CORPUS_MIGRATIONS[3]))).toBe("14cf1051272801bdc5f564dc8367ce352c5fe6a514db9f6595cad5bbb54b8626");
+		expect(snapshotRequestId("c".repeat(64), "pattern_findings", [2])).toBe(`corpus:snapshot:${"c".repeat(64)}:pattern_findings:2`);
+		expect(SNAPSHOT_SETS.patterns).toEqual(["pattern_coordinated_changes", "pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits",
+			"pattern_lineage_edges", "pattern_findings", "pattern_finding_repos"]);
+		expect(CORPUS_MIGRATIONS).toHaveLength(5);
+	});
+
+	it("pages, replays and restarts WITHOUT ROWID tickets by composite key; answers pr, ticket and session gets and explore; restores exact-NULL pr_key:1", async () => {
+		const p = await isolated();
+		const { cutIdOf } = await import("../src/corpus/snapshots");
+		const { chunkHash } = await import("../src/corpus/families");
+		const { accountStub } = await import("../src/mcp");
+		const load = async (tables: string[], tag: string, file: string, asOf: string, client: Json = p.client, chunkRows = 200) =>
+			uploadCorpus({ source: (await syntheticSource(records(tag))).source, client, profile: p.name, tables, asOf, fileSha256: file, state: {}, chunkRows });
+		const stopAfter = (n: number, sent: Json[] = []) => { let k = 0; return { status: p.client.status, send: async (x: Json) => { if (++k > n) throw new Error("offline"); sent.push(x); return p.client.send(x); } }; };
+		const store = (g: string) => env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${g}`)) as unknown as Rpc;
+		const get = (kind: string, key: string, g = p.generation) => store(g).query({ ...p.who, generation: g }, { action: "get", kind, key });
+		// Composite paging: the first chunk ends inside XP-9; a cursor behind the stage's greatest key is refused; a resend replays under a hashed first key.
+		const sent: Json[] = [];
+		expect(await load(TICKETS, "a", FILE, AS_OF, stopAfter(1, sent))).toMatchObject({ status: "stopped" });
+		const last = sent[0]!.rows.at(-1).slice(0, 3);
+		const st = await p.client.status(p.name);
+		expect(st.snapshots.tickets.loading.tables.tickets).toMatchObject({ rows: 200, last, final: false });
+		expect(st.snapshot_families.find((f: Json) => f.table === "tickets").key).toEqual(["ticket", "repo", "sha"]);
+		const behind: Json = { ...sent[0]!, after: sent[0]!.rows[0].slice(0, 3), rows: sent[0]!.rows.slice(1, 3), sha256: undefined };
+		expect(await p.client.send({ ...behind, sha256: chunkHash(behind as never) })).toMatchObject({ error: { details: { reason: "out_of_order", expected_after: last } } });
+		const replay = await p.client.send(sent[0]);
+		expect(replay.receipt).toMatchObject({ status: "replayed", last_key: last });
+		expect(replay.receipt.request_id).toMatch(new RegExp(`^corpus:snapshot:${cutIdOf("tickets", FILE, AS_OF)}:tickets:k[0-9a-f]{32}$`));
+		expect(await load(TICKETS, "a", FILE, AS_OF)).toMatchObject({ status: "done" });
+		// Restart: a newer cut abandons B, and B restarts whole from its first composite chunk.
+		expect(await load(TICKETS, "b", FILE2, CUT, stopAfter(1))).toMatchObject({ status: "stopped" });
+		expect(await load(TICKETS, "c", "ef".repeat(32), LATER, stopAfter(1))).toMatchObject({ status: "stopped" });
+		expect(await load(TICKETS, "b", FILE2, CUT)).toMatchObject({ status: "done" });
+		expect((await p.client.status(p.name)).snapshots.tickets).toMatchObject({ published: { cut_id: cutIdOf("tickets", FILE2, CUT) }, loading: null });
+		expect(await load(PRS, "a", FILE, AS_OF)).toMatchObject({ status: "done" });
+		expect(await load(SESSIONS, "a", FILE, AS_OF)).toMatchObject({ status: "done" });
+
+		const ticket = await get("ticket", "XP-1");
+		expect(ticket.value).toMatchObject({ kind: "ticket", found: true, episodes: [{ episode_id: "ep-b", ticket: "XP-1" }], commits_truncated: false, truncated: false });
+		expect(ticket.value.commits.map((r: Json) => [r.repo, r.sha])).toEqual([["acme/api", sha(1)], ["acme/web", sha(2)], ["acme/web", sha(3)]]);
+		expect(ticket.value.as_of.tickets).toMatchObject({ as_of: CUT, basis: "declared_snapshot", refresh: "snapshot", source_sha256: FILE2, rows: 504 });
+		const many = await get("ticket", "XP-9");
+		expect([many.value.commits.length, many.value.commits_truncated]).toEqual([500, true]);
+		expect((await get("ticket", "NOPE-1")).value).toMatchObject({ found: false, episodes: [], commits: [] });
+		const pr = await get("pr", "acme/web#12");
+		expect(pr.value).toMatchObject({ found: true, pull_requests: [{ rowid: 6, number: 12, title: "Fix XP-1", body: "Body; ping [REDACTED]", author: "alice-gh" }],
+			tickets: [{ ticket: "XP-1" }], commits: [{ relation: "head", sha: sha(2) }], tickets_truncated: false, commits_truncated: false });
+		expect(Object.keys(pr.value.as_of)).toEqual(["pr_commit_links", "pr_tickets", "pull_requests"]);
+		expect(pr.value.pull_requests[0]).not.toHaveProperty("pr_key");
+		expect((await get("pr", "acme/web#99")).value.found).toBe(false);
+		expect(await get("pr", "acme/web")).toMatchObject({ ok: false, error: { code: "validation" } });
+		const session = await get("session", "s-1");
+		expect(session.value).toMatchObject({ found: true, sessions: [{ session_id: "s-1", originator: "codex_cli", git_branch: "main" }], commits: [{ commit_ref: "abc1234" }], tickets: [{ ticket: "XP-1" }] });
+		expect(Object.keys(session.value.sessions[0])).not.toEqual(expect.arrayContaining(["cwd"]));
+		const hidden = await p.inCorpus((sql) => [sql.exec("SELECT pr_key, \"pr_key:1\" AS k1 FROM pull_requests").one(),
+			sql.exec("SELECT source_file, store, cwd, git_repo, relevance_json FROM codex_sessions").one()]);
+		expect(hidden).toEqual([{ pr_key: null, k1: null }, { source_file: null, store: null, cwd: null, git_repo: null, relevance_json: null }]);
+
+		// Explore counts for PR and ticket nodes.
+		await call(await contextFor(), "record_knowledge", { profile: p.name, nodes: [{ kind: "pr", key: "github:acme/web#12", name: "PR 12" }, { kind: "ticket", key: "jira:XP-1", name: "XP-1" }] });
+		const explore = async (key: string) => JSON.parse(((await p.rpc("tools/call", { name: "explore", arguments: { profile: p.name, node: { key } } })).result as { content: { text: string }[] }).content[0]!.text).data as Json;
+		expect((await explore("github:acme/web#12")).corpus).toMatchObject({ kind: "pr", key: "acme/web#12", counts: { pull_requests: 1, pr_tickets: 1, pr_commit_links: 1 } });
+		expect((await explore("jira:XP-1")).corpus).toMatchObject({ kind: "ticket", key: "XP-1", counts: { tickets: 3, ticket_episodes: 1, pr_tickets: 1, session_ticket_links: 1 } });
+
+		// Export/restore at schema 5: the never-uploaded pr_key:1 exports NULL and restores; a non-NULL value there refuses the restore.
+		const admin = (cmd: Json) => accountStub(env, OWNER).admin(cmd as never) as Promise<Json>;
+		const onAccount = (f: (sql: SqlStorage) => void) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => f(s.storage.sql));
+		const move = (g: string) => onAccount((sql) => {
+			sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g, `${OWNER}:${p.name}:${g}`, p.name);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g, p.name, new Date().toISOString());
+		});
+		const exportNow = async () => ((await admin({ op: "export", profile: p.name, corpus: true })).value as Json)[`corpus-${p.name}`].id as string;
+		const first = await exportNow(), g2 = rand();
+		await move(g2);
+		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: first })).toMatchObject({ ok: true });
+		expect(await admin({ op: "restoreStep" })).toMatchObject({ ok: true, value: { state: "ready" } });
+		expect(await admin({ op: "openRestore" })).toMatchObject({ ok: true });
+		expect((await get("pr", "acme/web#12", g2)).value).toMatchObject({ found: true, pull_requests: [{ rowid: 6 }] });
+		expect((await get("ticket", "XP-1", g2)).value.commits).toHaveLength(3);
+		await runInDurableObject(env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${g2}`)), (_i, s) => s.storage.sql.exec("UPDATE pull_requests SET \"pr_key:1\" = 'builder'"));
+		const second = await exportNow(), g3 = rand();
+		await move(g3);
+		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: second })).toMatchObject({ ok: true });
+		expect(await admin({ op: "restoreStep" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		await admin({ op: "abortRestore" });
+	});
+
+	it("registers judgment and PR repo and people terms in work, and loads the three session metadata tables", async () => {
+		const w = await workAccount();
+		const judged = (sql: SqlStorage) => {
+			records()(sql);
+			sql.exec(`INSERT INTO validated_contracts (rowid, key, name, journey, repository, sha, confidence, auth_contract_json, failure_boundaries_json, provenance_json)
+				VALUES (1, 'c-1', 'Checkout auth', 'checkout', 'acme/contracts-repo', ?, 'high', '{}', '[]', '[]')`, sha(1));
+			sql.exec(`INSERT INTO frontend_business_facts (rowid, fact_id, repo_key, domain, fact_type, statement, confidence, snapshot_id, evidence_json, notes)
+				VALUES (1, 'f-1', 'acme/quokka-private', 'cart', 'rule', 'Totals round half up', 0.9, 'acme/quokka-private', '[]', NULL)`);
+			sql.exec(`INSERT INTO frontend_workflows (rowid, workflow_id, repo_key, domain, name, actor, "trigger", steps_json, outcomes_json, confidence, snapshot_id, evidence_json, notes)
+				VALUES (1, 'w-1', 'acme/flows-repo', 'cart', 'Checkout', 'buyer', 'click pay', '[]', '[]', 0.8, 'acme/flows-repo', '[]', NULL)`);
+		};
+		const { source } = await syntheticSource(judged);
+		for (const tables of [JUDGMENT, PRS, SESSIONS]) expect(await uploadCorpus({ source, client: w.client, profile: "work", tables, asOf: AS_OF, fileSha256: FILE, state: {} })).toMatchObject({ status: "done" });
+		expect(await w.terms()).toEqual(expect.arrayContaining(["acme/contracts-repo", "acme/quokka-private", "acme/flows-repo", "acme/web", "alice-gh", "bob-gh"]));
+		expect((await w.terms()).join(" ")).not.toMatch(/@|REDACTED|carol-gh/);
+		const rows = await (w.corpus() as unknown as Rpc).query(w.ref("work"), { action: "sql", sql: "SELECT \"trigger\" FROM frontend_workflows" });
+		expect(rows.value.rows).toEqual([["click pay"]]);
 	});
 });

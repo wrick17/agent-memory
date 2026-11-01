@@ -25,7 +25,7 @@ a[aria-current]{font-weight:600}.prefs{list-style:none;padding:0}.prefs>li{borde
 .legend{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.25rem 1rem;font-size:13px}.dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;vertical-align:-.05rem}
 .graph aside{position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow:auto}.matches{list-style:none;padding:0;margin:0}.matches button{width:100%;text-align:left;margin:0 0 .25rem}
 #signin:empty{display:none}</style></head>
-<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="#/move">Moves</a><a href="#/wipe">Wipe</a><a href="/settings">Settings</a></nav>
+<body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="#/routing">Routing</a><a href="#/move">Moves</a><a href="#/wipe">Wipe</a><a href="/settings">Settings</a></nav>
 <main><h1>Agent Memory</h1>
 <p id="status" role="status">Loading sign-in…</p><div id="signin"></div>
 <div id="view" hidden></div>
@@ -117,7 +117,22 @@ export async function dashboardMain(win: any): Promise<void> {
 	};
 
 	const home = (view: Node) => {
-		const h = el("h2", view, "Profiles");
+		const h = el("h2", view, "Profiles"), version = pageVersion;
+		// Account-wide facts from bounded reads: the recovery status (with the last export) and the first page of the review list.
+		const acct = el("dl", view);
+		acct.setAttribute("aria-label", "Account summary");
+		const say = (dl: Node, k: string, v: string, na = false) => { if (version !== pageVersion) return; el("dt", dl, k); const dd = el("dd", dl, v); if (na) dd.setAttribute("class", "na"); };
+		void (async () => {
+			const [rec, rev] = await Promise.allSettled([call("/api/recovery"), call("/api/review?limit=100")]);
+			if (rec.status === "fulfilled") {
+				say(acct, "Last backup", rec.value?.last_export?.at ? `Taken ${day(String(rec.value.last_export.at))}` : "No export recorded yet", !rec.value?.last_export);
+				if (rec.value?.recovery) say(acct, "Recovery", `Open (${recorded(rec.value.recovery.state)}): the account is closed until it is opened or aborted in Backups`);
+			} else say(acct, "Last backup", `Could not read: ${why(rec.reason)}`, true);
+			if (rev.status === "fulfilled" && Array.isArray(rev.value?.items)) {
+				const n = (k: string) => rev.value.items.filter((i: J) => i.kind === k).length, more = rev.value.next_after ? " or more" : "";
+				say(acct, "Waiting in Review", `${n("migration")}${more} migrated records, ${n("collision")}${more} stopped moves`);
+			} else say(acct, "Waiting in Review", `Could not read: ${rev.status === "rejected" ? why(rev.reason) : "no list"}`, true);
+		})();
 		const cards = el("div", view);
 		cards.setAttribute("class", "cards");
 		for (const p of profiles) {
@@ -132,9 +147,26 @@ export async function dashboardMain(win: any): Promise<void> {
 				["Default for", `${can.filter((d) => d.default_profile === p.name).length} device(s)`],
 				["Last use by its devices", day(can.map((d) => d.last_used_at ?? "").sort().pop() || null)],
 				batchRow(p.name),
-				["Projects, people, open work, decisions", "Not available yet: the server has no overview read", true],
-				["Last backup", "See Backups", true],
+				["Storage used", "Not available: the server has no storage read", true],
 			]);
+			if (p.status !== "active") continue;
+			// One count row for records, the board's open total and the newest changes; kinds only from a graph this tab already loaded.
+			const sum = el("dl", card), base = `/api/profiles/${enc(p.name)}`;
+			sum.setAttribute("aria-label", `${p.name} summary`);
+			void (async () => {
+				const [nodes, board, act] = await Promise.allSettled([call(`${base}/graph?part=nodes&limit=1`), call(`${base}/board?limit=1`), call(`${base}/activity?limit=3`)]);
+				const failed = (r: PromiseSettledResult<J>) => r.status === "rejected" ? `Could not read: ${why(r.reason)}` : null;
+				const total = nodes.status === "fulfilled" ? nodes.value?.total : undefined;
+				say(sum, "Records", failed(nodes) ?? (typeof total === "number" ? total.toLocaleString("en") : "Too many to count in one read"), nodes.status === "rejected");
+				const g = graphs.get(`${p.name}:${p.generation ?? ""}`), month = Date.now() - 30 * 86_400_000;
+				if (g?.parts.nodes.done) {
+					const all = [...g.nodes.values()], kind = (k: string) => all.filter((n) => n.kind === k);
+					say(sum, "Projects, people, decisions", `${kind("project").length} projects, ${kind("person").length} people, ${kind("decision").filter((n) => n.updated && Date.parse(n.updated) >= month).length} decisions changed in the last 30 days`);
+				} else say(sum, "Projects, people, decisions", "Counted once its graph is open in this tab", true);
+				say(sum, "Open work", failed(board) ?? `${recorded(board.status === "fulfilled" ? board.value?.total : null)} items (uploaded work only)`, board.status === "rejected");
+				const items: J[] = act.status === "fulfilled" && Array.isArray(act.value?.items) ? act.value.items : [];
+				say(sum, "Recent changes", failed(act) ?? (items.map((a) => `${day(String(a.at))} ${recorded(a.op)} by ${recorded(a.actor)}`).join("; ") || "None"), act.status === "rejected");
+			})();
 		}
 		if (!profiles.length) el("p", view, "No profiles yet.");
 		return h;
@@ -978,6 +1010,182 @@ export async function dashboardMain(win: any): Promise<void> {
 		return h;
 	};
 
+	// The restore drill (section 18): a profile's newest export restored into a scratch generation that never becomes live, and the
+	// account's newest export checked without being applied. The account stays open. Begin keeps its exact body, request id included,
+	// so an unconfirmed begin is sent again unchanged; step and cleanup name the drill shown. Nothing runs by itself.
+	let drillSent: { profile: string; generation?: string; request_id: string } | null = null;
+	const drillView = (parent: Node, recovering: boolean) => {
+		const version = pageVersion, sec = el("section", parent);
+		sec.setAttribute("aria-label", "Restore drill");
+		el("h3", sec, "Restore drill");
+		note(sec, "A drill restores a profile's newest export into a scratch copy that never becomes live, and checks the account's newest export without applying it. The account stays open and nothing live changes. Cleanup deletes only the scratch copy and its own vectors.");
+		const body = el("div", sec);
+		body.textContent = "Reading the drill status…";
+		const report = (d: J) => {
+			const rp = d.report ?? {}, cleaned = rp.cleaned?.scratch === true;
+			// Passed only as the server says, and only once its scratch copy is gone.
+			const verdict = d.passed === true && cleaned ? "Passed: every check passed and the scratch copy was cleaned up."
+				: d.passed === true ? "Checks passed, but the cleanup of the scratch copy is not confirmed." : d.state === "done" ? "Did not pass." : "Not finished.";
+			el("p", body, verdict).setAttribute("class", d.passed === true && cleaned ? "na" : "warn");
+			if (d.error) el("p", body, `Failure: ${recorded(d.error.message ?? d.error.code)}`);
+			facts(body, [["Profile", recorded(d.profile)], ["Live generation", recorded(d.live_generation)], ["Scratch generation", recorded(d.scratch)], ["From export", `${recorded(d.export)} (${recorded(d.export_at)})`],
+				["State", `${recorded(d.state)}${d.progress ? ` (${String(d.progress)})` : ""}`], ["Started", recorded(d.at)], ["Finished", recorded(d.finished_at)],
+				...(d.report ? [["Chunks verified", recorded(rp.chunks)], ["Rows restored", Object.entries(rp.rows ?? {}).map(([t, n]) => `${t} ${String(n)}`).join(", ") || "None"],
+					["Records and requests", `${recorded(rp.nodes)} records, ${recorded(rp.requests)} requests`], ["Vectors embedded", recorded(rp.vectors)],
+					["Held elsewhere now", `${recorded(rp.owned_elsewhere)} records, ${recorded(rp.requests_elsewhere)} requests`], ["Named by a wipe", recorded(rp.wiped)],
+					["Account export", rp.account ? `${recorded(rp.account.export)}: ${recorded(rp.account.chunks)} chunks checked, ${recorded(rp.account.rows)} rows` : "Not checked"],
+					["Live generation unchanged", rp.live_generation_unchanged === true ? "Yes" : "No"],
+					["Cleaned up", `${cleaned ? "scratch copy deleted" : "scratch copy not confirmed deleted"}, ${recorded(rp.cleaned?.vectors)} vectors`]] as [string, string][] : [])]);
+		};
+		(async () => {
+			let s: J;
+			try { s = await call("/api/backups/drill"); } catch (err) { if (version === pageVersion) body.textContent = `Could not read the drill status: ${why(err)}`; return; }
+			if (version !== pageVersion) return;
+			body.textContent = "";
+			const d = s?.drill, last = s?.last;
+			if (drillSent && [d, last].some((x) => x?.request_id === drillSent!.request_id)) drillSent = null; // the begin was received
+			if (d) {
+				el("h4", body, "Drill in progress");
+				report(d);
+				const row = el("p", body), id = { id: String(d.id) }, done = (x: J) => ({ text: `Drill is now ${recorded(x?.state)}${x?.progress ? ` (${String(x.progress)})` : ""}.` });
+				if (d.state !== "cleaning" && d.state !== "done") btn(row, "Run the next drill step", () => act("/api/backups/drill/step", "run the next drill step", id, done));
+				btn(row, d.state === "cleaning" ? "Continue the cleanup" : "Stop and clean up", () => act("/api/backups/drill/cleanup", "clean up the drill", id, done));
+				note(body, "Recoveries and wipes cannot begin until this drill and its cleanup have finished.");
+				return;
+			}
+			if (last) { el("h4", body, "Last drill"); report(last); }
+			if (recovering) { note(body, "A drill cannot begin while a recovery is open."); return; }
+			if (drillSent) {
+				const sent = drillSent;
+				el("p", body, `A drill of ${sent.profile} may or may not have begun. Send the same request again to find out; it cannot begin twice.`).setAttribute("class", "warn");
+				btn(el("p", body), "Send the same drill request again", () => beginDrill(sent));
+				return;
+			}
+			const f = el("form", body), pick = choose(f, "drill-profile", "Profile to drill", active().map((q) => [q.name, q.name]));
+			el("button", el("p", f), "Begin a restore drill").setAttribute("type", "submit");
+			f.addEventListener("submit", (event) => {
+				event.preventDefault();
+				const q = active().find((x) => x.name === pick.value);
+				if (!q) return;
+				beginDrill({ profile: q.name, ...(q.generation ? { generation: q.generation } : {}), request_id: `dashboard:${crypto.randomUUID()}` });
+			});
+		})();
+	};
+	const beginDrill = (sent: NonNullable<typeof drillSent>) => {
+		drillSent = sent;
+		act(() => call("/api/backups/drill", "POST", sent).catch((e: Failure) => {
+			// Only a definite refusal drops the exact request; an unconfirmed one is kept to send again unchanged.
+			if (e.status && e.status < 500 && e.status !== 408 && e.status !== 429) drillSent = null;
+			throw e;
+		}), `begin a restore drill of ${sent.profile}`, undefined, (x) => { drillSent = null; return { text: `Drill begun: ${recorded(x?.state)}. Run its steps below.` }; });
+	};
+
+	// Routing (sections 6 and 15): the stored rules, edited as one list and saved whole after a preview, and a read-only test of
+	// where a remote or path routes. The server renumbers the rules and the last save wins, so the list is read again after saving.
+	// An unconfirmed or refused save keeps this tab's list; nothing is saved or tested by itself.
+	type RuleRow = { priority: string; match: string; pattern: string; profile: string; enabled: boolean };
+	let rulesDraft: { rows: RuleRow[]; text?: string; unsure?: boolean } | null = null;
+	const routingPage = (view: Node) => {
+		const version = pageVersion, h = el("h2", view, "Routing");
+		note(view, "A write from a repository goes to the profile of the first enabled rule that matches it, by priority. Saving replaces the whole list and renumbers it; if another tab or device saves too, the last save wins. Nothing is ever routed into me.");
+		const { msg, say } = pageStatus(view);
+		const box = el("section", view), tester = el("section", view);
+		box.setAttribute("aria-label", "Routing rules");
+		tester.setAttribute("aria-label", "Test a route");
+		// The test is read only: the server's own resolver over the stored rules, never the unsaved list.
+		el("h3", tester, "Test where a repository routes");
+		note(tester, "Uses the saved rules, not unsaved edits. Nothing is written.");
+		const tf = el("form", tester), remote = input(tf, "route-remote", "Remote (for example github.com/org/repo)"), path = input(tf, "route-path", "Or a path");
+		remote.setAttribute("maxlength", "500");
+		path.setAttribute("maxlength", "1000");
+		el("button", el("p", tf), "Test").setAttribute("type", "submit");
+		const out = el("div", tester);
+		out.setAttribute("aria-live", "polite");
+		let test = 0;
+		tf.addEventListener("submit", async (event) => {
+			event.preventDefault();
+			const body = { ...(remote.value.trim() ? { remote: remote.value.trim() } : {}), ...(path.value.trim() ? { path: path.value.trim() } : {}) }, n = ++test;
+			out.replaceChildren();
+			if (!Object.keys(body).length) { el("p", out, "Give a remote, a path or both."); return; }
+			let r: J;
+			try { r = await call("/api/rules/test", "POST", body); } catch (err) { if (n === test && version === pageVersion) el("p", out, `Could not test: ${why(err)}`); return; }
+			if (n !== test || version !== pageVersion) return;
+			const rule = r?.rule, w = r?.write, rd = r?.read;
+			facts(out, [["Remote as read", recorded(r?.remote)], ["Path as read", recorded(r?.path)],
+				["Matching rule", rule ? `priority ${recorded(rule.priority)}, ${recorded(rule.match)} “${recorded(rule.pattern)}” → ${recorded(rule.profile)}` : "No enabled rule matches"],
+				["A write goes to", w?.error ? `Refused: ${recorded(w.error.message ?? w.error.code)}` : `${recorded(w?.profile)} (${recorded(w?.routed_by)})`],
+				["A recall reads", rd?.error ? `Refused: ${recorded(rd.error.message ?? rd.error.code)}` : `${recorded(rd?.primary)}${rd?.with_me ? " and me" : ""} (${recorded(rd?.routed_by)})`]]);
+		});
+		say("Loading the rules…");
+		(async () => {
+			let r: J;
+			try { r = await call("/api/rules"); if (!Array.isArray(r?.rules)) throw new Error("the server sent no rules"); }
+			catch (err) { if (version === pageVersion) say(`Could not read the rules: ${why(err)}`); return; }
+			if (version !== pageVersion) return;
+			say("");
+			const profiles: string[] = Array.isArray(r.profiles) ? r.profiles.map(String) : [];
+			const rows: RuleRow[] = rulesDraft?.rows ?? r.rules.map((x: J) => ({ priority: String(x.priority), match: String(x.match), pattern: String(x.pattern), profile: String(x.profile), enabled: x.enabled === true }));
+			el("h3", box, `Rules (${rows.length} ${rulesDraft ? "in this tab's unsaved list" : "saved"})`);
+			if (rulesDraft?.text) note(box, rulesDraft.text, "warn");
+			const tools = el("p", box), list = el("ol", box), problems = el("ul", box), row = el("p", box), shown = el("p", box);
+			let previewed = !!rulesDraft?.unsure; // an unconfirmed save may be sent again exactly as it was
+			const body = () => ({ rules: rows.map((x) => ({ priority: Number(x.priority.trim()), match: x.match, pattern: x.pattern.trim(), profile: x.profile, enabled: x.enabled })) });
+			const invalid = () => [...(rows.length > 128 ? ["At most 128 rules."] : []), ...rows.flatMap((x, i) => [
+				...(/^-?\d{1,9}$/.test(x.priority.trim()) ? [] : [`Rule ${i + 1}: the priority must be a whole number.`]),
+				...(x.match === "remote" || x.match === "path" ? [] : [`Rule ${i + 1}: match a remote or a path.`]),
+				...(x.pattern.trim().length >= 1 && x.pattern.trim().length <= 300 ? [] : [`Rule ${i + 1}: the pattern must be 1 to 300 characters.`]),
+				...(profiles.includes(x.profile) ? [] : [`Rule ${i + 1}: choose an active profile other than me.`])])];
+			const save = btn(row, rulesDraft?.unsure ? "Save the same list again" : "Save rules", () => {
+				if (!previewed || invalid().length) return;
+				const sent = body();
+				act(() => call("/api/rules", "PUT", sent).catch((e: Failure) => {
+					const unsure = !e.status || e.status >= 500 || e.status === 408 || e.status === 429;
+					rulesDraft = { rows, unsure, text: unsure ? "Saving may or may not have happened. Save the same list again, or discard it and read the saved list." : `Not saved: ${why(e)}. Fix the list and save again.` };
+					throw e;
+				}), "save the routing rules", undefined, (x) => { rulesDraft = null; return { text: `Saved ${recorded(x?.rules)} rules. The list below is read again from the server.` }; });
+			});
+			const sync = () => {
+				problems.replaceChildren();
+				const bad = invalid();
+				for (const t of bad) el("li", problems, t);
+				save.disabled = !previewed || bad.length > 0;
+			};
+			const edited = () => { rulesDraft = { rows }; previewed = false; shown.textContent = ""; save.textContent = "Save rules"; sync(); };
+			const draw = () => {
+				list.replaceChildren();
+				rows.forEach((x, i) => {
+					const li = el("li", list), n = `rule-${i + 1}`;
+					const pr = input(li, `${n}-priority`, `Rule ${i + 1} priority`), mt = choose(li, `${n}-match`, `Rule ${i + 1} matches a`, [["remote", "Remote"], ["path", "Path"]]);
+					const pt = input(li, `${n}-pattern`, `Rule ${i + 1} pattern`), pf = choose(li, `${n}-profile`, `Rule ${i + 1} profile`,
+						[...profiles.map((q) => [q, q] as [string, string]), ...(profiles.includes(x.profile) ? [] : [[x.profile, `${x.profile} (not allowed)`] as [string, string]])]);
+					pt.setAttribute("maxlength", "300");
+					pr.value = x.priority; mt.value = x.match; pt.value = x.pattern; pf.value = x.profile;
+					const lab = el("label", li), on = el("input", lab);
+					on.setAttribute("type", "checkbox");
+					on.checked = x.enabled;
+					el("span", lab, ` Rule ${i + 1} enabled`);
+					for (const [f, k] of [[pr, "priority"], [mt, "match"], [pt, "pattern"], [pf, "profile"]] as const) f.addEventListener(k === "match" || k === "profile" ? "change" : "input", () => { x[k] = f.value; edited(); });
+					on.addEventListener("change", () => { x.enabled = on.checked; edited(); });
+					btn(el("p", li), "Remove", () => { rows.splice(i, 1); edited(); draw(); }, `Remove rule ${i + 1}`);
+				});
+				if (!rows.length) el("li", list, "No rules: every write without an explicit profile or a device default is refused.");
+			};
+			btn(tools, "Add a rule", () => { rows.push({ priority: String(Math.max(0, ...rows.map((x) => Number(x.priority) || 0)) + 10), match: "remote", pattern: "", profile: profiles[0] ?? "", enabled: true }); edited(); draw(); });
+			btn(tools, "Preview", () => {
+				const bad = invalid();
+				if (bad.length) { sync(); say("Fix the list first."); msg.focus(); return; }
+				previewed = true;
+				shown.textContent = `Preview: the saved list becomes ${rows.length} rule${rows.length === 1 ? "" : "s"}, in this order: ${body().rules.map((x, i) => `${i + 1}. ${x.enabled ? "" : "(disabled) "}${x.match} “${x.pattern}” → ${x.profile} at priority ${x.priority}`).join("; ") || "none"}. It replaces every saved rule.`;
+				sync();
+				save.focus();
+			});
+			if (rulesDraft) btn(tools, "Discard changes and read the saved list", () => { rulesDraft = null; render(false); });
+			draw();
+			sync();
+		})();
+		return h;
+	};
+
 	// The owner's copy choices of an open recovery (section 18, step 4). Each sent choice keeps its exact body, request id included,
 	// so an unconfirmed answer is sent again unchanged; the server binds the id to that body. A refusal drops it, and a copy that
 	// changed needs an explicit reread before a new preview, which gets a new request id. Nothing is sent by itself.
@@ -1139,6 +1347,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			}
 			el("h3", rec, "Last export");
 			if (s?.last_export) { el("p", rec, `Taken ${recorded(s.last_export.at)}`); results(rec, s.last_export.results); } else el("p", rec, "No export recorded yet.");
+			drillView(rec, !!r);
 			if (r) return; // exports and new restores are refused while a recovery is open
 			el("h3", forms, "Export now");
 			note(forms, "Exports are encrypted on the server. Two complete exports are kept per store, so a new one replaces the oldest. Each profile pauses its writes for up to 30 seconds while it is exported.");
@@ -2634,6 +2843,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			else if (pg[1] === "copy") h = copyPage(view, p, id);
 			else h = activityPage(view, p);
 		} else if (hash === "#/backups") h = backupsPage(view);
+		else if (hash === "#/routing") h = routingPage(view);
 		else if (hash === "#/wipe" || hash.startsWith("#/wipe/")) h = wipePage(view, hash === "#/wipe" ? undefined : dec(hash.slice(7)));
 		else if (hash === "#/work" || m?.[1] === "work") {
 			const ok = active(), p = name === undefined ? ok.find((x) => x.name === "work") : ok.find((x) => x.name === name);

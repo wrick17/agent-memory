@@ -9,7 +9,7 @@ import { migrate, type Migration } from "../storage";
 import { chunkHash, checkChunk as checkBulkChunk, chunkTerms as bulkTerms, FAMILIES, manifest, named, requestIdOf, SCANS, scanManifest, SEARCH_DDL, VIEWS, type Family, type Key, type Value } from "./families";
 import { get, runSql, search, type CorpusQuery, type Head } from "./query";
 import { addToPartitions, META, MIGRATION, refresh, refreshActive, refreshStatus, type RefreshCommand } from "./refresh";
-import { abandonLoadingCuts, applySnapshotChunk, checkSnapshotChunk, isSnapshot, SNAPSHOT_MIGRATION, SNAPSHOTS, snapshotManifest, snapshotStatus, snapshotTableOf, snapshotTerms, stageName } from "./snapshots";
+import { abandonLoadingCuts, applySnapshotChunk, checkSnapshotChunk, isSnapshot, SNAPSHOT_MIGRATION, SNAPSHOT_MIGRATION_5, SNAPSHOTS, snapshotManifest, snapshotStatus, snapshotTableOf, snapshotTerms, stageName } from "./snapshots";
 
 export { CHUNK_ROWS, FAMILIES, FORBIDDEN, HELD, manifest, refusal, SCAN_ORDER, SCANS, VIEWS } from "./families";
 /** The route's stateless chunk check: dated snapshot tables first (before HELD), every other table by its bulk family. */
@@ -35,7 +35,9 @@ export const CORPUS_MIGRATIONS: Migration[] = [[
 // Checkout scans under their original DDL (plus one partition index each) and the read-time views; additive, no data moves.
 [...Object.values(SCANS).flatMap((f) => [f.ddl, ...f.indexes]), ...Object.values(VIEWS)],
 // Dated per-profile snapshot sets: live tables under their original DDL, one stage each, and the cut ledger (snapshots.ts).
-SNAPSHOT_MIGRATION];
+SNAPSHOT_MIGRATION,
+// The v5 record-type sets (PRs, releases, tickets, session metadata, curated judgment): live tables with their original indexes, and stages.
+SNAPSHOT_MIGRATION_5];
 
 export interface CorpusChunk { table: string; schema_sha256: string; source: { file_sha256: string }; as_of: string; columns: string[]; after: Key | null; rows: Value[][]; final: boolean; sha256: string }
 export interface ChunkReceipt { status: "stored" | "replayed"; request_id: string; table: string; rows: number; last_key: Key | null; complete: boolean; sha256: string; rows_written?: number }
@@ -46,6 +48,18 @@ const closedState = (sql: SqlStorage) => {
 	sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);
 	return sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'closed'`).toArray()[0]?.value;
 };
+/**
+ * pull_requests keeps its original DDL, whose builder column "pr_key:1" never uploads, so every export of it carries that column as NULL.
+ * The generic restore validator accepts only plain identifiers; this exact pair alone is dropped from the chunk (it stays NULL), and a
+ * non-NULL value refuses the restore.
+ */
+function prKeyFree<C extends { table: string; columns: string[]; rows: unknown[][] }>(c: C): C {
+	const i = c.table === "pull_requests" ? c.columns.indexOf("pr_key:1") : -1;
+	if (i < 0) return c;
+	if (c.rows.some((r) => r[i] !== null)) throw Fail.of("validation", "a pull_requests export holds a value in its never-uploaded builder column");
+	return { ...c, columns: c.columns.filter((_, j) => j !== i), rows: c.rows.map((r) => r.filter((_, j) => j !== i)) };
+}
+
 /** An unfinished corpus restore: its generation exports nothing until it is done. */
 const restoring = (sql: SqlStorage) => sql.exec(`SELECT 1 FROM ${META} WHERE key = 'restore_id'`).toArray().length > 0 && !sql.exec(`SELECT 1 FROM ${META} WHERE key = 'restore_done'`).toArray().length;
 const assertOpen = (sql: SqlStorage) => { if (closedState(sql)) throw Fail.of("profile_wiped", "this corpus generation is closed"); };
@@ -217,7 +231,7 @@ export class CorpusStore extends DurableObject<Env> {
 			const started = Date.now(), live = () => Date.now() - started < 10_000;
 			// Chunks hold at most 500 rows and 512 KB, the scale of one uploaded corpus chunk, so each applies in one transaction.
 			while (Number(meta("restore_next")) < m.value.chunks.length && live()) {
-				const at = Number(meta("restore_next")), c = await readChunk(this.env, m.value, at);
+				const at = Number(meta("restore_next")), c = prKeyFree(await readChunk(this.env, m.value, at));
 				this.ctx.storage.transactionSync(() => {
 					if (Number(meta("restore_next")) !== at) return;
 					applyRows(all, c, 0, c.rows.length, adjust, { n: 0 }, c.table === META);

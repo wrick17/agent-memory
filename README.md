@@ -16,7 +16,7 @@ The graph includes an unsaved what-if view with local draft items and a metadata
 
 The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
 
-The capture client code is installed and updated, but automatic capture remains off and runtime acceptance is blocked. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). A fresh native Work corpus read returned zero repositories, with no as-of timestamp or truncation ([receipt](/private/tmp/am-hosted-corpus-read-parent-20261101/receipt.json)). The hosted corpus is enabled with a new SQLite namespace but has not been loaded or accepted; self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
+Personal Claude and Codex capture hooks are enabled, but a positive Work capture remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). A fresh native Work corpus read returned zero repositories, with no as-of timestamp or truncation ([receipt](/private/tmp/am-hosted-corpus-read-parent-20261101/receipt.json)). The hosted corpus is enabled with a new SQLite namespace but has not been loaded or accepted; self-host setup, first scheduled backup execution, and multi-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
 
 ## Completed development milestones
 
@@ -94,7 +94,7 @@ Codex may open a browser during setup. Sign-in uses Clerk; scoped device access 
 
 ## Privacy and capture
 
-The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. A private ChatGPT sign-in works, but automatic capture remains off while model compatibility is checked.
+The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Personal capture hooks are enabled, with Work acceptance still pending. The separate own-app model path remains blocked after eight diagnostic requests.
 
 ## Explore the project
 

@@ -8,6 +8,8 @@ import { EMAIL, PHONE } from "../src/domain/personal.ts";
 import { REDACTED, redactText } from "../src/domain/redact.ts";
 
 export const FORBIDDEN = ["session_messages", "session_decisions", "user_directives"];
+/** The cleared session metadata snapshot tables, by exact name: the only session-named tables the broad name refusal lets through. */
+const SESSION_METADATA = ["codex_sessions", "session_commit_links", "session_ticket_links"];
 const PERSONAL = new RegExp(`${EMAIL.source}|${PHONE.source}`, "g");
 const TRANSIENT = ["busy", "unavailable"];
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
@@ -34,7 +36,7 @@ export async function validateSource(source, fam) {
 export async function uploadCorpus({ source, client, profile, tables, asOf, fileSha256, state = {}, save = () => {}, chunkRows = 5000, chunkBytes = 900_000 }) {
 	if (!/^[a-z][a-z0-9-]{0,11}$/.test(profile) || profile === "me") return { status: "refused", reason: "invalid_profile" };
 	// Refused by name before anything is read, under any listing.
-	const forbidden = tables.find((t) => FORBIDDEN.includes(String(t).toLowerCase()) || /session|directive|decision/i.test(String(t)));
+	const forbidden = tables.find((t) => FORBIDDEN.includes(String(t).toLowerCase()) || (/session|directive|decision/i.test(String(t)) && !SESSION_METADATA.includes(String(t))));
 	if (forbidden) return { status: "refused", table: forbidden, reason: "never_import" };
 	const st = await client.status(profile);
 	if (st.error) return { status: TRANSIENT.includes(st.error.code) ? "stopped" : "refused", reason: st.error.details?.reason ?? st.error.code };

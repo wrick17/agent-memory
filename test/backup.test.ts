@@ -817,3 +817,208 @@ describe("recovery choices and deferred steps", () => {
 		expect(await stepUntilChecked()).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0 });
 	});
 });
+
+// The restore drill (section 18): a scratch generation restored from the newest compatible export, checked and cleaned up
+// while the account stays open; its exclusion holds every recovery begin and the wipe until nothing of the copy remains.
+describe("restore drill", () => {
+	type Drill = { id: string; state: string; scratch: string | null; live_generation: string; export: string; passed?: boolean; error?: { code: string };
+		report: { chunks: number; rows: Record<string, number>; nodes: number; requests: number; vectors: number; owned_elsewhere: number; requests_elsewhere: number; wiped: number;
+			account: { export: string; chunks: number; rows: number } | null; live_generation_unchanged: boolean; cleaned: { vectors: number; scratch: boolean } } };
+	const vectorIds = () => (env.VECTORS as unknown as { _ids(): Promise<string[]> })._ids();
+	const live = async (generation: string) => ({
+		account: await accountSql((sql) => [sql.exec("SELECT node_id, profile FROM node_index ORDER BY node_id").toArray(), sql.exec("SELECT request_id, profile, op, payload_hash FROM request_index ORDER BY request_id").toArray(),
+			sql.exec("SELECT name, generation, status FROM profiles ORDER BY name").toArray()]),
+		vectors: (await vectorIds()).filter((v) => v.startsWith(`g${generation}:`)).sort(),
+	});
+	/** Every recovery begin and the wipe, each answering before any change; the wipe's typed name is wrong, so a missing guard cannot wipe. */
+	const begins = async (profile: string) => Promise.all([
+		admin({ op: "beginRestore", profile, export: "latest" }), admin({ op: "beginAccountRestore", export: "latest" }),
+		admin({ op: "beginPitr", profile, at: new Date(Date.now() - 60_000).toISOString() }), admin({ op: "beginCorpusRestore", profile, export: "latest" }),
+		admin({ op: "wipeProfile", profile, typed: "not-this-profile" })]);
+	const stepUntilDone = async (id: string, op: "drillStep" | "drillCleanup" = "drillStep") => {
+		for (let i = 0; i < 40; i++) {
+			const d = await value<Drill>(admin({ op, id }));
+			if (d.state === "done") return d;
+		}
+		throw new Error("the drill did not finish");
+	};
+
+	it("restores, embeds under its own ids, checks and cleans up a scratch copy, with the live profile, indexes and vectors unchanged; replays by request id", async () => {
+		const c = await contextFor();
+		await call(c, "save_memory", { name: "Drill card", type: "reference", description: "drilled", content: "drill canary body", profile: "personal", request_id: "drill-card-1" });
+		await value(admin({ op: "export" }));
+		const generation = await genOf("personal"), before = await live(generation);
+		const begun = await value<Drill>(admin({ op: "beginDrill", profile: "personal", generation, request_id: "drill-req-1" }));
+		expect(begun).toMatchObject({ state: "restoring", live_generation: generation, scratch: expect.any(String) });
+		expect(begun.scratch).not.toBe(generation);
+		expect(await value(admin({ op: "beginDrill", profile: "personal", generation, request_id: "drill-req-1" }))).toEqual(begun);
+		expect(await admin({ op: "beginDrill", profile: "work", request_id: "drill-req-1" })).toMatchObject({ ok: false, error: { code: "idempotency_mismatch" } });
+		expect(await admin({ op: "beginDrill", profile: "personal", request_id: "drill-req-2" })).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "drill_open" } } });
+		// The account stays open, and every recovery begin and the wipe wait for the drill.
+		expect(await call(c, "get_memory", { memory_id: (await call<{ memory_id: string }>(c, "save_memory", { name: "During drill", type: "reference", description: "d", profile: "personal" })).memory_id })).toMatchObject({ name: "During drill" });
+		for (const r of await begins("personal")) expect(r).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "drill_open" } } });
+
+		const d = await stepUntilDone(begun.id);
+		expect(d).toMatchObject({ state: "done", passed: true, report: { live_generation_unchanged: true, cleaned: { scratch: true } } });
+		for (const n of ["chunks", "nodes", "requests", "vectors", "owned_elsewhere", "requests_elsewhere", "wiped"] as const) expect(typeof d.report[n]).toBe("number");
+		expect(d.report.nodes).toBeGreaterThan(0);
+		expect(d.report.vectors).toBeGreaterThan(0);
+		expect(d.report.cleaned.vectors).toBe(d.report.nodes); // every scratch node's own id, embedded or not
+		// One bounded step can run the whole drill, so its g<scratch>: vectors come and go inside it: the counts say they were
+		// embedded and deleted, none is left, and the live generation's own vectors are all still there (below).
+		expect((await vectorIds()).filter((v) => v.startsWith(`g${begun.scratch}:`))).toEqual([]);
+		expect(d.report.account).toMatchObject({ export: expect.any(String), chunks: expect.any(Number), rows: expect.any(Number) });
+		expect(Object.values(d.report.rows).every((n) => typeof n === "number")).toBe(true);
+		const after = await live(generation);
+		// The drill wrote none of the live state: the profiles rows are as they were, and every node_index and request_index row
+		// from before is unchanged (the record saved during the drill only adds its own).
+		expect(after.account[2]).toEqual(before.account[2]);
+		for (const i of [0, 1] as const) expect(after.account[i]).toEqual(expect.arrayContaining(before.account[i]!));
+		expect(before.vectors.filter((v) => !after.vectors.includes(v))).toEqual([]);
+		expect(await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:personal:${begun.scratch}`)), (_i, st) => st.storage.sql.exec("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").one().n)).toBe(0); // nothing of the copy is left
+		expect(await (await env.BACKUPS.get(`generations/${begun.scratch}.json`))!.json()).toMatchObject({ purpose: "scratch", state: "retired" });
+		expect(await value(admin({ op: "drillStatus" }))).toMatchObject({ drill: null, last: { id: begun.id, state: "done" } });
+		expect(await value(admin({ op: "beginDrill", profile: "personal", generation, request_id: "drill-req-1" }))).toMatchObject({ id: begun.id, state: "done" });
+		expect(await admin({ op: "beginDrill", profile: "personal", generation: "stale-generation", request_id: "drill-req-3" })).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "generation_changed" } } });
+	});
+
+	it("cleanup deletes every scratch node's vector, including one whose accepted upsert was never recorded, and leaves live vectors", async () => {
+		const c = await contextFor();
+		const r = await call<{ memory_id: string }>(c, "save_memory", { name: "Drill retired", type: "reference", description: "r", content: "retired body", profile: "personal" });
+		await call(c, "save_memory", { memory_id: r.memory_id, retire: true });
+		await value(admin({ op: "export", profile: "personal" }));
+		const generation = await genOf("personal"), liveBefore = (await vectorIds()).filter((v) => v.startsWith(`g${generation}:`));
+		const begun = await value<Drill>(admin({ op: "beginDrill", profile: "personal", request_id: "drill-orphan-1" }));
+		// Vectorize accepted this upsert, but its reply never reached the scratch store: no embed_hash records it.
+		await (env.VECTORS as unknown as { upsert(v: unknown[]): Promise<unknown> }).upsert([{ id: `g${begun.scratch}:${r.memory_id}`, values: Array.from({ length: 64 }, () => 1), namespace: `${OWNER}:personal:g${begun.scratch}` }]);
+		expect(await stepUntilDone(begun.id)).toMatchObject({ state: "done", passed: true, report: { cleaned: { scratch: true } } });
+		expect((await vectorIds()).filter((v) => v.startsWith(`g${begun.scratch}:`))).toEqual([]);
+		const liveAfter = await vectorIds();
+		expect(liveBefore.filter((v) => !liveAfter.includes(v))).toEqual([]);
+	});
+
+	it("a restore whose manifest read was pending when a drill began is refused, opens no recovery and keeps the drill", async () => {
+		const c = await contextFor();
+		await call(c, "save_memory", { name: "Drill race", type: "reference", description: "r", content: "race body", profile: "personal" });
+		const generation = await genOf("personal");
+		// A corpus export of personal, so its corpus restore reaches its manifest read too.
+		await runInDurableObject(env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:personal:${generation}`)), (_i, st) => {
+			const sql = st.storage.sql;
+			if (!sql.exec("SELECT 1 FROM corpus_store_meta WHERE key = 'user_id'").toArray().length) for (const [k, v] of [["user_id", OWNER], ["profile", "personal"], ["generation", generation]]) sql.exec("INSERT INTO corpus_store_meta (key, value) VALUES (?, ?)", k, v);
+			sql.exec("INSERT OR IGNORE INTO repos (rowid, full_name, owner, name, archived, private, commit_count, ref_count, empty) VALUES (3, 'org/race', 'org', 'race', 0, 1, 1, 1, 0)");
+		});
+		await value(admin({ op: "export", corpus: true }));
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER));
+		/** Holds the account's first read of a manifest under `prefix` until released: the begin's await, made wide. */
+		const hold = async (prefix: string) => {
+			let release!: () => void, held = false;
+			const gate = new Promise<void>((r) => { release = r; });
+			let base: Env | undefined;
+			await runInDurableObject(account, (instance) => {
+				const inst = instance as unknown as { env: Env };
+				base = inst.env;
+				const r2 = base.BACKUPS as unknown as Record<string, unknown>;
+				const backups = new Proxy(r2, { get: (t, k) => {
+					const v = t[k as string];
+					if (k !== "get") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+					return async (key: string, ...rest: unknown[]) => {
+						if (!held && key.startsWith(prefix) && key.endsWith("/manifest.enc")) { held = true; await gate; }
+						return (v as (...a: unknown[]) => unknown).call(t, key, ...rest);
+					};
+				} });
+				inst.env = new Proxy(base, { get: (t, k) => (k === "BACKUPS" ? backups : (t as unknown as Record<string, unknown>)[k as string]) }) as Env;
+			});
+			return { held: () => held, release: () => release(), restore: () => runInDurableObject(account, (instance) => { (instance as unknown as { env: Env }).env = base!; }) };
+		};
+		const flows: [string, () => Promise<Outcome<unknown>>][] = [
+			["exports/profile-personal/", () => admin({ op: "beginRestore", profile: "personal", export: "latest" })],
+			["exports/account/", () => admin({ op: "beginAccountRestore", export: "latest" })],
+			["exports/corpus-personal/", () => admin({ op: "beginCorpusRestore", profile: "personal", export: "latest" })]];
+		for (const [i, [prefix, begin]] of flows.entries()) {
+			const h = await hold(prefix);
+			try {
+				const pending = begin();
+				for (let n = 0; n < 200 && !h.held(); n++) await new Promise((r) => setTimeout(r, 5));
+				expect([prefix, h.held()]).toEqual([prefix, true]);
+				const drill = await value<Drill>(admin({ op: "beginDrill", profile: "personal", request_id: `drill-race-${i}` }));
+				h.release();
+				expect([prefix, await pending]).toEqual([prefix, expect.objectContaining({ ok: false, error: expect.objectContaining({ code: "busy", details: expect.objectContaining({ reason: "drill_open" }) }) })]);
+				expect(await value<{ recovery: unknown }>(admin({ op: "restoreStatus" }))).toMatchObject({ recovery: null });
+				expect((await value<{ drill: Drill | null }>(admin({ op: "drillStatus" }))).drill?.id).toBe(drill.id);
+				await h.restore();
+				expect(await stepUntilDone(drill.id, "drillCleanup")).toMatchObject({ state: "done" });
+			} finally {
+				h.release();
+				await h.restore();
+				// Whatever the outcome, nothing stays open for the next flow.
+				const open = await value<{ recovery: { id: string } | null }>(admin({ op: "restoreStatus" }));
+				if (open.recovery) for (let n = 0; n < 60 && (await value<{ recovery: unknown }>(admin({ op: "restoreStatus" }))).recovery; n++) await admin({ op: "abortRestore" });
+				const d = (await value<{ drill: Drill | null }>(admin({ op: "drillStatus" }))).drill;
+				if (d) await stepUntilDone(d.id, "drillCleanup").catch(() => undefined);
+			}
+		}
+	});
+
+	it("a step whose restore reply was pending when cleanup began cannot reopen embedding or the drill, on success or failure", async () => {
+		const c = await contextFor();
+		// A card the fake model answers after 1.5 s: an embed admitted late would upsert well after cleanup finished.
+		await call(c, "save_memory", { name: "Stale reply", type: "reference", description: "late [[embed-slow]]", content: "stale body", profile: "personal" });
+		await value(admin({ op: "export", profile: "personal" }));
+		for (const outcome of ["success", "failure"] as const) {
+			const begun = await value<Drill>(admin({ op: "beginDrill", profile: "personal", request_id: `drill-stale-${outcome}` }));
+			const scratch = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:personal:${begun.scratch}`));
+			let release!: () => void, held = false;
+			const gate = new Promise<void>((r) => { release = r; });
+			// The scratch restore's first chunk read waits until released, then answers it, or answers nothing.
+			await runInDurableObject(scratch, (instance) => {
+				const inst = instance as unknown as { env: Env }, base = inst.env, r2 = base.BACKUPS as unknown as Record<string, unknown>;
+				const backups = new Proxy(r2, { get: (t, k) => {
+					const v = t[k as string];
+					if (k !== "get") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+					return async (key: string, ...rest: unknown[]) => {
+						if (!held && key.endsWith(".enc") && !key.endsWith("manifest.enc")) { held = true; await gate; if (outcome === "failure") return null; }
+						return (v as (...a: unknown[]) => unknown).call(t, key, ...rest);
+					};
+				} });
+				inst.env = new Proxy(base, { get: (t, k) => (k === "BACKUPS" ? backups : (t as unknown as Record<string, unknown>)[k as string]) }) as Env;
+			});
+			const step = admin({ op: "drillStep", id: begun.id });
+			for (let n = 0; n < 200 && !held; n++) await new Promise((r) => setTimeout(r, 5));
+			expect([outcome, held]).toEqual([outcome, true]);
+			const cleanup = admin({ op: "drillCleanup", id: begun.id });
+			await new Promise((r) => setTimeout(r, 50)); // cleanup is now waiting on the held restore
+			release();
+			const [stale, cleaned] = await Promise.all([step, cleanup]);
+			// The stale reply moves nothing: the drill was cleaning, and it ends done, cleaned, with no scratch vector, then or later.
+			expect([outcome, stale]).toEqual([outcome, expect.objectContaining({ ok: false, error: expect.objectContaining({ code: "busy", details: expect.objectContaining({ reason: "drill_changed" }) }) })]);
+			let last = cleaned.ok ? cleaned.value as Drill : undefined;
+			for (let n = 0; n < 20 && last?.state !== "done"; n++) last = await value<Drill>(admin({ op: "drillCleanup", id: begun.id }));
+			expect([outcome, last?.state, last?.report.cleaned.scratch]).toEqual([outcome, "done", true]);
+			await new Promise((r) => setTimeout(r, 2_000)); // past any late embed's answer
+			expect([outcome, (await vectorIds()).filter((v) => v.startsWith(`g${begun.scratch}:`))]).toEqual([outcome, []]);
+			expect([outcome, (await value<{ drill: Drill | null }>(admin({ op: "drillStatus" }))).drill]).toEqual([outcome, null]);
+			expect(await (await env.BACKUPS.get(`generations/${begun.scratch}.json`))!.json()).toMatchObject({ state: "retired" });
+		}
+	});
+
+	it("a failed cleanup keeps every recovery begin and the wipe refused; the gate goes only once the scratch copy and its ledger id are gone", async () => {
+		await value(admin({ op: "export", profile: "personal" }));
+		const begun = await value<Drill>(admin({ op: "beginDrill", profile: "personal", request_id: "drill-fail-1" }));
+		const scratch = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:personal:${begun.scratch}`));
+		// A stray copy under another identity in the scratch object: the restore refuses it, and so does the cleanup.
+		await runInDurableObject(scratch, (_i, st) => { for (const [k, v] of [["user_id", OWNER], ["profile", "personal"], ["generation", "someone-else"]]) st.storage.sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, ?)", k, v); });
+		// The refused restore ends the checks, recorded, and the cleanup that follows refuses too: the drill stays cleaning.
+		expect(await value(admin({ op: "drillStep", id: begun.id }))).toMatchObject({ state: "cleaning", error: expect.any(Object) });
+		expect((await admin({ op: "drillStep", id: begun.id })).ok).toBe(false);
+		expect((await value<{ drill: Drill | null }>(admin({ op: "drillStatus" }))).drill).toMatchObject({ state: "cleaning", error: expect.any(Object) });
+		for (const r of await begins("personal")) expect(r).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "drill_open" } } });
+		expect(await (await env.BACKUPS.get(`generations/${begun.scratch}.json`))!.json()).toMatchObject({ state: "reserved" });
+		// With the stray identity gone, cleanup finishes, retires the scratch id, and only then lets recoveries begin again.
+		await runInDurableObject(scratch, (_i, st) => st.storage.sql.exec("DELETE FROM profile_meta WHERE key IN ('user_id', 'profile', 'generation')"));
+		const done = await stepUntilDone(begun.id, "drillCleanup");
+		expect(done).toMatchObject({ state: "done", passed: false, error: expect.any(Object), report: { cleaned: { scratch: true } } });
+		expect(await (await env.BACKUPS.get(`generations/${begun.scratch}.json`))!.json()).toMatchObject({ state: "retired" });
+		const restore = await value<Recovery>(admin({ op: "beginRestore", profile: "personal", export: "latest" }));
+		expect(await value(admin({ op: "abortRestore", id: restore.id }))).toMatchObject({ state: "aborted" });
+	});
+});

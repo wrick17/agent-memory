@@ -46,6 +46,10 @@ export const redact = (s) => PATTERNS.reduce((t, [re, f]) => t.replace(re, f), s
 
 // ---------- hook ----------
 
+/** The client's own home as the hook process sees it: its configured directory, else that client's default. */
+export const clientHome = (client, env = process.env) =>
+	path.resolve(client === "codex" ? env.CODEX_HOME || path.join(os.homedir(), ".codex") : env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"));
+
 /** Writes a trigger file and starts a detached run. No network I/O; returns at once. */
 export function hook(client, input, { spawnRun = true } = {}) {
 	if (!CLIENTS.has(client)) return;
@@ -59,8 +63,9 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	// Each trigger is a new generation. A run that is handling an older one (now under claimed/) handles this one after it.
 	// A SessionStart's sweep request is its own file, so no trigger written for the session, even an older one, can erase it.
 	if (h.hook_event_name === "SessionStart") writePrivate(file.replace(/\.json$/, ".start"), "");
-	// last_assistant_message is never stored: it cannot stand in for a range.
-	writePrivate(file, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event: h.hook_event_name ?? null,
+	// last_assistant_message is never stored: it cannot stand in for a range. client_home keeps the session's origin, so whichever
+	// process later holds the run lock looks for this transcript only in the store of the client that fired the hook.
+	writePrivate(file, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event: h.hook_event_name ?? null, client_home: clientHome(client),
 		transcript_path: h.transcript_path ?? prior?.transcript_path ?? claimed?.transcript_path ?? null, cwd: h.cwd ?? prior?.cwd ?? claimed?.cwd ?? null,
 		turn_id: h.turn_id ?? null, at: Date.now(), first_at: prior?.first_at ?? Date.now() }));
 	if (spawnRun && !lockHeld()) {
@@ -122,9 +127,13 @@ export const dropLock = () => {
 
 // ---------- transcripts ----------
 
-/** The hook's path, else the client's own session store (Codex rollouts; Claude project transcripts). */
-export function findTranscript(t, env = process.env) {
+/**
+ * The hook's path, else the session store under the trigger's recorded client_home (Codex rollouts; Claude project
+ * transcripts). Never the runner's own environment: without a recorded origin there is nothing safe to search.
+ */
+export function findTranscript(t) {
 	if (t.transcript_path && fs.existsSync(t.transcript_path)) return t.transcript_path;
+	if (typeof t.client_home !== "string" || !path.isAbsolute(t.client_home)) return null;
 	const walk = (dir, test, depth) => {
 		if (depth < 0) return null;
 		let entries;
@@ -137,10 +146,10 @@ export function findTranscript(t, env = process.env) {
 		return null;
 	};
 	if (t.client === "codex") {
-		const root = path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sessions");
+		const root = path.join(t.client_home, "sessions");
 		return walk(root, (n) => n.startsWith("rollout-") && n.endsWith(`${t.session}.jsonl`), 4);
 	}
-	const root = path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "projects");
+	const root = path.join(t.client_home, "projects");
 	return walk(root, (n) => n === `${t.session}.jsonl`, 2);
 }
 
@@ -193,8 +202,15 @@ export function extract(client, lines) {
 		let role = null, text = "";
 		if (client === "codex") {
 			if (obj.type !== "event_msg") continue;
-			if (obj.payload?.type === "user_message") { role = "owner"; text = String(obj.payload.message ?? ""); }
-			else if (obj.payload?.type === "agent_message") { role = "assistant"; text = String(obj.payload.message ?? ""); }
+			const p = obj.payload, item = p?.type === "item_completed" ? p.item : null;
+			if (p?.type === "user_message") { role = "owner"; text = String(p.message ?? ""); }
+			else if (p?.type === "agent_message") { role = "assistant"; text = String(p.message ?? ""); }
+			// Codex 0.166+: completed turn items. A UserMessage is what the owner submitted; AGENTS.md, environment and developer
+			// context arrive only as response_item records, which are never read. Text blocks only.
+			else if (item?.type === "UserMessage" || item?.type === "AgentMessage") {
+				role = item.type === "UserMessage" ? "owner" : "assistant";
+				text = (Array.isArray(item.content) ? item.content : []).filter((c) => /^text$/i.test(c?.type ?? "")).map((c) => String(c.text ?? "")).join("\n");
+			}
 		} else {
 			if ((obj.type !== "user" && obj.type !== "assistant") || obj.isMeta || obj.isSidechain) continue;
 			const c = obj.message?.content;
@@ -471,12 +487,18 @@ function spool(batch) {
 	return true;
 }
 
+/**
+ * HTTP 403: the server refuses this device for the profile the session routes to (or the token lacks the ingest scope).
+ * That is a decision, not an outage: it is never spooled or retried, and the session's local text is not kept for it.
+ */
+const refusedBy = (e) => e?.status === 403;
+
 async function replaySpool(server) {
 	const dir = path.join(home(), "spool");
 	for (const f of fs.existsSync(dir) ? fs.readdirSync(dir).sort() : []) {
 		const batch = readJson(path.join(dir, f), null);
 		if (!batch) continue;
-		try { await server.ingest(batch); fs.unlinkSync(path.join(dir, f)); } catch { return; }
+		try { await server.ingest(batch); fs.unlinkSync(path.join(dir, f)); } catch (e) { if (refusedBy(e)) fs.unlinkSync(path.join(dir, f)); else return; }
 	}
 }
 
@@ -496,21 +518,21 @@ export function repoOf(cwd) {
  * One session: new range and heuristic digest when the source is found, then consolidation of every kept pending range
  * (whether or not the source can still be found), then acknowledgement, saved before any local copy is removed.
  */
-export async function processSession(t, { server, runner, env = process.env, now = Date.now() }) {
+export async function processSession(t, { server, runner, now = Date.now() }) {
 	const file = statePath(t.client, t.session);
 	const st = readJson(file, { epoch: null, digested_to: 0, consolidated_to: 0, ranges: {}, pending_source_since: null });
 	const save = () => writePrivate(file, JSON.stringify(st));
 	const pendingDir = path.join(home(), "pending");
 	const repo = repoOf(t.cwd);
 	const where = repo ? { repo } : {};
-	const src = findTranscript(t, env);
+	const src = findTranscript(t);
 	if (!src) {
 		st.pending_source_since ??= now;
 		save();
 	} else {
 		st.pending_source_since = null;
 		// What a SessionStart sweep needs to queue this session again: the found transcript and the hook's routing input.
-		st.source = { client: t.client, session: t.session, transcript_path: src, cwd: t.cwd ?? null };
+		st.source = { client: t.client, session: t.session, transcript_path: src, cwd: t.cwd ?? null, client_home: t.client_home ?? null };
 		checkEpoch(st, src);
 		const epoch = st.epoch;
 		const { end, lines } = readLines(src, st.digested_to);
@@ -526,8 +548,9 @@ export async function processSession(t, { server, runner, env = process.env, now
 				const r = await server.ingest(batch);
 				if (!r.every((x) => x.status === "stored" || x.status === "replayed")) st.ranges[id].heuristic = r.find((x) => x.status === "refused")?.reason ?? "refused";
 				st.digested_to = end;
-			} catch {
-				if (spool(batch)) st.digested_to = end;
+			} catch (e) {
+				if (refusedBy(e)) Object.assign(st.ranges[id], { status: "refused", reason: `http_${e.status}` });
+				if (refusedBy(e) || spool(batch)) st.digested_to = end;
 			}
 		}
 		save();
@@ -543,21 +566,24 @@ export async function processSession(t, { server, runner, env = process.env, now
 		fs.rmSync(path.join(pendingDir, `${safeName(id)}.parts`), { recursive: true, force: true });
 	};
 	const outcomes = {};
+	// Refused ranges keep no local text; they settle like acknowledged ones and are never sent again.
+	const refuse = (id, r, e) => { r.status = "refused"; r.reason = `http_${e.status}`; cleanup(id); outcomes[id] = "refused"; };
 	for (const [id, r] of Object.entries(st.ranges)) {
 		// Acknowledged earlier; a crash may have left its local copies behind.
 		if (r.status === "consolidated") { cleanup(id); continue; }
+		if (r.status === "refused") { cleanup(id); outcomes[id] = "refused"; continue; }
 		const messages = readJson(path.join(pendingDir, `${safeName(id)}.txt`), null);
 		if (!messages) {
 			// The text is gone. If the server already holds the range's manifest (a crash before the acknowledgement was saved),
 			// adopt it; otherwise the range is stuck. Nothing is invented.
 			let held;
-			try { held = (await server.state([id], repo))?.[id]; } catch { outcomes[id] = "offline"; continue; }
+			try { held = (await server.state([id], repo))?.[id]; } catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 			if (held?.consolidated) { r.status = "consolidated"; delete r.reason; outcomes[id] = "consolidated"; continue; }
 			r.status = "stuck"; r.reason = "pending_text_missing"; outcomes[id] = "stuck";
 			continue;
 		}
 		let result;
-		try { result = await consolidate({ id, start: r.start, end: r.end }, messages, { runner, server, dir: pendingDir, repo }); } catch { outcomes[id] = "offline"; continue; }
+		try { result = await consolidate({ id, start: r.start, end: r.end }, messages, { runner, server, dir: pendingDir, repo }); } catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 		if (result.status !== "ready") { r.status = result.status === "stuck" ? "stuck" : "pending"; r.reason = result.reason ?? result.status; outcomes[id] = r.status; continue; }
 		try {
 			const session = { client: t.client, id: t.session };
@@ -568,7 +594,7 @@ export async function processSession(t, { server, runner, env = process.env, now
 			}
 			const m = await server.ingest({ session, ...where, digests: [], manifests: [{ range_id: id, parts: result.parts.map(({ part_id, sha256 }) => ({ part_id, sha256 })) }] });
 			if (m[0]?.status !== "stored" && m[0]?.status !== "replayed") { r.reason = m[0]?.reason; outcomes[id] = "pending"; continue; }
-		} catch { outcomes[id] = "offline"; continue; }
+		} catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 		// The server holds a manifest that tiles the range. Save the acknowledgement first, then remove this range's local copies.
 		r.status = "consolidated";
 		delete r.reason;
@@ -621,7 +647,7 @@ function sweep(now, debounceMs) {
 		// Linked, never renamed, into place: a trigger a hook wrote meanwhile is kept.
 		const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
 		writePrivate(tmp, JSON.stringify({ client, session: s.session, gen: randomBytes(6).toString("hex"), event: "sweep", transcript_path: s.transcript_path,
-			cwd: s.cwd, turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
+			cwd: s.cwd, client_home: s.client_home ?? null, turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
 		try { fs.linkSync(tmp, path.join(qdir, name)); } catch { /* a newer trigger is queued */ }
 		fs.rmSync(tmp, { force: true });
 	}
@@ -666,7 +692,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 				let r;
 				try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
 				results[f] = r;
-				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated");
+				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused");
 				if (settled || r.status === "source_missing_expired") fs.rmSync(claimed, { force: true });
 				else unclaim(claimed, path.join(qdir, f));
 			}

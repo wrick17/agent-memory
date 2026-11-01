@@ -54,6 +54,11 @@ export type AccountCommand =
 	| { op: "beginCorpusRestore"; profile: string; export: string }
 	/** The open recovery or a finished one's record, by id. */
 	| { op: "restoreRecord"; id: string }
+	// The restore drill (section 18): one at a time, into a scratch generation; the account stays open.
+	| { op: "beginDrill"; profile: string; generation?: string; request_id: string }
+	| { op: "drillStatus" }
+	| { op: "drillStep"; id: string }
+	| { op: "drillCleanup"; id: string }
 	/** The open recovery's copy conflicts, after a node id, with both copies as each profile holds them now. */
 	| { op: "recoveryConflicts"; id: string; after?: string }
 	/** The owner keeps one copy of a conflict; the other becomes a flagged tombstone, its content in that profile's archive. */
@@ -141,15 +146,25 @@ export interface AccountRecovery extends Choices {
 	settle?: Settle; settled?: number;
 }
 const CHECKPOINT = "account-checkpoint";
+/** The restore drill, kept in `drill_state` from before its scratch copy exists until its cleanup deleted it; see AccountStore.drill. */
+export interface Drill {
+	id: string; request_id: string; profile: string; live_generation: string; scratch: string | null; export: string; export_at: string; account_export: string | null;
+	state: "restoring" | "embedding" | "checking" | "cleaning" | "done"; at: string; finished_at?: string; progress?: string; passed?: boolean;
+	error?: { code: string; message: string };
+	report: { chunks: number; rows: Record<string, number>; nodes: number; requests: number; vectors: number; owned_elsewhere: number; requests_elsewhere: number; wiped: number;
+		account: { export: string; chunks: number; rows: number } | null; live_generation_unchanged: boolean; cleaned: { vectors: number; scratch: boolean } };
+	/** Internal cursors: the ownership pages, then the account export's chunks (-1 once checked). */
+	after?: { node: string; request: string }; account_next?: number;
+}
 /** A profile's `requests.op` is its write command; the account binds the tool's name (mcp.ts write). Others bind as stored. */
 const TOOL_OP: Record<string, string> = { save: "save_memory", append: "append_memory", capture: "capture_memory", candidate: "review_candidates", knowledge: "record_knowledge" };
 const boundOp = (q: RestoredPage["requests"][number]) => q.legacy_hash ? (q.legacy_op ?? q.op) : TOOL_OP[q.op] ?? q.op;
 /** account_meta keys a restore neither clears nor overwrites: identity, the sequence, the schema, the open recovery, restore history and wipe fences. */
-const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "recovery_state"].includes(key) || key.startsWith("restore:") || key.startsWith("wiped:");
-const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%'";
+const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "recovery_state"].includes(key) || key.startsWith("restore:") || key.startsWith("wiped:") || key.startsWith("drill");
+const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%' AND key NOT LIKE 'drill%'";
 /** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. */
 const MERGED = ["counters", "refresh_days", "sensitive_terms"];
-const ADMIN_WHILE_RESTORING = ["listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
+const ADMIN_WHILE_RESTORING = ["drillStatus", "listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
 const flag = (r: { unresolved: { kind: string; id: string }[]; unresolved_count: number }, found: { kind: string; id: string }[]) => {
 	r.unresolved.push(...found.slice(0, Math.max(0, 50 - r.unresolved.length)));
 	r.unresolved_count += found.length;
@@ -555,7 +570,7 @@ export class AccountStore extends DurableObject<Env> {
 	}
 	private profileAt(ref: ProfileRef) {
 		return this.env.PROFILE.get(this.env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
-			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests">;
+			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
 	}
 	private corpusAt(ref: ProfileRef) {
 		return this.env.CORPUS_STORE!.get(this.env.CORPUS_STORE!.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
@@ -598,9 +613,191 @@ export class AccountStore extends DurableObject<Env> {
 
 	/** Internal RPC: only the open restore may write into its reserved generation; a corpus restore only into its corpus. */
 	async restoreAuthority(who: ProfileRef, id: string, kind?: "corpus"): Promise<Outcome<null>> {
-		const r = this.recovery();
-		return this.meta("user_id") === who.userId && r?.id === id && r.state === "restoring" && r.to === who.generation && r.profile === who.profile && r.kind === kind
-			? ok(null) : fail("forbidden", "no open restore names this generation");
+		const r = this.recovery(), d = kind ? undefined : this.drillOpen();
+		const restore = r?.id === id && r.state === "restoring" && r.to === who.generation && r.profile === who.profile && r.kind === kind;
+		const drill = d?.id === id && d.state === "restoring" && d.scratch === who.generation && d.profile === who.profile;
+		return this.meta("user_id") === who.userId && (restore || drill) ? ok(null) : fail("forbidden", "no open restore names this generation");
+	}
+
+	/** An unfinished restore drill: its scratch generation may hold a copy of a profile, so recoveries and wipes wait for it. */
+	private drillOpen(): Drill | undefined {
+		const raw = this.meta("drill_state");
+		return raw ? JSON.parse(raw) as Drill : undefined;
+	}
+	private saveDrill(d: Drill): void {
+		this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('drill_state', ?)", JSON.stringify(d));
+	}
+
+	/** Internal RPC: only the open drill's own step may act on its scratch generation, in that step's state. */
+	async drillAuthority(who: ProfileRef, id: string, state: Drill["state"]): Promise<Outcome<null>> {
+		const d = this.drillOpen();
+		return this.meta("user_id") === who.userId && d?.id === id && d.state === state && d.scratch === who.generation && d.profile === who.profile
+			? ok(null) : fail("forbidden", "no open drill names this generation");
+	}
+
+	/**
+	 * The restore drill (section 18): one profile's newest compatible export is restored into a fresh scratch generation reserved
+	 * in the R2 ledger, embedded under its own `g<scratch>:` ids, checked, and cleaned up; the account's newest export is decrypted
+	 * and hash- and count-checked without being applied. The scratch generation is never active, and `profiles`, `node_index` and
+	 * `request_index` are never written, so the account stays open. `drill_state` is written before any copy exists and removed
+	 * only after the cleanup deleted it, so recoveries and wipes stay refused while a copy may exist.
+	 */
+	private async drill(userId: string, cmd: Extract<AccountCommand, { op: "beginDrill" | "drillStatus" | "drillStep" | "drillCleanup" }>): Promise<Outcome<unknown>> {
+		if (cmd.op === "drillStatus") {
+			const last = this.meta("drill_last");
+			return ok({ drill: this.drillOpen() ?? null, last: last ? JSON.parse(this.meta(`drill:${last}`) ?? "null") as Drill | null : null });
+		}
+		if (cmd.op === "beginDrill") {
+			const payload = sha256(canonicalJson({ profile: cmd.profile, generation: cmd.generation ?? null })), key = `drill_request:${sha256(cmd.request_id)}`;
+			const held = JSON.parse(this.meta(key) ?? "null") as { id: string; payload: string } | null;
+			if (held) {
+				if (held.payload !== payload) return fail("idempotency_mismatch", "this request id began a drill with other arguments");
+				const open = this.drillOpen();
+				return ok(open?.id === held.id ? open : JSON.parse(this.meta(`drill:${held.id}`) ?? "null") as unknown);
+			}
+			const refuse = () => this.meta("recovery_state") ? fail("busy", "a recovery is open", { reason: "recovery_open" })
+				: this.wiping() ? fail("busy", "a profile wipe is unfinished", { reason: "wipe_unfinished" })
+				: this.drillOpen() ? fail("busy", "another drill is not finished", { reason: "drill_open" }) : null;
+			const early = refuse();
+			if (early) return early;
+			const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
+			if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
+			if (p.status !== "active") return fail("profile_wiped", "only an active profile can be drilled");
+			if (cmd.generation !== undefined && p.generation !== cmd.generation) return fail("busy", "the profile changed since it was shown; read its status", { reason: "generation_changed" });
+			// The newest complete export this code can restore: same profile and schema, and not of a wiped generation.
+			let chosen: Manifest | undefined;
+			for (const id of (await listExports(this.env, `profile-${cmd.profile}`)).reverse()) {
+				const m = await readManifest(this.env, `profile-${cmd.profile}`, id, userId);
+				if (!m.ok || m.value.profile !== cmd.profile || m.value.schema_version !== PROFILE_MIGRATIONS.length) continue;
+				if (this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ?", m.value.generation ?? "").toArray()[0]?.state === "wiped") continue;
+				chosen = m.value;
+				break;
+			}
+			if (!chosen) return fail("not_found", `no complete compatible export of ${cmd.profile}`);
+			let account: string | null = null;
+			for (const id of (await listExports(this.env, "account")).reverse()) {
+				const m = await readManifest(this.env, "account", id, userId);
+				if (m.ok && m.value.schema_version === ACCOUNT_MIGRATIONS.length) { account = m.value.id; break; }
+			}
+			// Rechecked after the awaits: the gate below is the only one, and it lands before anything else.
+			const late = refuse();
+			if (late) return late;
+			if (this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ? AND status = 'active'", cmd.profile).toArray()[0]?.generation !== p.generation) {
+				return fail("busy", "the profile changed since it was shown; read its status", { reason: "generation_changed" });
+			}
+			const d: Drill = { id: crypto.randomUUID(), request_id: cmd.request_id, profile: cmd.profile, live_generation: p.generation, scratch: null, export: chosen.id,
+				export_at: chosen.at, account_export: account, state: "restoring", at: now(),
+				report: { chunks: chosen.chunks.length, rows: chosen.counts, nodes: 0, requests: 0, vectors: 0, owned_elsewhere: 0, requests_elsewhere: 0, wiped: 0,
+					account: null, live_generation_unchanged: true, cleaned: { vectors: 0, scratch: false } } };
+			this.write(() => { this.saveDrill(d); this.sql.exec("INSERT INTO account_meta (key, value) VALUES (?, ?)", key, JSON.stringify({ id: d.id, payload })); });
+			let scratch: string;
+			try { scratch = await this.reserveGeneration(userId, cmd.profile, "scratch"); } catch (e) {
+				// Nothing was copied: the drill ends here, failed, and the gate goes with it.
+				return ok(this.finishDrill(d, { code: "unavailable", message: `could not reserve a scratch generation: ${(e as Error).message}` }));
+			}
+			this.write((seq) => {
+				// A cleanup during the reservation finished this drill: its just-reserved id is left unused, and nothing reopens it.
+				this.sameDrill(d);
+				d.scratch = scratch;
+				this.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'scratch', 'reserved', ?, ?)", scratch, cmd.profile, now(), seq);
+				this.saveDrill(d);
+			});
+			return ok(d);
+		}
+		const d = this.drillOpen();
+		if (!d || d.id !== cmd.id) return fail("busy", "the drill changed since it was shown; read its status", { reason: "drill_changed" });
+		// Every write first checks that the drill is still the one, in the state, this request last saw: a reply that waited out a
+		// cleanup or a finish is stale, and moves nothing (no later phase, no failure recreating a finished drill).
+		const save = (change: Partial<Drill>) => this.write(() => { this.sameDrill(d); Object.assign(d, change); this.saveDrill(d); });
+		// A deterministic refusal ends the checks; the copy is still cleaned up before the drill finishes.
+		const failed = (e: { code: string; message: string }) => { save({ state: "cleaning", error: { code: e.code, message: e.message }, progress: undefined }); return ok(d); };
+		const transient = (e: { code: string }) => e.code === "busy" || e.code === "unavailable";
+		if (cmd.op === "drillCleanup" && d.state !== "cleaning") save({ state: "cleaning", progress: undefined, error: d.error ?? { code: "stopped", message: "the owner stopped the drill" } });
+		if (!d.scratch) return ok(this.finishDrill(d, d.error ?? null));
+		const ref = { userId, profile: d.profile, generation: d.scratch }, stub = this.profileAt(ref), started = Date.now(), live = () => Date.now() - started < 20_000;
+		if (d.state === "restoring") {
+			const s = await stub.restoreStep(ref, { id: d.id, exportId: d.export });
+			if (!s.ok) return transient(s.error) ? s : failed(s.error);
+			if (!s.value.done) { save({ progress: `${s.value.applied} of ${s.value.chunks} chunks` }); return ok(d); }
+			save({ state: "embedding", progress: undefined });
+		}
+		if (d.state === "embedding") {
+			const x = await stub.drillEmbed(ref, d.id);
+			if (!x.ok) return transient(x.error) ? x : failed(x.error);
+			if (!x.value.done) { save({ progress: `${x.value.embedded} cards embedded`, report: { ...d.report, vectors: x.value.embedded } }); return ok(d); }
+			save({ state: "checking", progress: undefined, report: { ...d.report, vectors: x.value.embedded }, after: { node: "", request: "" } });
+		}
+		while (d.state === "checking" && live()) {
+			if (d.after) {
+				// Ownership against the live index, read only: what a restore of this export would find, without one.
+				const page = await stub.restoredPage(ref, d.after);
+				if (!page.ok) return transient(page.error) ? page : failed(page.error);
+				const r = { ...d.report };
+				for (const n of page.value.nodes) {
+					r.nodes++;
+					if (this.meta(`wiped:${n.id}`)) r.wiped++;
+					else if (n.status !== "moved" && n.status !== "incoming") {
+						const owner = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", n.id).toArray()[0]?.profile;
+						if (owner && owner !== d.profile) r.owned_elsewhere++;
+					}
+				}
+				for (const q of page.value.requests) {
+					r.requests++;
+					const row = this.sql.exec<{ profile: string; op: string }>("SELECT profile, op FROM request_index WHERE request_id = ?", q.request_id).toArray()[0];
+					if (row && row.op !== "wiped" && row.profile !== d.profile) r.requests_elsewhere++;
+				}
+				const more = page.value.nodes.length === 200 || page.value.requests.length === 200;
+				save({ report: r, after: more ? { node: page.value.nodes.at(-1)?.id ?? d.after.node, request: page.value.requests.at(-1)?.request_id ?? d.after.request } : undefined, account_next: 0 });
+				continue;
+			}
+			if (d.account_export && (d.account_next ?? 0) >= 0) {
+				const m = await readManifest(this.env, "account", d.account_export, userId);
+				if (!m.ok) return transient(m.error) ? m : failed(m.error);
+				let next = d.account_next ?? 0, rows = d.report.account?.rows ?? 0;
+				try {
+					for (; next < m.value.chunks.length && live(); next++) rows += (await readChunk(this.env, m.value, next)).rows.length;
+				} catch (e) { return e instanceof Fail ? failed(e.failure) : fail("unavailable", (e as Error).message); }
+				const total = Object.values(m.value.counts).reduce((a, b) => a + b, 0);
+				if (next < m.value.chunks.length) { save({ account_next: next, report: { ...d.report, account: { export: m.value.id, chunks: next, rows } } }); continue; }
+				if (rows !== total) return failed({ code: "validation", message: `the account export holds ${rows} rows, its manifest ${total}` });
+				save({ account_next: -1, report: { ...d.report, account: { export: m.value.id, chunks: next, rows } } });
+				continue;
+			}
+			const unchanged = this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ?", d.profile).toArray()[0]?.generation === d.live_generation
+				&& this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ?", d.scratch).toArray()[0]?.state === "reserved";
+			save({ state: "cleaning", report: { ...d.report, live_generation_unchanged: unchanged }, ...(unchanged ? {} : { error: { code: "validation", message: "the live or scratch generation changed during the drill" } }) });
+		}
+		if (d.state !== "cleaning") return ok(d);
+		// Cleanup deletes only the scratch object and its own vectors; until it has, the gate stays.
+		while (live()) {
+			const x = await stub.drillDiscard(ref, d.id);
+			if (!x.ok) return x;
+			save({ report: { ...d.report, cleaned: { vectors: d.report.cleaned.vectors + x.value.vectors, scratch: x.value.done } } });
+			if (x.value.done) break;
+		}
+		if (!d.report.cleaned.scratch) return ok(d);
+		await this.ledger(d.scratch, d.profile, "scratch", "retired");
+		this.write((seq) => this.sql.exec("UPDATE generations SET state = 'retired', seq = ? WHERE id = ? AND purpose = 'scratch'", seq, d.scratch));
+		return ok(this.finishDrill(d, d.error ?? null));
+	}
+
+	/** Throws busy unless the stored drill is `d`, in `d`'s state: a request acting on what it read before an await is stale otherwise. */
+	private sameDrill(d: Drill): void {
+		const cur = this.drillOpen();
+		if (!cur || cur.id !== d.id || cur.state !== d.state) throw Fail.of("busy", "the drill moved since this step read it; read its status", { reason: "drill_changed" });
+	}
+
+	/** Records the finished drill and removes the gate, in one write; only once nothing of its copy remains. */
+	private finishDrill(d: Drill, error: { code: string; message: string } | null): Drill {
+		const done: Drill = { ...d, state: "done", finished_at: now(), passed: !error && d.report.live_generation_unchanged && (d.report.cleaned.scratch || !d.scratch),
+			progress: undefined, after: undefined, account_next: undefined, ...(error ? { error } : {}) };
+		this.write(() => {
+			this.sameDrill(d);
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", `drill:${d.id}`, JSON.stringify(done));
+			this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('drill_last', ?)", d.id);
+			this.sql.exec("DELETE FROM account_meta WHERE key = 'drill_state'");
+		});
+		return done;
 	}
 
 	/** The generation a settlement reads and writes: the restored one for the restored profile, else the active one. */
@@ -695,11 +892,14 @@ export class AccountStore extends DurableObject<Env> {
 		switch (cmd.op) {
 			case "beginAccountRestore": {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				const m = await readManifest(this.env, "account", cmd.export, userId);
 				if (!m.ok) return m;
 				if (m.value.schema_version !== ACCOUNT_MIGRATIONS.length) return fail("validation", "this export's schema version does not match");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				// Rechecked after the manifest read, in the same turn as the write below: a drill begun meanwhile keeps the account to itself.
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				const r: AccountRecovery = { kind: "account", id: crypto.randomUUID(), export: m.value.id, export_at: m.value.at, export_seq: m.value.seq, at: now(),
 					state: "checkpoint", next: 0, row: 0, unresolved: [], unresolved_count: 0 };
 				// A transfer unfinished now, or begun or finished after the export, is settled from both profiles by the fixed rules (phase settle).
@@ -758,6 +958,7 @@ export class AccountStore extends DurableObject<Env> {
 			}
 			case "beginPitr": {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
 				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
@@ -792,6 +993,7 @@ export class AccountStore extends DurableObject<Env> {
 			}
 			case "beginCorpusRestore": {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				if (!this.env.CORPUS_STORE) return fail("unavailable", "the corpus is not bound");
 				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
@@ -804,6 +1006,8 @@ export class AccountStore extends DurableObject<Env> {
 				const gen = this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ? AND profile = ?", m.value.generation ?? "", cmd.profile).toArray()[0];
 				if (gen?.state === "wiped") return fail("profile_wiped", "this export belongs to a wiped generation");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				// Rechecked after the manifest read, in the same turn as the write below: a drill begun meanwhile keeps the account to itself.
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				const r: Recovery = { kind: "corpus", id: crypto.randomUUID(), profile: cmd.profile, export: m.value.id, from: p.generation, to: p.generation, at: now(),
 					export_at: m.value.at, export_seq: m.value.seq, state: "restoring", unresolved: [], unresolved_count: 0 };
 				this.write(() => this.saveRecovery(r));
@@ -811,6 +1015,7 @@ export class AccountStore extends DurableObject<Env> {
 			}
 			case "beginRestore": {
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				const p = this.sql.exec<{ generation: string; status: string }>("SELECT generation, status FROM profiles WHERE name = ?", cmd.profile).toArray()[0];
 				if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
@@ -821,6 +1026,8 @@ export class AccountStore extends DurableObject<Env> {
 				const gen = this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ? AND profile = ?", m.value.generation ?? "", cmd.profile).toArray()[0];
 				if (gen?.state === "wiped") return fail("profile_wiped", "this export belongs to a wiped generation");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
+				// Rechecked after the manifest read, in the same turn as the write below: a drill begun meanwhile keeps the account to itself.
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				// Close first (step 1): every profile call is refused from here until open or abort.
 				const r: Recovery = { id: crypto.randomUUID(), profile: cmd.profile, export: m.value.id, from: p.generation, at: now(), export_at: m.value.at, export_seq: m.value.seq,
 					state: "restoring", unresolved: [], unresolved_count: 0 };
@@ -1695,10 +1902,27 @@ export class AccountStore extends DurableObject<Env> {
 			case "recoveryConflicts": case "resolveConflict":
 			case "restoreStatus": case "restoreStep": case "openRestore": case "abortRestore":
 				return this.backup(cmd);
+			case "beginDrill": case "drillStatus": case "drillStep": case "drillCleanup": {
+				const userId = this.meta("user_id");
+				if (!userId) return fail("unavailable", "the account is not set up");
+				// The frozen public shape: the internal page and chunk cursors stay in drill_state.
+				const view = (d: unknown) => { if (!d || typeof d !== "object" || !("request_id" in d)) return d; const { after: _a, account_next: _n, ...out } = d as Drill; return out; };
+				try {
+					const r = await this.drill(userId, cmd);
+					if (!r.ok) return r;
+					const v = r.value as Record<string, unknown>;
+					return ok(cmd.op === "drillStatus" ? { drill: view(v.drill), last: view(v.last) } : view(v));
+				} catch (e) {
+					if (e instanceof Fail) return { ok: false, error: e.failure };
+					return fail("unavailable", `the drill step did not finish: ${(e as Error).message}; step again`);
+				}
+			}
 			case "wipeProfile": {
 				const userId = this.meta("user_id");
 				if (!userId) return fail("unavailable", "the account is not set up");
 				if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
+				// A drill's scratch copy of a profile would outlive the wipe: the wipe waits for its cleanup.
+				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
 				// The caller's generation, when sent, binds the wipe to the profile it showed; checked before any await or change.
 				if (cmd.generation !== undefined && this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = ?", cmd.profile).toArray()[0]?.generation !== cmd.generation) {
 					return fail("busy", "the profile changed since it was shown; read its status", { reason: "generation_changed" });

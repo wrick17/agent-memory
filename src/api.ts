@@ -13,7 +13,7 @@ import { chunkSchema, corpusOn, corpusStub, refreshSchema } from "./corpus-tools
 import { checkChunk, chunkTerms, HELD, refreshTerms, type RefreshCommand } from "./corpus/store";
 import { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms, type ImportStep } from "./profile/store";
 import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
-import { mayUse, routeWrite } from "./routing";
+import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 
@@ -970,6 +970,39 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		const page = r.value as { items: unknown[]; after: string | null };
 		return json({ profile: wp[1], generation: v.generation, target: target.profile, target_generation: target.generation, part: bind.p, items: page.items,
 			next: page.after === null ? null : Buffer.from(JSON.stringify({ ...bind, a: page.after }), "utf8").toString("base64url") });
+	}
+	// Routing rules (section 9), owner only: the stored rules, their whole-list replacement through setRules (never a me rule;
+	// last writer wins), and a read-only test of a repo against the current resolver. Nothing here routes or writes memory.
+	if (url.pathname === "/api/rules" && request.method === "GET") return json({ rules: ctx.value.rules, profiles: ctx.value.known.filter((p) => p !== "me") });
+	if (url.pathname === "/api/rules" && request.method === "PUT") {
+		const b = z.object({ rules: z.array(z.object({ priority: z.number().int().min(-1_000_000).max(1_000_000), match: z.enum(["remote", "path"]),
+			pattern: z.string().min(1).max(300), profile: z.string().regex(PROFILE_NAME), enabled: z.boolean() }).strict()).max(128) }).strict().safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send rules: up to 128 of {priority, match remote or path, pattern, profile, enabled}" } }, 400);
+		return run({ op: "setRules", rules: b.data.rules });
+	}
+	if (url.pathname === "/api/rules/test" && request.method === "POST") {
+		const b = z.object({ remote: z.string().min(1).max(500).optional(), path: z.string().min(1).max(1_000).optional() }).strict()
+			.refine((v) => v.remote !== undefined || v.path !== undefined).safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send remote, path or both" } }, 400);
+		const repo = { ...(b.data.remote ? { remote: b.data.remote } : {}), ...(b.data.path ? { path: b.data.path } : {}) }, { caller, rules, known } = ctx.value;
+		const write = routeWrite(caller, rules, known, { repo }), read = readSet(caller, rules, known, { repo });
+		return json({ remote: b.data.remote ? normalizeRemote(b.data.remote) : null, path: b.data.path ?? null, rule: matchRule(rules, repo) ?? null,
+			write: write.ok ? { profile: write.value.profile, routed_by: write.value.routedBy } : { error: write.error },
+			read: read.ok ? { primary: read.value.primary, with_me: read.value.withMe, routed_by: read.value.routedBy } : { error: read.error } });
+	}
+	// The restore drill (section 18): one profile's newest compatible export into a scratch generation; the account stays open.
+	if (url.pathname === "/api/backups/drill" && request.method === "GET") return run({ op: "drillStatus" });
+	if (url.pathname === "/api/backups/drill" && request.method === "POST") {
+		const b = z.object({ profile: z.string().regex(PROFILE_NAME), generation: z.string().min(1).max(64).optional(), request_id: z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/) })
+			.strict().safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send profile, request_id and optionally generation, the one shown" } }, 400);
+		return run({ op: "beginDrill", ...b.data });
+	}
+	const dr = /^\/api\/backups\/drill\/(step|cleanup)$/.exec(url.pathname);
+	if (dr && request.method === "POST") {
+		const b = z.object({ id: z.uuid() }).strict().safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send id, the drill shown" } }, 400);
+		return run({ op: dr[1] === "step" ? "drillStep" : "drillCleanup", id: b.data.id });
 	}
 	// Backups and restore from an export (section 18). One recovery at a time; it closes the account until open or abort.
 	if (url.pathname === "/api/backups/export" && request.method === "POST") {

@@ -138,6 +138,17 @@ export class ProfileStore extends DurableObject<Env> {
 	 * every table's row count.
 	 */
 	async restoreStep(who: Who, r: { id: string; exportId: string }): Promise<Outcome<{ applied: number; chunks: number; done: boolean }>> {
+		return this.running(this.applyRestore(who, r));
+	}
+
+	/** The restore step or drill embed running in this object, which a drill cleanup waits out before deleting anything. */
+	private work: Promise<unknown> = Promise.resolve();
+	private running<T>(p: Promise<T>): Promise<T> {
+		this.work = Promise.all([this.work, p.catch(() => undefined)]);
+		return p;
+	}
+
+	private async applyRestore(who: Who, r: { id: string; exportId: string }): Promise<Outcome<{ applied: number; chunks: number; done: boolean }>> {
 		try {
 			const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "restoreAuthority">;
 			const auth = await account.restoreAuthority(who, r.id);
@@ -225,6 +236,59 @@ export class ProfileStore extends DurableObject<Env> {
 		if (!this.same(who) || this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = 'restore_id'").toArray()[0]?.value !== id) return;
 		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();
+	}
+
+	/**
+	 * Internal RPC from the account's restore drill: embeds this scratch generation's cards under its own `g<scratch>:` ids, for
+	 * about ten seconds per call, metered like any embedding. Only the open drill's embedding step may run it; the generation is
+	 * never active, so its own alarm does nothing.
+	 */
+	async drillEmbed(who: Who, id: string): Promise<Outcome<{ done: boolean; embedded: number }>> {
+		return this.running(this.embedScratch(who, id));
+	}
+	private async embedScratch(who: Who, id: string): Promise<Outcome<{ done: boolean; embedded: number }>> {
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "drillAuthority" | "meter">;
+		const gate = async () => { const a = await account.drillAuthority(who, id, "embedding"); if (!a.ok) throw new Fail(a.error); };
+		try {
+			await gate();
+			if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+			const started = Date.now();
+			let more = true;
+			while (more && Date.now() - started < 10_000) more = await embedStep(this.ctx.storage, this.env, who, async (neurons) => (await account.meter({ day: new Date().toISOString().slice(0, 10), neurons })).embed, gate);
+			const embedded = this.ctx.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE embed_hash IS NOT NULL").one().n;
+			return this.metered(ok({ done: !more, embedded }));
+		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/**
+	 * Internal RPC from the account's restore drill: deletes this scratch generation's own `g<scratch>:` vector id for every one of
+	 * its nodes, in bounded pages, then the whole object. Only the open drill's cleanup may run it; `done` once nothing of the copy
+	 * remains. `vectors` counts the ids whose deletion was acknowledged.
+	 */
+	async drillDiscard(who: Who, id: string): Promise<Outcome<{ done: boolean; vectors: number }>> {
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "drillAuthority">;
+		const a = await account.drillAuthority(who, id, "cleaning");
+		if (!a.ok) return a;
+		// A restore step or embed of this copy still running here ends first, so nothing lands after its ids were deleted.
+		await this.work;
+		if (!this.who()) { await this.ctx.storage.deleteAlarm(); await this.ctx.storage.deleteAll(); return ok({ done: true, vectors: 0 }); }
+		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
+		const sql = this.ctx.storage.sql, started = Date.now();
+		let vectors = 0;
+		// Every node's id, recorded upsert or not (an accepted upsert's reply can be lost): the cursor moves only after Vectorize
+		// acknowledged that page's deletion, and a replay deletes the same ids again harmlessly.
+		for (;;) {
+			const after = sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = 'drill_clean_after'").toArray()[0]?.value ?? "";
+			const ids = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id > ? ORDER BY id LIMIT 100", after).toArray().map((n) => n.id);
+			if (!ids.length) break;
+			if (Date.now() - started > 10_000) return ok({ done: false, vectors });
+			if (this.env.VECTORS) await this.env.VECTORS.deleteByIds(ids.map((n) => vectorId(who, n)));
+			sql.exec("INSERT OR REPLACE INTO profile_meta (key, value) VALUES ('drill_clean_after', ?)", ids.at(-1)!);
+			vectors += ids.length;
+		}
+		await this.ctx.storage.deleteAlarm();
+		await this.ctx.storage.deleteAll();
+		return ok({ done: true, vectors });
 	}
 
 	/** Internal RPC for recovery settlement (section 18, step 4): one page of this generation's transfer rows, read only. */

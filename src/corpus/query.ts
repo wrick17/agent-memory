@@ -4,9 +4,12 @@ import { Fail } from "../domain/types";
 import { FAMILIES, SCANS, type Value } from "./families";
 import { SNAPSHOTS } from "./snapshots";
 
+/** A dated snapshot table's projection, quoted (some original column names are SQL keywords). */
+const snapshotProjection = (table: string) => Object.keys(SNAPSHOTS[table]!.columns).map((c) => (c === "rowid" ? c : `"${c}"`)).join(", ");
+
 export type CorpusQuery =
 	| { action: "search"; query: string; limit: number }
-	| { action: "get"; kind: "commit" | "repo" | "ref" | "person"; key: string }
+	| { action: "get"; kind: "commit" | "repo" | "ref" | "person" | "pr" | "ticket" | "session"; key: string }
 	| { action: "sql"; sql: string };
 
 export const SQL_ROWS = 500;
@@ -91,9 +94,32 @@ export function search(sql: SqlStorage, q: { query: string; limit: number }, hea
 }
 
 /** Exact lookups: commit `repo@sha` (or a bare 40-hex sha across repos), repo full name, ref `repo:refname`, person name. */
-export function get(sql: SqlStorage, q: { kind: "commit" | "repo" | "ref" | "person"; key: string }, head: Head = {}) {
+export function get(sql: SqlStorage, q: { kind: "commit" | "repo" | "ref" | "person" | "pr" | "ticket" | "session"; key: string }, head: Head = {}) {
 	const rows = (table: string, where: string, ...args: Value[]) => sql.exec(`SELECT ${projection(table)} FROM ${table} WHERE ${where}`, ...args).toArray();
+	// Dated snapshot records: the published cut only (stages are never read), at most SQL_ROWS link rows per list with its own flag.
+	const snap = (table: string, where: string, order: string, ...args: Value[]) =>
+		sql.exec(`SELECT ${snapshotProjection(table)} FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ${SQL_ROWS + 1}`, ...args).toArray();
+	const capped = (name: string, list: Record<string, unknown>[]) => ({ [name]: list.slice(0, SQL_ROWS), [`${name}_truncated`]: list.length > SQL_ROWS });
 	switch (q.kind) {
+		case "pr": {
+			const at = q.key.lastIndexOf("#"), number = Number(q.key.slice(at + 1));
+			if (at < 1 || !/^\d+$/.test(q.key.slice(at + 1)) || !Number.isSafeInteger(number)) throw Fail.of("validation", "a pr key is owner/repo#number");
+			const repo = q.key.slice(0, at);
+			const prs = snap("pull_requests", "repo = ? AND number = ?", "rowid", repo, number);
+			return fit({ ...head, kind: q.kind, key: q.key, found: prs.length > 0, pull_requests: prs.slice(0, 20), ...capped("tickets", snap("pr_tickets", "repo = ? AND number = ?", "rowid", repo, number)),
+				...capped("commits", snap("pr_commit_links", "repo = ? AND number = ?", "rowid", repo, number)), as_of: asOf(sql, ["pull_requests", "pr_tickets", "pr_commit_links"]) }, ["pull_requests", "tickets", "commits"]);
+		}
+		case "ticket": {
+			const episodes = snap("ticket_episodes", "ticket = ?", "episode_no, rowid", q.key), links = snap("tickets", "ticket = ?", "repo, sha", q.key);
+			return fit({ ...head, kind: q.kind, key: q.key, found: episodes.length > 0 || links.length > 0, ...capped("episodes", episodes), ...capped("commits", links),
+				as_of: asOf(sql, ["ticket_episodes", "tickets"]) }, ["episodes", "commits"]);
+		}
+		case "session": {
+			const sessions = snap("codex_sessions", "session_id = ?", "rowid", q.key);
+			return fit({ ...head, kind: q.kind, key: q.key, found: sessions.length > 0, sessions: sessions.slice(0, 20), ...capped("commits", snap("session_commit_links", "session_id = ?", "rowid", q.key)),
+				...capped("tickets", snap("session_ticket_links", "session_id = ?", "rowid", q.key)), as_of: asOf(sql, ["codex_sessions", "session_commit_links", "session_ticket_links"]) },
+				["sessions", "commits", "tickets"]);
+		}
 		case "commit": {
 			if (/^[0-9a-f]{40}$/i.test(q.key)) {
 				const commits = rows("commits", "sha = ? ORDER BY repo LIMIT 20", q.key.toLowerCase());

@@ -427,3 +427,18 @@ describe("corpus snapshot sets (uploader)", () => {
 		} finally { source.close(); }
 	});
 });
+
+describe("corpus session metadata names (uploader)", () => {
+	it("lets exactly the three session metadata snapshot tables past the session-name refusal, and still refuses raw and lineage session tables by name", async () => {
+		let statuses = 0;
+		const client = { status: async () => { statuses++; return { error: { code: "unavailable" } }; }, send: async () => assert.fail("nothing is sent") };
+		const run = (tables) => uploadCorpus({ source: {}, client, profile: "test", tables, asOf: "2026-08-12T00:00:00.000Z", fileSha256: "cd".repeat(32), state: {} });
+		for (const raw of ["session_messages", "session_decisions", "user_directives", "session_reference_index", "pattern_session_commit_links", "Codex_Sessions"]) {
+			assert.deepEqual(await run([raw]), { status: "refused", table: raw, reason: "never_import" }, raw);
+		}
+		assert.deepEqual(await run(["codex_sessions", "session_messages"]), { status: "refused", table: "session_messages", reason: "never_import" });
+		assert.equal(statuses, 0, "name refusals happen before any request");
+		assert.deepEqual(await run(["codex_sessions", "session_commit_links", "session_ticket_links"]), { status: "stopped", reason: "unavailable" });
+		assert.equal(statuses, 1);
+	});
+});

@@ -107,19 +107,41 @@ describe("dashboard", () => {
 		expect(DASHBOARD_HTML(env)).toContain(`data-clerk-publishable-key="${env.CLERK_PUBLISHABLE_KEY}"`);
 	});
 
-	it("shows one card per profile from the real endpoints, and says which figures do not exist yet", async () => {
-		const b = browser({ signedIn: true, hash: "#/profiles" });
+	it("shows one card per profile from the real endpoints, fills bounded server figures, and never makes up a count it could not read", async () => {
+		const b = browser({ signedIn: true, hash: "#/profiles", api: (path) => {
+			if (path === "/api/profiles/work/graph?part=nodes&limit=1") return Response.json({ part: "nodes", items: [], next_after: "x", done: false, total: 1377 });
+			if (path === "/api/profiles/personal/graph?part=nodes&limit=1") return Response.json({ part: "nodes", items: [], next_after: "x", done: false, total: null });
+			if (path === "/api/profiles/work/board?limit=1") return Response.json({ ...workBoard(), total: 4 });
+			if (path === "/api/profiles/personal/board?limit=1") return Response.json({ error: { code: "unavailable", message: "board unreachable" } }, { status: 503 });
+			if (path.endsWith("/activity?limit=3")) return Response.json({ items: path.includes("/work/") ? [{ id: 9, at: "2026-10-30T10:00:00Z", actor: "agent", op: "save", summary: HOSTILE }] : [] });
+			if (path === "/api/recovery") return Response.json({ recovery: null, last_export: { at: "2026-10-30T02:00:00Z", results: {} } });
+			if (path === "/api/review?limit=100") return Response.json({ items: [{ id: "m:1", kind: "migration" }, { id: "c:1", kind: "collision" }], next_after: null });
+		} });
 		await dashboardMain(b.win);
-		expect(b.seen.fetched.sort()).toEqual(["/api/devices", "/api/profiles", "/api/profiles/personal/batch", "/api/profiles/work/batch"]);
-		expect(b.seen.auth).toEqual(Array(4).fill("Bearer session-token"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.fetched.sort()).toEqual(["/api/devices", "/api/profiles", "/api/profiles/personal/activity?limit=3", "/api/profiles/personal/batch", "/api/profiles/personal/board?limit=1",
+			"/api/profiles/personal/graph?part=nodes&limit=1", "/api/profiles/work/activity?limit=3", "/api/profiles/work/batch", "/api/profiles/work/board?limit=1", "/api/profiles/work/graph?part=nodes&limit=1",
+			"/api/recovery", "/api/review?limit=100"]);
+		expect(b.seen.auth).toEqual(Array(12).fill("Bearer session-token"));
+		expect(b.seen.posted).toEqual([]);
 		expect(b.els.status!.textContent).toBe("Signed in.");
 		expect(b.view().hidden).toBe(false);
 		const cards = find(b.view(), "section");
 		expect(cards.map((c) => find(c, "a")[0]!.attrs.href)).toEqual(["#/profiles/personal", "#/profiles/work"]);
 		// work: laptop is active and defaults to it; old-box is revoked, so it does not count as active.
 		expect(text(cards[1]!)).toContain("Active devices 1 Default for 1 device(s) Last use by its devices 2026-10-29");
-		expect(text(cards[1]!)).toContain("Not available yet");
-		expect(text(cards[1]!)).toContain("See Backups");
+		// Bounded reads only: a counted total, an uncountable one and a failed one each say so; nothing becomes a made-up zero.
+		expect(text(cards[1]!)).toContain("Records 1,377");
+		expect(text(cards[1]!)).toContain("Open work 4 items (uploaded work only)");
+		expect(text(cards[1]!)).toContain("Recent changes 2026-10-30 save by agent");
+		expect(text(cards[1]!)).not.toContain(HOSTILE);
+		expect(text(cards[1]!)).toContain("Projects, people, decisions Counted once its graph is open in this tab");
+		expect(text(cards[1]!)).toContain("Storage used Not available");
+		expect(text(cards[0]!)).toContain("Records Too many to count in one read");
+		expect(text(cards[0]!)).toContain("Open work Could not read: board unreachable");
+		expect(text(cards[0]!)).not.toMatch(/Records 0|Open work 0/);
+		expect(text(b.view())).toContain("Last backup Taken 2026-10-30");
+		expect(text(b.view())).toContain("Waiting in Review 1 migrated records, 1 stopped moves");
 		// The daily batch row shows the server's batch_status as text; a failed read marks only its own card.
 		expect(text(cards[1]!)).toContain("Daily batch Last lease never; last skipped 2026-10-29 (probe_indeterminate)");
 		expect(text(cards[0]!)).toContain("Daily batch Unavailable: profile store unreachable");
@@ -689,6 +711,116 @@ describe("dashboard memories and drafts", () => {
 		expect(b.seen.posted).toEqual(["/api/recovery/step", "/api/recovery/abort", "/api/profiles/work/restore"]);
 		expect(b.seen.bodies).toEqual([{ id: "rA" }, { id: "rA" }, { export: "e2" }]); // each recovery action names the recovery shown
 		expect(JSON.stringify(b.seen)).not.toMatch(/BACKUP_KEY/);
+	});
+
+	it("edits routing rules as one list after a validated preview, saves without ids, resends an unconfirmed save unchanged, rereads, and tests the saved rules read only", async () => {
+		let saved = [{ id: "r1", priority: 10, match: "remote", pattern: "github.com/acme/*", profile: "work", enabled: true }], lose = true;
+		const puts: unknown[] = [], late = gate();
+		let tests = 0;
+		const b = browser({ signedIn: true, hash: "#/routing", api: async (path, method, body) => {
+			if (path === "/api/rules" && method === "GET") return Response.json({ rules: saved, profiles: ["personal", "work"] });
+			if (path === "/api/rules" && method === "PUT") {
+				puts.push(body);
+				if (lose) { lose = false; return Response.json({ error: { code: "unavailable", message: "lost" } }, { status: 503 }); }
+				saved = (body as { rules: typeof saved }).rules.map((r, i) => ({ ...r, id: `r${i + 1}` }));
+				return Response.json({ rules: saved.length });
+			}
+			if (path === "/api/rules/test" && method === "POST") {
+				if (++tests === 1) { await late.wait; return Response.json({ remote: "github.com/acme/x", path: null, rule: saved[0], write: { profile: "work", routed_by: "rule" }, read: { primary: "work", with_me: true, routed_by: "rule" } }); }
+				return Response.json({ remote: "github.com/other/y", path: null, rule: null, write: { error: { code: "validation", message: "route_required" } }, read: { primary: "me", with_me: false, routed_by: "fallback" } });
+			}
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		expect(byId(b.view(), "rule-1-pattern").value).toBe("github.com/acme/*");
+		click(button(b.view(), "Add a rule"));
+		expect(button(b.view(), "Save rules").disabled).toBe(true);
+		click(button(b.view(), "Preview"));
+		expect(flat()).toContain("Rule 2: the pattern must be 1 to 300 characters.");
+		expect(button(b.view(), "Save rules").disabled).toBe(true);
+		typeIn(byId(b.view(), "rule-2-pattern"), "/Users/owner/personal");
+		const m = byId(b.view(), "rule-2-match"); m.value = "path"; m.on.change!();
+		const pf = byId(b.view(), "rule-2-profile"); pf.value = "personal"; pf.on.change!();
+		click(button(b.view(), "Preview"));
+		expect(flat()).toContain("1. remote “github.com/acme/*” → work at priority 10; 2. path “/Users/owner/personal” → personal at priority 20");
+		click(button(b.view(), "Save rules"));
+		for (let i = 0; i < 4; i++) await settle();
+		const sent = { rules: [{ priority: 10, match: "remote", pattern: "github.com/acme/*", profile: "work", enabled: true }, { priority: 20, match: "path", pattern: "/Users/owner/personal", profile: "personal", enabled: true }] };
+		expect(puts).toEqual([sent]); // the whole list, in order, with no ids or version
+		expect(flat()).toContain("Saving may or may not have happened");
+		click(button(b.view(), "Save the same list again"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(puts).toEqual([sent, sent]);
+		expect(status(b).textContent).toContain("Saved 2 rules.");
+		expect(flat()).toContain("Rules (2 saved)"); // read again from the server; this tab's list is gone
+		expect(b.seen.fetched.filter((x) => x === "/api/rules").length).toBeGreaterThanOrEqual(3);
+		// The test reads the saved rules only; a slower earlier answer never replaces the latest one.
+		const tf = find(b.view(), "form").find((f) => find(f, "input").some((i) => i.attrs.id === "route-remote"))!;
+		typeIn(byId(b.view(), "route-remote"), "github.com/acme/x");
+		void tf.on.submit!({ preventDefault() {} });
+		typeIn(byId(b.view(), "route-remote"), "github.com/other/y");
+		void tf.on.submit!({ preventDefault() {} });
+		for (let i = 0; i < 3; i++) await settle();
+		late.open();
+		for (let i = 0; i < 3; i++) await settle();
+		expect(flat()).toContain("Matching rule No enabled rule matches");
+		expect(flat()).toContain("A write goes to Refused: route_required");
+		expect(flat()).toContain("A recall reads me (fallback)");
+		expect(flat()).not.toContain("github.com/acme/x");
+		expect(b.seen.posted.filter((x) => x === "/api/rules/test")).toHaveLength(2);
+		expect(puts).toHaveLength(2);
+	});
+
+	it("begins a restore drill only by an explicit request for the shown generation, resends an unconfirmed begin unchanged, steps and cleans up by hand, and passes only a server-passed, cleaned drill", async () => {
+		const done = { id: "d1", request_id: "", profile: "work", live_generation: "bbbb", scratch: "s9", export: "e2", export_at: "2026-10-30T00:00:00Z", account_export: "a1", state: "done", at: "2026-11-01T00:00:00Z",
+			finished_at: "2026-11-01T00:10:00Z", passed: true, report: { chunks: 3, rows: { nodes: 10, texts: 4 }, nodes: 10, requests: 6, vectors: 5, owned_elsewhere: 0, requests_elsewhere: 0, wiped: 0,
+				account: { export: "a1", chunks: 2, rows: 42 }, live_generation_unchanged: true, cleaned: { vectors: 5, scratch: true } } };
+		let open: Record<string, unknown> | null = null, last: Record<string, unknown> | null = { ...done, id: "d0", report: { ...done.report, cleaned: { vectors: 0, scratch: false } } }, lose = true;
+		const begins: Record<string, unknown>[] = [];
+		const b = browser({ signedIn: true, hash: "#/backups", api: (path, method, body) => {
+			if (path === "/api/recovery") return Response.json({ recovery: null, last_export: null });
+			if (path === "/api/backups/drill" && method === "GET") return Response.json({ drill: open, last });
+			if (path === "/api/backups/drill" && method === "POST") {
+				begins.push(body as Record<string, unknown>);
+				if (lose) { lose = false; return Response.json({ error: { code: "unavailable", message: "lost" } }, { status: 503 }); }
+				open = { ...done, request_id: (body as { request_id: string }).request_id, state: "restoring", passed: undefined, report: undefined, finished_at: undefined };
+				return Response.json(open);
+			}
+			if (path === "/api/backups/drill/step" && method === "POST") { open = { ...open!, state: "checking" }; return Response.json(open); }
+			if (path === "/api/backups/drill/cleanup" && method === "POST") { last = { ...done, request_id: String(open!.request_id) }; open = null; return Response.json(last); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		// A drill whose checks passed but whose cleanup is not confirmed is not a pass.
+		expect(flat()).toContain("Checks passed, but the cleanup of the scratch copy is not confirmed.");
+		expect(flat()).not.toContain("Passed: every check passed");
+		expect(b.seen.posted).toEqual([]);
+		const pick = byId(b.view(), "drill-profile");
+		pick.value = "work";
+		find(b.view(), "form").find((f) => find(f, "select").some((x) => x.attrs.id === "drill-profile"))!.on.submit!({ preventDefault() {} });
+		for (let i = 0; i < 4; i++) await settle();
+		expect(begins[0]).toEqual({ profile: "work", generation: "bbbb", request_id: expect.stringMatching(/^dashboard:/) });
+		expect(flat()).toContain("may or may not have begun");
+		click(button(b.view(), "Send the same drill request again"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(begins[1]).toEqual(begins[0]);
+		expect(flat()).toContain("Drill in progress");
+		const posted = b.seen.posted.length;
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.posted.length).toBe(posted); // no step runs by itself
+		click(button(b.view(), "Run the next drill step"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(flat()).toContain("State checking");
+		click(button(b.view(), "Stop and clean up"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.posted).toEqual(["/api/backups/drill", "/api/backups/drill", "/api/backups/drill/step", "/api/backups/drill/cleanup"]);
+		expect(b.seen.bodies.slice(2)).toEqual([{ id: "d1" }, { id: "d1" }]);
+		expect(flat()).toContain("Passed: every check passed and the scratch copy was cleaned up.");
+		expect(flat()).toContain("Rows restored nodes 10, texts 4");
+		// The backend's account check counts rows as one number (account/store.ts Drill report); it must show, not vanish.
+		expect.soft(flat()).toContain("Account export a1: 2 chunks checked, 42 rows");
 	});
 
 	// Recovery copy choices (section 18, step 4): both copies as the server reads them now, and the owner's explicit choice.

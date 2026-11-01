@@ -219,6 +219,9 @@ export const HELD: Record<string, string> = {
 	// Loaded only as the dated per-profile snapshot set `patterns` (snapshots.ts), which the route checks before this list.
 	...group("snapshot: loads only as the dated per-profile snapshot set patterns, whole and replaced by a newer cut", ["pattern_coordinated_changes",
 		"pattern_coordinated_change_repos", "pattern_synchronized_migrations", "pattern_migration_commits", "pattern_lineage_edges", "pattern_findings", "pattern_finding_repos"]),
+	...group("snapshot: loads only as a dated per-profile record snapshot set (pull_requests, releases, tickets, sessions or judgment), whole and replaced by a newer cut",
+		["pull_requests", "pr_tickets", "pr_commit_links", "releases", "github_tags", "tickets", "ticket_episodes", "codex_sessions", "session_commit_links", "session_ticket_links",
+			"validated_contracts", "frontend_business_facts", "frontend_workflows", "frontend_relationships", "frontend_uncertainties", "ownership", "predecessor_links", "journey_edges"]),
 };
 
 export const CHUNK_ROWS = 5000;

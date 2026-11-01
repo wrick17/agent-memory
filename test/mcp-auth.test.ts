@@ -1198,3 +1198,45 @@ it("recovery conflict read and choice are owner only: a device token gets 403 an
 	expect((await http("/api/recovery")).body).toEqual(before);
 	expect((await http("/api/recovery/abort", "POST", { id })).body).toMatchObject({ state: "aborted" });
 });
+
+it("routing rules and the restore drill are owner only: stored rules, validated replacement without me, a test route that writes nothing", async () => {
+	await call(await contextFor(), "save_memory", { name: "Routing gate", type: "reference", description: "g", content: "routing body", profile: "personal" });
+	serveJwks();
+	const token = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN }), origin = new URL(env.RESOURCE_URL).origin;
+	const http = async (path: string, method = "GET", body?: unknown, t = token) => {
+		const r = await exports.default.fetch(new Request(origin + path, { method, headers: { authorization: `Bearer ${t}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+		return { status: r.status, body: await r.json() as any }; // response bodies are checked field by field
+	};
+	const device = (await deviceToken(`routing-${crypto.randomUUID().slice(0, 8)}`, ["read", "write"], ["personal"], "personal")).token;
+	const seq = () => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, st) => st.storage.sql.exec("SELECT value FROM account_meta WHERE key = 'write_seq'").one().value);
+	for (const [path, method, body] of [["/api/rules", "GET"], ["/api/rules", "PUT", { rules: [] }], ["/api/rules/test", "POST", { remote: "github.com/a/b" }],
+		["/api/backups/drill", "GET"], ["/api/backups/drill", "POST", { profile: "personal", request_id: "device-drill-1" }],
+		["/api/backups/drill/step", "POST", { id: crypto.randomUUID() }], ["/api/backups/drill/cleanup", "POST", { id: crypto.randomUUID() }]] as const) {
+		expect([path, method, (await http(path, method, body, device)).status]).toEqual([path, method, 403]);
+	}
+	const original = await http("/api/rules");
+	expect(original.status).toBe(200);
+	expect(original.body.profiles).not.toContain("me");
+	const restore = original.body.rules.map((r: Record<string, unknown>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== "id")));
+	// Validated: never a me rule, only the existing fields, and a bounded list.
+	expect((await http("/api/rules", "PUT", { rules: [{ priority: 1, match: "remote", pattern: "github.com/meorg/*", profile: "me", enabled: true }] })).status).toBe(400);
+	expect((await http("/api/rules", "PUT", { rules: [{ priority: 1, match: "remote", pattern: "github.com/x/*", profile: "work", enabled: true, id: "r9" }] })).status).toBe(400);
+	expect((await http("/api/rules", "PUT", { rules: [{ priority: 1, match: "glob", pattern: "x", profile: "work", enabled: true }] })).status).toBe(400);
+	expect((await http("/api/rules", "GET")).body.rules).toEqual(original.body.rules);
+	const rules = [{ priority: 10, match: "remote", pattern: "github.com/RouteOrg/*", profile: "work", enabled: true }, { priority: 20, match: "path", pattern: "/home/me/notes", profile: "personal", enabled: false }];
+	expect(await http("/api/rules", "PUT", { rules })).toMatchObject({ status: 200, body: { rules: 2 } });
+	expect((await http("/api/rules")).body.rules).toEqual([{ id: "r1", ...rules[0] }, { id: "r2", ...rules[1] }]);
+	// The test route answers from the current resolver and writes nothing.
+	const before = await seq();
+	expect(await http("/api/rules/test", "POST", { remote: "git@github.com:RouteOrg/app.git" })).toMatchObject({ status: 200, body: {
+		remote: "github.com/routeorg/app", rule: { id: "r1", profile: "work" }, write: { profile: "work", routed_by: "rule:github.com/RouteOrg/*" }, read: { primary: "work", routed_by: "rule:github.com/RouteOrg/*" } } });
+	expect(await http("/api/rules/test", "POST", { path: "/home/me/notes/x" })).toMatchObject({ status: 200, body: { rule: null, write: { error: { code: "route_required" } }, read: { primary: "me" } } });
+	expect((await http("/api/rules/test", "POST", {})).status).toBe(400);
+	expect(await seq()).toBe(before);
+	// The drill routes: strict bodies, and the status read.
+	expect((await http("/api/backups/drill", "POST", { profile: "personal", request_id: "short" })).status).toBe(400);
+	expect((await http("/api/backups/drill", "POST", { profile: "personal", request_id: "owner-drill-1", extra: 1 })).status).toBe(400);
+	expect((await http("/api/backups/drill/step", "POST", { id: "not-a-uuid" })).status).toBe(400);
+	expect(await http("/api/backups/drill")).toMatchObject({ status: 200, body: { drill: null } });
+	expect(await http("/api/rules", "PUT", { rules: restore })).toMatchObject({ status: 200 });
+});

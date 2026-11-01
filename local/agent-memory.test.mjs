@@ -97,7 +97,67 @@ describe("hook", () => {
 	});
 });
 
+describe("origin", () => {
+	it("searches for a missing Claude transcript only under the client home the hook ran in, whichever process runs the queue", async () => {
+		const office = path.join(tmp, `office-${n}`), personal = path.join(tmp, `personal-${n}`), session = `origin-${n}`;
+		for (const [dir, text] of [[office, "OFFICE canary"], [personal, "PERSONAL canary"]]) {
+			fs.mkdirSync(path.join(dir, ".claude", "projects", "p"), { recursive: true });
+			fs.writeFileSync(path.join(dir, ".claude", "projects", "p", `${session}.jsonl`), claudeLine("user", text) + claudeLine("assistant", "Noted."));
+		}
+		const saved = { HOME: process.env.HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
+		const restore = () => { for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+		try {
+			// The personal Claude client fires its hook with its own config dir; its transcript path does not exist (yet).
+			process.env.CLAUDE_CONFIG_DIR = path.join(personal, ".claude");
+			am.hook("claude-code", JSON.stringify({ session_id: session, transcript_path: path.join(tmp, "missing.jsonl"), hook_event_name: "Stop" }), { spawnRun: false });
+			// A legacy trigger with no recorded origin for another session.
+			fs.writeFileSync(path.join(am.home(), "queue", `claude-code-legacy-${n}.json`), JSON.stringify({ client: "claude-code", session: session.replace("origin", "legacy"), gen: "g", event: "Stop", transcript_path: null, cwd: null, at: 0, first_at: 0 }));
+			fs.copyFileSync(path.join(office, ".claude", "projects", "p", `${session}.jsonl`), path.join(office, ".claude", "projects", "p", `${session.replace("origin", "legacy")}.jsonl`));
+			// The queue is then run by a process of another client: no CLAUDE_CONFIG_DIR, and a home whose default .claude is Office.
+			delete process.env.CLAUDE_CONFIG_DIR;
+			process.env.HOME = office;
+			const server = fakeServer();
+			await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+			const text = server.storedText() + JSON.stringify(server.log);
+			assert.ok(text.includes("PERSONAL canary"));
+			assert.ok(!text.includes("OFFICE canary"), "the runner never reads the Office store");
+			const legacy = JSON.parse(fs.readFileSync(path.join(am.home(), "state", "claude-code", `${session.replace("origin", "legacy")}.json`), "utf8"));
+			assert.ok(legacy.pending_source_since && !legacy.source, "a trigger without an origin waits instead of searching");
+			const st = JSON.parse(fs.readFileSync(path.join(am.home(), "state", "claude-code", `${session}.json`), "utf8"));
+			assert.equal(st.source.client_home, path.join(personal, ".claude"), "the SessionStart sweep requeues with the same origin");
+		} finally { restore(); }
+	});
+});
+
 describe("reading", () => {
+	it("reads Codex 0.166 completed turn items as owner and assistant text, and none of the injected, tool or thinking records", () => {
+		const item = (type, content, extra = {}) => ({ type: "event_msg", payload: { type: "item_completed", turn_id: "t", item: { type, id: "i", content, ...extra } } });
+		const msg = (role, kinds, text) => ({ type: "response_item", payload: { type: "message", role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text }],
+			internal_chat_message_metadata_passthrough: { content_item_kinds: kinds } } });
+		const records = [
+			{ type: "session_meta", payload: { base_instructions: "BASE INSTRUCTIONS", cwd: "/w" } },
+			msg("developer", ["model.base_instructions"], "DEVELOPER CONTEXT"),
+			msg("user", ["agents_md.instructions", "environments.environment_context"], "# AGENTS.md instructions\nINJECTED RULES"),
+			msg("user", ["user.text"], "Use the staging database."),
+			{ type: "turn_context", payload: { cwd: "/w", model: "m" } },
+			item("UserMessage", [{ type: "text", text: "Use the staging database.", text_elements: [] }, { type: "image", url: "x" }]),
+			item("UserMessage", [{ type: "text", text: "<environment_context>INJECTED ENV</environment_context>", text_elements: [] }]),
+			{ type: "response_item", payload: { type: "reasoning", summary: [{ type: "summary_text", text: "THINKING" }] } },
+			{ type: "response_item", payload: { type: "function_call", name: "shell", arguments: "TOOL CALL" } },
+			{ type: "response_item", payload: { type: "function_call_output", output: "TOOL OUTPUT" } },
+			item("Reasoning", [{ type: "text", text: "THINKING ITEM" }]),
+			item("CommandExecution", [{ type: "text", text: "TOOL ITEM" }]),
+			msg("assistant", ["unknown"], "Switched to staging."),
+			item("AgentMessage", [{ type: "Text", text: "Switched to staging.<system-reminder>REMINDER</system-reminder>" }], { phase: "final_answer" }),
+			{ type: "event_msg", payload: { type: "task_complete", last_agent_message: "Switched to staging." } },
+		];
+		const got = am.extract("codex", records.map((obj, i) => ({ pos: i * 100, next: i * 100 + 100, obj })));
+		assert.deepEqual(got.map((m) => [m.role, m.text]), [["owner", "Use the staging database."], ["assistant", "Switched to staging."]]);
+		// The pre-0.166 event records still read the same way.
+		const legacy = am.extract("codex", [{ pos: 0, next: 1, obj: { type: "event_msg", payload: { type: "user_message", message: "Old owner text." } } }]);
+		assert.deepEqual(legacy.map((m) => m.text), ["Old owner text."]);
+	});
+
 	it("keeps owner and assistant text only", () => {
 		const claude = transcript("claude", [
 			claudeLine("user", "Please fix the loop."),
@@ -247,25 +307,57 @@ describe("capture protocol", () => {
 		assert.equal(r.consolidated_to, fs.statSync(f).size);
 	});
 
+	it("settles a session the server refuses (HTTP 403): nothing spooled or retried, no local text kept, and replay goes past it", async () => {
+		const server = fakeServer(), ingest = server.ingest, state = server.state;
+		const deny = () => Promise.reject(Object.assign(new Error("HTTP 403"), { status: 403 }));
+		const a = transcript("allowed-a", [claudeLine("user", "Work note for the allowed repo."), claudeLine("assistant", "Done.")]);
+		const b = transcript("refused-b", [claudeLine("user", "Personal note in a refused repo."), claudeLine("assistant", "Ok.")]);
+		// An outage first: both sessions' heuristic digests spool, the refused session's file first.
+		server.offline = true;
+		await am.processSession(trigger("claude-code", "refused-b", b), { server, runner: keepAllRunner() });
+		await new Promise((r) => setTimeout(r, 5));
+		await am.processSession(trigger("claude-code", "allowed-a", a), { server, runner: keepAllRunner() });
+		const spoolDir = path.join(am.home(), "spool"), pendingDir = path.join(am.home(), "pending");
+		assert.equal(fs.readdirSync(spoolDir).length, 2);
+		// Back online, the server refuses only session b's routed profile.
+		server.offline = false;
+		server.ingest = (batch) => (batch.session.id === "refused-b" ? deny() : ingest(batch));
+		server.state = (ids, repo) => (ids.some((id) => id.includes(":refused-b:")) ? deny() : state(ids, repo));
+		am.hook("claude-code", JSON.stringify({ session_id: "refused-b", transcript_path: b, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
+		await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		assert.deepEqual(fs.readdirSync(spoolDir), [], "the refused file is dropped and the next one replays");
+		assert.ok(server.log.some((x) => x.session.id === "allowed-a" && x.digests[0]?.capture_status === "heuristic"));
+		const st = JSON.parse(fs.readFileSync(path.join(am.home(), "state", "claude-code", "refused-b.json"), "utf8"));
+		assert.deepEqual(Object.values(st.ranges).map((r) => [r.status, r.reason]), [["refused", "http_403"]]);
+		assert.ok(!fs.readdirSync(pendingDir).some((x) => x.includes("refused-b")), "no local text is kept for a refused range");
+		assert.ok(!fs.existsSync(path.join(am.home(), "queue", "claude-code-refused-b.json")), "the refused session settles");
+		// A later turn in the refused session is refused at once: not spooled, not kept.
+		fs.appendFileSync(b, claudeLine("user", "Another personal note."));
+		const r = await am.processSession(trigger("claude-code", "refused-b", b), { server, runner: keepAllRunner() });
+		assert.ok(Object.values(r.outcomes).every((o) => o === "refused"));
+		assert.deepEqual(fs.readdirSync(spoolDir), []);
+		assert.ok(!fs.readdirSync(pendingDir).some((x) => x.includes("refused-b")));
+	});
+
 	it("finds a Codex rollout when the hook path is null, waits while it is missing, and starts a new epoch on a rewrite", async () => {
 		const codexHome = path.join(tmp, `codex-home-${n}`);
-		const t = trigger("codex", "thr_null", null);
+		const t = { ...trigger("codex", "thr_null", null), client_home: codexHome };
 		const server = fakeServer();
-		let r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		let r = await am.processSession(t, { server, runner: keepAllRunner() });
 		assert.equal(r.status, "source_missing");
 		assert.equal(server.log.length, 0);
 		const dir = path.join(codexHome, "sessions", "2026", "10", "28");
 		fs.mkdirSync(dir, { recursive: true });
 		const f = path.join(dir, "rollout-2026-10-28T10-00-00-thr_null.jsonl");
 		fs.writeFileSync(f, codexLine("user_message", "Use the staging database.") + codexLine("agent_message", "Switched."));
-		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		r = await am.processSession(t, { server, runner: keepAllRunner() });
 		assert.equal(r.consolidated_to, fs.statSync(f).size);
 		assert.ok(server.storedText().includes("Use the staging database."));
 		const calls = server.log.length;
-		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		r = await am.processSession(t, { server, runner: keepAllRunner() });
 		assert.equal(server.log.length, calls, "a repeated event on an unchanged transcript uploads nothing");
 		fs.writeFileSync(f, codexLine("user_message", "Rewritten history.") + codexLine("agent_message", "Ok."));
-		r = await am.processSession(t, { server, runner: keepAllRunner(), env: { CODEX_HOME: codexHome } });
+		r = await am.processSession(t, { server, runner: keepAllRunner() });
 		const epochs = new Set([...server.manifests.keys()].map((k) => k.split(":")[2]));
 		assert.equal(epochs.size, 2);
 	});
