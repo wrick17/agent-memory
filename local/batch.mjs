@@ -129,6 +129,9 @@ export function confine(judged, output) {
 	return { results, dropped };
 }
 
+/** `batch_runner: "claude"` selects the gated Claude Code runner, which exists only with explicit Claude tier models. */
+const execOf = (runner, config) => (config.batch_runner === "claude" ? runner?.batchExec : runner?.exec);
+
 const promptFor = (items) => `${PROMPT}\n<items>\n${JSON.stringify(items)}\n</items>\n`;
 
 /** One profile: lease, judge per model tier, then complete item by item. Returns a content-free outcome. */
@@ -151,7 +154,7 @@ async function profileBatch(profile, { server, runner, config, clock }) {
 	for (const [items, model, effort] of tiers) {
 		if (!items.length) continue;
 		if (clock() > deadline) return skipped("lease_short");
-		const out = await runner.exec({ prompt: promptFor(items), schema: OPS_SCHEMA, model, effort });
+		const out = await execOf(runner, config)({ prompt: promptFor(items), schema: OPS_SCHEMA, model, effort });
 		// Any tool, error or unknown event, or unusable output, discards the whole lease: the runtime is not the proven one.
 		if (out?.kind !== "ok") return skipped(out?.kind ?? "no_result", true);
 		if (!validOutput(out.part, OPS_SCHEMA)) return skipped("bad_output", true);
@@ -185,7 +188,7 @@ async function profileBatch(profile, { server, runner, config, clock }) {
  */
 export async function batch({ runner, config = loadConfig(), server = mcpJob(config), profiles = config.batch_profiles ?? [], clock = Date.now } = {}) {
 	const report = { at: new Date(clock()).toISOString(), runtime: runner?.classification ?? "unavailable", profiles: {} };
-	const proven = runner?.available && typeof runner.exec === "function";
+	const proven = runner?.available && typeof execOf(runner, config) === "function";
 	// The reason's code part only ("probe_indeterminate:curl" reports probe_indeterminate).
 	const code = String(runner?.available ? "" : runner?.reason ?? runner?.classification ?? "").split(":")[0];
 	const unproven = proven ? null : /^[a-z_]{1,64}$/.test(code) ? code : "runtime_unavailable";

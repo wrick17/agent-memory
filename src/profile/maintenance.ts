@@ -141,7 +141,11 @@ function context(sql: SqlStorage, subjects: string[], kind: string) {
 	const ids = JSON.stringify([...readable]);
 	const nodes = sql.exec<{ id: string; kind: string; other_label: string | null; memory_type: string | null; scope: string; name: string; description: string; status: string; origin: string; pinned: number; revision: number }>(
 		"SELECT id, kind, other_label, memory_type, scope, name, description, status, origin, pinned, revision FROM nodes WHERE id IN (SELECT value FROM json_each(?))", ids).toArray()
-		.map((n) => ({ ...n, ...(n.kind === "journal" ? journalPrefix(sql, n.id) : {}), passage: n.other_label === "capture" ? captureText(sql, n.id).slice(0, 1200) : readPrefix(sql, n.id) }));
+		.map((n) => ({ ...n, ...(n.kind === "journal" ? journalPrefix(sql, n.id) : {}), passage: n.other_label === "capture" ? captureText(sql, n.id).slice(0, 1200)
+			// A capture item's session text is its current digest parts (read.ts captureVisible): never a manifest or a superseded heuristic.
+			: n.kind === "session" && (kind === "unprocessed_capture" || kind === "preference_signal") ? sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part = 'capture' AND lane = 'capture' AND live = 1 AND capture_part IS NOT 'manifest' ORDER BY rowid", n.id)
+				.toArray().map((r) => r.body).join("\n").slice(0, 1200)
+			: readPrefix(sql, n.id) }));
 	const refs = sql.exec<{ id: number; src: string }>("SELECT id, src FROM edges WHERE ended_at IS NULL AND (src IN (SELECT value FROM json_each(?)) OR dst IN (SELECT value FROM json_each(?))) LIMIT 50", ids, ids).toArray();
 	const sources = readableNodeIds(sql, [...new Set(refs.map((e) => e.src))]);
 	for (const id of archiveNodeIds(sql,[...sources])) sources.delete(id);

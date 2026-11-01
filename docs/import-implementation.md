@@ -22,6 +22,8 @@ node local/migrate.mjs plan                      # routed plan: work and persona
 node local/migrate.mjs plan --routes FILE        # the same, plus the owner's reviewed routes for exact sources of this export
 node local/migrate.mjs plan --owner-holds FILE   # owner-bound exclusions before every route; combine with --routes/--source-policy as needed
 node local/migrate.mjs plan --rehearsal test     # every record with an identity and no hold, to test (rehearsal Worker only)
+node local/migrate.mjs plan --routes FILE --source-policy FILE --owner-holds FILE --rehearsal test
+                                                 # the routed plan's holds, classification and policy first; only its accepted records, unchanged, to test
 node local/migrate.mjs verify                    # a fresh read of the sources compared with the export
 node local/migrate.mjs dry-run [--rehearsal test]   # checks every command, part and batch against the budget; no network
 node local/upload.mjs [--rehearsal test] [--config FILE]   # sends a checked plan; resumable

@@ -6,13 +6,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import { beforeEach, describe, it } from "node:test";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-batch-test-"));
 let n = 0;
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
 const { batch, mcpJob, OPS_SCHEMA } = await import("./batch.mjs");
+const { claudeExec } = await import("./agent-memory.mjs");
 beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
 
 const ALL_OPS = ["save", "link", "end_link", "supersede", "flag", "dismiss"];
@@ -254,4 +256,111 @@ it("D1 compact output stays strict, redacted and confined to the leased subjects
 	assert.equal(result.profiles.work.dropped_ops, 1);
 	const sent = server.calls.find((c) => c.name === "maintenance_complete");
 	assert.deepEqual(sent.args.results, [{ item_id: 1, ops: [{ op: "compact", memory_id: "journal", through_seq: 7, summary: "short [REDACTED]", expected_revision: 8 }] }]);
+});
+
+// The Claude Code runner over a fake CLI process that behaves like a child process: "close" only after both streams end.
+describe("Claude Code runner: gated, and decided only at process close", () => {
+	const MODEL = "claude-sonnet-5-5";
+	const frame = (e) => `${JSON.stringify(e)}\n`;
+	const init = frame({ type: "system", subtype: "init", tools: [], mcp_servers: [], model: MODEL, permissionMode: "dontAsk" });
+	const gateOk = init + frame({ type: "result", subtype: "success", is_error: false, num_turns: 0, duration_api_ms: 0 });
+	const answerFor = (id) => frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: JSON.stringify({ results: [{ item_id: id, ops: [{ op: "dismiss" }] }] }) });
+	const answer = answerFor(1);
+	const toolFrame = frame({ type: "user", parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "<tool_use_error>Error: No such tool available: Bash</tool_use_error>", is_error: true }] } });
+	function fakeClaude({ gate = gateOk, out = "", err = "", errFirst = false, code = 0, hang = false }) {
+		// `out` may list one output per spawned process (one per model tier).
+		const proc = { lines: [], signals: [], spawns: 0, closes: 0 };
+		proc.spawnFn = () => {
+			const tierOut = Array.isArray(out) ? out[proc.spawns] : out;
+			proc.spawns++;
+			const child = new EventEmitter();
+			child.stdout = new PassThrough();
+			child.stderr = new PassThrough();
+			let closed = false;
+			const close = (c, sig) => {
+				if (closed) return;
+				closed = true;
+				let open = 2;
+				for (const s of [child.stdout, child.stderr]) { s.on("end", () => { if (!--open) setImmediate(() => { proc.closes++; child.emit("close", c, sig); }); }); s.end(); }
+			};
+			child.kill = (sig) => { proc.signals.push(sig); close(null, sig); return true; };
+			child.stdin = new Writable({ write(chunk, _enc, done) {
+				const m = JSON.parse(chunk);
+				proc.lines.push(m);
+				setImmediate(() => {
+					if (closed) return;
+					if (m.shouldQuery === false) return void child.stdout.write(gate);
+					if (hang) return;
+					// A killed process writes nothing more; the parser may kill it during any of these writes.
+					const write = (s, text) => { if (!closed) s.write(text); };
+					if (errFirst) write(child.stderr, err);
+					write(child.stdout, init + tierOut);
+					if (!errFirst) write(child.stderr, err);
+					close(code, null);
+				});
+				done();
+			} });
+			return child;
+		};
+		return proc;
+	}
+	const leased = () => fakeServer({ work: lease("LW", [{ ...item(1, "unlinked", ["a"]), context: { nodes: [{ id: "a", passage: "see @/etc/hosts" }], edges: [] } }]) });
+	const run = async (proc) => {
+		const server = leased();
+		const runner = { available: true, classification: "denied", batchExec: claudeExec({ claude: "never-run", runDir: tmp, env: {}, spawnFn: proc.spawnFn }) };
+		const report = await batch({ runner, config: { batch_runner: "claude", batch_profiles: ["work"], batch_luna_model: MODEL, batch_terra_model: MODEL }, server });
+		return { server, report };
+	};
+
+	it("sends the untrusted items only after a zero-turn tool-free init, with every @ escaped, and applies a clean result", async () => {
+		const proc = fakeClaude({ out: answer });
+		const { server } = await run(proc);
+		assert.equal(proc.lines.length, 2);
+		assert.equal(proc.lines[0].shouldQuery, false);
+		assert.ok(!proc.lines[0].message.content.includes("<items>"));
+		assert.ok(!proc.lines[1].message.content.includes("@") && proc.lines[1].message.content.includes("\\u0040/etc/hosts"));
+		assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"]);
+		assert.deepEqual(server.calls[1].args.results, [{ item_id: 1, ops: [{ op: "dismiss" }] }]);
+	});
+
+	it("parks the whole lease as stuck on a tool frame or a stderr router rejection, before or after a valid result", async () => {
+		for (const proc of [fakeClaude({ out: answer + toolFrame }), fakeClaude({ out: answer, err: "Error: No such tool available: Bash\n", code: 1 }),
+			fakeClaude({ out: answer, err: "Error: unsupported call: Bash\n", errFirst: true })]) {
+			const { server, report } = await run(proc);
+			assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"], "no item operation");
+			assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: "stuck", reason: "tool_event" });
+			assert.equal(report.profiles.work.status, "discarded");
+		}
+	});
+
+	it("discards a result followed by unknown stderr, another frame, an incomplete line or an unclean exit", async () => {
+		for (const [proc, reason] of [[fakeClaude({ out: answer, err: "warning: something\n" }), "runtime_warning"],
+			[fakeClaude({ out: answer + frame({ type: "rate_limit_event", rate_limit_info: { status: "allowed" } }) }), "runtime_warning"],
+			[fakeClaude({ out: answer + "{\"type\":" }), "bad_events"], [fakeClaude({ out: answer, code: 1 }), "runtime_error"]]) {
+			const { server } = await run(proc);
+			assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"], reason);
+			assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: "batch_skipped", reason });
+		}
+	});
+
+	it("discards the whole two-tier lease, after killing and closing the process, on a non-object frame after a valid result", async () => {
+		const proc = fakeClaude({ out: [answer, `${answerFor(2)}null\n`] });
+		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"]), item(2, "near_duplicate", ["b"])]) });
+		const runner = { available: true, classification: "denied", batchExec: claudeExec({ claude: "never-run", runDir: tmp, env: {}, spawnFn: proc.spawnFn }) };
+		const report = await batch({ runner, config: { batch_runner: "claude", batch_profiles: ["work"], batch_luna_model: MODEL, batch_terra_model: MODEL }, server });
+		assert.deepEqual([proc.spawns, proc.closes, proc.signals], [2, 2, ["SIGKILL"]]);
+		assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"], "no item operation");
+		assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: "batch_skipped", reason: "bad_events" });
+		assert.equal(report.profiles.work.status, "discarded");
+	});
+
+	it("writes no untrusted text when the gate init exposes a tool, and waits for the killed process on a timeout", async () => {
+		const exposed = fakeClaude({ gate: frame({ type: "system", subtype: "init", tools: ["Bash"], mcp_servers: [], model: MODEL, permissionMode: "dontAsk" }) });
+		const job = { prompt: "do it\n<items>\n[]\n</items>\n", schema: {}, model: MODEL, effort: "low" };
+		assert.deepEqual(await claudeExec({ claude: "x", runDir: tmp, env: {}, spawnFn: exposed.spawnFn })(job), { kind: "runtime_warning" });
+		assert.deepEqual([exposed.lines.length, exposed.signals], [1, ["SIGKILL"]]);
+		const stalled = fakeClaude({ hang: true });
+		assert.deepEqual(await claudeExec({ claude: "x", runDir: tmp, env: {}, spawnFn: stalled.spawnFn, timeoutMs: 50 })(job), { kind: "runtime_error" });
+		assert.deepEqual(stalled.signals, ["SIGKILL"]);
+	});
 });

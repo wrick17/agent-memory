@@ -199,7 +199,7 @@ To retire the machine, revoke its device in Settings. The server refuses the tok
 - **Embeddings off:** recall stays lexical. You can turn embeddings on later only through a fresh setup run. Setup never edits an existing config, so move the old one aside first.
 - **Corpus:** Workers Paid only. The current source exports `CorpusStore`; setup with `"corpus": "on"` binds it as `CORPUS_STORE`, adds migration `v2`, and sets `CORPUS`. This is reviewed source with prior local corpus checks, not combined self-host or live acceptance. Turning it off again is not supported by setup.
 - **Capture client:** still under separate verification and excluded from this archive. Setup does not install capture or change client settings. Connect to the MCP explicitly with the commands above.
-- **Daily maintenance batch:** the local runner is excluded with capture. This package does not install, activate or downgrade a model runtime.
+- **Daily maintenance batch:** the runner is excluded with capture from this archive. A separately installed client keeps `batch_profiles` empty by default. The Claude batch path is opt-in: set `batch_runner` to `claude`, give both `batch_luna_model` and `batch_terra_model` explicit full Claude model IDs, and set `claude_bin` to a pinned Claude Code CLI executable. Its initial no-query gate requires no tools or MCP servers before untrusted text is sent; this is a runtime gate, not OS confinement. Current live Claude authentication and P1 acceptance remain open. This package does not install, activate or downgrade a model runtime.
 
 ## Profile backups and restore
 

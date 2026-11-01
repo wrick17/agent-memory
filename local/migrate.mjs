@@ -825,9 +825,9 @@ function refreshCommands(it, base) {
  * record's content, so an unchanged record keeps its parts across plans and the server can replay them.
  */
 export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null, ownerHolds = null } = {}) {
-	// A rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
+	// A bare rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
+	// With reviewed routes or a source policy it plans the routed set exactly, then sends only its accepted records to `test`.
 	if (rehearsal !== null && rehearsal !== "test") throw new Error("a rehearsal goes to the test profile only");
-	if (rehearsal !== null && (routes || sourcePolicy)) throw new Error("a rehearsal ignores routing; reviewed routes apply to a routed plan only");
 	return withLock(async () => {
 		const manifest = readJson(path.join(exportDir, "manifest.json"), null);
 		if (!manifest) throw new Error(`no export manifest in ${exportDir}`);
@@ -855,7 +855,7 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		const review = [], holds = [];
 		const previous = new Map(base?.records.map((r) => [r.key, r]) ?? []), records = new Map(previous);
 		for (const it of items) {
-			if (rehearsal && it.id && !it.held) it.route = { profile: rehearsal, rule: "rehearsal" };
+			if (rehearsal && !reviewed && !policy && it.id && !it.held) it.route = { profile: rehearsal, rule: "rehearsal" };
 			if (!it.route && !it.held && !it.review.includes("missing_scope")) it.review.push(it.source === "bothq" ? "unrouted_scope" : "unrouted_path");
 			// The server's personal-field rule: a node it would strip an attribute from is held, never rewritten.
 			if (stripPersonal(it.node.kind, it.node.attrs).stripped.length) it.review.push("personal_fields");
@@ -869,6 +869,8 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			// Refresh keeps the same owner choice only; a missing, added or changed classification never adopts a hosted copy in place.
 			if (old && ownerSemantic(old.node.attrs.source?.owner_classification ?? null) !== ownerSemantic(it.node.attrs.source?.owner_classification ?? null)) it.review.push("classification_changed");
 		}
+		// After holds, owner classification and source policy: only a record the routed plan would accept moves, its payload unchanged.
+		if (rehearsal && (reviewed || policy)) for (const it of items) if (it.route && !it.review.some((r) => r !== "duplicate_content")) it.route = { profile: rehearsal, rule: "rehearsal" };
 		// Identity: one id per item, and one active (profile, scope, type, name) per profile, as the hosted unique index requires.
 		const seen = new Map();
 		for (const it of items.filter((x) => x.id)) { const k = `id:${it.id}`; seen.set(k, [...(seen.get(k) ?? []), it]); }
@@ -955,7 +957,7 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		const planManifest = {
 			version, ...(policy ? {source_policy:{version:1,sha256:policy.sha256,entries:policy.entries.length}} : {}), input_sha256: inputSha, export_dir: tilde(exportDir), rules, rehearsal,
 			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size, ...(reviewed.version === 2 ? { version: 2, effect: "legacy_work_owner",
-				owner_decision_sha256: reviewed.owner_decision_sha256, classified: items.filter((x) => x.route?.rule === "legacy_work_owner").length } : {}) } } : {}),
+				owner_decision_sha256: reviewed.owner_decision_sha256, classified: items.filter((x) => x.node.attrs.source?.owner_classification).length } : {}) } } : {}),
 			...(held ? { owner_holds: { version: 1, sha256: held.sha256, holds: held.holds.size } } : {}),
 			items: items.length, planned: ready.filter((x) => x.planned).length, review: review.length, holds: holds.length, reasons, records_by_profile: byProfile,
 			commands: commands.length, stage: stages.length, finalize: count((c) => c.op === "finalize"), link: count((c) => c.op === "link"), batches: batches.length,

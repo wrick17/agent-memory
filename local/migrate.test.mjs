@@ -537,7 +537,7 @@ describe("reviewed routes", () => {
 		assert.deepEqual(outputs(dir), first);
 	});
 
-	it("refuses another export, a changed or unknown source, me, a bad schema, a rule-routed source and a rehearsal, before any output", async () => {
+	it("refuses another export, a changed or unknown source, me, a bad schema and a rule-routed source, also for a rehearsal, before any output", async () => {
 		const repo = fs.mkdtempSync(path.join(tmp, "rr-repo-"));
 		spawnSync("git", ["init", "-q", repo]);
 		spawnSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:Sequoia-Engineering/app.git"]);
@@ -560,7 +560,7 @@ describe("reviewed routes", () => {
 			[routesFile(dir, [["codex:~/rr/r2.md", "personal"]]), /route 1 conflicts with an existing routing rule/],
 		];
 		for (const [file, error] of cases) await assert.rejects(m.plan({ exportDir: dir, routes: file }), error);
-		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: one() }), /rehearsal ignores routing/);
+		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: route({ profile: "me" }) }), /nothing is routed into me/);
 		assert.ok(!fs.existsSync(path.join(dir, "plan")) && !fs.existsSync(path.join(m.migrationDir(), "state.json")), "no plan, review or state written");
 	});
 
@@ -722,7 +722,7 @@ describe("legacy Work owner classification", () => {
 			[(d) => ({ ...d, profile: "personal" }), /schema/],
 		];
 		for (const [edit, error] of cases) await assert.rejects(m.plan({ exportDir: dir, routes: ownerFile(dir, [key], edit) }), error);
-		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: ownerFile(dir) }), /rehearsal ignores routing/);
+		await assert.rejects(m.plan({ exportDir: dir, rehearsal: "test", routes: ownerFile(dir, [key], entry({ source_sha256: "0".repeat(64) })) }), /no longer matches its exported source/);
 		assert.ok(!fs.existsSync(path.join(dir, "plan")) && !fs.existsSync(path.join(m.migrationDir(), "state.json")), "no plan, review or state written");
 	});
 
@@ -751,6 +751,45 @@ describe("legacy Work owner classification", () => {
 		entries[2].profile_review_sha256 = sha256("superseded individual profile review");
 		writePolicy();
 		await assert.rejects(m.plan({ exportDir: dir, routes, sourcePolicy }), /profile receipt differs from the owner classification/);
+	});
+
+	it("plans a test rehearsal from the routed set: holds, classification and policy first, then only accepted records, unchanged, to test", async () => {
+		const archive = { system: "codex", project: "same-project", rel: "skills/archive/SKILL.md", category: "codex_reference_candidate", realpath: "~/rh/skills/archive/SKILL.md", paths: ["~/rh/skills/archive/SKILL.md"],
+			content: "archived reference", sha256: sha256("archived reference"), bytes: 18, utf8: true, birthtime: "2026-01-01T00:00:00Z", mtime: "2026-02-01T00:00:00Z" };
+		const kept = legacy("rh-kept", "bot_hq"), fresh = legacy("rh-fresh", "personal"), secret = legacy("rh-secret", "personal", { content: "Use token=abc123secret." }), other = legacy("rh-other", "personal");
+		const scopeless = record({ eid: "lw-rh-scopeless", name: "no scope", props: { content: "safe" } });
+		const dir = makeExport([kept, fresh, secret, other, scopeless], [archive]), id = (r) => m.bothqItem(r).id;
+		const routes = ownerFile(dir, [kept, fresh, secret, scopeless, archive].map(keyOf)), reviewed = m.readReviewedRoutes(routes, dir), ref = m.markdownItem(archive, []);
+		const decision = { reference: "synthetic owner intent", answer: "retain archived reference", kind: "archival_reference", permitted_ids: [ref.id] };
+		const sourcePolicy = path.join(dir, "policy.json"), ownerHolds = path.join(dir, "holds.json");
+		fs.writeFileSync(sourcePolicy, JSON.stringify({ version: 1, export_manifest_sha256: exportSha(dir), entries: [{ source: ref.key, id: ref.id, scope: ref.node.scope, profile: "work", source_sha256: sha256(canonicalJson(archive)),
+			kind: "archival_reference", owner_decision: decision, owner_decision_sha256: sha256(canonicalJson(decision)), profile_review_sha256: sha256(canonicalJson(m.ownerWitness(reviewed, reviewed.routes.get(ref.key), ref))) }] }), { mode: 0o600 });
+		fs.writeFileSync(ownerHolds, JSON.stringify({ version: 1, export_manifest_sha256: exportSha(dir), holds: [{ source: keyOf(fresh), source_sha256: sha256(canonicalJson(fresh)), reason: "unreviewed_new" }] }), { mode: 0o600 });
+		const opts = { exportDir: dir, routes, sourcePolicy, ownerHolds };
+		const routed = await m.plan(opts), routedCommands = fs.readFileSync(path.join(routed.dir, "commands.jsonl"), "utf8");
+		const test = await m.plan({ ...opts, rehearsal: "test" }), sub = "plan-rehearsal-test";
+		assert.equal(test.dir, path.join(dir, sub));
+		// Same accepted records with the same node, texts, revisions, requests and links; only the destination and its record hash move.
+		const strip = (r) => ({ ...r, route: undefined, record_sha256: undefined });
+		const a = new Map(m.planRecords(routed.dir).map((r) => [r.key, r])), b = new Map(m.planRecords(test.dir).map((r) => [r.key, r]));
+		assert.deepEqual([[...a.values()].map((r) => r.route.profile).sort(), [...b.keys()].sort()], [["personal", "work", "work"], [...a.keys()].sort()]);
+		for (const [k, r] of b) assert.deepEqual([r.route, strip(r)], [{ profile: "test", rule: "rehearsal" }, strip(a.get(k))]);
+		assert.deepEqual(reviewOf(dir, sub), reviewOf(dir));
+		assert.deepEqual(reviewOf(dir, sub).map((r) => [r.key, r.reasons]).sort(), [[keyOf(fresh), ["owner_hold:unreviewed_new"]], [keyOf(scopeless), ["missing_scope"]], [keyOf(secret), ["needs_redaction"]]].sort());
+		const pick = (x) => [x.planned, x.review, x.holds, x.reasons, x.link, x.batches, x.reviewed_routes.classified, x.owner_holds, x.source_policy];
+		assert.deepEqual([pick(test.manifest), test.manifest.records_by_profile, test.manifest.rehearsal], [pick(routed.manifest), { test: 3 }, "test"]);
+		const fins = Object.fromEntries(planned(dir, sub).filter((c) => c.op === "finalize").map((c) => [c.record_id, c]));
+		assert.ok(planned(dir, sub).every((c) => c.profile === "test"));
+		assert.deepEqual([id(kept), ref.id, id(other)].map((x) => [fins[x].classification_version, fins[x].policy_version]), [[1, undefined], [1, 1], [undefined, undefined]]);
+		assert.equal(fins[ref.id].node.attrs.import_review.witness.profile, "work");
+		assert.equal(fins[id(kept)].node.attrs.source.owner_classification.profile, "work");
+		assert.deepEqual(m.dryRun({ exportDir: dir, rehearsal: "test" }).records_by_profile, { test: 3 });
+		assert.equal(fs.readFileSync(path.join(routed.dir, "commands.jsonl"), "utf8"), routedCommands, "the routed plan is untouched");
+		await assert.rejects(m.plan({ ...opts, rehearsal: "work" }), /test profile only/);
+		// A bare rehearsal keeps its old meaning: no owner classification or policy, owner holds still apply.
+		await m.plan({ exportDir: dir, ownerHolds, rehearsal: "test", force: true });
+		const bare = planned(dir, sub);
+		assert.ok(bare.every((c) => c.classification_version === undefined && c.policy_version === undefined) && !bare.some((c) => c.record_id === id(fresh)));
 	});
 
 	it("refreshes the same classified identity with a fresh witness, provenance-only when unchanged, and holds a missing or changed classification", async () => {

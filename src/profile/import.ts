@@ -75,7 +75,10 @@ const ledgerKey = (c: RecordStep) => c.refresh ? "shadow_id" : "record_id";
 const stagedRecord = (sql: SqlStorage, c: RecordStep) => sql.exec<RecordRow>(`SELECT * FROM ${ledger(c)} WHERE ${ledgerKey(c)} = ?`, stagedId(c)).toArray()[0];
 const finalizeHash = (c: FinalizeStep) => sha256(canonicalJson(c.refresh ? { node: c.node, refresh: c.refresh, parts: c.parts, request_ids: c.request_ids } : c.node));
 
-/** Required before replay shortcuts too: reserved metadata never silently downgrades into an ordinary import. */
+/**
+ * Required before replay shortcuts too: reserved metadata never silently downgrades into an ordinary import.
+ * `test` takes a witnessed record unchanged as its isolated rehearsal copy; the deployment's IMPORT_PROFILES allowlist and import auth still apply.
+ */
 function policyCheck(sql: SqlStorage, c: RecordStep, profile: string): void {
 	const current = sql.exec<{ attrs: string }>("SELECT attrs FROM nodes WHERE id = ?", c.record_id).toArray()[0];
 	const stored = current && policyOf(current.attrs);
@@ -87,7 +90,7 @@ function policyCheck(sql: SqlStorage, c: RecordStep, profile: string): void {
 	const n = c.node, source = n.attrs.source as Record<string, unknown> | undefined;
 	if (!source || typeof source.realpath !== "string" || uuid5(`markdown:${source.realpath}`) !== n.id
 		|| sha256(`${source.system}:${source.realpath}`) !== p.witness.source_key_sha256
-		|| p.witness.profile !== profile || p.witness.scope !== n.scope || !p.owner_decision.permitted_ids.includes(n.id)
+		|| (p.witness.profile !== profile && profile !== "test") || p.witness.scope !== n.scope || !p.owner_decision.permitted_ids.includes(n.id)
 		|| sha256(canonicalJson(p.owner_decision)) !== p.owner_decision_sha256 || n.origin !== "import") throw refuse("policy_witness", "source-policy identity/profile/scope/decision differs");
 	if(n.kind !== "document" || n.memory_type !== "reference" || n.steps !== null) throw refuse("policy_effect","source-policy Markdown remains a reference document");
 	if (p.kind === "source_suffix") {
@@ -108,7 +111,7 @@ function classificationCheck(sql: SqlStorage, c: RecordStep, profile: string): v
 	if (c.op === "stage") return;
 	if (!k) { if (c.classification_version) throw refuse("classification_missing", "a classification command requires its reserved owner witness"); return; }
 	const n = c.node, source = n.attrs.source as Record<string, unknown>, policy = policyOf(n.attrs);
-	if (profile !== "work" || k.witness.id !== n.id || k.witness.scope !== n.scope || k.witness.memory_type !== n.memory_type || n.origin !== "import"
+	if ((profile !== "work" && profile !== "test") || k.witness.id !== n.id || k.witness.scope !== n.scope || k.witness.memory_type !== n.memory_type || n.origin !== "import"
 		|| (source.system !== "bothq" && uuid5(`markdown:${String(source.realpath)}`) !== n.id)
 		|| (policy?.kind === "archival_reference" && policy.profile_review_sha256 !== sha256(canonicalJson(k)))) throw refuse("classification_witness", "owner classification destination/identity/scope/type differs");
 }

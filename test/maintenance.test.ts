@@ -1802,6 +1802,37 @@ it("core job context hides fenced subjects and incoming candidate reasons while 
 	} finally { await runInDurableObject(stub, (_i, s) => s.storage.deleteAlarm()); }
 });
 
+it("leases an ingest-queued session capture with its current digest part, never its manifest or the superseded heuristic", async () => {
+	const owner = await contextFor(), profile = "personal", id = `ctx-${crypto.randomUUID()}`, range = `claude-code:${id}:0a1b2c3d:0-1800`;
+	const body = (correction: string) => JSON.stringify({ asks: [{ text: "Plan a reading schedule.", pos: 0 }], decisions: [], corrections: [{ text: correction, pos: 2 }],
+		outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+	const heuristic = body("SESSION_CTX_SUPERSEDED_HEURISTIC"), consolidated = body("SESSION_CTX_CORRECTION: write dates as YYYY-MM-DD.");
+	const job = await deviceToken(`session-context-${id}`, ["ingest", "maintenance"], [profile], profile);
+	// The normal upload path: heuristic digest, consolidated part and the tiling manifest that queues both capture items.
+	const res = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/v1/ingest`, { method: "POST",
+		headers: { authorization: `Bearer ${job.token}`, "content-type": "application/json" }, body: JSON.stringify({ session: { client: "claude-code", id }, profile,
+			digests: [{ range_id: range, capture_status: "heuristic", part_id: "-", sha256: sha256(heuristic), body: heuristic },
+				{ range_id: range, capture_status: "consolidated", part_id: "0-1800", sha256: sha256(consolidated), body: consolidated }],
+			manifests: [{ range_id: range, parts: [{ part_id: "0-1800", sha256: sha256(consolidated) }] }] }) }));
+	expect((await res.json() as { results: { status: string }[] }).results.map((r) => r.status)).toEqual(["stored", "stored", "stored"]);
+	const node = sha256(`session:claude-code:${id}`).slice(0, 32);
+	const who = owner.account.profiles.find((p) => p.profile === profile)!, stub = env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:${profile}:${who.generation}`));
+	// This file shares profile storage: an earlier test leased this profile, so its 20-hour batch gate is reset for this lease.
+	await runInDurableObject(stub, (_i, s) => { s.storage.sql.exec("DELETE FROM cursors WHERE stage = 'maintenance_batch'"); });
+	try {
+		const lease = await call<{ lease_id: string | null; items: { kind: string; subjects: string[]; allowed_ops: string[]; context: { nodes: { id: string; passage: string }[] } }[] }>(
+			await contextFor(devicePrincipal(job.token)), "maintenance_next", { profile, kinds: ["unprocessed_capture", "preference_signal"] });
+		expect(lease.lease_id).toEqual(expect.any(String));
+		const items = lease.items.filter((i) => i.subjects.includes(node));
+		expect(items.map((i) => i.kind).sort()).toEqual(["preference_signal", "unprocessed_capture"]);
+		for (const item of items) {
+			expect(item.allowed_ops).toContain("infer_preference");
+			// The model sees the stored correction it may cite with a node pointer to this session, and nothing else of the lane.
+			expect(item.context.nodes.find((n) => n.id === node)?.passage).toBe(consolidated);
+		}
+	} finally { await runInDurableObject(stub, (_i, s) => s.storage.deleteAlarm()); }
+});
+
 describe("owner archive restore", () => {
 	const owner = (who: Who, cmd: WriteCommand) => ({ actor: "owner" as const, platform: "test", routedBy: "explicit", userId: who.userId, payloadHash: requestHash(cmd.op, cmd.args as never) });
 	const run = (storage: DurableObjectStorage, who: Who, cmd: WriteCommand) => runWrite(storage, who, cmd, owner(who, cmd)).result as Record<string, unknown>;

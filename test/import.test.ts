@@ -767,6 +767,23 @@ describe("legacy Work owner classification import",()=>{
 			expect(()=>runWrite(s.storage,who,{op:"knowledge",args:{nodes:[forged as never],request_id:"forged-owner-classification"}},{actor:"owner",platform:"test",routedBy:"explicit",payloadHash:"forged-owner",userId:who.userId})).toThrow(/reserved for authenticated/);
 		});
 	});
+	it("takes unchanged Work classification and source-policy witnesses into an admitted test profile, and still refuses Personal, me and changed witnesses",async()=>{
+		const {token}=await deviceToken("legacy-rehearsal",["import"],["test","personal"],"test"),{token:workOnly}=await deviceToken("legacy-rehearsal-work",["import"],["work"],"work");
+		const legacyCommands=(profile:string,label:string,edit?:(n:Row)=>void)=>{const id=newMemoryId("test-user","test","personal","project",`legacy-rehearsal-${label}`),j=journal(id,1,i=>`${label}-${i}`),n=classified(id,{revision:2,chars:j.content.length});edit?.(n);return {id,n,cmd:commandsFor(profile,n,j.rows)};};
+		const t=legacyCommands("test","test");
+		expect((await send(workOnly,[t.cmd.stages[0]])).data.receipts[0]).toMatchObject({status:"refused",reason:"forbidden"});
+		expect((await send(token,[...t.cmd.stages,t.cmd.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		expect((await send(token,[...t.cmd.stages,t.cmd.finalize])).data.receipts.every(r=>r.status==="replayed")).toBe(true);
+		expect(JSON.parse(String(await profileSql("test",sql=>sql.exec("SELECT attrs FROM nodes WHERE id = ?",t.id).one().attrs))).source.owner_classification).toEqual((t.n.attrs as any).source.owner_classification);
+		const personal=legacyCommands("personal","personal");expect((await send(token,[...personal.cmd.stages,personal.cmd.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"classification_witness"});
+		const me=legacyCommands("me","me");expect((await send(token,me.cmd.stages)).data.receipts[0]).toMatchObject({status:"refused",reason:"me"});
+		const moved=legacyCommands("test","moved",n=>{(n.attrs as any).source.owner_classification.witness.scope="sequoia";});expect((await send(token,[...moved.cmd.stages,moved.cmd.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"classification_witness"});
+		const reference=(profile:string,path:string,edit?:(f:ReturnType<typeof reviewedMarkdown>)=>void)=>{const f=reviewedMarkdown(path,"untrusted rehearsal reference");edit?.(f);return commandsFor(profile,f.node as unknown as Row,[...f.texts.map(x=>["texts",{...x}] as [Table,Row]),...f.revisions.map(r=>["revisions",{...r}] as [Table,Row])]);};
+		const ref=reference("test","~/fixture-rehearsal/SKILL.md");expect((await send(token,[...ref.stages,ref.finalize])).data.receipts.at(-1)).toMatchObject({status:"published"});
+		expect(((ref.finalize.node as any).attrs.import_review.witness.profile)).toBe("work");
+		const elsewhere=reference("personal","~/fixture-rehearsal-personal/SKILL.md");expect((await send(token,[...elsewhere.stages,elsewhere.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"policy_witness"});
+		const scoped=reference("test","~/fixture-rehearsal-scoped/SKILL.md",f=>{(f.node.attrs.import_review as any).witness.scope="elsewhere";});expect((await send(token,[...scoped.stages,scoped.finalize])).data.receipts.at(-1)).toMatchObject({status:"refused",reason:"policy_witness"});
+	});
 	const delta=(full:ReturnType<typeof journal>,known:ReturnType<typeof journal>,after:number)=>full.rows.filter(([t,r])=>t==="requests"?!known.requests.some(q=>q.request_id===r.request_id):Number(r.revision)>after);
 	const imported=async(label:string,over:Row={})=>{
 		const {token}=await deviceToken(`legacy-${label}`,["import"],["work","personal"],"work"),id=newMemoryId("test-user","test","personal","project",`legacy-${label}`),j=journal(id,1,i=>`${label}-${i}`);
