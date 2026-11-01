@@ -617,7 +617,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			});
 			const editable = n.memory_type && n.memory_type !== "procedural" && n.kind !== "journal" && n.status === "active" && c.complete !== false && !cut.includes("description");
 			if (editable) btn(row, "Edit as a draft", () => {
-				drafts.set(p.name, { memory_id: id, expected_revision: Number(n.revision), name, type: String(n.memory_type), scope: n.scope ? String(n.scope) : "",
+				drafts.set(p.name, { memory_id: id, expected_revision: Number(n.revision), name, recordName: name, type: String(n.memory_type), scope: n.scope ? String(n.scope) : "",
 					description: String(n.description ?? ""), content: String(c.text ?? ""), target: "", targetName: "", reason: "" });
 				win.location.hash = `#/draft/${enc(p.name)}`;
 			});
@@ -671,7 +671,7 @@ export async function dashboardMain(win: any): Promise<void> {
 	// The map: the server's bounded walk, laid out in rings by distance from where it starts. What-if items are drawn on it
 	// and kept in this page only; nothing about them reaches the server until a draft is saved.
 	// `preview` is the exact payload (with its request id) a Save sends; `sent` is the last one Save sent, kept until the server confirms it.
-	type Draft = { memory_id?: string; expected_revision?: number; name: string; type: string; scope: string; description: string; content: string; target: string; targetName: string; reason: string;
+	type Draft = { memory_id?: string; expected_revision?: number; recordName?: string; name: string; type: string; scope: string; description: string; content: string; target: string; targetName: string; reason: string;
 		companyFree?: boolean; preview?: Record<string, unknown>; sent?: Record<string, unknown>; copyOf?: { profile: string; id: string; name: string; kind: string; back?: string } };
 	const drafts = new Map<string, Draft>();
 	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>(); // per profile, this tab only; never sent
@@ -821,9 +821,9 @@ export async function dashboardMain(win: any): Promise<void> {
 		const h = el("h2", view, `Write: ${p.name}`);
 		switcher(view, "draft", p.name);
 		const d = drafts.get(p.name) ?? { name: "", type: "project", scope: "", description: "", content: "", target: "", targetName: "", reason: "" };
-		const editing = !!d.memory_id;
+		const editing = !!d.memory_id, was = d.recordName ?? d.name; // `name` follows the field; `recordName` is the record's name when the edit began
 		if (editing) {
-			el("p", view, `Editing “${d.name}” at revision ${d.expected_revision}. Saving makes a new revision; the earlier one stays in its history. A change by someone else since then is refused, not overwritten.`);
+			el("p", view, `Editing “${was}” at revision ${d.expected_revision}. Saving makes a new revision; the earlier one stays in its history. A change by someone else since then is refused, not overwritten.`);
 			link(el("p", view), `#/memory/${enc(p.name)}/${enc(d.memory_id!)}`, "Back to the record");
 		} else if (d.copyOf) {
 			el("p", view, `A copy of “${d.copyOf.name}” from ${d.copyOf.profile}, saved as a new record in ${p.name}. Only what is shown below is saved; the original keeps its history, requests and links, and the copy has no tie to ${d.copyOf.profile}, so a wipe of ${d.copyOf.profile} leaves it.`);
@@ -833,7 +833,6 @@ export async function dashboardMain(win: any): Promise<void> {
 		const name = input(form, "draft-name", "Name");
 		name.setAttribute("maxlength", "512");
 		name.value = d.name;
-		if (editing) name.disabled = true;
 		const type = choose(form, "draft-type", "Type", [["project", "Project"], ["feedback", "Feedback"], ["reference", "Reference"], ["user", "User"]]);
 		type.value = d.type;
 		if (editing || d.copyOf) type.disabled = true; // a copy keeps its record's type (and kind) as they are
@@ -878,8 +877,8 @@ export async function dashboardMain(win: any): Promise<void> {
 		const show = (x: Record<string, unknown>) => {
 			el("h3", preview, "Preview (not saved)");
 			const link0 = (x.links as { reason: string }[] | undefined)?.[0];
-			facts(preview, [["Profile", p.name], ["Change", editing ? `New revision of “${d.name}” (now ${d.expected_revision})` : d.copyOf ? `A new record, copied from “${d.copyOf.name}” in ${d.copyOf.profile}` : "A new memory"],
-				...(editing ? [] : [["Name", String(x.name)], ["Type", String(x.type)], ...(d.copyOf ? [["Kind", String(x.kind)], ["Text", `${String(x.content ?? "").length.toLocaleString("en")} characters`]] : []),
+			facts(preview, [["Profile", p.name], ["Change", editing ? `New revision of “${was}” (now ${d.expected_revision})` : d.copyOf ? `A new record, copied from “${d.copyOf.name}” in ${d.copyOf.profile}` : "A new memory"],
+				...(editing ? [["Name", x.new_name ? `Renamed from “${was}” to “${String(x.new_name)}”` : "unchanged"]] as [string, string][] : [["Name", String(x.name)], ["Type", String(x.type)], ...(d.copyOf ? [["Kind", String(x.kind)], ["Text", `${String(x.content ?? "").length.toLocaleString("en")} characters`]] : []),
 					["Scope", x.scope ? String(x.scope) : "none"], ["Origin", d.copyOf ? `New in ${p.name}; no history, requests or links come along` : "Stated by you"]] as [string, string][]),
 				["Link", link0 ? `relates to “${d.targetName || d.target}”` : "none"]]);
 			el("h4", preview, "Description");
@@ -894,13 +893,13 @@ export async function dashboardMain(win: any): Promise<void> {
 			event.preventDefault();
 			stale();
 			const n = name.value.trim(), r = reason?.value.trim() ?? "";
-			const problem = !editing && !n ? "Give the memory a name." : !desc.value.trim() ? "Write a short description."
+			const problem = !n ? "Give the memory a name." : !desc.value.trim() ? "Write a short description."
 				: d.copyOf && !content.value.trim() ? "A copy needs the record's text." : d.copyOf && content.value.length > COPY_MAX ? "A copy's text must fit one record."
 				: d.target && (r.length < 8 || r.length > 600) ? "Say why they relate in 8 to 600 characters." : free && !free.checked ? "Saving to me needs the no-company-details confirmation." : "";
 			if (problem) { say(problem); msg.focus(); return; }
 			const next: Record<string, unknown> = {
 				// A copy is a plain creation: no record id, revision, origin or source of any kind; creation derives them afresh.
-				...(editing ? { memory_id: d.memory_id, expected_revision: d.expected_revision, description: desc.value, content: content.value }
+				...(editing ? { memory_id: d.memory_id, expected_revision: d.expected_revision, ...(n !== was ? { new_name: n } : {}), description: desc.value, content: content.value }
 					: d.copyOf ? { name: n, type: d.type, kind: d.copyOf.kind, description: desc.value, ...(scope.value.trim() ? { scope: scope.value.trim() } : {}), content: content.value }
 					: { name: n, type: type.value, origin: "stated", description: desc.value, ...(scope.value.trim() ? { scope: scope.value.trim() } : {}), ...(content.value.trim() ? { content: content.value } : {}) }),
 				...(d.target ? { links: [{ rel: "relates_to", to: { id: d.target }, reason: r, evidence: [{ kind: "node", ref: d.target }] }] } : {}),
@@ -917,9 +916,9 @@ export async function dashboardMain(win: any): Promise<void> {
 			if (!payload) return;
 			const sent = payload;
 			keep({ sent });
-			act(`/api/profiles/${enc(p.name)}/save`, editing ? `save “${d.name}”` : `save “${String(sent.name)}”`, sent, (r) => {
+			act(`/api/profiles/${enc(p.name)}/save`, editing ? `save “${was}”` : `save “${String(sent.name)}”`, sent, (r) => {
 				drafts.delete(p.name);
-				const text = `Saved: ${String(r.action ?? "saved")} “${String(r.name ?? d.name)}”, revision ${recorded(r.revision)}. Open it from Memories.`;
+				const text = `Saved: ${String(r.action ?? "saved")} “${String(r.name ?? sent.new_name ?? d.name)}”, revision ${recorded(r.revision)}. Open it from Memories.`;
 				// A copy asked for from a wipe page goes back there; that page reads its preview afresh. Nothing is typed or confirmed.
 				const back = d.copyOf?.back;
 				// The hash change renders that page once; retiring this page's version keeps this action from rendering it a second time.
@@ -1290,6 +1289,7 @@ export async function dashboardMain(win: any): Promise<void> {
 
 	// Backups and recovery (section 18): exports, restore of one profile or of the account from an export, and the open
 	// recovery's step, open and abort. The backup key stays on the server; this page only asks it to act.
+	let lastPit: { id: string; profile: string } | null = null; // the point-in-time restore last opened in this tab, to reverse by its id
 	const backupsPage = (view: Node) => {
 		const version = pageVersion, h = el("h2", view, "Backups and recovery");
 		note(view, "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days. Devices and routes stay in Settings.");
@@ -1309,6 +1309,8 @@ export async function dashboardMain(win: any): Promise<void> {
 		const summary = (v: J) => typeof v === "string" ? v : v?.error ? `failed: ${recorded(v.error.message)}` : v && typeof v === "object" ? `saved${v.id ? ` (${String(v.id)})` : ""}${typeof v.rows === "number" ? `, ${v.rows} rows` : ""}` : recorded(v);
 		const results = (parent: Node, r: J) => { const ul = el("ul", parent); for (const [k, v] of Object.entries(r ?? {})) el("li", ul, `${k}: ${summary(v)}`); };
 		say("Loading recovery status…");
+		// A restore gives its profile a new generation, so the drill and new restores take the profile list read now, not at startup.
+		const fresh = call("/api/profiles").catch((err: Error) => err);
 		(async () => {
 			let s: J;
 			try { s = await call("/api/recovery"); } catch (err) { if (version === pageVersion) say(`Could not read recovery status: ${why(err)}`); return; }
@@ -1320,7 +1322,7 @@ export async function dashboardMain(win: any): Promise<void> {
 				el("h3", rec, `A recovery is open: the account is closed`);
 				note(rec, account ? "Every profile and every device token is refused until this account restore is opened or aborted. Device tokens must be reissued in Settings afterwards."
 					: `Every profile and device is refused until this restore of “${String(r.profile)}” is opened or aborted.`, "danger");
-				facts(rec, [["Restoring", account ? "The account's own records" : `Profile ${String(r.profile)}`], ["From export", recorded(r.export)], ["Export taken", recorded(r.export_at)],
+				facts(rec, [["Restoring", account ? "The account's own records" : `Profile ${String(r.profile)}`], ["Restore id", recorded(r.id)], ["From export", recorded(r.export)], ["Export taken", recorded(r.export_at)],
 					["Started", recorded(r.at)], ["State", `${recorded(r.state)}${r.phase ? ` (${String(r.phase)})` : ""}`], ["Unresolved findings", recorded(r.unresolved_count)],
 					...(r.restored ? [["Checked so far", `${recorded(r.restored.nodes)} records, ${recorded(r.restored.requests)} requests`]] as [string, string][] : [])]);
 				if (Array.isArray(r.unresolved) && r.unresolved.length) {
@@ -1336,7 +1338,10 @@ export async function dashboardMain(win: any): Promise<void> {
 				if (r.state === "ready") note(rec, "Ready to open. Opening makes the restored copy current; for a profile, its previous copy is retired and changes made after the export are no longer current.", "warn");
 				else if (r.state === "opening") note(rec, "Opening has started and cannot be aborted. Choose Open again to finish it.", "warn");
 				else if (r.state !== "unresolved") btn(row, "Run the next step", () => act("/api/recovery/step", "run the next recovery step", shownId, stepDone));
-				if (r.state === "ready" || r.state === "opening") btn(row, "Open", () => act("/api/recovery/open", "open the restored data", shownId, stepDone));
+				if (r.state === "ready" || r.state === "opening") btn(row, "Open", () => act("/api/recovery/open", "open the restored data", shownId, (x) => {
+					if (r.kind === "pitr" && x.state === "opened") lastPit = { id: shownId.id, profile: String(r.profile) };
+					return { text: `Recovery ${shownId.id} is now ${recorded(x.state)}${x.phase ? ` (${String(x.phase)})` : ""}.${lastPit?.id === shownId.id ? " Its id reverses it under “Restore a profile to a point in time”." : ""}` };
+				}));
 				if (r.state !== "opening") {
 					const ab = el("div", rec);
 					confirmBox(ab, account ? "Abort rolls the account back to its state before this restore, step by step; choose Abort again while it is rolling back." : "Abort discards the restored copy and reopens the account unchanged.", "abort", "Abort", () => act("/api/recovery/abort", "abort the recovery", shownId, stepDone));
@@ -1347,6 +1352,10 @@ export async function dashboardMain(win: any): Promise<void> {
 			}
 			el("h3", rec, "Last export");
 			if (s?.last_export) { el("p", rec, `Taken ${recorded(s.last_export.at)}`); results(rec, s.last_export.results); } else el("p", rec, "No export recorded yet.");
+			const list = await fresh;
+			if (version !== pageVersion) return;
+			if (Array.isArray(list)) profiles = list;
+			else note(rec, `Could not read the profiles again: ${why(list)}. A drill or restore begun below may be refused as stale; reload the page first.`, "warn");
 			drillView(rec, !!r);
 			if (r) return; // exports and new restores are refused while a recovery is open
 			el("h3", forms, "Export now");
@@ -1370,7 +1379,7 @@ export async function dashboardMain(win: any): Promise<void> {
 					const exp = choose(pick, `exp-${title.replace(/\W+/g, "-").toLowerCase()}`, "Export (newest first)", [...list].reverse().map((x: string) => [String(x), String(x)]));
 					confirmBox(pick, `Restore ${what()} from the chosen export.`, expected(), `Begin restore of ${what()}`, () => {
 						const [path, data] = begin(exp.value);
-						act(path, `begin restoring ${what()}`, data, (x) => ({ text: `Recovery begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` }));
+						act(path, `begin restoring ${what()}`, data, (x) => ({ text: `Recovery ${recorded(x.id)} begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` }));
 					});
 				} };
 			};
@@ -1391,10 +1400,11 @@ export async function dashboardMain(win: any): Promise<void> {
 			note(pitSec, "Beginning closes the whole account. The profile goes back to the chosen time, within the last 30 days; changes after it are no longer current. Its record keeps an undo, so a restore id below reverses it the same way.", "danger");
 			const pp = choose(pitSec, "pitr-profile", "Profile", active().map((q) => [q.name, q.name]));
 			const when = input(pitSec, "pitr-at", "Time, as ISO (for example 2026-10-27T09:00:00Z)");
+			if (lastPit) el("p", pitSec, `Opened in this tab: point-in-time restore ${lastPit.id} of ${lastPit.profile}. Enter that id below to reverse it.`);
 			const undo = input(pitSec, "pitr-undo", "Or the id of a point-in-time restore to reverse");
 			confirmBox(pitSec, "Restore the chosen profile.", "restore in time", "Begin point-in-time restore", () =>
 				act(`/api/profiles/${enc(pp.value)}/pitr`, `restore ${pp.value} in time`, undo.value.trim() ? { undo: undo.value.trim() } : { at: when.value.trim() },
-					(x) => ({ text: `Recovery begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` })));
+					(x) => ({ text: `Recovery ${recorded(x.id)} begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` })));
 
 			// A profile's corpus: exported weekly and kept two; a restore fills the profile's current, empty corpus.
 			btn(el("p", forms), "Export every corpus now", () => act("/api/backups/export", "export every corpus", { corpus: true }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));

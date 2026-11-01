@@ -622,7 +622,17 @@ describe("owner API", () => {
 		expect((found.body.results as { memory_id: string }[]).map((r) => r.memory_id)).toContain(made.body.memory_id);
 		expect(await post("/api/profiles/personal/save", { memory_id: made.body.memory_id, expected_revision: 1, content: "Edited." })).toMatchObject({ status: 200, body: { revision: 2 } });
 		expect((await post("/api/profiles/personal/save", { memory_id: made.body.memory_id, expected_revision: 1, content: "Stale." })).status).toBe(409);
+		// Rename, as the Review page's draft sends it: new_name is admitted, binds to its request id, and keeps the revision and collision checks.
 		const c = await contextFor();
+		// Seeded first, so the owner rename stays the latest personal write the activity check below reads.
+		const taken = await call(c, "save_memory", { name: `Taken name ${Date.now()}`, type: "project", description: "taken", content: "Already here.", profile: "personal" });
+		const renamed = `Renamed draft ${Date.now()}`, rename = { memory_id: made.body.memory_id, expected_revision: 2, new_name: renamed, description: "A dashboard draft", content: "Edited.", request_id: `dash-rename-${Date.now()}` };
+		expect(await post("/api/profiles/personal/save", rename)).toMatchObject({ status: 200, body: { action: "updated", name: renamed, revision: 3 } });
+		expect(await post("/api/profiles/personal/save", rename)).toMatchObject({ status: 200, body: { name: renamed, revision: 3 } }); // a retry replays, no fourth revision
+		expect((await post("/api/profiles/personal/save", { ...rename, new_name: `${renamed} again` })).body.error).toMatchObject({ code: "idempotency_mismatch" });
+		expect(await post("/api/profiles/personal/save", { ...rename, expected_revision: 2, new_name: `${renamed} stale`, request_id: `dash-stale-${Date.now()}` })).toMatchObject({ status: 409, body: { error: { code: "revision_conflict" } } });
+		expect(await post("/api/profiles/personal/save", { ...rename, expected_revision: 3, new_name: taken.name, request_id: `dash-taken-${Date.now()}` })).toMatchObject({ status: 400, body: { error: { code: "already_exists" } } });
+		expect(await call(c, "get_memory", { memory_id: made.body.memory_id })).toMatchObject({ name: renamed, revision: 3, profile: "personal" });
 		const other = await call(c, "save_memory", { name: `Work record ${Date.now()}`, type: "project", description: "work", content: "Stays in work.", profile: "work" });
 		expect((await post("/api/profiles/personal/save", { memory_id: other.memory_id, content: "Moved?" })).status).toBe(404);
 		expect(await call(c, "get_memory", { memory_id: other.memory_id })).toMatchObject({ profile: "work", content: "Stays in work.", revision: 1 });

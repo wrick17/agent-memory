@@ -5,7 +5,7 @@
 import { createHash } from "node:crypto";
 import { EMAIL, PHONE } from "../src/domain/personal.ts";
 import { REDACTED, redactText } from "../src/domain/redact.ts";
-import { validateSource } from "./corpus-upload.mjs";
+import { privateKeyColumn, validateSource } from "./corpus-upload.mjs";
 
 export const PROJECTION = "corpus-projection/1";
 export const FAMILIES = ["repos", "commits", "refs", "commit_paths", "contributors"];
@@ -122,10 +122,14 @@ export async function refreshCorpus({ source, client, profile, repo, intent = "r
 		if (seen.error) return { status: TRANSIENT.includes(seen.error.code) ? "stopped" : "refused", reason: seen.error.details?.reason ?? seen.error.code };
 		// A checkout cannot supply unknown GitHub metadata for an existing repo.
 		if (requireNewRepo && seen.base.repos.length) return { status: "refused", reason: "repo_metadata_required" };
-		const target = {};
+		const target = {}, held = {};
 		for (const t of tables) {
 			const fam = list.find((f) => f.table === t);
-			const rows = intent === "remove" ? [] : await source.repoRows(t, fams[t].columns, repo, fam.repo);
+			const all = intent === "remove" ? [] : await source.repoRows(t, fams[t].columns, repo, fam.repo);
+			// The bulk uploader's key rule on the refresh key (repos by full name; rowid is not projected): a key that would need redaction
+			// holds its row, counted in the result. The next refresh derives the target again, so this hold is never permanent.
+			const rows = all.filter((r) => !privateKeyColumn(t === "repos" ? ["full_name"] : fam.key, fams[t].columns, r));
+			if (rows.length < all.length) held[t] = all.length - rows.length;
 			// The bulk uploader's rule: non-key text is redacted before hashing, so refreshed rows match the loaded ones byte for byte.
 			// A scan row's partition column must stay the plan's repo, so it is never rewritten.
 			target[t] = rows.map((r) => r.map((v, i) => (typeof v === "string" && !fam.key.includes(fams[t].columns[i]) && fams[t].columns[i] !== fam.repo ? redactText(v).replace(PERSONAL, REDACTED) : v)));
@@ -138,14 +142,14 @@ export async function refreshCorpus({ source, client, profile, repo, intent = "r
 			schemas: Object.fromEntries(tables.map((t) => [t, fams[t].schema_sha256])), observed: [...tables], observed_at: observedAt,
 			targets: Object.fromEntries(tables.map((t) => [t, target[t].reduce((d, v) => add(d, rowHash(t, fams[t].schema_sha256, v)), ZERO)])), op_count: ops.length, chain: "" };
 		header.chain = chains(seedOf(profile, st.generation, header), ops).at(-1);
-		plan = { plan_id: planIdOf(profile, st.generation, header), header, ops };
+		plan = { plan_id: planIdOf(profile, st.generation, header), header, ops, ...(Object.keys(held).length ? { held } : {}) };
 		Object.assign(state, { profile, generation: st.generation, repo, plan, published: null });
 		save(state); // the exact plan is durable before begin
 	}
 	const steps = chains(seedOf(profile, st.generation, plan.header), plan.ops);
 	const call = async (body) => { try { return await client.refresh({ ...pin, ...body }); } catch (e) { return { error: { code: "unavailable", details: { reason: String(e?.message ?? e).slice(0, 200) } } }; } };
 	const stop = (r) => ({ status: TRANSIENT.includes(r.error.code) ? "stopped" : "refused", reason: r.error.details?.reason ?? r.error.code, details: r.error.details });
-	const done = (receipt) => { Object.assign(state, { plan: null, published: receipt }); save(state); return { status: "published", receipt }; };
+	const done = (receipt) => { Object.assign(state, { plan: null, published: receipt }); save(state); return { status: "published", receipt, ...(plan.held ? { held: plan.held } : {}) }; };
 	const begun = await call({ command: "begin", header: plan.header });
 	if (begun.error) return stop(begun);
 	if (begun.receipt.plan_id !== plan.plan_id) return { status: "refused", reason: "plan_id_mismatch" };

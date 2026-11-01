@@ -1292,3 +1292,106 @@ describe("corpus schema-6 delivery snapshots", () => {
 		expect(await restored.query({ ...p.who, generation }, { action: "sql", sql: "SELECT 1" })).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
 	});
 });
+
+// Private-key holds (corpus-implementation.md privacy rule): synthetic ticket branches, retina asset names and an email-like path.
+const SK_REF = "refs/heads/feature/sk-1234-fix-login-flow", RETINA = "assets/icon@2x.png", EMAILISH = "fixtures/first.last@acme.example.com.json";
+const PLANTED = ["sk-1234", "icon@2x", "first.last@"];
+/** The planted rows alone: a clean ref on each side of the ticket branch (alpha optional) and two private paths. */
+function plant(sql: SqlStorage, alpha = true) {
+	const ref = (name: string, short: string, target: string) => sql.exec("INSERT INTO refs VALUES ('acme/web', ?, 'heads', ?, ?, 'commit', '2026-08-01T09:00:00Z', 'Bob', NULL, 'Add retry backoff')", name, short, target);
+	if (alpha) ref("refs/heads/alpha", "alpha", sha(2));
+	ref(SK_REF, SK_REF.slice(11), sha(2));
+	ref("refs/heads/zeta", "zeta", sha(2));
+	for (const path of [RETINA, EMAILISH]) sql.exec("INSERT INTO commit_paths VALUES ('acme/web', ?, ?, ?, ?)", sha(2), path, path.split("/")[0]!, path.split(".").at(-1)!);
+}
+const privateKeys = (sql: SqlStorage) => { seed(sql); plant(sql); };
+const count = (p: { inCorpus: <T>(f: (sql: SqlStorage) => T) => Promise<T> }, q: string) => p.inCorpus((sql) => sql.exec<{ n: number }>(q).one().n);
+
+describe("corpus private-key holds", () => {
+	it("stops before a private key after storing the clean prefix; held rows are never sent and resume from fresh state reconciles stored plus held", async () => {
+		const p = await isolated();
+		const { source, inSource } = await syntheticSource(privateKeys);
+		const sent: string[] = [];
+		const recorded = (send = p.client.send) => ({ status: p.client.status, send: async (c: Json) => { sent.push(JSON.stringify(c)); return send(c); } });
+		// Default: the clean ref before the ticket branch is stored, then the run stops locally with the key's hash, never its value.
+		const state: Json = {};
+		expect(await uploadCorpus({ source, client: recorded(), profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state })).toEqual({
+			status: "refused", table: "refs", reason: "row_key_private", column: "refname", key_sha256: sha256(JSON.stringify(["acme/web", SK_REF])), held: 0 });
+		expect(state.tables.refs).toEqual({ last_key: ["acme/web", "refs/heads/alpha"], rows: 1, complete: false });
+		expect(await count(p, "SELECT count(*) AS n FROM refs")).toBe(1);
+		// Owner-approved hold, with the acknowledgement of the commit_paths chunk lost after the server stored it.
+		let sends = 0;
+		const lossy = recorded(async (c) => { const r = await p.client.send(c); if (++sends === 2) throw new Error("connection reset"); return r; });
+		expect(await uploadCorpus({ source, client: lossy, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state, holdPrivateKeys: true })).toMatchObject({ status: "stopped", table: "commit_paths" });
+		expect(Object.values(state.tables.refs.held)).toEqual(["refname"]);
+		// Fresh local state: the ledger is rebuilt from the source up to each stored last key, and nothing is sent twice.
+		const fresh: Json = {};
+		const resumed = await uploadCorpus({ source, client: recorded(), profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: fresh, holdPrivateKeys: true });
+		expect(resumed).toMatchObject({ status: "held", held: { refs: 1, commit_paths: 2 } });
+		expect(fresh.tables.commit_paths.held).toEqual({ [sha256(JSON.stringify(["acme/web", sha(2), RETINA]))]: "path", [sha256(JSON.stringify(["acme/web", sha(2), EMAILISH]))]: "path" });
+		for (const t of ["refs", "commit_paths"]) {
+			const total = await inSource((sql) => sql.exec<{ n: number }>(`SELECT count(*) AS n FROM ${t}`).one().n);
+			expect(await count(p, `SELECT count(*) AS n FROM ${t}`) + resumed.held[t]).toBe(total);
+		}
+		expect(await count(p, `SELECT count(*) AS n FROM refs WHERE refname = '${SK_REF}'`) + await count(p, "SELECT count(*) AS n FROM commit_paths WHERE path LIKE '%@%'")).toBe(0);
+		// Commit keys are `repo@sha`, so only the planted identifiers prove no private key was indexed; the clean neighbours were.
+		expect(await count(p, `SELECT count(*) AS n FROM corpus_search_documents WHERE ${PLANTED.map((v) => `key LIKE '%${v}%'`).join(" OR ")}`)).toBe(0);
+		expect(await count(p, "SELECT count(*) AS n FROM corpus_search_documents WHERE key IN ('acme/web:refs/heads/alpha', 'acme/web:refs/heads/zeta')")).toBe(2);
+		expect(sent.filter((c) => PLANTED.some((s) => c.includes(s)))).toEqual([]);
+		// A finished load reruns with no send and the same counts.
+		const silent = { status: p.client.status, send: () => { throw new Error("no send expected"); } };
+		expect(await uploadCorpus({ source, client: silent, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {}, holdPrivateKeys: true })).toMatchObject({ status: "held", held: { refs: 1, commit_paths: 2 } });
+		// A source that cannot reproduce the stored progress stops rather than underreporting held rows.
+		const { source: drifted } = await syntheticSource((sql) => { seed(sql); plant(sql, false); });
+		expect(await uploadCorpus({ source: drifted, client: silent, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {}, holdPrivateKeys: true })).toEqual({ status: "refused", table: "refs", reason: "hold_ledger_mismatch" });
+	});
+
+	it("recovers trailing and all-held rows of completed tables from the source when local state is lost or stale", async () => {
+		const p = await isolated();
+		// refs: one stored row, then a trailing held ticket branch; commit_paths: every row held, so the server stores none.
+		const { source } = await syntheticSource((sql) => {
+			seed(sql);
+			sql.exec("INSERT INTO refs VALUES ('acme/web', 'refs/heads/sk-9999-trailing-fix', 'heads', 'sk-9999-trailing-fix', ?, 'commit', '2026-08-01T09:00:00Z', 'Bob', NULL, 'Trailing')", sha(2));
+			sql.exec("DELETE FROM commit_paths");
+			for (const path of [RETINA, EMAILISH]) sql.exec("INSERT INTO commit_paths VALUES ('acme/web', ?, ?, 'assets', 'png')", sha(2), path);
+		});
+		const run = (state: Json, client: Json = p.client) => uploadCorpus({ source, client, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state, holdPrivateKeys: true });
+		const first: Json = {};
+		expect(await run(first)).toMatchObject({ status: "held", held: { refs: 1, commit_paths: 2 } });
+		expect(await count(p, "SELECT count(*) AS n FROM refs") + await count(p, "SELECT count(*) AS n FROM commit_paths")).toBe(1);
+		const silent = { status: p.client.status, send: () => { throw new Error("no send expected"); } };
+		// Lost state: both ledgers come back whole, without a send.
+		const fresh: Json = {};
+		expect(await run(fresh, silent)).toMatchObject({ status: "held", held: { refs: 1, commit_paths: 2 } });
+		expect(fresh.tables.refs.held).toEqual(first.tables.refs.held);
+		expect(fresh.tables.commit_paths.held).toEqual(first.tables.commit_paths.held);
+		// A stale incomplete ledger at the same rows and last key is not trusted for a complete table.
+		const stale: Json = { ...fresh, tables: { ...fresh.tables, refs: { last_key: ["acme/web", "refs/heads/main"], rows: 1, complete: false } } };
+		expect(await run(stale, silent)).toMatchObject({ status: "held", held: { refs: 1, commit_paths: 2 } });
+	});
+
+	it("refreshes a repo with the same keys held and counted, and keeps the counts across a lost finish and saved-plan resume", async () => {
+		const p = await refreshable();
+		const cut = (extra: string[]) => (sql: SqlStorage) => {
+			twoRepos(sql);
+			plant(sql, false);
+			for (const path of extra) sql.exec("INSERT INTO commit_paths VALUES ('acme/web', ?, ?, 'docs', 'md')", sha(2), path);
+		};
+		const { source } = await syntheticSource(cut(["docs/a.md"]));
+		const state: Json = {};
+		expect(await refreshCorpus({ source, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published", held: { refs: 1, commit_paths: 2 } });
+		const sql = async (q: string) => (await p.tool({ action: "sql", sql: q })).value.rows;
+		expect(await sql("SELECT refname FROM refs WHERE repo = 'acme/web' ORDER BY refname")).toEqual([["refs/heads/main"], ["refs/heads/zeta"]]);
+		expect(await sql("SELECT count(*) FROM commit_paths WHERE repo = 'acme/web' AND path LIKE '%@%'")).toEqual([[0]]);
+		expect(await sql("SELECT count(*) FROM commit_paths WHERE repo = 'acme/web'")).toEqual([[4]]);
+		// The finish acknowledgement is lost: the saved plan keeps its counts and the rerun publishes it once.
+		const { source: later } = await syntheticSource(cut(["docs/a.md", "docs/b.md"]));
+		let lost = false;
+		const flaky = { status: p.refresher.status, refresh: async (b: Json) => { const r = await p.refresher.refresh(b); if (b.command === "finish" && !lost) { lost = true; throw new Error("connection reset"); } return r; } };
+		expect(await refreshCorpus({ source: later, client: flaky, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state })).toMatchObject({ status: "stopped" });
+		expect(state.plan.held).toEqual({ refs: 1, commit_paths: 2 });
+		expect(await refreshCorpus({ source: later, client: p.refresher, profile: p.name, repo: "acme/web", observedAt: LATER, sourceId: FILE2, state })).toMatchObject({ status: "published", held: { refs: 1, commit_paths: 2 } });
+		expect(await sql("SELECT count(*) FROM commit_paths WHERE repo = 'acme/web'")).toEqual([[5]]);
+		expect(JSON.stringify(state)).not.toMatch(/sk-1234|icon@2x|first\.last@/);
+	});
+});

@@ -372,7 +372,7 @@ const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Numb
 const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
 const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor"];
 const DASHBOARD_REVIEW = ["action", "status", "limit", "candidate_id", "into", "reason", "request_id"];
-const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free"];
+const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free", "new_name"];
 const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
 const decoded = (s: string) => { try { return decodeURIComponent(s); } catch { return null; } };
 const isoOf = (s: string | undefined) => (s ? new Date(s).toISOString() : undefined);

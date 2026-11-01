@@ -648,6 +648,58 @@ describe("dashboard memories and drafts", () => {
 		expect(byId(b.view(), "draft-name").value).toBe("");
 	});
 
+	it("renames a record from Edit as a draft: new_name only when changed, with its revision, and a fresh request id only for a changed body", async () => {
+		let saves = 0;
+		const b = browser({ signedIn: true, hash: "#/memory/work/m1", api: (path, method, body) => {
+			if (path === "/api/profiles/work/nodes/m1") return Response.json(entity());
+			if (path === "/api/profiles/work/save" && method === "POST") {
+				if (++saves === 1) throw new Error("response lost after commit");
+				return Response.json({ ok: true, action: "updated", memory_id: "m1", name: (body as { new_name?: string }).new_name, revision: 4 });
+			}
+		} });
+		await dashboardMain(b.win);
+		await settle();
+		click(button(b.view(), "Edit as a draft"));
+		b.go("#/draft/work");
+		const name = byId(b.view(), "draft-name");
+		expect([name.value, name.disabled, byId(b.view(), "draft-type").disabled, byId(b.view(), "draft-scope").disabled]).toEqual([HOSTILE, false, true, true]);
+		submit(b.view());
+		expect(text(b.view())).toContain("Name unchanged");
+		typeIn(byId(b.view(), "draft-name"), "");
+		expect(button(b.view(), "Save").disabled).toBe(true); // a changed name needs a new preview
+		submit(b.view());
+		expect(status(b).textContent).toBe("Give the memory a name.");
+		typeIn(byId(b.view(), "draft-name"), "  Use SQLite ");
+		submit(b.view());
+		expect(text(b.view())).toContain(`Renamed from “${HOSTILE}” to “Use SQLite”`);
+		click(button(b.view(), "Save"));
+		await settle();
+		expect(status(b).textContent).toContain("response lost after commit");
+		b.go("#/draft/work"); // the draft survives a re-render and still knows the record's own name
+		expect(text(b.view())).toContain(`Editing “${HOSTILE}” at revision 3`);
+		submit(b.view());
+		click(button(b.view(), "Save"));
+		await settle();
+		const [first, second] = b.seen.bodies as Record<string, unknown>[];
+		expect(first).toMatchObject({ memory_id: "m1", expected_revision: 3, new_name: "Use SQLite", description: "Why we chose it", content: "Line one\nLine two" });
+		expect(first).not.toHaveProperty("name");
+		expect(second).toEqual(first); // the unchanged retry replays under the same request id
+		expect(status(b).textContent).toContain("Saved: updated “Use SQLite”, revision 4.");
+		b.go("#/memory/work/m1");
+		await settle();
+		click(button(b.view(), "Edit as a draft"));
+		b.go("#/draft/work");
+		typeIn(byId(b.view(), "draft-desc"), "A changed summary");
+		submit(b.view());
+		click(button(b.view(), "Save"));
+		await settle();
+		const third = b.seen.bodies[2] as Record<string, unknown>;
+		expect(third).not.toHaveProperty("new_name"); // an unchanged name is not sent
+		expect(third).toMatchObject({ memory_id: "m1", expected_revision: 3, description: "A changed summary" });
+		expect(third.request_id).not.toBe(first!.request_id);
+		expect(b.seen.posted).toEqual(Array(3).fill("/api/profiles/work/save"));
+	});
+
 	it("draws the map's readable records as buttons, states partial and opaque coverage, and keeps what-if items local until a draft is saved", async () => {
 		const map = { center: null, starts: ["p1"], depth: 1, nodes: [{ id: "p1", kind: "project", name: "Agent Memory", status: "active" }, { id: "c1", kind: "component", name: HOSTILE, status: "active" }],
 			links: [{ id: 1, rel: "part_of", reason: "lives in it", from: { id: "c1", readable: true }, to: { id: "p1", readable: true } }, { id: 2, rel: "relates_to", from: { id: "p1", readable: true }, to: { id: "zz", readable: false } }],
@@ -770,6 +822,41 @@ describe("dashboard memories and drafts", () => {
 		expect(flat()).not.toContain("github.com/acme/x");
 		expect(b.seen.posted.filter((x) => x === "/api/rules/test")).toHaveLength(2);
 		expect(puts).toHaveLength(2);
+	});
+
+	it("shows the open recovery's id, keeps an opened point-in-time restore's id to reverse it, and drills the generation read after the restore", async () => {
+		const RID = "0b6c3a1e-4d2f-4a8b-9c1d-2e3f4a5b6c7d", NEXT = "1c7d4b2f-5e3a-4b9c-8d2e-3f4a5b6c7d8e";
+		let opened = false;
+		const b = browser({ signedIn: true, hash: "#/backups", api: (path, method) => {
+			// The restore gave work a new generation; the startup list still says bbbb.
+			if (path === "/api/profiles" && opened) return Response.json(PROFILES.map((p) => p.name === "work" ? { ...p, generation: "cccc" } : p));
+			if (path === "/api/recovery") return Response.json({ recovery: opened ? null : { id: RID, kind: "pitr", profile: "work", export: "", export_at: "2026-10-31T00:00:00Z", at: "2026-11-01T00:00:00Z",
+				state: "ready", unresolved: [], unresolved_count: 0 }, last_export: null });
+			if (path === "/api/recovery/open" && method === "POST") { opened = true; return Response.json({ id: RID, kind: "pitr", state: "opened" }); }
+			if (path === "/api/backups/drill" && method === "GET") return Response.json({ drill: null, last: null });
+			if (path === "/api/backups/drill" && method === "POST") return Response.json({ id: "d1", state: "restoring" });
+			if (path === "/api/profiles/work/pitr" && method === "POST") return Response.json({ id: NEXT, kind: "pitr", profile: "work", state: "reconciling" });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		const flat = () => text(b.view()).replace(/\s+/g, " ");
+		expect(flat()).toContain(`Restore id ${RID}`);
+		click(button(b.view(), "Open"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(status(b).textContent).toContain(`Recovery ${RID} is now opened.`);
+		expect(flat()).toContain("No recovery is open");
+		byId(b.view(), "drill-profile").value = "work";
+		find(b.view(), "form").find((f) => find(f, "select").some((x) => x.attrs.id === "drill-profile"))!.on.submit!({ preventDefault() {} });
+		for (let i = 0; i < 4; i++) await settle();
+		expect(flat()).toContain(`Opened in this tab: point-in-time restore ${RID} of work.`); // still shown after another action replaced the status
+		byId(b.view(), "pitr-profile").value = "work";
+		typeIn(byId(b.view(), "pitr-undo"), RID);
+		typeIn(byId(b.view(), "confirm-begin-point-in-time-restore"), "restore in time");
+		click(button(b.view(), "Begin point-in-time restore"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.posted).toEqual(["/api/recovery/open", "/api/backups/drill", "/api/profiles/work/pitr"]);
+		expect(b.seen.bodies).toEqual([{ id: RID }, { profile: "work", generation: "cccc", request_id: expect.stringMatching(/^dashboard:/) }, { undo: RID }]);
+		expect(status(b).textContent).toContain(`Recovery ${NEXT} begun: reconciling.`);
 	});
 
 	it("begins a restore drill only by an explicit request for the shown generation, resends an unconfirmed begin unchanged, steps and cleans up by hand, and passes only a server-passed, cleaned drill", async () => {

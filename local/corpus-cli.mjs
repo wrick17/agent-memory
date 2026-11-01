@@ -126,7 +126,7 @@ export async function main(args, command = "node local/corpus-cli.mjs", { runner
 	const fromGit = checkouts?.length && profile && !db && !tables && !asOf && !args.includes("--remove") && (!repo || checkouts.length === 1);
 	const scans = args.includes("--scans");
 	if (!fromGit && (checkouts || !db || !profile || !(tables || repo) || (tables && repo) || !asOf || Number.isNaN(Date.parse(asOf)))) {
-		process.stderr.write(`usage: ${command} --db FILE --profile NAME (--tables t1,t2 | --refresh OWNER/REPO [--remove]) --as-of ISO [--config FILE]\n`
+		process.stderr.write(`usage: ${command} --db FILE --profile NAME (--tables t1,t2 | --refresh OWNER/REPO [--remove]) --as-of ISO [--hold-private-keys] [--config FILE]\n`
 			+ `       ${command} --git CHECKOUT[,CHECKOUT...] --profile NAME [--scans] [--refresh OWNER/REPO] [--base FILE] [--config FILE]\n`);
 		return 2;
 	}
@@ -162,11 +162,13 @@ export async function main(args, command = "node local/corpus-cli.mjs", { runner
 					return await refreshCorpus({ source, client: httpClient({ config }), profile, repo, intent: args.includes("--remove") ? "remove" : "refresh",
 						observedAt: new Date(asOf).toISOString(), sourceId: source.fileSha256, state, save });
 				}
-				return await uploadCorpus({ source, client: httpClient({ config }), profile, tables: tables.split(","), asOf: new Date(asOf).toISOString(), fileSha256: source.fileSha256, state, save });
+				return await uploadCorpus({ source, client: httpClient({ config }), profile, tables: tables.split(","), asOf: new Date(asOf).toISOString(), fileSha256: source.fileSha256, state, save,
+					holdPrivateKeys: args.includes("--hold-private-keys") });
 			} finally { source.close(); }
 		});
 		process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
-		return r.status === "done" || r.status === "published" ? 0 : 1;
+		// "held" exists only under the owner's --hold-private-keys; its counts are in the printed result.
+		return ["done", "held", "published"].includes(r.status) ? 0 : 1;
 	} catch (e) {
 		process.stderr.write(`${e.message}\n`);
 		return 1;
