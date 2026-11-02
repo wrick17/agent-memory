@@ -10,11 +10,11 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [x] Exercise core save, journal, recall and history operations in the owner trial.
 - [x] Restore full-size Account and Corpus data, verify Account checkpoint rollback, and reconcile the retained records, history, replay and corpus at the recorded scope.
 - [x] Release the earlier reviewed recovery and capture privacy fixes to the everyday canonical service.
-- [ ] Verify authenticated read, write, journal and capture flows in the actual Claude, Codex and T3 clients and machines.
-- [ ] Verify automatic preference learning from captured evidence, including owner controls, and enable the intended capture-to-learning path.
-- [ ] Switch remaining callers and competing native-memory writes using retained rollback snapshots.
+- [x] Verify authenticated read, write, journal and capture flows in the actual Claude, Codex and T3 clients and machines at the recorded scope.
+- [x] Verify automatic preference learning from captured evidence, including owner controls, and enable the intended capture-to-learning path.
+- [x] Switch the agreed everyday callers and competing native-memory writes using retained rollback snapshots.
 
-Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. Later Account reconciliation and learning-preview changes are reviewed and running in that fixture; final delivery remains open. Actual Claude, Codex and T3 read/write/journal checks passed on Main and MacBook at their recorded scopes. Capture, refresh and learning acceptance remain open. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
+Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
 
 Project and strategic reviews, the broader dashboard and reader trial, full-size Work-wipe expansion, cosmetic polish and exhaustive test matrices are follow-up work. Proactive PR and Jira feeds remain excluded. BothQ stays running and readable as a legacy fallback; there are no ordinary dual writes. The [feature manifest](docs/feature-manifest.md) retains the broader historical commitments and their evidence.
 

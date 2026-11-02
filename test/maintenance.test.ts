@@ -13,7 +13,7 @@ import type { Outcome, WriteCommand, WriteContext } from "../src/domain/types";
 import { MAINTENANCE_TOOLS } from "../src/maintenance-tools";
 import { archiveNode, archivePage, archiveRows, BudgetTx, purgeAfter, restoreArchived, type Row } from "../src/profile/archive";
 import { cleanupPurge, housekeep, OBJECT_LIMIT, sizeLevel, type Stage } from "../src/profile/housekeeping";
-import { complete, enqueue, finishBatch, next, nextPreview } from "../src/profile/maintenance";
+import { batchStatus, complete, enqueue, finishBatch, next, nextPreview } from "../src/profile/maintenance";
 import { mayChange } from "../src/profile/protect";
 import { undo } from "../src/profile/undo";
 import { runWrite, type Who } from "../src/profile/write";
@@ -384,6 +384,61 @@ describe("protection and the maintenance queue", () => {
 				expect(later.candidates.some((c) => c.item_id === held)).toBe(true);
 				expect(next(storage, {}).items.map((i) => i.item_id)).toEqual(later.candidates.map((c) => c.item_id));
 			} finally { vi.useRealTimers(); }
+		});
+	});
+
+	it("shows the last completed lease's stored per-op outcomes as codes and ids only, read-only", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql;
+			expect(batchStatus(sql).last_completed_lease).toBeNull();
+			const digest = String(wired(storage, who, save({ name: "correction digest" })).memory_id);
+			enqueue(storage, [{ kind: "preference_signal", subjects: [digest] }, { kind: "unlinked", subjects: [digest] }, { kind: "weekly_review", subjects: [digest] }]);
+			const lease = next(storage, {}), item = (kind: string) => lease.items.find((i) => i.kind === kind)!;
+			const job = { platform: "test", userId: USER };
+			complete(storage, who, { lease_id: lease.lease_id!, results: [
+				{ item_id: item("preference_signal").item_id, ops: [
+					{ op: "infer_preference", name: "Prefers short commits", description: "private preference text", evidence: [{ kind: "node", ref: digest }] },
+					{ op: "promote_to_me", from_op: 0, company_free: true }, { op: "secret op text" } as never] },
+				{ item_id: item("unlinked").item_id, ops: [{ op: "flag", node: digest, reason: "secret flag reason text" }] },
+			] }, job);
+			// A legacy row whose stored strings are not codes.
+			sql.exec("UPDATE maintenance SET state = 'done', done_at = '2000-01-01T00:00:00.000Z', outcome = ? WHERE id = ?",
+				JSON.stringify({ status: "done", ops: [{ op: "save", status: "rejected", code: "validation", reason: "legacy free text", created: ["ok-id", "not an id"] }] }), item("weekly_review").item_id);
+			const before = { m: sql.exec("SELECT * FROM maintenance ORDER BY id").toArray(), c: sql.exec("SELECT * FROM cursors ORDER BY stage").toArray(), a: sql.exec("SELECT count(*) AS c FROM activity").one().c };
+			const shown = batchStatus(sql).last_completed_lease!;
+			expect({ m: sql.exec("SELECT * FROM maintenance ORDER BY id").toArray(), c: sql.exec("SELECT * FROM cursors ORDER BY stage").toArray(), a: sql.exec("SELECT count(*) AS c FROM activity").one().c }).toEqual(before);
+			const inferred = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = 'preference'").one().id;
+			expect(shown).toEqual({ lease_id: lease.lease_id, items: [...lease.items].sort((a, b) => a.item_id - b.item_id).map((i) => ({ item_id: i.item_id, kind: i.kind, state: "done", done_at: expect.any(String), status: "done",
+				ops: i.kind === "preference_signal" ? [{ op: "infer_preference", status: "applied", activity_id: expect.any(Number), created: [inferred] },
+					{ op: "promote_to_me", status: "rejected", code: "forbidden" }, { op: "unrecognized", status: "rejected", code: "validation", reason: "op_not_allowed" }]
+					: i.kind === "unlinked" ? [{ op: "flag", status: "applied", activity_id: expect.any(Number) }]
+					: [{ op: "save", status: "rejected", code: "validation", reason: "unrecognized", created: ["ok-id"] }] })) });
+			expect(JSON.stringify(shown)).not.toMatch(/secret|private|legacy|not an id|Prefers/);
+		});
+	});
+
+	it("a correction capture's preference_signal applies an OPS_SCHEMA-shaped inference; a refused one keeps its reason code", async () => {
+		const { token } = await deviceToken("infer-capture-job", ["ingest"], ["test"], "test");
+		const body = JSON.stringify({ asks: [{ text: "Fix it", pos: 10 }], decisions: [], corrections: [{ text: "Use tabs, not spaces.", pos: 1200 }],
+			outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		const RANGE = "codex:thr_infer:0a1b2c3d:0-5000", session = { client: "codex", id: "thr_infer" }, sha = sha256(body);
+		const post = (payload: unknown) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/v1/ingest`, { method: "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(payload) }));
+		expect((await post({ session, digests: [{ range_id: RANGE, capture_status: "consolidated", part_id: "0-5000", sha256: sha, body }] })).status).toBe(200);
+		expect((await post({ session, manifests: [{ range_id: RANGE, parts: [{ part_id: "0-5000", sha256: sha }] }] })).status).toBe(200);
+		const ref = (await contextFor()).account.profiles.find((p) => p.profile === "test")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, s) => {
+			const who = { userId: ref.userId, profile: "test", generation: ref.generation };
+			const lease = next(s.storage, {}), item = lease.items.find((i) => i.kind === "preference_signal")!;
+			const evidence = [{ kind: "node" as const, ref: item.subjects[0]! }];
+			// What confine sends for OPS_SCHEMA output with why, how_to_apply and scope null: those fields dropped. A work-only job has no me.
+			const out = complete(s.storage, who, { lease_id: lease.lease_id!, results: [{ item_id: item.item_id, ops: [
+				{ op: "infer_preference", name: "Prefers tabs", description: "Indents with tabs.", evidence },
+				{ op: "infer_preference", name: "Prefers short commits", description: "d", scope: "all projects", evidence },
+				{ op: "promote_to_me", from_op: 0, company_free: true }] }] }, { platform: "test", userId: ref.userId, deviceId: "job-device" });
+			expect(out.results[0]!.ops).toEqual([{ op: "infer_preference", status: "applied", activity_id: expect.any(Number), created: [expect.any(String)] },
+				{ op: "infer_preference", status: "rejected", code: "validation", reason: "invalid_scope" }, { op: "promote_to_me", status: "rejected", code: "forbidden" }]);
+			expect(batchStatus(s.storage.sql).last_completed_lease!.items.find((i) => i.item_id === item.item_id)!.ops[1]).toEqual({ op: "infer_preference", status: "rejected", code: "validation", reason: "invalid_scope" });
 		});
 	});
 
@@ -1030,10 +1085,10 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		await runInDurableObject(r.of("work").stub, (_i, s) => enqueue(s.storage, [{ kind: "preference_signal", subjects: [digest] }]));
 		/** Leases the signal and completes it with an inference and its promotion, through the real MCP job tools. */
 		const run = async (c: ToolContext, description?: string) => {
-			const lease = await call<{ lease_id: string; items: { item_id: number }[] }>(c, "maintenance_next", { profile: "work" });
+			const lease = await call<{ lease_id: string; items: { item_id: number; allowed_ops: string[] }[] }>(c, "maintenance_next", { profile: "work" });
 			const args = { profile: "work", lease_id: lease.lease_id, results: [{ item_id: lease.items[0]!.item_id, ops: [infer("Prefers small reviewable diffs", digest, description), { op: "promote_to_me", from_op: 0, company_free: true }] }] };
 			const out = await call<{ results: { ops: Op[]; replayed?: boolean }[] }>(c, "maintenance_complete", args);
-			return { args, ops: out.results[0]!.ops, out, transfer: uuid5(`${r.userId}:promote:${lease.lease_id}:${lease.items[0]!.item_id}:1`) };
+			return { args, ops: out.results[0]!.ops, out, allowed: lease.items[0]!.allowed_ops, transfer: uuid5(`${r.userId}:promote:${lease.lease_id}:${lease.items[0]!.item_id}:1`) };
 		};
 		/** The real scheduled alarm of the source, once its outbox rows are due (five minutes on). */
 		const alarm = (expectRun = true) => fireAlarm(r.of("work").stub, expectRun);
@@ -1045,6 +1100,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		const r = await jobRig(), c = r.tool(["work", "me"]);
 		const first = await r.run(c);
 		const id = first.ops[0]!.created![0]!;
+		expect(first.allowed).toContain("promote_to_me");
 		expect(first.ops).toMatchObject([{ op: "infer_preference", status: "applied", created: [id] }, { op: "promote_to_me", status: "applied", memory_id: id, transfer_id: first.transfer }]);
 		await r.on("me", (sql) => {
 			expect(sql.exec("SELECT status, origin, kind, source_profile, json_extract(attrs, '$.company_free') AS cf FROM nodes WHERE id = ?", id).one()).toEqual({ status: "active", origin: "inferred", kind: "preference", source_profile: "work", cf: 1 });
@@ -1079,6 +1135,9 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		const r = await jobRig();
 		const refused = await r.run(r.tool(["work"]));
 		const id = refused.ops[0]!.created![0]!;
+		// A work-only job is not offered promotion; one sent anyway still meets the forbidden backstop.
+		expect(refused.allowed).toEqual(expect.arrayContaining(["infer_preference"]));
+		expect(refused.allowed).not.toContain("promote_to_me");
 		expect(refused.ops[1]).toMatchObject({ status: "rejected", code: "forbidden" });
 		// A work-only job leaves registration only: no executable me intent, and the alarm moves nothing.
 		expect(await r.outbox()).toEqual([{ created: [id], promote: [] }]);
@@ -2090,6 +2149,43 @@ describe("Weekly strategic review", () => {
 	const reviewOp = (ticket: string, pr: string) => ({ op: "strategic_review", summary, content: "As of the board's date, two uploaded items are open. The ticket leads; the PR waits on the owner's review.",
 		links: [{ to: ticket, reason: "Highest-scoring open item this week", evidence: [{ kind: "node", ref: ticket }] },
 			{ to: pr, reason: "Review requested from the owner", evidence: [{ kind: "node", ref: pr }, { kind: "node", ref: ticket }] }] });
+
+	it("replays model output under OPS_SCHEMA through the local batch's confine to a real ingest, lease and completion: a default-scope preference, no promotion offered to a work-only job", async () => {
+		const { name, stub, token } = await workBoardRig();
+		const body = JSON.stringify({ asks: [{ text: "Fix it", pos: 10 }], decisions: [], corrections: [{ text: "Use tabs, not spaces.", pos: 1200 }],
+			outcomes: { commits: [], prs: [], tests: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		const RANGE = "codex:thr_replay:0a1b2c3d:0-5000", session = { client: "codex", id: "thr_replay" }, sha = sha256(body);
+		const ingest = (payload: unknown) => exports.default.fetch(new Request(`${origin}/v1/ingest`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(payload) }));
+		expect((await ingest({ session, digests: [{ range_id: RANGE, capture_status: "consolidated", part_id: "0-5000", sha256: sha, body }] })).status).toBe(200);
+		expect((await ingest({ session, manifests: [{ range_id: RANGE, parts: [{ part_id: "0-5000", sha256: sha }] }] })).status).toBe(200);
+		// @ts-expect-error local/ is plain JavaScript without declarations
+		const { batch, OPS_SCHEMA } = await import("../local/batch.mjs") as { batch: (o: unknown) => Promise<{ profiles: Record<string, { status: string; dropped_ops: number; receipts: { kind: string; ops: { op: string; status: string; created?: string[] }[] }[] }> }>; OPS_SCHEMA: unknown };
+		expect(JSON.stringify(OPS_SCHEMA)).not.toContain('"scope"');
+		const seen: { kind: string; subjects: string[]; allowed_ops: string[] }[] = [];
+		// Strict structured output under OPS_SCHEMA: every field present, null where unused; promotion is attempted anyway.
+		const runner = { available: true, classification: "denied", async exec({ prompt }: { prompt: string }) {
+			const items = JSON.parse(prompt.split("<items>\n")[1]!.split("\n</items>")[0]!) as typeof seen;
+			seen.push(...items);
+			return { kind: "ok", part: { results: items.map((i) => ({ item_id: (i as unknown as { item_id: number }).item_id, ops: i.kind === "preference_signal"
+				? [{ op: "infer_preference", name: "Prefers tabs", description: "Indents with tabs.", why: null, how_to_apply: null, evidence: [{ kind: "node", ref: i.subjects[0] }] },
+					{ op: "promote_to_me", memory_id: null, from_op: 0, company_free: true }] : [{ op: "dismiss" }] })) } };
+		} };
+		process.env.AGENT_MEMORY_HOME = `/tmp/am-replay-${crypto.randomUUID()}`;
+		const report = await batch({ runner, config: { batch_profiles: [name] }, server: { call: (tool: string, args: Record<string, unknown>) => job(token, tool, args) } });
+		const signal = seen.find((i) => i.kind === "preference_signal")!;
+		expect(signal.allowed_ops).toContain("infer_preference");
+		expect(seen.every((i) => !i.allowed_ops.includes("promote_to_me"))).toBe(true);
+		const r = report.profiles[name]!;
+		expect(r).toMatchObject({ status: "completed", dropped_ops: 1 });
+		const ops = r.receipts.find((x) => x.kind === "preference_signal")!.ops;
+		expect(ops).toEqual([{ op: "infer_preference", status: "applied", activity_id: expect.any(Number), created: [expect.any(String)] }]);
+		await runInDurableObject(stub, async (_i, s) => {
+			const sql = s.storage.sql, id = ops[0]!.created![0]!;
+			expect(sql.exec("SELECT kind, memory_type, origin, scope, status FROM nodes WHERE id = ?", id).one()).toEqual({ kind: "preference", memory_type: "user", origin: "inferred", scope: "default", status: "active" });
+			expect(sql.exec("SELECT kind, ref FROM evidence WHERE owner = ?", `n:${id}`).toArray()).toEqual([{ kind: "node", ref: signal.subjects[0] }]);
+			await s.storage.deleteAlarm();
+		});
+	});
 
 	it("over the job HTTP route the weekly item names the board's open items, the review becomes one document with reasoned links, and work_board returns it", async () => {
 		const { owner, name, stub, ticket, pr, token } = await workBoardRig();

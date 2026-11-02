@@ -55,7 +55,9 @@ async function job(c: ToolContext, name: string, cmd: { op: "next" | "complete" 
 	// the profile stores a promotion intent only with this me generation.
 	const me = mayUse(c.caller, "me") ? c.account.profiles.find((p) => p.profile === "me") : undefined;
 	const r = await stub.maintenance(ref, cmd, { ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}), platform: c.platform, userId: c.caller.userId, ...(me ? { me: me.generation } : {}) });
-	return r.ok && "results" in cmd ? ok(await promote(c, ref, !!me, r.value as { results: { ops?: OpOutcome[] }[] })) : r;
+	// Promotion is offered only to a job that can reach me; without me the profile and promote() still refuse it.
+	if (r.ok && cmd.op === "next" && !me) for (const i of (r.value as { items?: { allowed_ops: string[] }[] }).items ?? []) i.allowed_ops = i.allowed_ops.filter((o) => o !== "promote_to_me");
+	return r.ok && "results" in cmd ?ok(await promote(c, ref, !!me, r.value as { results: { ops?: OpOutcome[] }[] })) : r;
 }
 
 /**

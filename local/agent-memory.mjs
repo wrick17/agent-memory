@@ -919,6 +919,67 @@ const CLAUDE_ARGS = ["-p", "--input-format", "stream-json", "--output-format", "
 const TOOL_REJECTION = /No such tool available:|unsupported call:/;
 const TOOL_FRAMES = new Set(["user", "tool_progress", "tool_use_summary"]);
 const TEXT_BLOCKS = new Set(["text", "thinking", "redacted_thinking"]);
+// Claude Code 2.1.316's `system/thinking_tokens` (SDK schema): a running thinking-token estimate for spinners, two integer counts
+// and stream ids, with no text, tool, config or execution state. Only this exact key set and these types are recognized.
+const THINKING_KEYS = new Set(["type", "subtype", "estimated_tokens", "estimated_tokens_delta", "user_message_uuid", "uuid", "session_id"]);
+const thinkingTokens = (e) => e.type === "system" && e.subtype === "thinking_tokens" && Object.keys(e).every((k) => THINKING_KEYS.has(k))
+	&& Number.isInteger(e.estimated_tokens) && Number.isInteger(e.estimated_tokens_delta) && typeof e.uuid === "string"
+	&& typeof e.session_id === "string" && (e.user_message_uuid === undefined || typeof e.user_message_uuid === "string");
+
+/**
+ * The JSON value of a Claude query result, or null. Owner-approved fallback (2026-11-02): pure JSON; otherwise exactly one
+ * top-level JSON object, found by a quote- and escape-aware brace scan, with only text outside it, where that text may be
+ * exactly one ```json fence around the object and no other fence. Several objects, any other fence, an unclosed brace or a
+ * malformed object returns null. The caller still validates the value against the full output schema.
+ */
+export function resultJson(text) {
+	try { return { value: JSON.parse(text) }; } catch { /* the fallback below */ }
+	const spans = [];
+	for (let i = 0; i < text.length; i++) {
+		if (text[i] !== "{") continue;
+		let depth = 0, inString = false, j = i;
+		for (; j < text.length; j++) {
+			const c = text[j];
+			if (inString) { if (c === "\\") j++; else if (c === '"') inString = false; continue; }
+			if (c === '"') inString = true;
+			else if (c === "{" || c === "[") depth++;
+			else if ((c === "}" || c === "]") && --depth === 0) break;
+		}
+		if (j >= text.length) return null;
+		spans.push([i, j + 1]);
+		i = j;
+	}
+	if (spans.length !== 1) return null;
+	const [start, end] = spans[0], before = text.slice(0, start), after = text.slice(end);
+	const fences = `${before}${after}`.split("```").length - 1;
+	if (fences && !(fences === 2 && /```json[ \t]*\r?\n\s*$/.test(before) && /^\s*```/.test(after))) return null;
+	// An element of a JSON array (`[{...}]`, `[x, {...}]`, `[{...}, x]`) is not a top-level object.
+	if (/[[,]\s*$/.test(before) || /^\s*[\],]/.test(after)) return null;
+	try {
+		const value = JSON.parse(text.slice(start, end));
+		return value && typeof value === "object" && !Array.isArray(value) ? { value } : null;
+	} catch { return null; }
+}
+
+/**
+ * Owner-approved diagnostic for a query result whose text is not JSON: the whole final frame, redacted, in a new mode-600 file
+ * under the Agent Memory home's `diagnostics/` (the run dir is deleted with the runner). It is never uploaded or printed, and a
+ * failed write changes nothing: the result is discarded either way.
+ */
+function retainUnparsedResult(e) {
+	try {
+		const dir = path.join(home(), "diagnostics");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, `claude-result-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomBytes(4).toString("hex")}.txt`);
+		// Exclusive create: never follows or reuses an existing path.
+		const fd = fs.openSync(file, "wx", 0o600);
+		try {
+			fs.fchmodSync(fd, 0o600);
+			// Strings first, then the serialized frame, so key/value secrets ("token": "...") are caught as well.
+			fs.writeSync(fd, `${redact(JSON.stringify(redactDeep(e)))}\n`);
+		} finally { fs.closeSync(fd); }
+	} catch { /* diagnostics only */ }
+}
 
 /**
  * Claude Code headless (`claude -p`, stream-json). Gate before any untrusted text: the trusted instructions go first with
@@ -983,11 +1044,15 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 				if (e.subtype !== "success" || e.is_error) return fail("runtime_error");
 				if (e.num_turns !== 1) return fail("tool_event");
 				if (typeof e.result !== "string") return fail("no_output");
-				try { pending = { kind: "ok", part: JSON.parse(e.result) }; } catch { return fail("bad_output"); }
+				const parsed = resultJson(e.result);
+				if (!parsed) { retainUnparsedResult(e); return fail("bad_output"); }
+				pending = { kind: "ok", part: parsed.value };
 				phase = "after";
 				return;
 			}
 			if (textOnly && phase === "query" && reinit) return;
+			// The gate turn makes no API request, so progress there (or before the re-init, or after the result) still fails closed.
+			if (phase === "query" && reinit && thinkingTokens(e)) return;
 			// Before the untrusted text is sent, anything else means this is not the gated runtime; the lease's items stay open.
 			return fail("runtime_warning");
 		};

@@ -44,7 +44,8 @@ export const OPS_SCHEMA = {
 			op("supersede", { keep: str, retire: { type: "array", items: str } }),
 			op("flag", { node: str, reason: str }),
 			op("dismiss", {}),
-			op("infer_preference", { name: str, description: str, why: nstr, how_to_apply: nstr, scope: nstr,
+			// No scope: the model never picks one, so an inference saves under the default scope.
+			op("infer_preference", { name: str, description: str, why: nstr, how_to_apply: nstr,
 				evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } }),
 			op("promote_to_me", { memory_id: nstr, from_op: { type: ["integer", "null"] }, company_free: { enum: [true] } }),
 			op("strategic_review", { summary: str, content: str, links: { type: "array", items: { type: "object", additionalProperties: false, required: ["to", "reason", "evidence"], properties: {
@@ -134,6 +135,17 @@ const execOf = (runner, config) => (config.batch_runner === "claude" ? runner?.b
 
 const promptFor = (items) => `${PROMPT}\n<items>\n${JSON.stringify(items)}\n</items>\n`;
 
+// The server's per-op outcome as codes and ids only; any other string reads as "unrecognized", never as text.
+const CODE = /^[a-z0-9_]{1,64}$/, ID = /^[A-Za-z0-9_:.-]{1,128}$/;
+const asCode = (v) => (typeof v === "string" && CODE.test(v) ? v : "unrecognized");
+const asId = (v) => (typeof v === "string" && ID.test(v) ? v : undefined);
+const opReceipt = (o) => {
+	const ids = (Array.isArray(o?.created) ? o.created : []).map(asId).filter(Boolean);
+	return { op: asCode(o?.op), status: asCode(o?.status), ...(o?.code !== undefined ? { code: asCode(o.code) } : {}), ...(o?.reason !== undefined ? { reason: asCode(o.reason) } : {}),
+		...(Number.isSafeInteger(o?.activity_id) ? { activity_id: o.activity_id } : {}), ...(ids.length ? { created: ids } : {}),
+		...(asId(o?.memory_id) ? { memory_id: o.memory_id } : {}), ...(asId(o?.transfer_id) ? { transfer_id: o.transfer_id } : {}) };
+};
+
 /** One profile: lease, judge per model tier, then complete item by item. Returns a content-free outcome. */
 async function profileBatch(profile, { server, runner, config, clock }) {
 	const lease = await server.call("maintenance_next", { profile, limit: LEASE.limit, lease_seconds: LEASE.seconds });
@@ -162,12 +174,15 @@ async function profileBatch(profile, { server, runner, config, clock }) {
 		for (const [k, v] of c.results) results.set(k, v);
 		dropped += c.dropped;
 	}
-	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, dropped_ops: dropped, codes: {} };
-	for (const [itemId, ops] of results) {
+	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, dropped_ops: dropped, codes: {}, receipts: [] };
+	const kindOf = new Map(lease.items.map((i) => [i.item_id, i.kind]));
+	for (const [itemId, sent] of results) {
 		if (clock() > deadline) { outcome.status = "lease_short"; break; }
 		try {
-			const r = await server.call("maintenance_complete", { profile, lease_id: lease.lease_id, results: [{ item_id: itemId, ops }] });
-			for (const o of r.results?.[0]?.ops ?? []) outcome.codes[o.code ?? o.status] = (outcome.codes[o.code ?? o.status] ?? 0) + 1;
+			const r = await server.call("maintenance_complete", { profile, lease_id: lease.lease_id, results: [{ item_id: itemId, ops: sent }] });
+			const ops = r.results?.[0]?.ops ?? [];
+			for (const o of ops) outcome.codes[o.code ?? o.status] = (outcome.codes[o.code ?? o.status] ?? 0) + 1;
+			outcome.receipts.push({ item_id: itemId, kind: asCode(kindOf.get(itemId)), status: asCode(r.results?.[0]?.status), sent: sent.map((o) => asCode(o.op)), ops: ops.map(opReceipt) });
 			outcome.completed++;
 			outcome.retained--;
 		} catch (e) {
@@ -175,6 +190,7 @@ async function profileBatch(profile, { server, runner, config, clock }) {
 			if (e.code === "lease_expired") { outcome.status = "lease_expired"; break; }
 			outcome.rejected++;
 			outcome.codes[e.code ?? "error"] = (outcome.codes[e.code ?? "error"] ?? 0) + 1;
+			outcome.receipts.push({ item_id: itemId, kind: asCode(kindOf.get(itemId)), status: "refused", code: asCode(e.code ?? "error"), sent: sent.map((o) => asCode(o.op)), ops: [] });
 		}
 	}
 	return outcome;

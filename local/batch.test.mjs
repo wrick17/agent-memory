@@ -69,7 +69,9 @@ describe("job flow", () => {
 			["maintenance_next", "work", null, null], ["maintenance_complete", "work", "LW", [1]], ["maintenance_complete", "work", "LW", [2]],
 			["maintenance_next", "personal", null, null], ["maintenance_complete", "personal", "LP", [3]]]);
 		assert.deepEqual([server.calls[0].args.limit, server.calls[0].args.lease_seconds], [40, 900]);
-		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, dropped_ops: 0, codes: { applied: 2 } });
+		const receipt = (id, kind) => ({ item_id: id, kind, status: "done", sent: ["dismiss"], ops: [{ op: "dismiss", status: "applied" }] });
+		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, dropped_ops: 0, codes: { applied: 2 },
+			receipts: [receipt(1, "unlinked"), receipt(2, "near_duplicate")] });
 	});
 
 	it("sends only allowed ops on the item's own subjects, drops nulls and redacts model text", async () => {
@@ -96,7 +98,7 @@ describe("job flow", () => {
 		signal.allowed_ops = [...ALL_OPS, "infer_preference", "promote_to_me"];
 		const server = fakeServer({ work: lease("LW", [signal]) });
 		const secret = `ghp_${"B".repeat(36)}`;
-		const infer = (ref) => ({ op: "infer_preference", name: "Prefers small diffs", description: `seen in corrections ${secret}`, why: null, how_to_apply: null, scope: null, evidence: [{ kind: "node", ref }] });
+		const infer = (ref) => ({ op: "infer_preference", name: "Prefers small diffs", description: `seen in corrections ${secret}`, why: null, how_to_apply: null, evidence: [{ kind: "node", ref }] });
 		const runner = fakeRunner(() => ({ kind: "ok", part: { results: [{ item_id: 1, ops: [infer("s"), infer("elsewhere"),
 			{ op: "promote_to_me", memory_id: null, from_op: 0, company_free: true }, { op: "promote_to_me", memory_id: "elsewhere", from_op: null, company_free: true }] }] } }));
 		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
@@ -132,7 +134,8 @@ describe("work is retained on every failure", () => {
 			{ results: [{ item_id: 2, ops: [{ ...save, memory_id: "b", content: 42 }] }] },
 			{ results: [{ item_id: 2, ops: [{ op: "save", memory_id: "b" }] }] },
 			{ results: [{ item_id: 2, ops: [{ op: "promote_to_me", memory_id: "b", from_op: null, company_free: false }] }] },
-			{ results: [{ item_id: 2, ops: [{ op: "infer_preference", name: "n", description: "d", why: null, how_to_apply: null, scope: null, evidence: [{ kind: "url", ref: "b" }] }] }] }];
+			{ results: [{ item_id: 2, ops: [{ op: "infer_preference", name: "n", description: "d", why: null, how_to_apply: null, evidence: [{ kind: "url", ref: "b" }] }] }] },
+			{ results: [{ item_id: 2, ops: [{ op: "infer_preference", name: "n", description: "d", why: null, how_to_apply: null, scope: "all projects", evidence: [{ kind: "node", ref: "b" }] }] }] }];
 		for (const part of invalid) {
 			const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"]), item(2, "near_duplicate", ["b"]) ]), personal: lease("LP", [item(3, "unlinked", ["c"])]) });
 			const runner = fakeRunner(({ model }) => ({ kind: "ok", part: model === "gpt-6-luna" ? { results: [{ item_id: 1, ops: [save] }] } : part }));
@@ -159,12 +162,17 @@ describe("work is retained on every failure", () => {
 	});
 
 	it("keeps going past a refused item, stops at an expired lease, and never starts a run on a short lease", async () => {
-		const refuse = (code) => (args) => { if (args.results[0].item_id === 1) throw Object.assign(new Error("x"), { code }); return { results: [{ ops: [] }] }; };
+		const refuse = (code) => (args) => { if (args.results[0].item_id === 1) throw Object.assign(new Error("x"), { code });
+			return { results: [{ status: "done", ops: [{ op: "save", status: "rejected", code: "validation", reason: "free text /Users/x", created: ["p1", "not an id"] }] }] }; };
 		const items = () => [item(1, "unlinked", ["a"]), item(2, "unlinked", ["b"])];
 		let server = fakeServer({ work: lease("LW", items()) }, refuse("validation"));
 		let r = await batch({ runner: fakeRunner(dismissAll), config: { batch_profiles: ["work"] }, server });
 		assert.deepEqual(server.calls.slice(1).map((c) => c.args.results[0].item_id), [1, 2]);
 		assert.deepEqual([r.profiles.work.status, r.profiles.work.completed, r.profiles.work.rejected, r.profiles.work.retained], ["completed", 1, 1, 1]);
+		// The per-op receipt keeps codes and ids only; a refused item keeps its refusal code and the op names it sent.
+		assert.deepEqual(r.profiles.work.receipts, [{ item_id: 1, kind: "unlinked", status: "refused", code: "validation", sent: ["dismiss"], ops: [] },
+			{ item_id: 2, kind: "unlinked", status: "done", sent: ["dismiss"], ops: [{ op: "save", status: "rejected", code: "validation", reason: "unrecognized", created: ["p1"] }] }]);
+		assert.doesNotMatch(fs.readFileSync(path.join(process.env.AGENT_MEMORY_HOME, "batch", "last.json"), "utf8"), /free text|not an id/);
 		server = fakeServer({ work: lease("LW", items()) }, refuse("lease_expired"));
 		r = await batch({ runner: fakeRunner(dismissAll), config: { batch_profiles: ["work"] }, server });
 		assert.deepEqual(server.calls.slice(1).map((c) => c.args.results[0].item_id), [1]);

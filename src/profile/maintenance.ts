@@ -317,7 +317,34 @@ export function batchStatus(sql: SqlStorage) {
 		"SELECT stage, last_run_at, last_error, stats FROM cursors WHERE stage IN ('maintenance_batch', 'batch_status')").toArray().map((r) => [r.stage, r]));
 	const s = rows.get("batch_status"), stats = s?.stats ? (JSON.parse(s.stats) as { status: string; items: number }) : null;
 	return { last_lease_at: rows.get("maintenance_batch")?.last_run_at ?? null,
-		last_status: s && stats ? { status: stats.status, reason: s.last_error, items: stats.items, at: s.last_run_at } : null };
+		last_status: s && stats ? { status: stats.status, reason: s.last_error, items: stats.items, at: s.last_run_at } : null,
+		last_completed_lease: lastCompletedLease(sql) };
+}
+
+// Stored op names and reasons predate this read; anything that is not a plain code reads as "unrecognized", never as text.
+const CODE = /^[a-z0-9_]{1,64}$/, ID = /^[A-Za-z0-9_:.-]{1,128}$/;
+const asCode = (v: unknown) => (typeof v === "string" && CODE.test(v) ? v : "unrecognized");
+const asId = (v: unknown) => (typeof v === "string" && ID.test(v) ? v : undefined);
+
+/** One stored op outcome as an allowlist of codes and ids: no prompt, summary, flag reason or other text. */
+function opReceipt(o: Partial<Record<keyof OpOutcome, unknown>>) {
+	const ids = (Array.isArray(o.created) ? o.created : []).map(asId).filter((x): x is string => !!x);
+	return { op: asCode(o.op), status: asCode(o.status), ...(o.code !== undefined ? { code: asCode(o.code) } : {}), ...(o.reason !== undefined ? { reason: asCode(o.reason) } : {}),
+		...(Number.isSafeInteger(o.activity_id) ? { activity_id: o.activity_id as number } : {}), ...(ids.length ? { created: ids } : {}),
+		...(asId(o.memory_id) ? { memory_id: asId(o.memory_id) } : {}), ...(asId(o.transfer_id) ? { transfer_id: asId(o.transfer_id) } : {}) };
+}
+
+/** Every item of the lease that most recently completed an item, with its stored per-op outcomes. Read-only; ids and codes only. */
+function lastCompletedLease(sql: SqlStorage) {
+	const lease = sql.exec<{ lease_id: string }>("SELECT lease_id FROM maintenance WHERE lease_id IS NOT NULL AND state IN ('done', 'dismissed') ORDER BY done_at DESC, id DESC LIMIT 1").toArray()[0]?.lease_id;
+	if (!lease) return null;
+	const items = sql.exec<{ id: number; kind: string; state: string; done_at: string | null; outcome: string | null }>(
+		"SELECT id, kind, state, done_at, outcome FROM maintenance WHERE lease_id = ? ORDER BY id LIMIT ?", lease, MAX_ITEMS).toArray();
+	return { lease_id: lease, items: items.map((r) => {
+		const o = r.outcome ? JSON.parse(r.outcome) as { status?: unknown; reason?: unknown; ops?: unknown } : {};
+		return { item_id: r.id, kind: r.kind, state: r.state, done_at: r.done_at, ...(o.status !== undefined ? { status: asCode(o.status) } : {}),
+			...(o.reason !== undefined ? { reason: asCode(o.reason) } : {}), ops: Array.isArray(o.ops) ? o.ops.map((x) => opReceipt(x ?? {})) : [] };
+	}) };
 }
 
 /** `earlier`: this item's outcomes so far, so a from_op can name only an op before it. `item`: the leased item, which dates a review. */
@@ -326,6 +353,8 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 	const sql = storage.sql;
 	const done = (outcome: Omit<OpOutcome, "op">, embedDue = false) => ({ outcome: { op: op.op, ...outcome }, embedDue });
 	const refuse = (reason: string) => done({ status: "rejected", code: "validation", reason });
+	// A shared-writer refusal keeps its content-free reason code (details.reason), never its message.
+	const failed = (e: Fail) => { const r = e.failure.details?.reason; return done({ status: "rejected", code: e.failure.code, ...(typeof r === "string" && CODE.test(r) ? { reason: r } : {}) }); };
 	if (op.op === "dismiss") return done({ status: "applied" });
 	let touched: string[], local = true;
 	if (op.op === "end_link") {
@@ -382,7 +411,7 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 			});
 			return done({ status: op.op === "flag" ? "applied" : "flagged", activity_id: ids[ids.length - 1]! });
 		} catch (e) {
-			if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+			if (e instanceof Fail) return failed(e);
 			throw e;
 		}
 	}
@@ -395,7 +424,7 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		const prior = sql.exec<{ node_id: string; result: string }>("SELECT node_id, result FROM requests WHERE request_id = ? AND op = 'save'", requestId).toArray()[0];
 		if (prior) {
 			try { assertOpen(sql); assertNotWiped(sql, prior.node_id); } catch (e) {
-				if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+				if (e instanceof Fail) return failed(e);
 				throw e;
 			}
 			const result = JSON.parse(prior.result) as { action: string; activity_id?: number };
@@ -427,7 +456,7 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		return done({ status: action === "flagged" ? "flagged" : "applied", ...(typeof out.result.activity_id === "number" ? { activity_id: out.result.activity_id } : {}),
 			...((op.op === "infer_preference" || op.op === "strategic_review") && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
 	} catch (e) {
-		if (e instanceof Fail) return done({ status: "rejected", code: e.failure.code });
+		if (e instanceof Fail) return failed(e);
 		throw e;
 	}
 }

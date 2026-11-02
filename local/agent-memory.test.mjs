@@ -4,15 +4,17 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { beforeEach, describe, it } from "node:test";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-local-test-"));
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
 const am = await import("./agent-memory.mjs");
+const { batch } = await import("./batch.mjs");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
 let n = 0;
 beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
@@ -951,5 +953,162 @@ describe("self-host corpus judgment closure", () => {
 		assert.deepEqual(fs.readFileSync(path.join(stage, file)), fs.readFileSync(path.join(root, file)));
 		assert.equal(fs.statSync(path.join(stage, file)).mode & 0o777, 0o644);
 		assert.equal(typeof (await import(pathToFileURL(path.join(stage, "local/corpus-cli.mjs")).href)).main, "function");
+	});
+});
+
+describe("Claude Code stream gate: thinking-token progress frames", () => {
+	const MODEL = "claude-sonnet-5-5";
+	const frame = (e) => `${JSON.stringify(e)}\n`;
+	const init = frame({ type: "system", subtype: "init", tools: [], mcp_servers: [], model: MODEL, permissionMode: "dontAsk" });
+	const gate = init + frame({ type: "result", subtype: "success", is_error: false, num_turns: 0, duration_api_ms: 0 });
+	const answer = frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "{\"results\":[]}" });
+	// The CLI 2.1.316 frame shape (SDK schema plus its stream-json wrapper, which adds uuid and session_id).
+	const thinking = (extra = {}) => frame({ type: "system", subtype: "thinking_tokens", estimated_tokens: 40, estimated_tokens_delta: 40, uuid: "u", session_id: "s", ...extra });
+	// A fake CLI: the gate turn on the shouldQuery:false line, the query frames on the next; "close" only after both streams end.
+	const fakeClaude = (gateOut, queryOut) => {
+		const proc = { lines: [], signals: [] };
+		proc.spawnFn = () => {
+			const child = new EventEmitter();
+			child.stdout = new PassThrough();
+			child.stderr = new PassThrough();
+			let closed = false;
+			const close = (code, sig) => {
+				if (closed) return;
+				closed = true;
+				let open = 2;
+				for (const s of [child.stdout, child.stderr]) { s.on("end", () => { if (!--open) setImmediate(() => child.emit("close", code, sig)); }); s.end(); }
+			};
+			child.kill = (sig) => { proc.signals.push(sig); proc.atKill = proc.onKill?.(); close(null, sig); return true; };
+			child.stdin = new Writable({ write(chunk, _enc, done) {
+				const m = JSON.parse(chunk);
+				proc.lines.push(m);
+				setImmediate(() => {
+					if (closed) return;
+					if (m.shouldQuery === false) return void child.stdout.write(gateOut);
+					child.stdout.write(queryOut);
+					close(0, null);
+				});
+				done();
+			} });
+			return child;
+		};
+		return proc;
+	};
+	const job = { prompt: "do it\n<items>\n[]\n</items>\n", schema: {}, model: MODEL, effort: "low" };
+	const exec = (proc) => am.claudeExec({ claude: "never-run", runDir: tmp, env: {}, spawnFn: proc.spawnFn })(job);
+
+	it("applies the result of a query turn that streams exact thinking_tokens progress frames (P1 evidence sequence)", async () => {
+		const proc = fakeClaude(gate, init + thinking() + thinking({ estimated_tokens: 90, estimated_tokens_delta: 50, user_message_uuid: "m" }) + answer);
+		assert.deepEqual(await exec(proc), { kind: "ok", part: { results: [] } });
+		assert.deepEqual([proc.lines.length, proc.signals], [2, []]);
+		assert.ok(!fs.existsSync(path.join(am.home(), "diagnostics")), "a parsed result leaves no diagnostic");
+	});
+
+	it("keeps an unparsable query result only as a new redacted mode-600 file under the home, written before the kill", async () => {
+		const diag = path.join(am.home(), "diagnostics");
+		const secrets = ["Bearer abcdefghijklmnop", "sk-ABCDEFGHIJKLMNOPQRSTUV", "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.c2lnbmF0dXJlMTIz", "hunter2pass"];
+		// Two fenced objects are ambiguous, so this result is kept.
+		const text = `\`\`\`json\n{"results":[]}\n\`\`\` ${secrets[0]} ${secrets[1]}\n\`\`\`json\n{"results":[]}\n\`\`\` ${secrets[2]} password: ${secrets[3]}`;
+		const proc = fakeClaude(gate, init + thinking() + frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: text, token: "frame-level-token" }));
+		proc.onKill = () => (fs.existsSync(diag) ? fs.readdirSync(diag) : []);
+		assert.deepEqual(await exec(proc), { kind: "bad_output" });
+		assert.deepEqual(proc.signals, ["SIGKILL"]);
+		const files = fs.readdirSync(diag);
+		assert.equal(files.length, 1);
+		assert.deepEqual(proc.atKill, files, "retained before the kill");
+		const file = path.join(diag, files[0]), st = fs.lstatSync(file);
+		assert.ok(st.isFile() && (st.mode & 0o777) === 0o600 && (fs.statSync(diag).mode & 0o777) === 0o700);
+		const kept = fs.readFileSync(file, "utf8");
+		for (const s of [...secrets, "abcdefghijklmnop", "frame-level-token"]) assert.ok(!kept.includes(s), s);
+		assert.ok(kept.includes("```json") && kept.includes("[REDACTED]") && kept.includes("\"subtype\":\"success\""), "the frame's shape survives");
+		// A second failure gets its own new file; nothing is overwritten.
+		await exec(fakeClaude(gate, init + frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "not json" })));
+		assert.equal(fs.readdirSync(diag).length, 2);
+	});
+
+	it("still fails closed on a thinking_tokens frame in the gate turn, after the result, before the re-init or of any other shape", async () => {
+		const gateResult = frame({ type: "result", subtype: "success", is_error: false, num_turns: 0, duration_api_ms: 0 });
+		const cases = [[init + thinking() + gateResult, init + answer], [gate, init + answer + thinking()], [gate, thinking() + init + answer],
+			[gate, init + thinking({ text: "x" }) + answer], [gate, init + thinking({ estimated_tokens: 1.5 }) + answer],
+			[gate, init + thinking({ estimated_tokens_delta: "1" }) + answer], [gate, init + thinking({ uuid: undefined }) + answer],
+			[gate, init + thinking({ user_message_uuid: 1 }) + answer]];
+		for (const [g, q] of cases) assert.deepEqual(await exec(fakeClaude(g, q)), { kind: "runtime_warning" }, q);
+	});
+});
+
+describe("Claude Code query result: pure JSON, or exactly one object with prose or one json fence around it", () => {
+	const MODEL = "claude-sonnet-5-5";
+	const ok = { results: [{ item_id: 1, ops: [{ op: "dismiss" }] }] }, okJson = JSON.stringify(ok);
+	const frame = (e) => `${JSON.stringify(e)}\n`;
+	const init = frame({ type: "system", subtype: "init", tools: [], mcp_servers: [], model: MODEL, permissionMode: "dontAsk" });
+	const gate = init + frame({ type: "result", subtype: "success", is_error: false, num_turns: 0, duration_api_ms: 0 });
+	const thinking = frame({ type: "system", subtype: "thinking_tokens", estimated_tokens: 40, estimated_tokens_delta: 40, uuid: "u", session_id: "s" });
+	// Batch 1 (06:06) and batch 2 (06:12) as observed: re-init, thinking-token frames, then (batch 2) a thinking and a text
+	// assistant frame, an allowed rate-limit event and the result.
+	const assistant = (block) => frame({ type: "assistant", parent_tool_use_id: null, message: { role: "assistant", content: [block] } });
+	const seq1 = (text) => init + thinking + frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: text });
+	const seq2 = (text) => init + thinking.repeat(7) + assistant({ type: "thinking", thinking: "t" }) + assistant({ type: "text", text })
+		+ frame({ type: "rate_limit_event", rate_limit_info: { status: "allowed" } }) + frame({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: text });
+	const spawnFor = (queryOut) => () => {
+		const child = new EventEmitter();
+		child.stdout = new PassThrough();
+		child.stderr = new PassThrough();
+		let closed = false;
+		const close = (code, sig) => {
+			if (closed) return;
+			closed = true;
+			let open = 2;
+			for (const st of [child.stdout, child.stderr]) { st.on("end", () => { if (!--open) setImmediate(() => child.emit("close", code, sig)); }); st.end(); }
+		};
+		child.kill = (sig) => { close(null, sig); return true; };
+		child.stdin = new Writable({ write(chunk, _enc, done) {
+			const m = JSON.parse(chunk);
+			setImmediate(() => {
+				if (closed) return;
+				if (m.shouldQuery === false) return void child.stdout.write(gate);
+				child.stdout.write(queryOut);
+				close(0, null);
+			});
+			done();
+		} });
+		return child;
+	};
+	// The real caller: batch() validates every accepted value against the full OPS_SCHEMA before any item operation.
+	const run = async (queryOut) => {
+		const calls = [];
+		const lease = { lease_id: "L", lease_until: new Date(Date.now() + 900_000).toISOString(), items: [{ item_id: 1, kind: "unlinked", subjects: ["a"], allowed_ops: ["dismiss"], context: { nodes: [{ id: "a", passage: "p" }], edges: [] } }] };
+		const server = { async call(name, args) { calls.push({ name, args }); return name === "maintenance_next" ? lease : { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] }; } };
+		const runner = { available: true, classification: "denied", batchExec: am.claudeExec({ claude: "never-run", runDir: tmp, env: {}, spawnFn: spawnFor(queryOut) }) };
+		await batch({ runner, config: { batch_runner: "claude", batch_profiles: ["work"], batch_luna_model: MODEL, batch_terra_model: MODEL }, server });
+		return calls[1].args;
+	};
+	const diagFiles = () => { const d = path.join(am.home(), "diagnostics"); return fs.existsSync(d) ? fs.readdirSync(d).length : 0; };
+
+	it("applies a schema-valid result in both observed sequences: pure JSON, one json fence, or one object inside prose", async () => {
+		const accepted = [okJson, `\`\`\`json\n${okJson}\n\`\`\``, `  \`\`\`json  \r\n${JSON.stringify(ok, null, 2)}\n\`\`\`\n`,
+			`Here are the results, as "asked":\n\`\`\`json\n${okJson}\n\`\`\`\nThat's all.`, `Here's the result: ${okJson} (one item, it's done).`];
+		for (const text of accepted) for (const seq of [seq1, seq2]) assert.deepEqual(await run(seq(text)), { profile: "work", lease_id: "L", results: ok.results }, text);
+		assert.equal(diagFiles(), 0, "an accepted result is not retained");
+	});
+
+	it("fails closed on several objects or fences, an array around a full valid result, another fence language, an unclosed or malformed object, and a schema-invalid value", async () => {
+		const rejected = [`${okJson}\n${okJson}`, `\`\`\`json\n${okJson}\n\`\`\`\n\`\`\`json\n${okJson}\n\`\`\``, `\`\`\`json\n${okJson}\n\`\`\`\n\`\`\`bash\nls\n\`\`\``,
+			`\`\`\`python\n${okJson}\n\`\`\``, `\`\`\`json\n${okJson}`, `Use {placeholder} then ${okJson}`, `${okJson} then {`, `{"results": [`, "{results: []}", "no json here", "",
+			`Results: [${okJson}]`];
+		for (const text of rejected) assert.deepEqual(await run(seq2(text)), { profile: "work", lease_id: "L", status: "batch_skipped", reason: "bad_output" }, text);
+		assert.equal(diagFiles(), rejected.length, "every unparsable result is retained");
+		// Extracted, then refused by the full schema: an unknown op, an extra key, a missing field.
+		for (const bad of [{ results: [{ item_id: 1, ops: [{ op: "nuke" }] }] }, { ...ok, extra: 1 }, { results: [{ item_id: 1 }] }]) {
+			assert.deepEqual(await run(seq2(`\`\`\`json\n${JSON.stringify(bad)}\n\`\`\``)), { profile: "work", lease_id: "L", status: "batch_skipped", reason: "bad_output" });
+		}
+	});
+
+	it("scans strings quote- and escape-aware, so braces, quotes and fences inside them never split or add an object", () => {
+		const tricky = { results: [], note: "a } b { c \\\" d ``` e \\\\" };
+		assert.deepEqual(am.resultJson(`Result: ${JSON.stringify(tricky)} done.`), { value: tricky });
+		assert.deepEqual(am.resultJson(`\`\`\`json\n${JSON.stringify(tricky)}\n\`\`\``), { value: tricky });
+		assert.equal(am.resultJson('Result: {"a": "unclosed}'), null);
+		assert.equal(am.resultJson("Result: [1, 2]"), null);
+		assert.deepEqual(am.resultJson("[1]"), { value: [1] }, "pure JSON is unchanged; the schema rejects it later");
 	});
 });
