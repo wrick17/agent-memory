@@ -11,7 +11,7 @@ import { board } from "./board";
 import { similarStep } from "./similar";
 import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
-import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
+import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPreview, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
@@ -726,7 +726,8 @@ export class ProfileStore extends DurableObject<Env> {
 				case "board":
 					return ok(board(sql, q));
 				case "batch_status":
-					return ok(batchStatus(sql));
+					// The owner-only /batch route adds a read-only preview of the next normal lease: an observation, never a lease.
+					return ok({ ...batchStatus(sql), next_preview: nextPreview(sql) });
 				case "owner_model":
 					return ok(ownerModel(sql, q));
 				case "wipe_preview":

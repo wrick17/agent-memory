@@ -293,6 +293,27 @@ describe("owner API", () => {
 		expect((await post(`/api/profiles/personal/nodes/not-a-node/pin`)).status).toBe(404);
 	});
 
+	it("rechecks request findings only for the owner, with a strict body bound to the open recovery", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const recheck = (body: unknown, token: string | null = session) => exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/api/recovery/recheck`,
+			{ method: "POST", headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "content-type": "application/json" }, body: JSON.stringify(body) }))
+			.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		const valid = { id: crypto.randomUUID(), request_ids: ["fixture-routing-20261102:target"] };
+		expect((await recheck(valid, null)).status).toBe(401);
+		const { token } = await deviceToken("recheck-device", ["read", "write"], ["personal"], "personal");
+		expect((await recheck(valid, token)).status).toBe(403);
+		for (const bad of [{ ...valid, request_ids: [] }, { ...valid, request_ids: [""] }, { ...valid, request_ids: ["x".repeat(257)] }, { ...valid, id: "not-a-uuid" }, { ...valid, clear: true }]) {
+			expect(await recheck(bad)).toMatchObject({ status: 400, body: { error: { code: "validation" } } });
+		}
+		// Any request id the tools accept, short ones too, reaches the account, which refuses any recovery but the open one.
+		const busy = { status: 400, body: { error: { code: "busy", details: { reason: "recovery_changed" } } } };
+		expect(await recheck({ ...valid, request_ids: ["r-1"] })).toMatchObject(busy);
+		const read = async (q: string) => { const r = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/api/recovery/request?${q}`, { headers: { authorization: `Bearer ${session}` } })); return { status: r.status, body: await r.json() }; };
+		expect(await read(`id=${valid.id}&request_id=r-1`)).toMatchObject(busy);
+		expect((await read(`id=${valid.id}&request_id=`)).status).toBe(400);
+	});
+
 	it("moves a record between disposable profiles once, replays a lost answer, and refuses a stale source, a repeat into its holder, bad input and devices", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
@@ -658,6 +679,12 @@ describe("owner API", () => {
 		const shown = await get("/api/profiles/work/batch");
 		expect(shown.status).toBe(200);
 		expect(shown.body).toMatchObject({ last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0 } });
+		// The owner's read-only preview of the next normal lease rides on the same owner-only route; a skip leased nothing.
+		expect(shown.body.next_preview).toMatchObject({ observation: "not_a_lease", lease_id: null, cooldown: { status: "open", next_allowed_at: null }, parks_as_stuck: [] });
+		expect(shown.body.last_lease_at).toBeNull();
+		const reader = (await deviceToken(`batch-preview-reader-${Date.now()}`, ["read"], ["work"], "work")).token;
+		expect((await get("/api/profiles/work/batch", reader)).status).toBe(403);
+		expect((await exports.default.fetch(new Request(`${origin}/api/profiles/work/batch`))).status).toBe(401);
 		// A reason that is not a content-free code, or a park without a lease, is refused before the store.
 		expect((await skip({ reason: "probe failed: /Users/x" })).data.result.isError).toBe(true);
 		expect((await rpc(job, "tools/call", { name: "maintenance_complete", arguments: { profile: "work", status: "stuck", reason: "tool_event" } })).data.result.isError).toBe(true);

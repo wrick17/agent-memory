@@ -62,6 +62,10 @@ export type AccountCommand =
 	| { op: "drillCleanup"; id: string }
 	/** The open recovery's copy conflicts, after a node id, with both copies as each profile holds them now. */
 	| { op: "recoveryConflicts"; id: string; after?: string }
+	/** Content-free placement of one request id across the active profiles and the account, for the open recovery's findings. */
+	| { op: "recoveryRequest"; id: string; request_id: string }
+	/** Runs the account restore's index rebuild again when its only findings are request ids that recoveryRequest shows stale. */
+	| { op: "recheckRequests"; id: string; request_ids: string[] }
 	/** The owner keeps one copy of a conflict; the other becomes a flagged tombstone, its content in that profile's archive. */
 	| { op: "resolveConflict"; id: string; node: string; keep: string; expect: CopyExpectation[]; request_id: string }
 	| { op: "beginAccountRestore"; export: string }
@@ -142,9 +146,11 @@ export interface AccountRecovery extends Choices {
 	kind: "account"; id: string; export: string; export_at: string; export_seq: number; at: string;
 	state: "checkpoint" | "applying" | "reconciling" | "ready" | "unresolved" | "rolling_back" | "opening";
 	checkpoint?: string; phase?: "clear" | "apply" | "ledger" | "tombstones" | "profiles" | "settle" | "index" | "precheck" | "deferred";
-	next: number; row: number; last?: string; after?: { profile: string; node: string; request: string; done: boolean };
+	next: number; row: number; last?: string; after?: { profile: string; node: string; request: string; done: boolean; pass?: "held" | "requests" };
 	unresolved: { kind: string; id: string }[]; unresolved_count: number;
 	settle?: Settle; settled?: number;
+	/** Each owner recheck of stale request findings: when, and the findings it replaced. */
+	rechecks?: { at: string; findings: { kind: string; id: string }[] }[];
 }
 const CHECKPOINT = "account-checkpoint";
 /** The restore drill, kept in `drill_state` from before its scratch copy exists until its cleanup deleted it; see AccountStore.drill. */
@@ -165,7 +171,43 @@ const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "re
 const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%' AND key NOT LIKE 'drill%'";
 /** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. */
 const MERGED = ["counters", "refresh_days", "sensitive_terms"];
-const ADMIN_WHILE_RESTORING = ["drillStatus", "listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
+const ADMIN_WHILE_RESTORING = ["drillStatus", "listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "recoveryRequest", "recheckRequests", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
+/** recoveryRequest's content-free placement of one request id. */
+interface Placement {
+	recovery: string; state: string; request_id: string; finding: boolean;
+	profiles: { profile: string; present: boolean | null; node_id?: string | null; node_status?: string | null; op?: string; legacy?: boolean; payload?: string | null; legacy_payload?: string | null; bound_payload?: string | null }[];
+	binding: { profile: string; op: string; legacy: boolean; payload: string | null } | null;
+	nodes: { node_id: string; index: string | null; decided: string | null; owner: string | null; held: string | null; wiped: boolean }[];
+	rebuild: { binds: string | null; flags: boolean };
+}
+/**
+ * A restoredPage cursor just below request id `id` in SQLite's text order (UTF-8 bytes, so code points): the id with its last
+ * code point lowered and then 256 of the highest, or its prefix when that code point is U+0000. Every id between the cursor and
+ * `id` would start with those 256 code points and so exceed the 256-character request id domain.
+ */
+const cursorBelow = (id: string): string => {
+	const cps = Array.from(id), last = cps.pop()!.codePointAt(0)!, prefix = cps.join("");
+	if (last === 0) return prefix;
+	const lower = last - 1 >= 0xd800 && last - 1 <= 0xdfff ? 0xd7ff : last - 1;
+	return `${prefix}${String.fromCodePoint(lower)}${"\u{10FFFF}".repeat(256)}`;
+};
+/** Why a placement does not prove a request_elsewhere finding stale; undefined when it does. */
+const staleWhy = (p: Placement): string | undefined => {
+	const rows = p.profiles.filter((x) => x.present), node = p.nodes[0], b = p.binding;
+	if (!p.finding) return "not_a_finding";
+	if (p.profiles.some((x) => x.present === null)) return "unknown_presence";
+	if (rows.length < 2 || p.nodes.length !== 1 || rows.some((x) => !x.node_id || x.node_id !== node!.node_id)) return "not_one_node";
+	// The holder: the indexed or decided owner, else the profile that archived the node (the rebuild's held pass indexes it).
+	const holder = node!.held;
+	if (node!.wiped || !holder) return "no_owner";
+	if (rows.some((x) => x.op !== rows[0]!.op || x.legacy !== rows[0]!.legacy || !x.bound_payload || x.bound_payload !== rows[0]!.bound_payload)) return "requests_differ";
+	const held = rows.find((x) => x.profile === holder);
+	if (!held || held.node_status === "moved" || held.node_status === "incoming") return "owner_lacks_request";
+	// The binding may sit on a moved copy's profile; the rerun rebinds it to the holder only when op, legacy and hash agree.
+	if (!b || b.op === "wiped" || b.op !== held.op || b.legacy !== held.legacy || b.payload !== held.bound_payload) return "binding_differs";
+	if (p.rebuild.flags || p.rebuild.binds !== holder) return "rebuild_flags";
+	return undefined;
+};
 const flag = (r: { unresolved: { kind: string; id: string }[]; unresolved_count: number }, found: { kind: string; id: string }[]) => {
 	r.unresolved.push(...found.slice(0, Math.max(0, 50 - r.unresolved.length)));
 	r.unresolved_count += found.length;
@@ -875,8 +917,15 @@ export class AccountStore extends DurableObject<Env> {
 	private requestOwner(r: Recovery | AccountRecovery, q: RestoredPage["requests"][number], profile: string): string | undefined {
 		return (q.node_id ? this.ownerOf(r, q.node_id) : undefined) ?? (q.node_status && q.node_status !== "moved" && q.node_status !== "incoming" ? profile : undefined);
 	}
+	/**
+	 * A request row whose node is absent from its profile, with no decision or wipe: the profile archived that node (an owner
+	 * forget or TTL removal keeps its receipts and its live index row; the 300-day purge removes the receipts with the archive).
+	 */
+	private archivedHere(r: Recovery | AccountRecovery, q: RestoredPage["requests"][number]): q is RestoredPage["requests"][number] & { node_id: string } {
+		return !!q.node_id && q.node_status === null && this.decidedOf(r, q.node_id) === undefined && !this.meta(`wiped:${q.node_id}`);
+	}
 
-	private async backup(cmd: Extract<AccountCommand, { op: "export" | "listExports" | "beginRestore" | "beginAccountRestore" | "beginPitr" | "beginCorpusRestore" | "restoreRecord" | "recoveryConflicts" | "resolveConflict" | "restoreStatus" | "restoreStep" | "openRestore" | "abortRestore" }>): Promise<Outcome<unknown>> {
+	private async backup(cmd: Extract<AccountCommand, { op: "export" | "listExports" | "beginRestore" | "beginAccountRestore" | "beginPitr" | "beginCorpusRestore" | "restoreRecord" | "recoveryConflicts" | "recoveryRequest" | "recheckRequests" | "resolveConflict" | "restoreStatus" | "restoreStep" | "openRestore" | "abortRestore" }>): Promise<Outcome<unknown>> {
 		const userId = this.meta("user_id");
 		if (!userId) return fail("unavailable", "the account is not set up");
 		// Checked before any await, so nothing below runs for a recovery other than the one the caller named.
@@ -970,6 +1019,16 @@ export class AccountStore extends DurableObject<Env> {
 					last_export_failed: JSON.parse(this.meta("last_export_failed") ?? "null") as unknown });
 			case "recoveryConflicts":
 				return this.recoveryConflicts(userId, cmd);
+			case "recoveryRequest": {
+				const r = this.recovery() as Recovery | AccountRecovery | undefined;
+				if (!r || r.id !== cmd.id) return fail("busy", "the recovery changed since it was shown; read its status", { reason: "recovery_changed" });
+				return this.requestPlacement(userId, r, cmd.request_id);
+			}
+			case "recheckRequests":
+				try { return await this.recheckRequests(userId, cmd); } catch (e) {
+					if (e instanceof Fail) return { ok: false, error: e.failure };
+					throw e;
+				}
 			case "resolveConflict":
 				try { return await this.resolveConflict(userId, cmd); } catch (e) {
 					if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -1377,6 +1436,93 @@ export class AccountStore extends DurableObject<Env> {
 		}
 		if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status", { reason: "recovery_changed" });
 		return ok({ recovery: r.id, state: r.state, open: r.conflicts?.open ?? 0, conflicts, next: rows.length > 20 ? conflicts.at(-1)!.node : null });
+	}
+
+	/**
+	 * The owner's read of where one request id sits for the open recovery: each active profile's row (its node and that node's
+	 * status there, its op, and labels that say which hashes are equal), the account's binding, each node's owner, decision and
+	 * wipe mark, and what the nodes-then-requests rebuild would bind and flag. Read only; no payloads, hashes or contents.
+	 */
+	private async requestPlacement(userId: string, r: Recovery | AccountRecovery, id: string): Promise<Outcome<Placement>> {
+		// The request id domain every writer accepts: 1 to 256 characters, any text SQLite stores as it is.
+		if (id.length < 1 || id.length > 256 || !id.isWellFormed()) return fail("validation", "request_id must be 1 to 256 characters of well-formed text");
+		const below = cursorBelow(id);
+		const labels = new Map<string, string>(), label = (h: string | null | undefined) => {
+			if (!h) return null;
+			if (!labels.has(h)) labels.set(h, `h${labels.size + 1}`);
+			return labels.get(h)!;
+		};
+		const names = this.sql.exec<{ name: string }>("SELECT name FROM profiles WHERE status = 'active' ORDER BY name").toArray().map((p) => p.name);
+		const rows: { profile: string; q?: RestoredPage["requests"][number]; present: boolean | null }[] = [];
+		for (const profile of names) {
+			const generation = this.settleGeneration(r, profile);
+			if (!generation) { rows.push({ profile, present: null }); continue; }
+			const who = { userId, profile, generation };
+			const page = await this.profileAt(who).restoredPage(who, { node: "\u{10FFFF}", request: below });
+			if (!page.ok) return page;
+			// Nothing a profile can hold sorts between the cursor and the id, so the first row is the id or it is absent.
+			const q = page.value.requests[0]?.request_id === id ? page.value.requests[0] : undefined;
+			rows.push({ profile, q, present: !!q });
+		}
+		if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status", { reason: "recovery_changed" });
+		const bound = this.sql.exec<{ profile: string; op: string; payload_hash: string; legacy: number }>("SELECT profile, op, payload_hash, legacy FROM request_index WHERE request_id = ?", id).toArray()[0];
+		const profiles = rows.map(({ profile, q, present }) => ({ profile, present, ...(q ? { node_id: q.node_id, node_status: q.node_status, op: boundOp(q),
+			legacy: !!q.legacy_hash, payload: label(q.payload_hash), legacy_payload: label(q.legacy_hash), bound_payload: label(q.legacy_hash ?? q.payload_hash) } : {}) }));
+		const binding = bound ? { profile: bound.profile, op: bound.op, legacy: bound.legacy === 1, payload: bound.op === "wiped" ? null : label(bound.payload_hash) } : null;
+		// The rebuild's held pass: the first profile, in name order, that archived the node; a second, or a live owner elsewhere, flags.
+		let flags = false;
+		const heldBy = (node: string) => {
+			let held = this.ownerOf(r, node);
+			for (const { profile, q } of rows) {
+				if (!q || q.node_id !== node || !this.archivedHere(r, q)) continue;
+				if (!held) held = profile; else if (held !== profile) flags = true;
+			}
+			return held;
+		};
+		const nodes = [...new Set(rows.map((x) => x.q?.node_id).filter((n): n is string => !!n))].slice(0, 10).map((node) => ({ node_id: node,
+			index: this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", node).toArray()[0]?.profile ?? null,
+			decided: this.decidedOf(r, node) ?? null, owner: this.ownerOf(r, node) ?? null, held: heldBy(node) ?? null, wiped: !!this.meta(`wiped:${node}`) }));
+		// The rebuild's request pass against those owners and today's binding, profile by profile in name order.
+		let would = bound && bound.op !== "wiped" ? bound.profile : undefined;
+		for (const { profile, q } of rows) {
+			if (!q || bound?.op === "wiped") continue;
+			const held = q.node_id ? nodes.find((n) => n.node_id === q.node_id)?.held ?? undefined : undefined;
+			const owner = held ?? (q.node_status && q.node_status !== "moved" && q.node_status !== "incoming" ? profile : undefined);
+			if (would && would !== profile) { if (owner === profile) would = profile; else if (owner !== would) flags = true; }
+			else if (!would && [undefined, profile].includes(owner)) would = profile;
+		}
+		const finding = r.unresolved.some((f) => f.kind === "request_elsewhere" && f.id === id);
+		return ok({ recovery: r.id, state: r.state, request_id: id, finding, profiles, binding, nodes,
+			rebuild: { binds: bound?.op === "wiped" ? bound.profile : would ?? null, flags } });
+	}
+
+	/**
+	 * The owner's continuation of an unresolved account restore whose only findings are `request_elsewhere`, each proven stale
+	 * by its placement: every profile answered, one identical request on one unwiped node, the account binding already on that
+	 * node's live owner with the same op, legacy flag and hash, and the nodes-then-requests rebuild binding it there unflagged.
+	 * Then only the index rebuild runs again, against today's indexes; earlier phases, decisions and kept steps stay as they are,
+	 * and any finding it makes keeps the account closed. Anything else is refused with its reason and nothing changes.
+	 */
+	private async recheckRequests(userId: string, cmd: Extract<AccountCommand, { op: "recheckRequests" }>): Promise<Outcome<unknown>> {
+		const r = this.accountRecovery();
+		if (!r || r.id !== cmd.id) return fail("busy", "the recovery changed since it was shown; read its status", { reason: "recovery_changed" });
+		if (r.state !== "unresolved" || r.phase) return fail("validation", `the account restore is ${r.state}; only an unresolved one is rechecked`, { reason: "not_unresolved" });
+		if (r.resolving || (r.conflicts?.open ?? 0) > 0) return fail("validation", "finish the open copy choices first", { reason: "conflicts_open" });
+		if (r.unresolved_count !== r.unresolved.length || r.unresolved.some((f) => f.kind !== "request_elsewhere")) {
+			return fail("validation", "only an account restore whose findings are all request_elsewhere is rechecked", { reason: "other_findings" });
+		}
+		const ids = [...new Set(r.unresolved.map((f) => f.id))].sort();
+		if (canonicalJson([...new Set(cmd.request_ids)].sort()) !== canonicalJson(ids)) return fail("busy", "the findings changed since they were shown; read the status", { reason: "findings_changed" });
+		for (const id of ids) {
+			const p = await this.requestPlacement(userId, r, id);
+			if (!p.ok) return p;
+			const why = staleWhy(p.value);
+			if (why) return fail("validation", `request ${id} is not shown stale (${why}); keep the restore closed, or abort it`, { reason: why, request_id: id });
+		}
+		// advance refuses if the recovery moved during the reads above.
+		this.advance(r, () => Object.assign(r, { state: "reconciling", phase: "index", after: { profile: "", node: "", request: "", done: true },
+			unresolved: [], unresolved_count: 0, rechecks: [...(r.rechecks ?? []), { at: now(), findings: r.unresolved }].slice(-5) }));
+		return ok(r);
 	}
 
 	/**
@@ -1809,9 +1955,15 @@ export class AccountStore extends DurableObject<Env> {
 			if (!s.ok) return s;
 		}
 		// Ownership from the active profiles' own rows (steps 3 and 5): the snapshot's node_index and request_index were not applied.
+		// Three passes over the active profiles: their nodes; the nodes they archived, known only from their kept receipts; then
+		// their requests. Step 5 then reads every final node owner whatever the profile order.
 		while (r.phase === "index" && live()) {
-			const a = r.after!;
+			const a = r.after!, pass = a.pass, binding = pass === "requests";
 			const p = this.sql.exec<{ name: string; generation: string }>(`SELECT name, generation FROM profiles WHERE status = 'active' AND name ${a.done ? ">" : "="} ? ORDER BY name LIMIT 1`, a.profile).toArray()[0];
+			if (!p && !binding) {
+				this.advance(r, () => { r.after = { profile: "", node: "", request: "", done: true, pass: pass ? "requests" : "held" }; });
+				continue;
+			}
 			if (!p) {
 				this.advance(r, () => {
 					flag(r, this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE completed_at IS NULL OR retry_at IS NOT NULL ORDER BY id").toArray().map((t) => ({ kind: "transfer_unfinished", id: t.id })));
@@ -1824,9 +1976,11 @@ export class AccountStore extends DurableObject<Env> {
 			if (!page.ok) return page;
 			this.advance(r, (tx) => {
 				const found: Finding[] = [];
-				if (!from.node && !from.request) found.push(...this.openTransfers(r, p.name, page.value));
+				if (!pass && !from.node) found.push(...this.openTransfers(r, p.name, page.value));
+				// Each pass reads only its own list; the other list's cursor stays where it is.
+				const pageNodes = pass ? [] : page.value.nodes, pageRequests = pass ? page.value.requests : [];
 				let nodes = 0, requests = 0;
-				for (const n of page.value.nodes) {
+				for (const n of pageNodes) {
 					if (tx.spent(0.5)) break;
 					nodes++;
 					const owner = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", n.id).toArray()[0]?.profile;
@@ -1839,7 +1993,16 @@ export class AccountStore extends DurableObject<Env> {
 					else if (owner && owner !== p.name) found.push({ kind: "owned_elsewhere", id: n.id, pair: [owner, p.name] });
 					else if (!owner) tx.run("INSERT INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", n.id, p.name, tx.seq);
 				}
-				if (nodes === page.value.nodes.length) for (const q of page.value.requests) {
+				if (pass === "held") for (const q of pageRequests) {
+					if (tx.spent(0.5)) break;
+					requests++;
+					if (!this.archivedHere(r, q)) continue;
+					// Indexed as the live account had it; an archived node another profile also holds keeps the account closed.
+					const owner = this.sql.exec<{ profile: string }>("SELECT profile FROM node_index WHERE node_id = ?", q.node_id).toArray()[0]?.profile;
+					if (!owner) tx.run("INSERT INTO node_index (node_id, profile, seq) VALUES (?, ?, ?)", q.node_id, p.name, tx.seq);
+					else if (owner !== p.name) found.push({ kind: "held_elsewhere", id: q.node_id });
+				}
+				if (binding && nodes === pageNodes.length) for (const q of pageRequests) {
 					if (tx.spent(0.5)) break;
 					requests++;
 					const row = this.sql.exec<{ profile: string; op: string }>("SELECT profile, op FROM request_index WHERE request_id = ?", q.request_id).toArray()[0];
@@ -1854,8 +2017,9 @@ export class AccountStore extends DurableObject<Env> {
 						q.request_id, p.name, boundOp(q), q.legacy_hash ?? q.payload_hash, q.at, tx.seq, q.legacy_hash ? 1 : 0);
 				}
 				this.flagFound(r, found);
-				const finished = nodes === page.value.nodes.length && requests === page.value.requests.length && page.value.nodes.length < 200 && page.value.requests.length < 200;
-				r.after = { profile: p.name, node: page.value.nodes[nodes - 1]?.id ?? from.node, request: page.value.requests[requests - 1]?.request_id ?? from.request, done: finished };
+				const finished = nodes === pageNodes.length && requests === pageRequests.length && pageNodes.length < 200 && pageRequests.length < 200;
+				r.after = { profile: p.name, node: pageNodes[nodes - 1]?.id ?? from.node, request: pageRequests[requests - 1]?.request_id ?? from.request, done: finished,
+					...(pass ? { pass } : {}) };
 			});
 		}
 		return ok(r);
@@ -1924,7 +2088,7 @@ export class AccountStore extends DurableObject<Env> {
 		if (this.accountRecovery() && !ADMIN_WHILE_RESTORING.includes(cmd.op)) return fail("busy", "account is closed for an account restore");
 		switch (cmd.op) {
 			case "export": case "listExports": case "beginRestore": case "beginAccountRestore": case "beginPitr": case "beginCorpusRestore": case "restoreRecord":
-			case "recoveryConflicts": case "resolveConflict":
+			case "recoveryConflicts": case "recoveryRequest": case "recheckRequests": case "resolveConflict":
 			case "restoreStatus": case "restoreStep": case "openRestore": case "abortRestore":
 				return this.backup(cmd);
 			case "beginDrill": case "drillStatus": case "drillStep": case "drillCleanup": {

@@ -8,13 +8,13 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 
 - [x] Import and audit the approved records, history and request receipts at the recorded scope.
 - [x] Exercise core save, journal, recall and history operations in the owner trial.
-- [ ] Complete full-size recovery and rollback, then reconcile restored records, history, replay and corpus against the retained evidence.
-- [ ] Release the reviewed recovery and capture privacy fixes to the everyday canonical service.
+- [x] Restore full-size Account and Corpus data, verify Account checkpoint rollback, and reconcile the retained records, history, replay and corpus at the recorded scope.
+- [x] Release the earlier reviewed recovery and capture privacy fixes to the everyday canonical service.
 - [ ] Verify authenticated read, write, journal and capture flows in the actual Claude, Codex and T3 clients and machines.
 - [ ] Verify automatic preference learning from captured evidence, including owner controls, and enable the intended capture-to-learning path.
 - [ ] Switch remaining callers and competing native-memory writes using retained rollback snapshots.
 
-The recovery and capture privacy fixes are source-reviewed and adopted; 284 affected Worker tests, typecheck and lint passed. The isolated fixture runs the reviewed changes. Full-size Test Corpus restore opened with all 7,549 chunks applied and zero findings; Account restore stopped with one unresolved finding under review. Main and MacBook native Codex reads passed at their recorded scopes. Claude, fresh T3 and Settings verification, client configuration and cutover remain open. Prior hosted Work recovery and bounded client checks do not prove full-size recovery or cross-machine cutover. [Current evidence](docs/import-verification.md#core-v1-source-and-runtime-checkpoint-2026-11-02).
+Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. Later Account reconciliation and learning-preview changes are reviewed and running in that fixture; final delivery remains open. Actual Claude, Codex and T3 read/write/journal checks passed on Main and MacBook at their recorded scopes. Capture, refresh and learning acceptance remain open. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
 
 Project and strategic reviews, the broader dashboard and reader trial, full-size Work-wipe expansion, cosmetic polish and exhaustive test matrices are follow-up work. Proactive PR and Jira feeds remain excluded. BothQ stays running and readable as a legacy fallback; there are no ordinary dual writes. The [feature manifest](docs/feature-manifest.md) retains the broader historical commitments and their evidence.
 

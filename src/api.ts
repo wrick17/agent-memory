@@ -1023,6 +1023,18 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		if (!q.success) return json({ error: { code: "validation", message: "send id, the recovery shown, and optionally after, the last node id of the previous page" } }, 400);
 		return run({ op: "recoveryConflicts", id: q.data.id, ...(q.data.after ? { after: q.data.after } : {}) });
 	}
+	// Where one request id sits for the open recovery: content-free placement across the active profiles and the account. Read only.
+	if (url.pathname === "/api/recovery/request" && request.method === "GET") {
+		const q = z.object({ id: z.uuid(), request_id: z.string().min(1).max(256) }).strict().safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success) return json({ error: { code: "validation", message: "send id, the recovery shown, and request_id" } }, 400);
+		return run({ op: "recoveryRequest", id: q.data.id, request_id: q.data.request_id });
+	}
+	// Reruns an unresolved account restore's index rebuild only when every finding is a request id the read above shows stale.
+	if (url.pathname === "/api/recovery/recheck" && request.method === "POST") {
+		const b = z.object({ id: z.uuid(), request_ids: z.array(z.string().min(1).max(256)).min(1).max(50) }).strict().safeParse(await body(request));
+		if (!b.success) return json({ error: { code: "validation", message: "send id, the recovery shown, and request_ids, its request_elsewhere findings" } }, 400);
+		return run({ op: "recheckRequests", ...b.data });
+	}
 	if (url.pathname === "/api/recovery/conflicts/resolve" && request.method === "POST") {
 		const copy = z.object({ profile: z.string().regex(PROFILE_NAME), generation: z.string().min(1).max(64).nullable(), status: z.string().min(1).max(32).nullable(),
 			revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable() }).strict();

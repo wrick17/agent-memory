@@ -1,5 +1,19 @@
 # Import verification and rehearsal preparation
 
+## Account recovery and learning preview, 2026-11-02
+
+The isolated fixture opened the full-size Account restore after its owner diagnostic identified the archived holder and the proof-gated recheck reran reconciliation. The prior finding remains in recovery history. The postrestore audit matched 1,374 records, 5,291 expected texts, 5,699 revisions and 4,173 request receipts, with no semantic mismatch or drift. Five record/history reads and 20 Corpus reads passed, as did two stored replays and two changed-payload refusals with unchanged heads.
+
+An Account checkpoint rollback used the exact retained 18-chunk export. It reached ready, then was aborted before open. A second semantic audit and the same bounded read and replay checks passed; all active generations remained unchanged and the audit device was revoked. This establishes the Account checkpoint rollback at this scope, not a full Profile point-in-time or Corpus rollback. The [postrestore audit](/private/tmp/am-postrestore-audit-context-qzoy9GVg/export/plan-rehearsal-test/audit-am-final-6915cbeb.memory.wrick17.com.json) has SHA-256 `56995e077cc8272c4b81ebb277e02f9979a14e59102365f647ae3df9b272d8ab`; the [postrollback audit](/private/tmp/am-postrollback-audit-4_1um2tq/export/plan-rehearsal-test/audit-am-final-6915cbeb.memory.wrick17.com.json) has SHA-256 `13d95ec7275f03288f1207dbaf19cd00319dd7add71af3c2b135c080e7feca23`.
+
+The [recovery acceptance receipt](/private/tmp/am-v1-recovery-runtime-fbuuqOAj/acceptance.json), SHA-256 `af8127a45d75d92641347c8c25678b4cfecba667cc645b39dc9168bdc03ac94a`, records the six pre- and postrollback reports, owner boundaries, audit revocation and Work handoff. The [rollback receipt](/private/tmp/am-v1-recovery-runtime-fbuuqOAj/account-rollback.json) has SHA-256 `d879c6425a8c6e594950d1b0d5efb43ce44868830004983212836f7a88044ff1`.
+
+The fixture used Worker version `fa3b993c-1c87-4266-a61f-14fd09f83a15` and a temporary zero-cooldown overlay. Its previous version `f0e3bd75-e820-421d-95e8-0868eb87e352` is retained for code rollback; changing Worker versions does not restore data. Canonical Worker version `78f0276c-e33b-420f-a9db-54769dca8bb9` remains separate. The fixture's normal 20-hour cooldown must be restored after the authorized learning workflow finishes.
+
+The combined backup, maintenance and MCP-auth run passed 147 tests before the final Account-only correction. The final recovery author run passed 72 affected backup and auth tests, typecheck and lint, and the targeted independent review cleared that correction. The maintenance selector and tests were unchanged by it. The preview is owner-only and read-only; actual inference, owner controls and normal capture-to-learning activation remain open. [Contracts and retained limits](module-contracts.md#account-reconciliation-and-maintenance-preview-2026-11-02).
+
+At 05:59:09 UTC, the existing BothQ local client passed read-only health and a count query with connectivity true and 24,025 nodes. The [receipt](/var/folders/mm/dwsn1_0j0cb2scdpkdw6_4rm0000gp/T/bothq-health-sbq73dot.json) has SHA-256 `6db0a105bd4cd5959b1ab63ee5eabd535cd57821963164ab354f59f8d53030f6`. No node content was read, and this did not check the separate MCP connector.
+
 ## Separate synthetic self-host fixture, 2026-10-30
 
 The packaged setup created a separate workers.dev Worker, version `3ba050f5-8d9f-4dcf-a475-f829319be252`, with fresh AccountStore and ProfileStore SQLite namespaces, its own R2 generation ledger, and a 1,024-dimensional cosine Vectorize index with a string `kind` index. Corpus is unbound, previews are disabled, and no DNS or route change was made. The original generated setup config retains an empty import allowlist and its creation receipts; a separate deployment config permits only `test`.

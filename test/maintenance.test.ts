@@ -13,7 +13,7 @@ import type { Outcome, WriteCommand, WriteContext } from "../src/domain/types";
 import { MAINTENANCE_TOOLS } from "../src/maintenance-tools";
 import { archiveNode, archivePage, archiveRows, BudgetTx, purgeAfter, restoreArchived, type Row } from "../src/profile/archive";
 import { cleanupPurge, housekeep, OBJECT_LIMIT, sizeLevel, type Stage } from "../src/profile/housekeeping";
-import { complete, enqueue, finishBatch, next } from "../src/profile/maintenance";
+import { complete, enqueue, finishBatch, next, nextPreview } from "../src/profile/maintenance";
 import { mayChange } from "../src/profile/protect";
 import { undo } from "../src/profile/undo";
 import { runWrite, type Who } from "../src/profile/write";
@@ -325,6 +325,65 @@ describe("protection and the maintenance queue", () => {
 			expect(() => complete(storage, who, { lease_id: lease.lease_id!, results: [{ item_id: other.item_id, ops: [{ op: "dismiss" }] }] }, job))
 				.toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "lease_expired" }) }));
 			expect(sql.exec("SELECT count(*) AS c FROM maintenance WHERE state = 'open'").one().c).toBe(44);
+		});
+	});
+
+	it("previews exactly the next normal lease (expired reopen, stuck park, cooldown) without leasing or changing anything", async () => {
+		await inStore((storage) => {
+			const sql = storage.sql, T0 = Date.parse("2026-11-02T00:00:00.000Z");
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(T0);
+			try {
+				const KINDS = ["near_duplicate", "possible_contradiction", "unlinked", "unprocessed_capture", "preference_signal", "stale_journal", "weekly_review", "dangling_link"];
+				enqueue(storage, Array.from({ length: 48 }, (_, i) => ({ kind: KINDS[i % KINDS.length]!, subjects: [`missing-${i}`] })));
+				// Creation order differs from id order; the special rows are among the oldest, so each is inside the first 40.
+				sql.exec("UPDATE maintenance SET created_at = '2026-10-01T00:00:00.000Z' WHERE id % 3 = 0");
+				const [reopen, cap, held, done] = [5, 6, 7, 8];
+				sql.exec("UPDATE maintenance SET created_at = '2026-09-01T00:00:00.000Z' WHERE id IN (?, ?, ?, ?)", reopen, cap, held, done);
+				sql.exec("UPDATE maintenance SET state = 'leased', lease_id = 'old', lease_until = '2026-11-01T00:00:00.000Z', attempts = 1 WHERE id = ?", reopen);
+				sql.exec("UPDATE maintenance SET state = 'leased', lease_id = 'old', lease_until = '2026-11-01T00:00:00.000Z', attempts = 3 WHERE id = ?", cap);
+				sql.exec("UPDATE maintenance SET state = 'leased', lease_id = 'live', lease_until = '2026-11-02T00:10:00.000Z', attempts = 1 WHERE id = ?", held);
+				sql.exec("UPDATE maintenance SET state = 'done' WHERE id = ?", done);
+				const snapshot = () => ({ items: sql.exec("SELECT * FROM maintenance ORDER BY id").toArray(), cursors: sql.exec("SELECT * FROM cursors ORDER BY stage").toArray(),
+					meta: sql.exec("SELECT * FROM profile_meta ORDER BY 1").toArray(), activity: sql.exec("SELECT count(*) AS c FROM activity").one().c });
+				const before = snapshot();
+				// The documented order over open items and reopened expired leases: created_at, then id; the cap, the live lease and done are out.
+				const expected = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE id NOT IN (?, ?, ?) ORDER BY created_at, id LIMIT 40", cap, held, done).toArray().map((r) => r.id);
+				expect(expected).not.toEqual([...expected].sort((a, b) => a - b));
+
+				const p = nextPreview(sql);
+				expect(snapshot()).toEqual(before);
+				expect(p).toMatchObject({ observation: "not_a_lease", lease_id: null, observed_at: new Date(T0).toISOString(), cooldown: { status: "open", next_allowed_at: null }, leasable_now: true, parks_as_stuck: [cap] });
+				expect(p.candidates.map((c) => c.item_id)).toEqual(expected);
+				expect(p.candidates.find((c) => c.item_id === reopen)).toEqual({ item_id: reopen, kind: KINDS[(reopen - 1) % KINDS.length], created_at: "2026-09-01T00:00:00.000Z",
+					attempts: 1, expired_lease: true, subjects: [`missing-${reopen - 1}`] });
+				expect(new Set(p.candidates.map((c) => c.kind))).toEqual(new Set(KINDS));
+				// Ids, kinds, dates and counts only: no item carries a passage, context or other text.
+				for (const c of p.candidates) expect(Object.keys(c).sort()).toEqual(["attempts", "created_at", "expired_lease", "item_id", "kind", "subjects"]);
+
+				// The actual normal lease takes exactly the previewed items, in order, and parks the capped expired lease.
+				const lease = next(storage, {});
+				expect(lease.items.map((i) => i.item_id)).toEqual(p.candidates.map((c) => c.item_id));
+				expect(sql.exec("SELECT state FROM maintenance WHERE id = ?", cap).one().state).toBe("stuck");
+				expect(sql.exec("SELECT state, attempts FROM maintenance WHERE id = ?", reopen).one()).toEqual({ state: "leased", attempts: 2 });
+
+				// Inside the cooldown the preview reports the gate and names candidates, never as leasable now; next() agrees and leases nothing.
+				vi.setSystemTime(T0 + 3_600_000);
+				const gatedBefore = snapshot(), g = nextPreview(sql);
+				expect(snapshot()).toEqual(gatedBefore);
+				expect(g).toMatchObject({ lease_id: null, cooldown: { status: "gated", next_allowed_at: new Date(T0 + 20 * 3_600_000).toISOString() }, leasable_now: false });
+				expect(g.candidates.length).toBeGreaterThan(0);
+				expect(next(storage, {})).toEqual({ lease_id: null, items: [], next_allowed_at: g.cooldown.next_allowed_at });
+				expect(snapshot()).toEqual(gatedBefore);
+
+				// After the cooldown the first lease and the held lease have expired: they come back as expired leases, and the next lease matches again.
+				vi.setSystemTime(T0 + 20 * 3_600_000);
+				const later = nextPreview(sql), expired = new Set([...lease.items.map((i) => i.item_id), held]);
+				expect(later).toMatchObject({ cooldown: { status: "open" }, leasable_now: true, parks_as_stuck: [] });
+				for (const c of later.candidates) expect([c.item_id, c.expired_lease]).toEqual([c.item_id, expired.has(c.item_id)]);
+				expect(later.candidates.some((c) => c.item_id === held)).toBe(true);
+				expect(next(storage, {}).items.map((i) => i.item_id)).toEqual(later.candidates.map((c) => c.item_id));
+			} finally { vi.useRealTimers(); }
 		});
 	});
 

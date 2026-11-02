@@ -7,7 +7,7 @@ import type { AccountRecovery, Recovery } from "../src/account/store";
 import { listExports, readChunk, readManifest, type Manifest } from "../src/backup";
 import { driveTransfer, transferPorts } from "../src/transfer";
 import { settleRule, type SettleFacts } from "../src/profile/settle";
-import { canonicalJson, sha256 } from "../src/domain/ids";
+import { canonicalJson, requestHash, sha256 } from "../src/domain/ids";
 import { fail, type Outcome } from "../src/domain/types";
 import { accountStub, profileStub } from "../src/mcp";
 import type { ProfileStore } from "../src/profile/store";
@@ -957,6 +957,93 @@ describe("recovery choices and deferred steps", () => {
 		const again = await exportOf("personal");
 		await value(admin({ op: "beginRestore", profile: "personal", export: again }));
 		expect(await stepUntilChecked()).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0 });
+	});
+
+	/** The recovery as an earlier version left it: unresolved on `found`, whatever this version's rebuild concluded. */
+	const leftUnresolved = (found: { kind: string; id: string }[]) => accountSql((sql) => {
+		const r = JSON.parse(sql.exec<{ value: string }>("SELECT value FROM account_meta WHERE key = 'recovery_state'").one().value) as AccountRecovery;
+		sql.exec("UPDATE account_meta SET value = ? WHERE key = 'recovery_state'", JSON.stringify({ ...r, state: "unresolved", phase: undefined, unresolved: found, unresolved_count: found.length }));
+	});
+	type Placement = { finding: boolean; binding: { profile: string } | null; rebuild: { binds: string | null; flags: boolean } };
+
+	it("account restore: a request id on moved copies binds to its later owner unflagged, and an owner recheck continues a stale finding left unresolved", async () => {
+		const c = await contextFor();
+		const saved = await call<{ memory_id: string }>(c, "save_memory", { name: "Moved twice", type: "reference", description: "m", content: "moved body", profile: "me", request_id: "r-1" });
+		await move(saved.memory_id, "me", "personal");
+		await move(saved.memory_id, "personal", "test");
+		const exported = await value<Record<string, { id: string }>>(admin({ op: "export" }));
+		// Moved copies in me and personal sort before the active one in test (work was wiped above): nodes first, so the request binds to test.
+		await value(admin({ op: "beginAccountRestore", export: exported.account!.id }));
+		const r = await accountSteps();
+		expect(r).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0 });
+		expect([await bound(saved.memory_id), await binding("r-1")]).toEqual(["test", "test"]);
+
+		// A short id the MCP tools accept is inspected and rechecked like any other.
+		const stale = [{ kind: "request_elsewhere", id: "r-1" }];
+		await leftUnresolved(stale);
+		expect(await value<Placement>(admin({ op: "recoveryRequest", id: r.id, request_id: "r-1" }))).toMatchObject({ finding: true, binding: { profile: "test" }, rebuild: { binds: "test", flags: false } });
+		const recheck = (request_ids: string[]) => admin({ op: "recheckRequests", id: r.id, request_ids });
+		expect(await recheck(["other-req-1"])).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "findings_changed" } } });
+		// A binding whose hash differs from the owner's row is a divergence, not ordering: refused, nothing changes.
+		const hash = await accountSql((sql) => sql.exec<{ payload_hash: string }>("SELECT payload_hash FROM request_index WHERE request_id = 'r-1'").one().payload_hash);
+		await accountSql((sql) => sql.exec("UPDATE request_index SET payload_hash = 'diverged' WHERE request_id = 'r-1'"));
+		expect(await recheck(["r-1"])).toMatchObject({ ok: false, error: { code: "validation", details: { reason: "binding_differs" } } });
+		expect(await status()).toMatchObject({ state: "unresolved", unresolved: stale });
+		await accountSql((sql) => sql.exec("UPDATE request_index SET payload_hash = ? WHERE request_id = 'r-1'", hash));
+
+		expect(await value(recheck(["r-1"]))).toMatchObject({ state: "reconciling", phase: "index", unresolved: [], rechecks: [{ findings: stale }] });
+		expect(await recheck(["r-1"])).toMatchObject({ ok: false, error: { code: "validation", details: { reason: "not_unresolved" } } });
+		expect(await accountSteps()).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0, rechecks: [{ findings: stale }] });
+		expect([await bound(saved.memory_id), await binding("r-1")]).toEqual(["test", "test"]);
+		await abortAccount();
+	});
+
+	it("account restore: a request whose node was moved and then forgotten stays with the profile that archived it, and a recheck continues the earlier finding", async () => {
+		const c = await contextFor();
+		const saved = await call<{ memory_id: string }>(c, "save_memory", { name: "Moved then forgotten", type: "reference", description: "f", content: "forgotten body", profile: "personal", request_id: "forgot-req-1" });
+		await move(saved.memory_id, "personal", "test");
+		// An owner forget archives the node and keeps its receipts and the account's index rows.
+		const ref = c.account.profiles.find((p) => p.profile === "test")!, cmd = { op: "owner" as const, args: { action: "forget" as const, memory_id: saved.memory_id } };
+		await value(profileStub(env, ref).write(ref, cmd, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: OWNER, payloadHash: requestHash(cmd.op, cmd.args) }));
+		expect([await bound(saved.memory_id), await binding("forgot-req-1")]).toEqual(["test", "test"]);
+		const exported = await value<Record<string, { id: string }>>(admin({ op: "export" }));
+		await value(admin({ op: "beginAccountRestore", export: exported.account!.id }));
+		const r = await accountSteps();
+		expect(r).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0 });
+		expect([await bound(saved.memory_id), await binding("forgot-req-1")]).toEqual(["test", "test"]);
+
+		// The earlier rebuild's result: no index for the archived node, the request bound to the moved copy, and the finding.
+		const stale = [{ kind: "request_elsewhere", id: "forgot-req-1" }];
+		await accountSql((sql) => { sql.exec("DELETE FROM node_index WHERE node_id = ?", saved.memory_id); sql.exec("UPDATE request_index SET profile = 'personal' WHERE request_id = 'forgot-req-1'"); });
+		await leftUnresolved(stale);
+		expect(await value(admin({ op: "recoveryRequest", id: r.id, request_id: "forgot-req-1" }))).toMatchObject({ finding: true, binding: { profile: "personal" },
+			nodes: [{ owner: null, held: "test", wiped: false }], rebuild: { binds: "test", flags: false } });
+		expect(await value(admin({ op: "recheckRequests", id: r.id, request_ids: ["forgot-req-1"] }))).toMatchObject({ state: "reconciling", rechecks: [{ findings: stale }] });
+		expect(await accountSteps()).toMatchObject({ state: "ready", unresolved: [], unresolved_count: 0 });
+		expect([await bound(saved.memory_id), await binding("forgot-req-1")]).toEqual(["test", "test"]);
+		await abortAccount();
+	});
+
+	it("account restore: a request id two profiles hold with no common owner stays a finding, and a recheck refuses it unchanged", async () => {
+		const c = await contextFor(), CLASH = "clash/€ 1"; // spaces, slashes and non-ASCII are request ids too
+		await call(c, "save_memory", { name: "Clash", type: "reference", description: "c", content: "clash body", profile: "personal", request_id: CLASH });
+		// The same request id in test, on no node and with another payload: a true collision.
+		const row = await onProfile("personal", (sql) => sql.exec("SELECT * FROM requests WHERE request_id = ?", CLASH).one());
+		await onProfile("test", (sql) => {
+			const r: Record<string, unknown> = { ...row, node_id: null, payload_hash: "another-payload" }, cols = Object.keys(r);
+			sql.exec(`INSERT INTO requests (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, ...cols.map((k) => r[k] as SqlStorageValue));
+		});
+		const exported = await value<Record<string, { id: string }>>(admin({ op: "export" }));
+		await value(admin({ op: "beginAccountRestore", export: exported.account!.id }));
+		const found = [{ kind: "request_elsewhere", id: CLASH }];
+		const r = await accountSteps();
+		expect(r).toMatchObject({ state: "unresolved", unresolved: found, unresolved_count: 1 });
+		expect(await value<Placement>(admin({ op: "recoveryRequest", id: r.id, request_id: CLASH }))).toMatchObject({ finding: true, binding: { profile: "personal" }, rebuild: { flags: true } });
+		expect(await admin({ op: "recheckRequests", id: r.id, request_ids: [CLASH] })).toMatchObject({ ok: false, error: { code: "validation", details: { reason: "not_one_node" } } });
+		expect(await status()).toMatchObject({ state: "unresolved", unresolved: found });
+		expect(await admin({ op: "openRestore" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		await abortAccount();
+		await onProfile("test", (sql) => sql.exec("DELETE FROM requests WHERE request_id = ?", CLASH));
 	});
 });
 

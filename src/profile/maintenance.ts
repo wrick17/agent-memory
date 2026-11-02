@@ -104,13 +104,11 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 	if (limit < 1 || lease < 1) throw Fail.of("validation", "limit and lease_seconds must be positive");
 	return storage.transactionSync(() => {
 		const sql = storage.sql, now = Date.now(), iso = new Date(now).toISOString();
-		const last = sql.exec<{ last_run_at: string | null }>("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").toArray()[0]?.last_run_at;
-		if (last && now - Date.parse(last) < BATCH_GAP_MS) return { lease_id: null, items: [], next_allowed_at: new Date(Date.parse(last) + BATCH_GAP_MS).toISOString() };
+		const gated = cooldownUntil(sql, now);
+		if (gated) return { lease_id: null, items: [], next_allowed_at: gated };
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), iso);
 		release(tx);
-		const kinds = q.kinds?.length ? JSON.stringify(q.kinds) : null;
-		const items = sql.exec<{ id: number; kind: string; subjects: string; created_at: string }>(`SELECT id, kind, subjects, created_at FROM maintenance WHERE state = 'open'
-			AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, kinds, kinds, limit).toArray();
+		const items = selectNext(sql, iso, q.kinds, limit);
 		if (!items.length) return { lease_id: null, items: [], next_allowed_at: null };
 		const leaseId = crypto.randomUUID(), until = new Date(now + lease * 1000).toISOString();
 		tx.run("UPDATE maintenance SET state = 'leased', lease_id = ?, lease_until = ?, attempts = attempts + 1, seq = ? WHERE id IN (SELECT value FROM json_each(?))",
@@ -123,6 +121,43 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 				...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, JSON.parse(i.subjects) as string[]) } : {}) })),
 		};
 	});
+}
+
+/** The 20-hour gate: when the next lease is allowed, or null when a lease may run now. */
+function cooldownUntil(sql: SqlStorage, now: number): string | null {
+	const last = sql.exec<{ last_run_at: string | null }>("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").toArray()[0]?.last_run_at;
+	return last && now - Date.parse(last) < BATCH_GAP_MS ? new Date(Date.parse(last) + BATCH_GAP_MS).toISOString() : null;
+}
+
+/**
+ * The items a lease at `iso` takes, in lease order: open items and the expired leases release() reopens. After release() the
+ * second clause matches nothing, so next() and the owner's preview share this one selection.
+ */
+function selectNext(sql: SqlStorage, iso: string, kinds: string[] | undefined, limit: number) {
+	const k = kinds?.length ? JSON.stringify(kinds) : null;
+	return sql.exec<{ id: number; kind: string; subjects: string; created_at: string; attempts: number; state: string }>(`SELECT id, kind, subjects, created_at, attempts, state
+		FROM maintenance WHERE (state = 'open' OR (state = 'leased' AND lease_until < ? AND attempts < ?))
+		AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, iso, MAX_ATTEMPTS, k, k, limit).toArray();
+}
+
+/**
+ * The owner's read-only observation of the next normal lease (maintenance_next with no kind filter and the full limit), as
+ * of observed_at. It takes no lease and changes no item, attempt, cursor or clock. While the cooldown holds, the candidates
+ * are what a lease would select at observed_at, not what may be leased now. Ids, kinds, dates and counts only.
+ */
+export function nextPreview(sql: SqlStorage) {
+	const now = Date.now(), iso = new Date(now).toISOString(), until = cooldownUntil(sql, now);
+	const candidates = selectNext(sql, iso, undefined, MAX_ITEMS);
+	// release()'s other effect: an expired lease at the attempt cap parks as stuck instead of reopening.
+	const park = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE state = 'leased' AND lease_until < ? AND attempts >= ? ORDER BY id", iso, MAX_ATTEMPTS).toArray();
+	return {
+		observation: "not_a_lease" as const, lease_id: null, observed_at: iso,
+		cooldown: until ? { status: "gated" as const, next_allowed_at: until } : { status: "open" as const, next_allowed_at: null },
+		leasable_now: !until && candidates.length > 0,
+		candidates: candidates.map((r) => ({ item_id: r.id, kind: r.kind, created_at: r.created_at, attempts: r.attempts,
+			expired_lease: r.state === "leased", subjects: JSON.parse(r.subjects) as string[] })),
+		parks_as_stuck: park.map((r) => r.id),
+	};
 }
 
 /** Expired leases return to the queue; an item that keeps expiring is parked as stuck. */
