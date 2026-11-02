@@ -24,6 +24,10 @@ node local/migrate.mjs plan --owner-holds FILE   # owner-bound exclusions before
 node local/migrate.mjs plan --rehearsal test     # every record with an identity and no hold, to test (rehearsal Worker only)
 node local/migrate.mjs plan --routes FILE --source-policy FILE --owner-holds FILE --rehearsal test
                                                  # the routed plan's holds, classification and policy first; only its accepted records, unchanged, to test
+node local/migrate.mjs preview-held [--routes FILE] [--out DIR]
+                                                 # private preview of privacy-held records and a draft held-migration input; no plan, no network
+node local/migrate.mjs plan --routes FILE --owner-holds FILE --held-migration FILE --refresh-from DIR
+                                                 # adds owner-approved held records to a refresh of a completed base
 node local/migrate.mjs verify                    # a fresh read of the sources compared with the export
 node local/migrate.mjs dry-run [--rehearsal test]   # checks every command, part and batch against the budget; no network
 node local/upload.mjs [--rehearsal test] [--config FILE]   # sends a checked plan; resumable
@@ -42,6 +46,78 @@ The token file holds one `import`-scoped device token (mode 0600). It is read on
 `plan --owner-holds FILE` takes an owner-owned private JSON file, kept outside the repository with mode0600. Its closed top-level fields are `version: 1`, `export_manifest_sha256` and a nonempty `holds` array. The export hash must match this export's `manifest.json`. Each hold has exactly `source`, `source_sha256` and `reason`; the row hash is the SHA-256 of that exported row's canonical JSON. Sources must be strictly sorted with no duplicates. Reasons are only `privacy_hold` or `unreviewed_new`. Foreign ownership, group/other access, unknown fields, invalid reasons and mismatched bindings refuse the whole input before plan output.
 
 Holds clear automatic routing and take precedence over reviewed routes, owner454 overrides and rehearsal routing. Held sources remain in review as `owner_hold:<reason>` with no route or commands; other privacy and identity guards remain. Absent sources cannot be named, so exclusions neither delete nor resurrect them. The hold-file hash binds the plan input/manifest; without the flag, prior input hashing and unheld command behavior are unchanged. This is reviewed planner source support only. The current fresh plan remains private and has not been uploaded.
+
+## Held-record migration, 2026-11-02
+
+The completed final refresh left 119 sources held: 92 scopeless BothQ records (89 with no other reason, 3 also privacy-held), 25 more privacy-held records, Codex `raw_memories.md` held by the owner, and one new Personal journal quarantined as `unreviewed_new`. The owner decided:
+
+| Decision | Planner behavior |
+|---|---|
+| Q1, scopeless records | Migrate to Work with assigned identities. Skip duplicates of records already in Work. |
+| Q2 and Q3, privacy-held records | Never automatic. Only owner-approved records migrate, as redacted copies. |
+| Q4, `raw_memories.md` | Stays held by its owner hold. |
+| Q5, quarantined journal | Remove its `unreviewed_new` entry from the owner-holds file. Its `personal/…` scope routes it to Personal with its revisions and requests. No code change. |
+| Q6, absent sources | Keep their accounting. Holds and routes cannot name them, so nothing is resurrected. |
+
+`plan --held-migration FILE` takes a private owner file (mode 0600) and requires `--refresh-from` a completed base. Its closed fields are `version: 1`, `export_manifest_sha256`, `owner_decision` (`reference`, `answer`), `assign` and `redacted`. At least one list is nonempty. Each list is strictly sorted by `source`. An `assign` entry is `{source, source_sha256}`, with an optional sorted `distinct_from` id list. A `redacted` entry is `{source, source_sha256, redacted_sha256}`. A stale binding, an unknown source, a wrong record kind or a schema change refuses the whole input before any output.
+
+Identity assignment (`assign`):
+
+- Applies only to a BothQ record with no id, no scope and the `missing_scope` reason. It runs after owner holds and routes, so a held record stays held.
+- The id is `uuid5("held-migration:" + source key)`. The source key is `bothq:<element id>`, so a replan gives the same id and an unchanged record emits no commands.
+- The scope is `bothq/unscoped`, and the route is Work. The original `legacy_snapshot` revision keeps `scope: null`.
+- `attrs.source.held_migration` records the owner-decision digest, the source-key digest and `assigned: {id, scope, recovered: false, original_scope: null}`.
+- The record is compared with Work records of other sources in the completed base that have the same type and normalized name, or the same whitespace-collapsed, lowercased text.
+- A match with the same content hash, status, revision operations and hashes, and request hashes is skipped as `duplicate_of_migrated` with `duplicate_of: <id>`.
+- Any other match is held as `possible_duplicate` with `possible_duplicate_of: [ids]`. The owner keeps it as a distinct record by setting `distinct_from` to exactly those ids.
+- Assigned records that conflict with each other stay held as `identity_conflict`.
+- A refresh first gives each source that the base assigned its identity back, without an input file, and only then compares other sources. A newer snapshot of an assigned record is added after the base history as a refresh, as for a changed Markdown file. A rewritten snapshot with the same or a lower version is held as `history_rewritten`.
+
+Redaction, for every item:
+
+- Each complete text value is checked as a whole, as well as row by row. This covers the body and every entry, live or historical. A secret split across two 16,000-character text rows therefore holds the record as `needs_redaction`. Before this change, such a record with no other secret was planned unredacted.
+- Every state a reader can see is checked. For each revision and each entry revision, the planner rebuilds the fields and content that the hosted `as_of` reader would show. The rebuild is a port of `pastOf` and `contentAt` in `src/profile/read.ts`:
+  - The fields come from the newest snapshot with a description, with the name of any newer name-only snapshot.
+  - The content is the newest content snapshot plus later entries. Without a content snapshot, it is the body rows plus later entries.
+  - The current node and its content form one more state.
+  - Each field is checked alone, and all fields are checked joined with newlines.
+  - The port drops the reader's fail-closed nulls, so it rebuilds at least every state the reader can show. This covers intermediate append states and past fields beside later appends.
+- A match only in a rebuilt state holds the record as `needs_redaction`. Such a match cannot be mapped back onto the stored parts, so its redacted copy is never `complete`, and an approval holds it as `redaction_incomplete`.
+
+Redacted approval (`redacted`):
+
+- `preview-held --refresh-from BASE [--routes FILE]` writes `preview.json` and `held-migration.draft.json`, both mode 0600. The default folder is `~/.agent-memory/migration-base/previews/held-<UTC>-<rand>/`, outside git. It applies routes, restored identities, assignment and duplicate matching as the plan would, but not owner holds.
+- For each record that the redactor would change, the preview holds its source binding, `redacted_sha256`, name, kind, destination and `already_hosted` id. It also holds `findings` and the redacted fields and text. Each finding gives a field and the rules that fired there: `private_key`, `auth_header`, `vendor_token`, `aws_key`, `jwt`, `key_value`, `url_password` or `sensitive_key`. A finding never includes the matched text.
+- The preview also lists skipped and possible duplicates, each with a ready-to-copy `distinct_from` binding.
+- The draft lists every scopeless record in `assign` and leaves `redacted` empty.
+- To approve a record, copy its three binding fields into `redacted` and remove its `privacy_hold` entry from the owner-holds file. A record that is still owner-held refuses the input.
+- The redacted copy redacts each complete text value before it is split into rows again. Every other field, revision and request is the server redactor's output. Stored JSON is serialized again only where redaction changed it. The node's `chars` and `content_hash` are computed again.
+- `redacted_sha256` covers the destination profile and the copy's full outgoing payload: node, id, scope, text rows, revisions and requests. Only held-migration provenance is left out. A changed route or payload refuses the approval until the owner approves it again.
+- A copy that the redactor would still change is held as `redaction_incomplete`.
+- `attrs.source.held_migration.redacted` records the binding and the number of changed values. The original text is never sent.
+- A refresh keeps an approved copy while its binding is unchanged. Otherwise the record is held again.
+
+Unapproved records keep `needs_redaction` and their private hold derivative.
+
+The held-migration file hash binds the plan input. The plan manifest reports `held_migration` counts: `assigned`, `duplicates`, `possible_duplicates` and `approved_redacted`. The offline projection against the retained base is private; this repository holds no record text or names.
+
+Offline projection, 2026-11-02, against the retained final completed refresh without a fresh BothQ export. No network was used and nothing was uploaded. Two runs gave the same commands hash. After the reader-state check, the counts and the commands hash are unchanged, so no retained record has a match only in a rebuilt state. A plan of the retained export now takes about 19 seconds.
+
+| Result | Count |
+|---|---|
+| New Work records with assigned identities | 86 (172 commands) |
+| New Personal record (the Q5 journal: 2 revisions, 1 request) | 1 (2 commands) |
+| Batches | 4 |
+| Duplicates skipped | 0 |
+| Held for owner selection: `possible_duplicate` | 2 |
+| Still held: privacy owner hold | 25 |
+| Still held: privacy hold and missing scope | 3 |
+| Still held: `raw_memories.md` | 1 |
+| Still held: assigned record that the current redactor now flags | 1 |
+| Already-migrated Work records that the current redactor now flags (`route_changed`, no commands) | 3 |
+| Preview entries (all complete; 3 already hosted) | 32 |
+
+The redactor change in `27a85c4` came after the final plan and causes the last two held rows. For the 3 hosted records, the only rule that fires is `key_value`. In two records it fires in legacy source properties. In the third it fires in the description, its revision snapshot and its body text. A fresh export would also pick up BothQ changes made since 2026-10-31: new or edited records, new scopeless records, and changed row hashes. Every bound input (routes, holds, policy, held migration) must then be regenerated for the new manifest.
 
 ## Export review fixes, 2026-10-29
 

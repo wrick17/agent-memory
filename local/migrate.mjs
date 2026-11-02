@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson, collapse, normalizeName, normalizeScope, sha256, uuid5 } from "../src/domain/ids.ts";
-import { redactPayload, redactText } from "../src/domain/redact.ts";
+import { redactPayload, redactText, redactionRules } from "../src/domain/redact.ts";
 import { stripPersonal } from "../src/domain/personal.ts";
 import { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK, PART_OVERHEAD, pack, publishCost, refreshPublishCost } from "../src/domain/import-cost.ts";
 
@@ -22,9 +22,14 @@ export { IMPORT_BUDGET as BUDGET, TEXT_CHUNK as CHUNK } from "../src/domain/impo
 const BATCH = { commands: 50, bytes: 1_000_000 };
 /** Bytes an upload request adds around its commands (`{"import_id":…,"batch":…,"commands":[…]}`), kept out of every command's share. */
 const ENVELOPE = 1024;
+/** The current text of an item, read back from its live rows: body chunks, then entries with their separators. */
+const liveText = (texts) => texts.filter((t) => t.live).sort((a, b) => (a.part === "entry") - (b.part === "entry") || a.seq_no - b.seq_no || a.chunk - b.chunk)
+	.map((t) => (t.chunk === 0 ? t.separator ?? "" : "") + t.body).join("");
 const BODY_OPS = new Set(["saved", "updated", "legacy_adopted"]);
 const KNOWN_OPS = new Set([...BODY_OPS, "appended", "superseded", "retired"]);
 const TYPES = new Set(["feedback", "project", "reference", "procedural", "user"]);
+/** The Work scope a scopeless BothQ record gets under the owner's held-record migration; the original scope stays null in its history. */
+export const HELD_SCOPE = "bothq/unscoped";
 
 export const home = () => process.env.AGENT_MEMORY_HOME || path.join(os.homedir(), ".agent-memory");
 export const migrationDir = () => path.join(home(), "migration");
@@ -388,6 +393,90 @@ function applyOwnerHolds(items, rows, owner) {
 	}
 }
 
+/**
+ * The owner's held-record migration (`plan --held-migration FILE`), bound to one export and sorted by source key. `assign` lists
+ * scopeless BothQ records that get a new deterministic Work identity; `redacted` lists privacy-held records that migrate only as
+ * the redacted copy `preview-held` showed, bound by its digest. It never targets me and never waives an owner hold.
+ */
+export function readHeldMigration(file, exportDir) {
+	const st = fs.statSync(file), bytes = fs.readFileSync(file);
+	const fail = (why) => { throw new Error(`held migration refused: ${why}`); };
+	if (st.uid !== process.getuid() || (st.mode & 0o077)) fail("needs a private owner file");
+	const exact = (o, keys) => !!o && typeof o === "object" && !Array.isArray(o) && JSON.stringify(Object.keys(o).sort()) === JSON.stringify([...keys].sort());
+	let doc;
+	try { doc = JSON.parse(bytes.toString("utf8")); } catch { fail("not JSON"); }
+	const d = doc?.owner_decision;
+	if (!exact(doc, ["version", "export_manifest_sha256", "owner_decision", "assign", "redacted"]) || doc.version !== 1 || !Array.isArray(doc.assign) || !Array.isArray(doc.redacted)
+		|| !(doc.assign.length + doc.redacted.length) || !exact(d, ["reference", "answer"]) || !nonEmpty(d.reference) || d.reference.length > 512 || !nonEmpty(d.answer) || d.answer.length > 1024) fail("schema");
+	if (doc.export_manifest_sha256 !== sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json")))) fail("made for another export");
+	const ids = (v) => Array.isArray(v) && v.length > 0 && v.every(nonEmpty) && v.every((x, i) => !i || v[i - 1] < x);
+	const list = (name, keys, optional = []) => new Map(doc[name].map((e, i) => {
+		if (!(exact(e, keys) || optional.length && exact(e, [...keys, ...optional])) || !nonEmpty(e.source) || keys.some((k) => k.endsWith("sha256") && !/^[0-9a-f]{64}$/.test(e[k]))
+			|| ("distinct_from" in e && !ids(e.distinct_from))) fail(`${name} ${i + 1} schema`);
+		if (i && !(doc[name][i - 1].source < e.source)) fail(`${name} ${i + 1} is not strictly sorted by source`);
+		return [e.source, { ...e, n: i + 1 }];
+	}));
+	return { sha256: sha256Bytes(bytes), owner_decision_sha256: sha256(canonicalJson(d)),
+		assign: list("assign", ["source", "source_sha256"], ["distinct_from"]), redacted: list("redacted", ["source", "source_sha256", "redacted_sha256"]) };
+}
+
+/** Exact entries of one held-migration list, each still the row it was bound to. */
+function heldEntries(items, rows, list, name) {
+	const at = new Map(items.map((it, i) => [it.key, i]));
+	return [...list.values()].map((e) => {
+		const fail = (why) => { throw new Error(`held migration refused: ${name} ${e.n} ${why}`); };
+		const i = at.get(e.source);
+		if (i === undefined) fail("names a source this export does not have");
+		if (sha256(canonicalJson(rows[i])) !== e.source_sha256) fail("no longer matches its exported source");
+		return { e, it: items[i], fail };
+	});
+}
+
+const scopeless = (it) => it.source === "bothq" && !it.id && !it.node.scope && it.review.includes("missing_scope");
+const heldId = (key) => uuid5(`held-migration:${key}`);
+/** Gives a scopeless record its assigned Work identity, with provenance saying id and scope were assigned, not recovered. */
+function assignIdentity(it, decisionSha) {
+	const id = heldId(it.key);
+	Object.assign(it, { id, route: { profile: "work", rule: "held_migration" } });
+	Object.assign(it.node, { id, scope: HELD_SCOPE });
+	it.review = it.review.filter((r) => r !== "missing_scope");
+	it.node.attrs.source.held_migration = { version: 1, owner_decision_sha256: decisionSha, source_key_sha256: sha256(it.key),
+		assigned: { id: "uuid5(held-migration:<source key>)", scope: HELD_SCOPE, recovered: false, original_scope: null } };
+}
+
+/** A refresh first gives each source the completed base assigned its identity back, under the same owner decision; no input file needed. */
+function restoreAssigned(items, baseRecords) {
+	const prior = new Map(baseRecords.filter((r) => r.node.attrs.source?.held_migration?.assigned && r.id === heldId(r.key)).map((r) => [r.key, r]));
+	for (const it of items) if (prior.has(it.key) && !it.held && scopeless(it)) assignIdentity(it, prior.get(it.key).node.attrs.source.held_migration.owner_decision_sha256);
+}
+
+/** What makes two records the same memory: exact content (name, type, text fields, steps), status and history, not ids or dates. */
+const semantic = (x) => canonicalJson({ content_hash: x.node.content_hash, status: x.node.status, history: x.revisions.map((v) => [v.op, v.content_hash]),
+	requests: x.requests.map((q) => q.legacy_hash) });
+
+/**
+ * Each listed scopeless BothQ record gets id uuid5(`held-migration:<source key>`) and HELD_SCOPE in Work. It is compared with the Work
+ * records of other sources in the completed base that share its type and normalized name or its whitespace-collapsed text: one that is
+ * semantically equivalent skips it as `duplicate_of_migrated`; any other match holds it as `possible_duplicate` until the owner lists
+ * the exact matched ids in `distinct_from`. An owner hold still wins; a source the base already assigned keeps its identity.
+ */
+function applyHeldAssign(items, rows, hm, baseRecords) {
+	const textKey = (s) => (s?.trim() ? sha256(collapse(s).toLowerCase()) : null);
+	const nameKey = (node) => { try { return `${node.memory_type}:${normalizeName(node.name ?? "")}`; } catch { return null; } };
+	const index = new Map(), add = (k, r) => k && index.set(k, [...(index.get(k) ?? []), r]);
+	for (const r of baseRecords.filter((x) => x.route.profile === "work")) { add(`n:${nameKey(r.node)}`, r); add(`t:${textKey(r.content)}`, r); }
+	for (const { e, it, fail } of heldEntries(items, rows, hm.assign, "assign")) {
+		if (it.node.attrs.source?.held_migration?.assigned) continue;
+		if (!scopeless(it)) fail("is not a scopeless BothQ record");
+		if (it.held || !nameKey(it.node)) continue;
+		const matches = [...new Set([...(index.get(`n:${nameKey(it.node)}`) ?? []), ...(index.get(`t:${textKey(it.content)}`) ?? [])])].filter((r) => r.key !== it.key);
+		const same = matches.find((r) => semantic(r) === semantic(it)), ids = [...new Set(matches.map((r) => r.id))].sort();
+		if (same) { it.review.push("duplicate_of_migrated"); it.duplicate_of = same.id; continue; }
+		if (ids.length && canonicalJson(e.distinct_from ?? null) !== canonicalJson(ids)) { it.review.push("possible_duplicate"); it.possible_duplicate_of = ids; continue; }
+		assignIdentity(it, hm.owner_decision_sha256);
+	}
+}
+
 /** One private exact-source approval input; it changes no routing rule and grants no other hold waiver. */
 export function readSourcePolicy(file, exportDir) {
 	const st = fs.statSync(file), bytes = fs.readFileSync(file);
@@ -599,19 +688,134 @@ const outgoing = (it) => ({
 	requests: it.requests.map((x) => ({ ...x, result: parse(x.result) ?? x.result })),
 });
 
+/** Each logical text value (one body or entry, across its chunk rows), so a secret split at a row boundary is seen whole. */
+function textValues(texts) {
+	const by = new Map();
+	for (const t of texts) { const k = `${t.part}:${t.revision}:${t.seq_no}`; by.set(k, [...(by.get(k) ?? []), t]); }
+	return [...by].map(([k, rows]) => { rows.sort((x, y) => x.chunk - y.chunk); return { k, rows, value: rows.map((t) => t.body).join("") }; });
+}
+
 /**
- * Where the server's redactor (`redactPayload`: string patterns and values under sensitive keys) would change what an item
- * sends, and the redacted copy. Any change holds the whole item; the copy is only for the owner's private review.
+ * Every state a reader can see: for each revision (and entry revision) the fields and content that the hosted `as_of` reader rebuilds
+ * then, ported from src/profile/read.ts `pastOf` (the newest snapshot with a description, with the name of a newer name-only snapshot)
+ * and `contentAt` (the newest content snapshot plus later entries, or without one the body rows plus later entries); then the current
+ * node with its content. The port drops the reader's fail-closed nulls, so it rebuilds at least every state the reader can show.
+ */
+const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+function readerStates(it) {
+	const revs = it.revisions.map((r) => ({ revision: r.revision, op: r.op, snap: parse(r.snapshot) })).filter((r) => isObj(r.snap)).sort((a, b) => a.revision - b.revision);
+	const values = textValues(it.texts).map((v) => ({ ...v.rows[0], value: v.value }));
+	const entries = values.filter((v) => v.part === "entry").sort((a, b) => a.seq_no - b.seq_no || a.revision - b.revision);
+	const bodies = values.filter((v) => v.part === "body").sort((a, b) => a.revision - b.revision);
+	const at = [...new Set([...it.revisions.map((r) => r.revision), ...entries.map((e) => e.revision)])].sort((a, b) => a - b);
+	const states = at.map((E) => {
+		const upto = revs.filter((r) => r.revision <= E);
+		const full = upto.findLast((r) => "description" in r.snap), head = upto.findLast((r) => typeof r.snap.name === "string");
+		const snap = { ...(full?.snap ?? {}), ...(head && (!full || head.revision > full.revision) ? { name: head.snap.name } : {}) };
+		const base = upto.findLast((r) => r.op !== "compacted" && typeof r.snap.content === "string"), body = bodies.findLast((b) => b.revision <= E);
+		const from = base ? base.revision : body?.revision ?? 0;
+		const tail = entries.filter((e) => e.revision > from && e.revision <= E).map((e) => (e.separator ?? "") + e.value).join("");
+		return { at: `revision ${E}`, snap, content: (base ? base.snap.content : body?.value ?? "") + tail };
+	});
+	return [...states, { at: "current", snap: it.node, content: it.content }];
+}
+
+/** The text fields of one reader state, one by one and joined with newlines as a reader shows them together. */
+function stateTexts({ snap, content }) {
+	const steps = Array.isArray(snap.steps) ? snap.steps.flatMap((x) => (isObj(x) ? [x.action, x.success_criteria] : [])) : [];
+	const fields = [snap.name, snap.description, snap.why, snap.how_to_apply, snap.objective, ...steps, content].filter((x) => typeof x === "string" && x);
+	return [...fields, fields.join("\n")];
+}
+/**
+ * Where the server's redactor (`redactPayload`: string patterns and values under sensitive keys) would change what an item sends,
+ * the redacted copy, and per changed field the rule categories that fired (never the matched text). Every complete text value is
+ * checked whole as well as row by row, and so is every field, alone and joined, of every state a reader can see (readerStates); a secret
+ * that only appears in a rebuilt state cannot be mapped back onto the parts, so it keeps even the redacted copy incomplete. Any change holds the whole item.
  */
 function redactionChanges(it) {
-	const sent = outgoing(it), redacted = redactPayload(sent), changed = [];
+	const sent = outgoing(it), redacted = redactPayload(sent), changed = [], findings = [];
 	const walk = (a, b, at) => {
 		if (a === b) return;
 		if (a && b && typeof a === "object" && typeof b === "object") { for (const k of Object.keys(a)) walk(a[k], b[k], Array.isArray(a) ? `${at}[${k}]` : at ? `${at}.${k}` : k); return; }
 		changed.push(at);
+		findings.push({ field: at, rules: typeof a === "string" && redactText(a) === b ? redactionRules(a) : ["sensitive_key"] });
 	};
 	walk(sent, redacted, "");
-	return { changed, derivative: redacted };
+	for (const { k, rows, value } of textValues(it.texts)) {
+		if (rows.length > 1 && redactText(value) !== value) { changed.push(`text:${k}`); findings.push({ field: `text:${k}`, rules: redactionRules(value) }); }
+	}
+	const seen = new Set();
+	for (const state of readerStates(it)) {
+		for (const value of stateTexts(state)) {
+			if (seen.has(value)) continue;
+			seen.add(value);
+			if (redactText(value) !== value) { changed.push(`state:${state.at}`); findings.push({ field: `state:${state.at}`, rules: redactionRules(value) }); }
+		}
+	}
+	return { changed, derivative: redacted, findings };
+}
+
+/**
+ * The redacted copy an owner approval migrates: each complete text value redacted before it is chunked again, every other field as the
+ * server's redactor writes it, stored JSON re-serialized only where redaction changed it, and the node's size and content hash
+ * recomputed. `complete` is false when anything in the copy would still change under redaction.
+ */
+export function redactedCopy(it) {
+	const { changed, derivative: d, findings } = redactionChanges(it);
+	const back = (orig, red) => { const p = typeof orig === "string" ? parse(orig) : undefined; return p === undefined || p === null ? red : canonicalJson(p) === canonicalJson(red) ? orig : JSON.stringify(red); };
+	const texts = textValues(it.texts).flatMap(({ rows, value }) => {
+		const meta = redactPayload(rows[0]);
+		delete meta.body; delete meta.chunk;
+		return chunkText(redactText(value)).map((body, chunk) => ({ ...meta, chunk, body, ...("separator" in rows[0] ? { separator: chunk === 0 ? meta.separator : null } : {}) }));
+	});
+	const item = { ...structuredClone(it), node: d.node, texts,
+		revisions: it.revisions.map((x, i) => ({ ...d.revisions[i], snapshot: back(x.snapshot, d.revisions[i].snapshot), delta: back(x.delta, d.revisions[i].delta) })),
+		requests: it.requests.map((x, i) => ({ ...d.requests[i], result: back(x.result, d.requests[i].result) })) };
+	item.content = liveText(item.texts);
+	item.node.chars = item.content.length;
+	item.node.content_hash = bothqContentHash({ ...item.node, content: item.content }, item.node.steps ?? []);
+	return { item, changed, findings, complete: !redactionChanges(item).changed.length };
+}
+
+/** An approval's binding: the destination profile and everything the copy would send, its id and scope included, except held-migration provenance. */
+export function approvalBinding(item, profile) {
+	const sent = structuredClone(outgoing(item));
+	delete sent.node.attrs.source?.held_migration;
+	return sha256(canonicalJson({ profile: profile ?? null, ...sent }));
+}
+
+/** Replaces an item by its redacted copy when the copy still has the approved binding; returns false, changing nothing, when it does not. */
+function approveCopy(it, binding, decisionSha, holds) {
+	const copy = redactedCopy(it);
+	if (approvalBinding(copy.item, it.route?.profile) !== binding) return false;
+	it.review = it.review.filter((r) => r !== "needs_redaction");
+	if (!copy.complete) { it.review.push("redaction_incomplete"); return true; }
+	Object.assign(it, { node: copy.item.node, texts: copy.item.texts, revisions: copy.item.revisions, requests: copy.item.requests, content: copy.item.content });
+	const source = it.node.attrs.source;
+	source.held_migration = { ...(source.held_migration ?? { version: 1, owner_decision_sha256: decisionSha, source_key_sha256: sha256(it.key) }),
+		redacted: { redacted_sha256: binding, changed: copy.changed.length } };
+	holds.splice(holds.findIndex((h) => h.key === it.key), 1);
+	return true;
+}
+
+/** A refresh keeps a redacted copy the base migrated while the fresh copy is still exactly what was approved; otherwise it is held again. */
+function restoreRedacted(items, baseRecords, holds) {
+	const prior = new Map(baseRecords.filter((r) => r.node.attrs.source?.held_migration?.redacted).map((r) => [r.key, r.node.attrs.source.held_migration]));
+	for (const it of items) {
+		const mark = prior.get(it.key);
+		if (mark && !it.held && it.route && it.review.includes("needs_redaction")) approveCopy(it, mark.redacted.redacted_sha256, mark.owner_decision_sha256, holds);
+	}
+}
+
+/** Each approved privacy-held record migrates as its previewed redacted copy to its previewed destination, marked redacted; its original never leaves. */
+function applyHeldRedacted(items, rows, hm, holds) {
+	for (const { e, it, fail } of heldEntries(items, rows, hm.redacted, "redacted")) {
+		if (it.node.attrs.source?.held_migration?.redacted) { if (it.node.attrs.source.held_migration.redacted.redacted_sha256 !== e.redacted_sha256) fail("differs from the redacted copy the owner previewed"); continue; }
+		if (it.held) fail("is still owner-held; remove its privacy_hold to approve it");
+		if (!it.review.includes("needs_redaction")) fail("needs no redaction");
+		if (!it.route) fail("has no destination");
+		if (!approveCopy(it, e.redacted_sha256, hm.owner_decision_sha256, holds)) fail("differs from the redacted copy or destination the owner previewed");
+	}
 }
 
 /** Serialized bytes of one command; every command and every batch must fit one upload request. */
@@ -661,8 +865,7 @@ export function planRecords(dir) {
 		const rows = commands.filter((s) => s.op === "stage" && s.record_id === c.record_id && s.profile === c.profile).map((s) => s.rows);
 		const source = c.node.attrs.source, system = source.system;
 		const texts = rows.flatMap((r) => r.texts);
-		const content = texts.filter((t) => t.live).sort((a, b) => (a.part === "entry") - (b.part === "entry") || a.seq_no - b.seq_no || a.chunk - b.chunk)
-			.map((t) => (t.chunk === 0 ? t.separator ?? "" : "") + t.body).join("");
+		const content = liveText(texts);
 		return { key: system === "bothq" ? `bothq:${source.element_id}` : `${system}:${source.realpath}`, source: system, id: c.record_id,
 			route: { profile: c.profile }, node: c.node, texts, revisions: rows.flatMap((r) => r.revisions), requests: rows.flatMap((r) => r.requests),
 			supersedes: [], content, record_sha256: c.record_sha256, refresh_no: 0,
@@ -759,6 +962,14 @@ function refreshed(it, base) {
 	if (it.id !== base.id) hold("history_rewritten");
 	if (it.route?.profile !== base.route.profile) hold("route_changed");
 	let adoption = false;
+	if (it.source === "bothq" && base.node.attrs.source?.held_migration?.assigned && it.revisions.length === 1 && it.revisions[0].op === "legacy_snapshot"
+		&& base.revisions.every((r) => r.op === "legacy_snapshot")) {
+		// An assigned record has no BothQ history: a newer snapshot is appended after the base's, the same one keeps the base history.
+		const rev = it.revisions[0];
+		if (same(rev, base.revisions.at(-1))) it = { ...it, texts: base.texts, revisions: base.revisions };
+		else if (rev.revision > base.node.revision) it = { ...it, texts: [...base.texts.map((t) => ({ ...t, live: false })), ...it.texts], revisions: [...base.revisions, rev] };
+		else hold("history_rewritten");
+	}
 	if (it.source === "bothq") {
 		adoption = adoptionOf(base, it);
 		if (base.revisions.some((r, i) => !(adoption && i === 0) && !same(r, it.revisions[i])) || base.requests.some((r) => !it.requests.some((q) => same(q, r)))) hold("history_rewritten");
@@ -824,7 +1035,7 @@ function refreshCommands(it, base) {
  * commands. Deterministic: the same export and rules give byte-identical commands. A part's id and hash depend only on its
  * record's content, so an unchanged record keeps its parts across plans and the server can replay them.
  */
-export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null, ownerHolds = null } = {}) {
+export async function plan({ exportDir, rules = defaultRouting(), force = false, rehearsal = null, refreshFrom = null, routes = null, sourcePolicy = null, ownerHolds = null, heldMigration = null } = {}) {
 	// A bare rehearsal sends every record that has an identity and no hold to the `test` profile, ignoring routing (section 16).
 	// With reviewed routes or a source policy it plans the routed set exactly, then sends only its accepted records to `test`.
 	if (rehearsal !== null && rehearsal !== "test") throw new Error("a rehearsal goes to the test profile only");
@@ -836,22 +1047,26 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 		const reviewed = routes ? readReviewedRoutes(routes, exportDir) : null;
 		const policy = sourcePolicy ? readSourcePolicy(sourcePolicy, exportDir) : null;
 		const held = ownerHolds ? readOwnerHolds(ownerHolds, exportDir) : null;
+		const hm = heldMigration ? readHeldMigration(heldMigration, exportDir) : null;
+		if (hm && !refreshFrom) throw new Error("held migration needs --refresh-from a completed base, to skip records it already migrated");
 		const base = refreshFrom ? completedBase(refreshFrom, rehearsal) : null;
 		const version = policy || reviewed?.version === 2 || base?.records.some(r=>r.node.attrs.import_review || r.node.attrs.source?.owner_classification) ? POLICY_PLAN_VERSION : PLAN_VERSION;
 		const inputSha = sha256(canonicalJson({ manifest, rules, rehearsal, version, ...(base ? { refresh_base: base.commands_sha256 } : {}),
-			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}), ...(policy ? {source_policy:policy.sha256} : {}), ...(held ? { owner_holds: held.sha256 } : {}) }));
+			...(reviewed ? { reviewed_routes: reviewed.sha256 } : {}), ...(policy ? {source_policy:policy.sha256} : {}), ...(held ? { owner_holds: held.sha256 } : {}), ...(hm ? { held_migration: hm.sha256 } : {}) }));
 		const out = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan");
 		const statePath = path.join(migrationDir(), "state.json");
 		const state = readJson(statePath, { exports: [], plans: {} });
 		const prior = state.plans[inputSha];
 		const last = readJson(path.join(out, "manifest.json"), null);
 		// Reviewed routes must be rechecked against current remotes and decoded paths.
-		if (!reviewed && !policy && !force && prior && last?.commands_sha256 === prior.commands_sha256 && last.input_sha256 === inputSha) return { status: "unchanged", dir: out, manifest: last };
+		if (!reviewed && !policy && !hm && !force && prior && last?.commands_sha256 === prior.commands_sha256 && last.input_sha256 === inputSha) return { status: "unchanged", dir: out, manifest: last };
 		if (reviewed || policy) remotes.clear();
 		const bothqRows = readJsonl(path.join(exportDir, "bothq", "records.jsonl")), rows = [...bothqRows, ...readJsonl(path.join(exportDir, "markdown", "files.jsonl"))];
 		const items = rows.map((r, i) => (i < bothqRows.length ? bothqItem(r) : markdownItem(r, rules)));
 		if (held) applyOwnerHolds(items, rows, held);
 		if (reviewed) (reviewed.version === 2 ? applyOwnerWork : applyReviewed)(items, rows, reviewed);
+		if (base) restoreAssigned(items, base.records);
+		if (hm) applyHeldAssign(items, rows, hm, base.records);
 		const review = [], holds = [];
 		const previous = new Map(base?.records.map((r) => [r.key, r]) ?? []), records = new Map(previous);
 		for (const it of items) {
@@ -862,6 +1077,8 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			const { changed, derivative } = redactionChanges(it);
 			if (changed.length) { it.review.push("needs_redaction"); holds.push({ key: it.key, changed, derivative }); }
 		}
+		if (base) restoreRedacted(items, base.records, holds);
+		if (hm) applyHeldRedacted(items, rows, hm, holds);
 		if (policy) applySourcePolicy(items, rows, policy);
 		for (const it of items) {
 			const old = previous.get(it.key);
@@ -928,7 +1145,7 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			// Only a record held for no reason but its missing route can be routed by the owner: its exact `plan --routes` binding.
 			const assignable = !rehearsal && !it.route && !it.held && it.id && it.node.scope && reasons.every((r) => UNROUTED.includes(r));
 			review.push({ key: it.key, source: it.source, id: it.id ?? null, name: it.node.name ?? null, reasons, ...(it.route ? { proposed: it.route } : {}),
-				planned: !!it.planned, ...(assignable ? { route_binding: { scope: it.node.scope, source_sha256: sha256(canonicalJson(rows[i])) } } : {}) });
+				planned: !!it.planned, ...(it.duplicate_of ? { duplicate_of: it.duplicate_of } : {}), ...(it.possible_duplicate_of ? { possible_duplicate_of: it.possible_duplicate_of } : {}), ...(assignable ? { route_binding: { scope: it.node.scope, source_sha256: sha256(canonicalJson(rows[i])) } } : {}) });
 		});
 		const batches = [];
 		let cur = null;
@@ -959,6 +1176,9 @@ export async function plan({ exportDir, rules = defaultRouting(), force = false,
 			...(reviewed ? { reviewed_routes: { sha256: reviewed.sha256, routes: reviewed.routes.size, ...(reviewed.version === 2 ? { version: 2, effect: "legacy_work_owner",
 				owner_decision_sha256: reviewed.owner_decision_sha256, classified: items.filter((x) => x.node.attrs.source?.owner_classification).length } : {}) } } : {}),
 			...(held ? { owner_holds: { version: 1, sha256: held.sha256, holds: held.holds.size } } : {}),
+			...(hm ? { held_migration: { version: 1, sha256: hm.sha256, owner_decision_sha256: hm.owner_decision_sha256, assign: hm.assign.size, redacted: hm.redacted.size,
+				assigned: items.filter((x) => x.node.attrs.source?.held_migration?.assigned).length, duplicates: items.filter((x) => x.duplicate_of).length, possible_duplicates: items.filter((x) => x.possible_duplicate_of).length,
+				approved_redacted: items.filter((x) => x.node.attrs.source?.held_migration?.redacted).length } } : {}),
 			items: items.length, planned: ready.filter((x) => x.planned).length, review: review.length, holds: holds.length, reasons, records_by_profile: byProfile,
 			commands: commands.length, stage: stages.length, finalize: count((c) => c.op === "finalize"), link: count((c) => c.op === "link"), batches: batches.length,
 			max_part: { rows: Math.max(0, ...stages.map((s) => s.cost.rows)), bytes: Math.max(0, ...stages.map((s) => s.cost.bytes)), json_bytes: Math.max(0, ...stages.map((s) => utf8(JSON.stringify(s)))) },
@@ -997,6 +1217,49 @@ export async function verify({ exportDir, sources = DEFAULT_SOURCES, bothq = tru
 		} finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 	}
 	return result;
+}
+
+// ---------- held-record preview ----------
+
+/**
+ * `preview-held`: offline and read-only for every source. For each record the redactor would hold: its name, kind, destination and
+ * the redacted copy an approval would migrate, in one private file outside git (default ~/.agent-memory/migration-base/previews/).
+ * Beside it, a draft `plan --held-migration` input: every scopeless BothQ record in `assign`, `redacted` empty for the owner to fill
+ * with the exact `{source, source_sha256, redacted_sha256}` of each approved preview entry. Owner holds are not applied here.
+ */
+export function previewHeld({ exportDir, rules = defaultRouting(), routes = null, refreshFrom = null, out = null }) {
+	const manifest = readJson(path.join(exportDir, "manifest.json"), null);
+	if (!manifest) throw new Error(`no export manifest in ${exportDir}`);
+	checkExport(exportDir, manifest);
+	if (!refreshFrom) throw new Error("preview-held needs --refresh-from the completed base the plan will refresh");
+	const reviewed = routes ? readReviewedRoutes(routes, exportDir) : null;
+	const base = completedBase(refreshFrom, null), hosted = new Map(base.records.map((r) => [r.key, r.id]));
+	const bothqRows = readJsonl(path.join(exportDir, "bothq", "records.jsonl")), rows = [...bothqRows, ...readJsonl(path.join(exportDir, "markdown", "files.jsonl"))];
+	const items = rows.map((r, i) => (i < bothqRows.length ? bothqItem(r) : markdownItem(r, rules)));
+	if (reviewed) (reviewed.version === 2 ? applyOwnerWork : applyReviewed)(items, rows, reviewed);
+	restoreAssigned(items, base.records);
+	// Every scopeless record as if listed, so ids, destinations and duplicate matches are exactly what the plan would see.
+	const assign = items.map((it, i) => scopeless(it) && { source: it.key, source_sha256: sha256(canonicalJson(rows[i])) }).filter(Boolean).sort((a, b) => (a.source < b.source ? -1 : 1));
+	applyHeldAssign(items, rows, { owner_decision_sha256: null, assign: new Map(assign.map((e, n) => [e.source, { ...e, n: n + 1 }])) }, base.records);
+	const records = [], duplicates = [];
+	items.forEach((it, i) => {
+		const source_sha256 = sha256(canonicalJson(rows[i]));
+		if (it.duplicate_of) duplicates.push({ source: it.key, source_sha256, name: it.node.name, skipped_as_duplicate_of: it.duplicate_of });
+		if (it.possible_duplicate_of) duplicates.push({ source: it.key, source_sha256, name: it.node.name, possible_duplicate_of: it.possible_duplicate_of,
+			to_keep_as_distinct: { source: it.key, source_sha256, distinct_from: it.possible_duplicate_of } });
+		if (!redactionChanges(it).changed.length) return;
+		const c = redactedCopy(it), n = c.item.node;
+		records.push({ source: it.key, source_sha256, redacted_sha256: approvalBinding(c.item, it.route?.profile), name: n.name, kind: n.kind, memory_type: n.memory_type,
+			destination: it.route?.profile ?? "unrouted", ...(hosted.has(it.key) ? { already_hosted: hosted.get(it.key) } : {}), complete: c.complete, findings: c.findings,
+			redacted: { description: n.description, why: n.why, how_to_apply: n.how_to_apply, objective: n.objective, steps: n.steps, text: c.item.content } });
+	});
+	const byKey = (a, b) => (a.source < b.source ? -1 : 1);
+	const dir = out ?? path.join(home(), "migration-base", "previews", `held-${stamp()}-${randomBytes(2).toString("hex")}`);
+	writePrivate(path.join(dir, "preview.json"), JSON.stringify({ version: 2, export_dir: tilde(exportDir), refresh_from: tilde(refreshFrom), records: records.sort(byKey), duplicates: duplicates.sort(byKey) }, null, 2));
+	writePrivate(path.join(dir, "held-migration.draft.json"), JSON.stringify({ version: 1, export_manifest_sha256: sha256Bytes(fs.readFileSync(path.join(exportDir, "manifest.json"))),
+		owner_decision: { reference: "", answer: "" }, assign, redacted: [] }, null, 2));
+	return { dir: tilde(dir), preview: records.length, incomplete: records.filter((r) => !r.complete).length, already_hosted: records.filter((r) => r.already_hosted).length,
+		assign: assign.length, duplicates: duplicates.filter((d) => d.skipped_as_duplicate_of).length, possible_duplicates: duplicates.filter((d) => d.possible_duplicate_of).length };
 }
 
 // ---------- dry run ----------
@@ -1050,10 +1313,11 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process
 	const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 	const run = {
 		export: async () => { const r = await exportAll({ ...DEFAULT_SOURCES, ...(opt("graph-db") ? { graphDb: opt("graph-db") } : {}), ...(opt("python") ? { python: opt("python") } : {}) }); print(r.manifest); },
-		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, sourcePolicy: opt("source-policy"), routes: opt("routes") ?? null, ownerHolds: opt("owner-holds") ?? null }); print({ status: r.status, ...r.manifest }); },
+		plan: async () => { const r = await plan({ exportDir, force: rest.includes("--force"), rehearsal: opt("rehearsal") ?? null, refreshFrom: opt("refresh-from") ?? null, sourcePolicy: opt("source-policy"), routes: opt("routes") ?? null, ownerHolds: opt("owner-holds") ?? null, heldMigration: opt("held-migration") ?? null }); print({ status: r.status, ...r.manifest }); },
 		verify: async () => print(await verify({ exportDir })),
+		"preview-held": async () => print(previewHeld({ exportDir, routes: opt("routes") ?? null, refreshFrom: opt("refresh-from") ?? null, out: opt("out") ?? null })),
 		"dry-run": async () => print(dryRun({ exportDir, rehearsal: opt("rehearsal") ?? null })),
 	}[cmd];
-	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--source-policy FILE] [--owner-holds FILE] [--rehearsal test] [--force] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
+	if (!run) { process.stderr.write("usage: node local/migrate.mjs export | plan [--export DIR] [--routes FILE] [--source-policy FILE] [--owner-holds FILE] [--held-migration FILE --refresh-from DIR] [--rehearsal test] [--force] | preview-held --refresh-from DIR [--export DIR] [--routes FILE] [--out DIR] | verify [--export DIR] | dry-run [--export DIR] [--rehearsal test]\n"); process.exit(2); }
 	run().catch((e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 }

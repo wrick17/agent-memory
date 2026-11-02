@@ -20,15 +20,26 @@ export function schemeBefore(text: string, end: number): boolean {
 	return false;
 }
 
+// Named in order, so a review can say which rule fired without showing what it matched.
+const RULES: [string, (s: string) => string][] = [
+	["private_key", (s) => s.replace(PRIVATE_KEY, REDACTED)],
+	["auth_header", (s) => s.replace(AUTH_HEADER, REDACTED)],
+	["vendor_token", (s) => s.replace(VENDOR_TOKEN, REDACTED)],
+	["aws_key", (s) => s.replace(AWS_KEY, REDACTED)],
+	["jwt", (s) => s.replace(JWT, REDACTED)],
+	["key_value", (s) => s.replace(KEY_VALUE, (_m, key: string, quote: string, sep: string) => `${key}${quote}${sep}${REDACTED}`)],
+	["url_password", (s) => s.replace(URL_PASSWORD, (m: string, head: string, at: string, offset: number, whole: string) => (schemeBefore(whole, offset) ? `${head}${REDACTED}${at}` : m))],
+];
+
 export function redactText(value: string): string {
-	return value
-		.replace(PRIVATE_KEY, REDACTED)
-		.replace(AUTH_HEADER, REDACTED)
-		.replace(VENDOR_TOKEN, REDACTED)
-		.replace(AWS_KEY, REDACTED)
-		.replace(JWT, REDACTED)
-		.replace(KEY_VALUE, (_m, key: string, quote: string, sep: string) => `${key}${quote}${sep}${REDACTED}`)
-		.replace(URL_PASSWORD, (m: string, head: string, at: string, offset: number, whole: string) => (schemeBefore(whole, offset) ? `${head}${REDACTED}${at}` : m));
+	return RULES.reduce((s, [, rule]) => rule(s), value);
+}
+
+/** The names of the rules that change a value, in the order redactText applies them. */
+export function redactionRules(value: string): string[] {
+	const fired: string[] = [];
+	RULES.reduce((s, [name, rule]) => { const next = rule(s); if (next !== s) fired.push(name); return next; }, value);
+	return fired;
 }
 
 /** A redacted copy; object keys that name secrets have their whole value replaced. */

@@ -829,3 +829,197 @@ describe("legacy Work owner classification", () => {
 		assert.deepEqual([planned(same).length, reviewOf(same)[0].reasons.includes("classification_changed")], [0, true]);
 	});
 });
+
+// Owner decisions Q1 to Q3 on records the final refresh held (docs/import-implementation.md#held-record-migration-2026-11-02).
+describe("held-record migration", () => {
+	const keyOf = (r) => `bothq:${r.eid}`;
+	const rowSha = (r) => sha256(canonicalJson(r));
+	const exportSha = (dir) => sha256(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+	const scoped = (eid, name, content = "safe", scope = "sequoia") => record({ eid: `hm-${eid}`, legacyId: uuid5(`${scope}:project:${name}`), scope, name, props: { content } });
+	const loose = (eid, name, content = "safe") => record({ eid: `hm-${eid}`, name, props: { content } });
+	const heldId = (r) => uuid5(`held-migration:${keyOf(r)}`);
+	const bySource = (a, b) => (a.source < b.source ? -1 : 1);
+	const privateFile = (prefix, doc) => {
+		const file = path.join(fs.mkdtempSync(path.join(tmp, prefix)), "input.json");
+		fs.writeFileSync(file, JSON.stringify(doc), { mode: 0o600 });
+		return file;
+	};
+	const assignOf = (r, extra = {}) => ({ source: keyOf(r), source_sha256: rowSha(r), ...extra });
+	const heldFile = (dir, assign, redacted = [], edit = (d) => d) => privateFile("held-", edit({ version: 1, export_manifest_sha256: exportSha(dir),
+		owner_decision: { reference: "synthetic owner decision", answer: "synthetic: assign scopeless, approve listed redactions" },
+		assign: assign.map((x) => (x.eid ? assignOf(x) : x)).sort(bySource), redacted: [...redacted].sort(bySource) }));
+	const routesFile = (dir, r, profile) => privateFile("routes-", { version: 1, export_manifest_sha256: exportSha(dir),
+		routes: [{ source: keyOf(r), id: m.bothqItem(r).id, scope: r.resolved_scope, profile, source_sha256: rowSha(r) }] });
+	const finalizes = (dir) => planned(dir).filter((c) => c.op === "finalize");
+	const commandsText = (dir) => fs.readFileSync(path.join(dir, "plan", "commands.jsonl"), "utf8");
+	const previewOf = (dir, opts) => {
+		const out = fs.mkdtempSync(path.join(tmp, "preview-")), summary = m.previewHeld({ exportDir: dir, out, ...opts });
+		const doc = JSON.parse(fs.readFileSync(path.join(out, "preview.json"), "utf8"));
+		const entry = (r) => doc.records.find((x) => x.source === keyOf(r));
+		const bind = (r) => ({ source: entry(r).source, source_sha256: entry(r).source_sha256, redacted_sha256: entry(r).redacted_sha256 });
+		return { out, summary, doc, entry, bind, draft: JSON.parse(fs.readFileSync(path.join(out, "held-migration.draft.json"), "utf8")) };
+	};
+	async function baseWith(...rows) { const base = makeExport(rows); await uploaded(base); return base; }
+
+	it("assigns deterministic Work identities, skips only equivalent duplicates, and holds possible duplicates for the owner", async () => {
+		const kept = scoped("kept", "Kept", "kept   TEXT"), base = await baseWith(kept), keptId = m.bothqItem(kept).id;
+		const fresh = loose("fresh", "Fresh one", "new text"), exact = loose("exact", "Kept", "kept   TEXT"), sameName = loose("same-name", "kept", "other text"),
+			sameText = loose("same-text", "Elsewhere", " Kept text ");
+		const dir = makeExport([kept, fresh, exact, sameName, sameText]);
+		const { doc, draft } = previewOf(dir, { refreshFrom: base });
+		assert.deepEqual(doc.duplicates.map((d) => [d.source, d.skipped_as_duplicate_of ?? null, d.possible_duplicate_of ?? null]),
+			[[keyOf(exact), keptId, null], [keyOf(sameName), null, [keptId]], [keyOf(sameText), null, [keptId]]]);
+		assert.deepEqual(draft.assign, [fresh, exact, sameName, sameText].map((r) => assignOf(r)).sort(bySource));
+		const held = heldFile(dir, [fresh, exact, assignOf(sameName, { distinct_from: [keptId] }), sameText]);
+		await assert.rejects(m.plan({ exportDir: dir, heldMigration: held }), /needs --refresh-from/);
+		const p = await uploaded(dir, { refreshFrom: base, heldMigration: held });
+		assert.deepEqual(finalizes(dir).map((c) => [c.record_id, c.profile, c.node.scope]).sort(), [fresh, sameName].map((r) => [heldId(r), "work", m.HELD_SCOPE]).sort());
+		assert.deepEqual(finalizes(dir)[0].node.attrs.source.held_migration.assigned, { id: "uuid5(held-migration:<source key>)", scope: m.HELD_SCOPE, recovered: false, original_scope: null });
+		assert.deepEqual(reviewOf(dir).map((r) => [r.key, r.reasons, r.duplicate_of ?? r.possible_duplicate_of]),
+			[[keyOf(exact), ["missing_scope", "duplicate_of_migrated"], keptId], [keyOf(sameText), ["missing_scope", "possible_duplicate"], [keptId]]]);
+		assert.deepEqual([p.manifest.held_migration.assigned, p.manifest.held_migration.duplicates, p.manifest.held_migration.possible_duplicates], [2, 1, 1]);
+		const cases = [
+			[heldFile(dir, [assignOf(fresh, { source_sha256: "0".repeat(64) })]), /assign 1 no longer matches its exported source/],
+			[heldFile(dir, [kept]), /assign 1 is not a scopeless BothQ record/],
+			[heldFile(dir, [fresh, fresh]), /assign 2 is not strictly sorted/],
+			[heldFile(dir, [assignOf(fresh, { distinct_from: [] })]), /assign 1 schema/],
+			[heldFile(dir, [fresh], [], (d) => ({ ...d, export_manifest_sha256: "0".repeat(64) })), /made for another export/],
+			[heldFile(dir, [fresh], [], (d) => ({ ...d, profile: "me" })), /schema/],
+			[heldFile(dir, []), /schema/],
+		];
+		for (const [file, error] of cases) await assert.rejects(m.plan({ exportDir: dir, refreshFrom: base, heldMigration: file }), error);
+	});
+
+	it("restores an assigned identity on refresh before dedupe and publishes the source's next snapshot", async () => {
+		const kept = scoped("kept", "Kept"), base = await baseWith(kept), fresh = loose("fresh", "Fresh one", "first text"), dir = makeExport([kept, fresh]);
+		await uploaded(dir, { refreshFrom: base, heldMigration: heldFile(dir, [fresh]) });
+		const same = makeExport([kept, fresh]);
+		fs.copyFileSync(path.join(dir, "manifest.json"), path.join(same, "manifest.json"));
+		await m.plan({ exportDir: same, refreshFrom: dir });
+		assert.equal(planned(same).length, 0);
+		const next = structuredClone(fresh);
+		Object.assign(next.props, { content: "first text, then more", _version: 2, _updated: dt("2026-03-03T00:00:00+00:00") });
+		const later = makeExport([kept, next]);
+		const p = await uploaded(later, { refreshFrom: dir, heldMigration: heldFile(later, [next]) });
+		const [stage, fin] = planned(later);
+		assert.deepEqual(reviewOf(later), []);
+		assert.deepEqual([planned(later).length, fin.record_id, fin.profile, fin.node.scope, fin.node.revision, fin.refresh.no, fin.refresh.base_revision, fin.refresh.body_revision],
+			[2, heldId(fresh), "work", m.HELD_SCOPE, 2, 1, 1, 2]);
+		assert.deepEqual([stage.rows.revisions.map((r) => [r.revision, r.op]), stage.rows.texts.map((t) => [t.revision, t.body, t.live])], [[[2, "legacy_snapshot"]], [[2, "first text, then more", true]]]);
+		assert.deepEqual([p.manifest.held_migration.duplicates, p.manifest.held_migration.possible_duplicates], [0, 0]);
+		const record = m.planRecords(p.dir).find((r) => r.id === heldId(fresh));
+		assert.deepEqual([record.revisions.length, record.texts.filter((t) => t.live).map((t) => t.body)], [2, ["first text, then more"]]);
+		const again = makeExport([kept, next]);
+		fs.copyFileSync(path.join(later, "manifest.json"), path.join(again, "manifest.json"));
+		await m.plan({ exportDir: again, refreshFrom: later });
+		assert.equal(planned(again).length, 0);
+	});
+
+	it("previews privacy-held records privately and migrates only approved copies bound to their payload and destination", async () => {
+		const kept = scoped("kept", "Kept"), base = await baseWith(kept);
+		const approved = scoped("approved", "Approved", "Use token=abc123secret.", "bot_hq"), unapproved = scoped("unapproved", "Unapproved", "password: hunter2xyz"),
+			both = loose("both", "Both", "Auth Bearer abcdefghijkl");
+		const dir = makeExport([kept, approved, unapproved, both]), toWork = routesFile(dir, approved, "work");
+		const { out, summary, entry, bind, draft } = previewOf(dir, { refreshFrom: base, routes: toWork });
+		assert.deepEqual([summary.preview, summary.incomplete, summary.assign, fs.statSync(path.join(out, "preview.json")).mode & 0o777], [3, 0, 1, 0o600]);
+		assert.deepEqual([entry(approved).destination, entry(both).destination, entry(approved).kind, entry(approved).redacted.text], ["work", "work", "journal", "Use token=[REDACTED]"]);
+		const kinds = (r) => [...new Set(entry(r).findings.map((f) => `${f.field.replace(/:.*/, "")} ${f.rules}`))];
+		assert.deepEqual([entry(approved).findings[0], kinds(approved), kinds(both)], [{ field: "texts[0].body", rules: ["key_value"] }, ["texts[0].body key_value", "state key_value"], ["texts[0].body auth_header", "state auth_header"]]);
+		assert.ok(!/abc123secret|abcdefghijkl|hunter2xyz/.test(fs.readFileSync(path.join(out, "preview.json"), "utf8")));
+		assert.deepEqual(draft.assign, [assignOf(both)]);
+		const approval = heldFile(dir, [both], [bind(approved), bind(both)]);
+		const p = await m.plan({ exportDir: dir, refreshFrom: base, routes: toWork, heldMigration: approval });
+		const fins = finalizes(dir);
+		assert.deepEqual(fins.map((c) => [c.record_id, c.profile]).sort(), [[m.bothqItem(approved).id, "work"], [heldId(both), "work"]].sort());
+		assert.ok(!/abc123secret|abcdefghijkl|hunter2xyz/.test(commandsText(dir)) && commandsText(dir).includes("[REDACTED]"));
+		const mark = fins.find((c) => c.record_id === m.bothqItem(approved).id).node.attrs.source.held_migration;
+		assert.deepEqual([mark.redacted.redacted_sha256, mark.redacted.changed, mark.assigned], [entry(approved).redacted_sha256, 3, undefined]);
+		assert.deepEqual([reviewOf(dir).map((r) => [r.key, r.reasons]), p.manifest.held_migration.approved_redacted, p.manifest.holds], [[[keyOf(unapproved), ["needs_redaction"]]], 2, 1]);
+		// The unchanged approval with routes that now send the record to Personal is refused until it is approved again.
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: base, routes: routesFile(dir, approved, "personal"), heldMigration: approval }), /redacted 1 differs from the redacted copy or destination/);
+		const holds = privateFile("holds-", { version: 1, export_manifest_sha256: exportSha(dir), holds: [{ source: keyOf(approved), source_sha256: rowSha(approved), reason: "privacy_hold" }] });
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: base, routes: toWork, ownerHolds: holds, heldMigration: heldFile(dir, [], [bind(approved)]) }), /still owner-held/);
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: base, routes: toWork, heldMigration: heldFile(dir, [], [{ ...bind(approved), redacted_sha256: "0".repeat(64) }]) }), /differs from the redacted copy/);
+		await assert.rejects(m.plan({ exportDir: dir, refreshFrom: base, heldMigration: heldFile(dir, [], [{ ...assignOf(kept), redacted_sha256: "0".repeat(64) }]) }), /needs no redaction/);
+	});
+
+	it("holds and redacts a secret split across text rows, live or historical, with no other secret in the record", async () => {
+		const kept = scoped("kept", "Kept"), base = await baseWith(kept);
+		const split = `${"x".repeat(15_996)} tok` + "en=zzz123secret";
+		const liveSplit = scoped("live-split", "Live split", split);
+		const fields = { name: "History split", memory_type: "project", description: "", why: "", how_to_apply: "", objective: "" }, h = (content) => m.bothqContentHash({ ...fields, content });
+		const rev = (revision, operation, content, snapshot, delta = null) => ({ revision_id: `hs:${revision}`, revision, operation, content_hash: h(content), snapshot_json: canonicalJson(snapshot),
+			delta_json: delta && canonicalJson(delta), request_id: null, _created: dt(`2026-03-0${revision}T00:00:00+00:00`) });
+		const historySplit = record({ eid: "hm-history-split", memoryId: "history-split", scope: "sequoia", name: fields.name,
+			props: { ...fields, content: "replaced", content_hash: h("replaced"), _version: 3 },
+			revisions: [rev(1, "saved", "", { ...fields, content: "", memory_id: "history-split", _version: 1 }), rev(2, "appended", split, { memory_id: "history-split", _version: 2 }, { content: split, separator: "\n" }),
+				rev(3, "updated", "replaced", { ...fields, content: "replaced", memory_id: "history-split", _version: 3 })] });
+		assert.ok(m.bothqItem(historySplit).texts.some((t) => !t.live && t.chunk === 1), "the split entry is historical");
+		const dir = makeExport([kept, liveSplit, historySplit]);
+		await m.plan({ exportDir: dir, refreshFrom: base });
+		assert.deepEqual([planned(dir).length, reviewOf(dir).map((r) => [r.key, r.reasons])], [0, [[keyOf(historySplit), ["needs_redaction"]], [keyOf(liveSplit), ["needs_redaction"]]]]);
+		const { entry, bind } = previewOf(dir, { refreshFrom: base });
+		assert.deepEqual([entry(liveSplit).complete, entry(historySplit).complete, entry(liveSplit).findings.find((f) => f.field.startsWith("text:"))], [true, true, { field: "text:body:1:0", rules: ["key_value"] }]);
+		const p = await m.plan({ exportDir: dir, refreshFrom: base, heldMigration: heldFile(dir, [], [bind(liveSplit), bind(historySplit)]) });
+		assert.deepEqual([p.manifest.finalize, p.manifest.held_migration.approved_redacted, reviewOf(dir)], [2, 2, []]);
+		assert.ok(!commandsText(dir).includes("zzz123secret"));
+	});
+
+	it("holds a credential that only appears where a body meets its appends or one field meets the next, and never approves it as complete", async () => {
+		const kept = scoped("kept", "Kept"), base = await baseWith(kept);
+		const fields = { name: "Span", memory_type: "project", description: "", why: "", how_to_apply: "", objective: "" };
+		/** A BothQ journal: a body ending in `Bearer`, the credential appended after a newline, optionally replaced later so both are history. */
+		function spanning(eid, { replaced = false, description = "" } = {}) {
+			const f = { ...fields, name: `Span ${eid}`, description }, h = (content) => m.bothqContentHash({ ...f, content }), id = `span-${eid}`, steps = [["saved", "Auth Bearer"], ["appended", "Auth Bearer\nabcdefghijklmnop"], ...(replaced ? [["updated", "replaced"]] : [])];
+			const revisions = steps.map(([operation, content], i) => ({ revision_id: `${id}:${i + 1}`, revision: i + 1, operation, content_hash: h(content), request_id: null, _created: dt(`2026-03-0${i + 1}T00:00:00+00:00`),
+				snapshot_json: canonicalJson(operation === "appended" ? { memory_id: id, _version: i + 1 } : { ...f, content, memory_id: id, _version: i + 1 }),
+				delta_json: operation === "appended" ? canonicalJson({ content: "abcdefghijklmnop", separator: "\n" }) : null }));
+			const content = steps.at(-1)[1];
+			return record({ eid: `hm-${eid}`, memoryId: id, scope: "sequoia", name: f.name, props: { ...f, content, content_hash: h(content), _version: steps.length }, revisions });
+		}
+		const live = spanning("live"), historical = spanning("historical", { replaced: true }), withSecret = spanning("with-secret", { description: "token=abc123secret" });
+		const acrossFields = record({ eid: "hm-fields", legacyId: uuid5("sequoia:project:Fields"), scope: "sequoia", name: "Fields", props: { description: "Auth Bearer", content: "abcdefghijklmnop" } });
+		assert.ok(m.bothqItem(historical).texts.every((t) => !/Bearer/.test(t.body) || t.live), "the body that met the credential is history only");
+		const dir = makeExport([kept, live, historical, withSecret, acrossFields]);
+		await m.plan({ exportDir: dir, refreshFrom: base });
+		assert.deepEqual([planned(dir).length, reviewOf(dir).map((r) => [r.key, r.reasons])], [0, [acrossFields, historical, live, withSecret].map((r) => [keyOf(r), ["needs_redaction"]])]);
+		const { entry, bind } = previewOf(dir, { refreshFrom: base });
+		// Only rebuilt reader states match: no stored value does.
+		assert.deepEqual([live, historical, acrossFields].map((r) => [...new Set(entry(r).findings.map((f) => `${f.field.replace(/:.*/, "")} ${f.rules}`))]), [["state auth_header"], ["state auth_header"], ["state auth_header"]]);
+		assert.deepEqual([live, historical, withSecret, acrossFields].map((r) => entry(r).complete), [false, false, false, false]);
+		const p = await m.plan({ exportDir: dir, refreshFrom: base, heldMigration: heldFile(dir, [], [live, historical, withSecret, acrossFields].map(bind)) });
+		assert.deepEqual([p.manifest.finalize, p.manifest.held_migration.approved_redacted, [...new Set(reviewOf(dir).flatMap((r) => r.reasons))]], [0, 0, ["redaction_incomplete"]]);
+		assert.ok(!commandsText(dir).includes("abcdefghijklmnop"));
+	});
+
+	it("holds a secret seen only in an intermediate append state or in a past description beside later appends, live and approved", async () => {
+		const kept = scoped("kept", "Kept"), base = await baseWith(kept);
+		/** A BothQ record built from [operation, text, separator, field changes] steps the way memory_store.py records them. */
+		function history(eid, ops, start = {}) {
+			const id = `hist-${eid}`, revisions = [];
+			let f = { name: `History ${eid}`, memory_type: "project", description: "", why: "", how_to_apply: "", objective: "", ...start }, content = "";
+			ops.forEach(([operation, text, separator = "\n", fields = {}], i) => {
+				if (operation === "appended") content += (content ? separator : "") + text; else { f = { ...f, ...fields }; content = text; }
+				revisions.push({ revision_id: `${id}:${i + 1}`, revision: i + 1, operation, content_hash: m.bothqContentHash({ ...f, content }), request_id: null, _created: dt(`2026-03-0${i + 1}T00:00:00+00:00`),
+					snapshot_json: canonicalJson(operation === "appended" ? { memory_id: id, _version: i + 1 } : { ...f, content, memory_id: id, _version: i + 1 }),
+					delta_json: operation === "appended" ? canonicalJson({ content: text, separator }) : null });
+			});
+			return record({ eid: `hm-${eid}`, memoryId: id, scope: "sequoia", name: f.name, props: { ...f, content, content_hash: m.bothqContentHash({ ...f, content }), _version: ops.length }, revisions });
+		}
+		// Revision 2 reads as an AWS key; revision 3's extra letter removes the word boundary, so the final text is clean.
+		const intermediate = [["saved", "AKIA"], ["appended", "A".repeat(16), ""], ["appended", "B", ""]];
+		// Revision 2 shows revision 1's description beside the appended credential; revision 3 clears both.
+		const pastFields = [["saved", ""], ["appended", "abcdefghijklmnop"], ["updated", "replaced", "\n", { description: "" }]];
+		const aws = history("aws", intermediate), awsApproved = history("aws-approved", intermediate, { why: "token=abc123secret" }),
+			past = history("past", pastFields, { description: "Auth Bearer" }), pastApproved = history("past-approved", pastFields, { description: "Auth Bearer", why: "token=abc123secret" });
+		for (const r of [aws, past]) assert.equal(m.redactedCopy(m.bothqItem(r)).findings.every((f) => f.field === "state:revision 2"), true);
+		const dir = makeExport([kept, aws, awsApproved, past, pastApproved]);
+		await m.plan({ exportDir: dir, refreshFrom: base });
+		assert.deepEqual([planned(dir).length, reviewOf(dir).map((r) => r.reasons)], [0, [["needs_redaction"], ["needs_redaction"], ["needs_redaction"], ["needs_redaction"]]]);
+		const { entry, bind } = previewOf(dir, { refreshFrom: base });
+		assert.deepEqual([aws, past].map((r) => [...new Set(entry(r).findings.map((f) => `${f.field} ${f.rules}`))]), [["state:revision 2 aws_key"], ["state:revision 2 auth_header"]]);
+		assert.deepEqual([aws, awsApproved, past, pastApproved].map((r) => entry(r).complete), [false, false, false, false]);
+		const p = await m.plan({ exportDir: dir, refreshFrom: base, heldMigration: heldFile(dir, [], [aws, awsApproved, past, pastApproved].map(bind)) });
+		assert.deepEqual([p.manifest.finalize, p.manifest.held_migration.approved_redacted, [...new Set(reviewOf(dir).flatMap((r) => r.reasons))]], [0, 0, ["redaction_incomplete"]]);
+	});
+});
