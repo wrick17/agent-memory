@@ -1,5 +1,15 @@
 # Import verification and rehearsal preparation
 
+## Held-record Work migration, 2026-11-02
+
+The owner-approved held-record migration added 112 Work records: 86 with assigned identities and 26 redacted copies. The Personal journal remains held because production permits imports only into Work. The already-hosted redactor-flagged records remain unchanged. The other privacy holds, possible duplicates, `raw_memories.md` and 178 absent sources keep their prior accounting.
+
+The first upload stopped in batch 3 with `import_disabled` for the Personal journal after publishing 74 Work records. The revised Work-only plan removed exactly the journal's two commands and used a fresh upload state because the plan hash and batch schedule changed. The old receipts were preserved. All 148 commands for the 74 published records replayed; the remaining 38 records published. The Work-only commands SHA-256 is `9c5bc8e4a4b56eb3fcbc08137d9009311f4bf9eb93dee8e4c7f3b32a2a2d2e58`.
+
+The pre-import audit matched 1,374 records; post-import and post-replay audits matched 1,486, all with zero mismatch or drift. A 50-command batch replayed without changes; an altered payload was refused with `hash_mismatch`. Work recall and get passed for three assigned and three redacted records; the latter showed redaction markers, and the six IDs did not appear in Personal recall. These are bounded isolation checks. Profile PITR target for rollback is `2026-11-02T10:25:05Z`. No new hosted export was created because backup retention could delete an older export.
+
+Private receipts are under `~/.agent-memory/migration-base/import-20261102/`: the baseline audit SHA-256 is `6c97bf8a0a111e11ca3e906d80e6bbc24d77f675ed6c9b1fc1ecca6530f11c41`; `fresh-work-upload/post-audit-before-replay.json` is `6019e083295795f7ecc91129e21845e500e78fdc4eba3c90a271c1d447593538`; and `fresh-work-upload/export/plan/audit-memory.wrick17.com.json` after replay is `81861f88fb17de06a09d72cd26b07ca8590d1741ecb92c4582df850f22e136ab`. The fresh command receipt SHA-256 is `3dc9b739bcf2e6c0cae5a973e7e251298e3e5880c849880dee4247f45a693279`; the spot-check receipt is `021aa9d38eb47d72ea25fd001aeb3a840fc40953c97510fbc527b4d5af3e23c5`.
+
 ## Account recovery and learning preview, 2026-11-02
 
 The isolated fixture opened the full-size Account restore after its owner diagnostic identified the archived holder and the proof-gated recheck reran reconciliation. The prior finding remains in recovery history. The postrestore audit matched 1,374 records, 5,291 expected texts, 5,699 revisions and 4,173 request receipts, with no semantic mismatch or drift. Five record/history reads and 20 Corpus reads passed, as did two stored replays and two changed-payload refusals with unchanged heads.
