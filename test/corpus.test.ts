@@ -28,6 +28,13 @@ async function settled(profile: string, generation: string, id: string): Promise
 	return id;
 }
 
+/** A corpus restore runs its chunks, its search index and its final checks in separate steps: steps until it is ready or fails. */
+async function corpusRestored(): Promise<Json> {
+	const { accountStub } = await import("../src/mcp");
+	for (let i = 0; i < 6; i++) { const r = await accountStub(env, OWNER).admin({ op: "restoreStep" }) as Json; if (!r.ok || r.value.state === "ready") return r; }
+	throw new Error("the corpus restore did not become ready");
+}
+
 /** A fresh active profile on the owner's account, an import token and a read token for it alone, and the env with CORPUS on. */
 async function isolated() {
 	await contextFor();
@@ -1064,7 +1071,7 @@ describe("corpus dated snapshots", () => {
 			s.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g2, p.name, new Date().toISOString());
 		});
 		await admin({ op: "beginCorpusRestore", profile: p.name, export: exportId });
-		expect(await admin({ op: "restoreStep" })).toMatchObject({ state: "ready" });
+		expect(await corpusRestored()).toMatchObject({ ok: true, value: { state: "ready" } });
 		await admin({ op: "openRestore" });
 		expect(await view(g2)).toEqual({ ledger: [[A, "superseded"], [B, "published"], [C, "abandoned"]], live: ["ep-b"], stage: 0 });
 		expect([await receipts(g2, C), await receipts(g2, B)]).toEqual([0, 7]);
@@ -1179,7 +1186,7 @@ describe("corpus v5 record snapshots", () => {
 		const first = await exportNow(), g2 = rand();
 		await move(g2);
 		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: first })).toMatchObject({ ok: true });
-		expect(await admin({ op: "restoreStep" })).toMatchObject({ ok: true, value: { state: "ready" } });
+		expect(await corpusRestored()).toMatchObject({ ok: true, value: { state: "ready" } });
 		expect(await admin({ op: "openRestore" })).toMatchObject({ ok: true });
 		expect((await get("pr", "acme/web#12", g2)).value).toMatchObject({ found: true, pull_requests: [{ rowid: 6 }] });
 		expect((await get("ticket", "XP-1", g2)).value.commits).toHaveLength(3);
@@ -1288,7 +1295,7 @@ describe("corpus schema-6 delivery snapshots", () => {
 			s.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", generation, p.name, new Date().toISOString());
 		});
 		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: id })).toMatchObject({ ok: true });
-		expect(await admin({ op: "restoreStep" })).toMatchObject({ ok: true, value: { state: "ready" } });
+		expect(await corpusRestored()).toMatchObject({ ok: true, value: { state: "ready" } });
 		expect(await admin({ op: "openRestore" })).toMatchObject({ ok: true });
 		const restored = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${generation}`));
 		const counts = () => runInDurableObject(restored, (_i, s) => DELIVERY.map((t) => s.storage.sql.exec<{ n: number }>(`SELECT count(*) AS n FROM ${t}`).one().n));

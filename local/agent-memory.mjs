@@ -34,7 +34,9 @@ const PATTERNS = [
 	[/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g, () => REDACTED],
 	[/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, () => REDACTED],
 	[/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, () => REDACTED],
-	[/\b(password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, (_m, k, s) => `${k}${s}${REDACTED}`],
+	// Stricter than the server's KEY_VALUE: a quoted key (JSON, dict) and a bounded name prefix (github_token) count too, as
+	// the server's SENSITIVE_KEY segment rule does for object keys; the value goes before any literal, prompt or pending text.
+	[/\b((?:[\w-]{0,64}[_-])?(?:password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret))(["']?)\s*([:=])\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, (_m, k, q, s) => `${k}${q}${s}${REDACTED}`],
 	// From the "://", with the scheme checked by one backward scan (see src/domain/redact.ts).
 	[/(:\/\/[^\s:/@]+:)[^\s/@]+(@)/g, (m, h, a, offset, whole) => (schemeBefore(whole, offset) ? `${h}${REDACTED}${a}` : m)],
 ];
@@ -328,10 +330,14 @@ export function rejectPart(part, sub) {
 	const problem = bodyProblem(p);
 	if (problem) return problem;
 	if (p.dropped.decisions !== 0 || p.dropped.corrections !== 0) return "dropped";
-	const haystack = [...p.asks, ...p.decisions, ...p.corrections].map((x) => x.text).concat(p.entities, Object.values(p.outcomes).flat().map(String)).join("\n");
-	const missing = literals(sub.messages).find((l) => !haystack.includes(l));
-	return missing ? `missing_literal` : null;
+	return missingLiterals(p, sub).length ? `missing_literal` : null;
 }
+
+/** The literals of `sub` that no string of the schema-valid part `p` contains. */
+const missingLiterals = (p, sub) => {
+	const haystack = [...p.asks, ...p.decisions, ...p.corrections].map((x) => x.text).concat(p.entities, Object.values(p.outcomes).flat().map(String)).join("\n");
+	return literals(sub.messages).filter((l) => !haystack.includes(l));
+};
 
 // ---------- subranges ----------
 
@@ -431,7 +437,10 @@ export async function consolidate(range, messages, { runner, server, dir, repo }
 			if (out.kind === "tool_event") return { status: "stuck", reason: "tool_event", parts: kept.concat(made) };
 			if (out.kind === "runtime_warning") return { status: "unavailable", reason: "runtime_warning", parts: kept.concat(made) };
 			if (out.kind !== "ok") { why = out.kind; continue; }
-			const body = JSON.stringify(redactDeep(out.part));
+			const part = redactDeep(out.part);
+			// The required literals are known here, not to the model: add any it paraphrased, verbatim, rather than retry to stuck.
+			if (!bodyProblem(part)) part.entities.push(...missingLiterals(part, sub));
+			const body = JSON.stringify(part);
 			why = rejectPart(body, sub);
 			if (!why) accepted = body;
 		}
@@ -588,7 +597,8 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		// Acknowledged earlier; a crash may have left its local copies behind.
 		if (r.status === "consolidated") { cleanup(id); continue; }
 		if (r.status === "refused") { cleanup(id); outcomes[id] = "refused"; continue; }
-		const messages = readJson(path.join(pendingDir, `${safeName(id)}.txt`), null);
+		// Re-redacted: text kept by an older client was redacted with fewer patterns, and literals, prompt and check all read it.
+		const messages = readJson(path.join(pendingDir, `${safeName(id)}.txt`), null)?.map((m) => ({ ...m, text: redact(m.text) })) ?? null;
 		if (!messages) {
 			// The text is gone. If the server already holds the range's manifest (a crash before the acknowledgement was saved),
 			// adopt it; otherwise the range is stuck. Nothing is invented.

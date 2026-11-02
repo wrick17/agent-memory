@@ -65,6 +65,11 @@ describe("save and update", () => {
 		const got = await call(c, "get_memory", { memory_id: first.memory_id });
 		expect(got.content).toBe("token=[REDACTED] and [REDACTED]");
 		expect(await call(c, "save_memory", args)).toMatchObject({ action: "replayed" });
+		// A quoted structured key, as the local capture client recognizes it: the whole value goes before storage and hashing.
+		const json = { ...note, name: "Has a JSON secret", content: `Inspect the diagnostic sample.\n{"api_key":"synthetic-only-value-42"} {'github_token': 'synthetic-only-value-42'}\n{"api_key":"ignored-prefix\\" synthetic-only/private-value-42"}`, request_id: "redact-json-1" };
+		const saved = await call(c, "save_memory", json);
+		expect((await call(c, "get_memory", { memory_id: saved.memory_id })).content).toBe(`Inspect the diagnostic sample.\n{"api_key":[REDACTED]} {'github_token':[REDACTED]}\n{"api_key":[REDACTED]}`);
+		expect(await call(c, "save_memory", json)).toMatchObject({ action: "replayed", memory_id: saved.memory_id });
 	});
 });
 

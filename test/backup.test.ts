@@ -2,7 +2,7 @@
 // refusals that guard against data loss and stray writes. Synthetic key and data only.
 import { createExecutionContext, createScheduledController, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountRecovery, Recovery } from "../src/account/store";
 import { listExports, readChunk, readManifest, type Manifest } from "../src/backup";
 import { driveTransfer, transferPorts } from "../src/transfer";
@@ -33,6 +33,11 @@ async function settled(profile: string, generation: string, id: string): Promise
 	const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${profile}:${generation}`));
 	for (let i = 0; i < 20 && !(await listExports(env, `corpus-${profile}`)).includes(id); i++) await runDurableObjectAlarm(store);
 	return id;
+}
+/** A corpus restore runs its chunks, its search index and its final checks in separate steps: steps until it is ready or fails. */
+async function corpusRestored(): Promise<Outcome<unknown>> {
+	for (let i = 0; i < 6; i++) { const r = await admin({ op: "restoreStep" }); if (!r.ok || (r.value as Recovery).state === "ready") return r; }
+	throw new Error("the corpus restore did not become ready");
 }
 const personal = async () => (await value<{ name: string; generation: string }[]>(admin({ op: "listProfiles" }))).find((p) => p.name === "personal")!.generation;
 
@@ -526,7 +531,7 @@ describe("corpus resumable export", () => {
 			sql.exec("UPDATE generations SET state = 'retired' WHERE id = ?", g);
 		});
 		await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
-		expect(await value(admin({ op: "restoreStep" }))).toMatchObject({ state: "ready" });
+		expect(await value(corpusRestored())).toMatchObject({ state: "ready" });
 		expect(await value(admin({ op: "openRestore" }))).toMatchObject({ state: "opened" });
 		const restored = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g2}`));
 		expect(await contributors(restored)).toEqual(expected);
@@ -589,7 +594,7 @@ describe("corpus export and restore", () => {
 		const begun = await value<Recovery>(admin({ op: "beginCorpusRestore", profile: name, export: "latest" }));
 		expect(begun).toMatchObject({ kind: "corpus", state: "restoring", to: g2, export: third });
 		expect(await admin({ op: "export" })).toMatchObject({ ok: false, error: { code: "busy" } });
-		expect(await value(admin({ op: "restoreStep" }))).toMatchObject({ state: "ready" });
+		expect(await value(corpusRestored())).toMatchObject({ state: "ready" });
 		expect(await value(admin({ op: "openRestore" }))).toMatchObject({ state: "opened" });
 		expect(await value(admin({ op: "restoreRecord", id: begun.id }))).toMatchObject({ kind: "corpus", state: "opened" });
 		await runInDurableObject(corpus(g2), (_i, st) => {
@@ -1197,5 +1202,133 @@ describe("scheduled export attribution", () => {
 		const manual = (await status()).last_export!;
 		expect(manual.trigger).toEqual({ kind: "manual" });
 		expect(manual.stores[`corpus-${name}`]).toEqual({ generation: g, state: "skipped_recent", export_id: corpus.export_id, due: false, export_generation: g });
+	});
+});
+
+describe("corpus restore search index at scale", () => {
+	it("with a deployed (frozen) clock, rebuilds the search index in fixed batches: chunks, then 50,000 documents, then the rest, then the final checks", async () => {
+		await contextFor();
+		const name = `fz${crypto.randomUUID().slice(0, 6)}`, g1 = crypto.randomUUID().slice(0, 8), g2 = crypto.randomUUID().slice(0, 8), N = 50_201;
+		const acct = (f: (sql: SqlStorage) => void) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => f(s.storage.sql));
+		const corpus = (g: string) => env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g}`));
+		await acct((sql) => {
+			const now = new Date().toISOString();
+			sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${g1}`, g1, now);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g1, name, now);
+		});
+		await runInDurableObject(corpus(g1), (_i, s) => {
+			const sql = s.storage.sql;
+			for (const [k, v] of [["user_id", OWNER], ["profile", name], ["generation", g1]]) sql.exec("INSERT INTO corpus_store_meta (key, value) VALUES (?, ?)", k, v);
+			for (let i = 1; i <= N; i++) sql.exec("INSERT INTO corpus_search_documents (rowid, evidence_id, kind, key, repo, date, title, detail) VALUES (?, ?, 'commit', ?, 'org/alpha', '2026-01-01', ?, ?)",
+				i, `e:${i}`, `k${i}`, `title ${i}`, `detail words ${i % 997}`);
+		});
+		const id = await settled(name, g1, (await value<Record<string, { id: string }>>(admin({ op: "export", profile: name, corpus: true })))[`corpus-${name}`]!.id);
+		await acct((sql) => {
+			sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g2, `${OWNER}:${name}:${g2}`, name);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g2, name, new Date().toISOString());
+			sql.exec("UPDATE generations SET state = 'retired' WHERE id = ?", g1);
+		});
+		await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
+		const restored = (k: string) => runInDurableObject(corpus(g2), (_i, s) => s.storage.sql.exec("SELECT value FROM corpus_store_meta WHERE key = ?", k).toArray()[0]?.value);
+		type Step = Recovery & { progress?: { applied: number; chunks: number; done: boolean } };
+		const step = () => value<Step>(admin({ op: "restoreStep" }));
+		// A deployed Worker's clock advances only on I/O; frozen here, so only a fixed count can end a synchronous rebuild.
+		const T = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(T);
+		try {
+			expect(await runInDurableObject(corpus(g2), () => Date.now())).toBe(T);
+			// 1: the step that applies the last chunk does no index work.
+			const s1 = await step();
+			expect(s1.progress).toMatchObject({ done: false });
+			expect(s1.progress!.applied).toBe(s1.progress!.chunks);
+			expect(await restored("restore_fts")).toBe("0");
+			// 2: exactly 250 batches of 200 documents.
+			expect((await step()).progress).toMatchObject({ done: false });
+			expect(await restored("restore_fts")).toBe("50000");
+			// 3: the remaining 201 documents finish the index, without the final checks.
+			expect((await step()).progress).toMatchObject({ done: false });
+			expect([await restored("restore_fts"), await restored("restore_done")]).toEqual(["done", undefined]);
+			// 4: the final counts, then ready.
+			expect((await step()).state).toBe("ready");
+			expect(await restored("restore_done")).toBe(id);
+		} finally { vi.restoreAllMocks(); }
+		expect(await value(admin({ op: "openRestore" }))).toMatchObject({ state: "opened" });
+		expect(await runInDurableObject(corpus(g2), (_i, s) => s.storage.sql.exec("SELECT count(*) AS n FROM corpus_search_documents").one().n)).toBe(N);
+	}, 300_000);
+});
+
+describe("corpus restore abort during a step", () => {
+	it("a step paused in its authority or manifest read never writes after an abort, fresh or resumed; a later restore still fills the generation", async () => {
+		await contextFor();
+		const name = `ca${crypto.randomUUID().slice(0, 6)}`, g1 = crypto.randomUUID().slice(0, 8), g2 = crypto.randomUUID().slice(0, 8);
+		const acct = (f: (sql: SqlStorage) => void) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => f(s.storage.sql));
+		const corpus = (g: string) => env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g}`));
+		await acct((sql) => {
+			const now = new Date().toISOString();
+			sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${g1}`, g1, now);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g1, name, now);
+		});
+		await runInDurableObject(corpus(g1), (_i, s) => {
+			const sql = s.storage.sql;
+			for (const [k, v] of [["user_id", OWNER], ["profile", name], ["generation", g1]]) sql.exec("INSERT INTO corpus_store_meta (key, value) VALUES (?, ?)", k, v);
+			sql.exec("INSERT INTO repos (rowid, full_name, owner, name, archived, private, commit_count, ref_count, empty) VALUES (7, 'org/alpha', 'org', 'alpha', 0, 1, 1, 1, 0)");
+		});
+		const id = await settled(name, g1, (await value<Record<string, { id: string }>>(admin({ op: "export", profile: name, corpus: true })))[`corpus-${name}`]!.id);
+		await acct((sql) => {
+			sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g2, `${OWNER}:${name}:${g2}`, name);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g2, name, new Date().toISOString());
+			sql.exec("UPDATE generations SET state = 'retired' WHERE id = ?", g1);
+		});
+		const state = () => runInDurableObject(corpus(g2), (_i, s) => ({
+			markers: s.storage.sql.exec("SELECT key FROM corpus_store_meta WHERE key LIKE 'restore_%' ORDER BY key").toArray().map((r) => r.key),
+			repos: s.storage.sql.exec("SELECT count(*) AS n FROM repos").one().n,
+		}));
+		let paused: "authority" | "manifest" | false = false, reached = () => {}, release = () => {};
+		const pause = async (at: "authority" | "manifest") => {
+			if (paused === at) { paused = false; await new Promise<void>((r) => { release = r; reached(); }); }
+		};
+		await runInDurableObject(corpus(g2), (inst) => {
+			const own = inst as unknown as { env: Env }, bucket = own.env.BACKUPS;
+			const accounts = new Proxy(own.env.ACCOUNT, { get: (t, p) => p !== "get" ? (Reflect.get(t, p) as (...a: unknown[]) => unknown).bind?.(t) ?? Reflect.get(t, p)
+				: (...args: unknown[]) => new Proxy((t.get as (...a: unknown[]) => object).apply(t, args), {
+					get: (stub, key) => key !== "restoreAuthority" ? Reflect.get(stub, key) : async (...a: unknown[]) => {
+						const result = await Reflect.apply(Reflect.get(stub, key) as (...a: unknown[]) => Promise<Outcome<unknown>>, stub, a);
+						if (result.ok) await pause("authority");
+						return result;
+					},
+				}) });
+			const backups = new Proxy(bucket, { get: (t, p) => p !== "get" ? (Reflect.get(t, p) as (...a: unknown[]) => unknown).bind?.(t) ?? Reflect.get(t, p)
+				: async (k: string, ...a: unknown[]) => {
+					if (k.endsWith("/manifest.enc")) await pause("manifest");
+					return (bucket.get as (...x: unknown[]) => unknown).call(bucket, k, ...a);
+				} });
+			own.env = Object.create(own.env, { ACCOUNT: { value: accounts }, BACKUPS: { value: backups } }) as Env;
+		});
+		const abortedDuringStep = async (at: "authority" | "manifest") => {
+			paused = at;
+			const waiting = new Promise<void>((r) => { reached = r; });
+			const step = admin({ op: "restoreStep" });
+			await waiting;
+			expect(await value(admin({ op: "abortRestore" }))).toMatchObject({ state: "aborted" });
+			expect(await state()).toEqual({ markers: [], repos: 0 });
+			release();
+			expect(await step).toMatchObject({ ok: false });
+			expect(await state()).toEqual({ markers: [], repos: 0 });
+		};
+
+		for (const at of ["authority", "manifest"] as const) {
+			await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
+			await abortedDuringStep(at);
+			await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
+			expect(await value<Recovery & { progress?: { done: boolean } }>(admin({ op: "restoreStep" }))).toMatchObject({ progress: { done: false } });
+			expect((await state()).repos).toBe(1);
+			await abortedDuringStep(at);
+		}
+
+		// The cleared generation still takes a restore to the end.
+		await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
+		expect(await value(corpusRestored())).toMatchObject({ state: "ready" });
+		expect(await value(admin({ op: "openRestore" }))).toMatchObject({ state: "opened" });
+		expect((await state()).repos).toBe(1);
 	});
 });

@@ -7,7 +7,9 @@ const AUTH_HEADER = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
 const VENDOR_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g;
 const AWS_KEY = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
-const KEY_VALUE = /\b(password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+// A quoted key (JSON, dict) and a bounded name prefix (github_token) count too, as SENSITIVE_KEY's segment rule does for object
+// keys; the bound keeps a long hyphenated run linear. Kept identical to local/agent-memory.mjs.
+const KEY_VALUE = /\b((?:[\w-]{0,64}[_-])?(?:password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret))(["']?)\s*([:=])\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi;
 // A URL's user-info password, matched from its "://". The scheme is the run of scheme characters just before it and must
 // hold a letter, exactly as BothQ's `[a-z][a-z0-9+.-]*://` requires; scanning back once per "://" keeps a long run linear,
 // where retrying that pattern at every character was quadratic (a 1 MB run took minutes).
@@ -25,7 +27,7 @@ export function redactText(value: string): string {
 		.replace(VENDOR_TOKEN, REDACTED)
 		.replace(AWS_KEY, REDACTED)
 		.replace(JWT, REDACTED)
-		.replace(KEY_VALUE, (_m, key: string, sep: string) => `${key}${sep}${REDACTED}`)
+		.replace(KEY_VALUE, (_m, key: string, quote: string, sep: string) => `${key}${quote}${sep}${REDACTED}`)
 		.replace(URL_PASSWORD, (m: string, head: string, at: string, offset: number, whole: string) => (schemeBefore(whole, offset) ? `${head}${REDACTED}${at}` : m));
 }
 

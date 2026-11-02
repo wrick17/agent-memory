@@ -479,6 +479,40 @@ describe("review regressions", () => {
 		assert.equal(am.rejectPart({ ...emptyPart(), asks: ask, entities: ["docs/x.md", "notes/y.md"] }, quoted), "missing_literal");
 	});
 
+	it("adds the literals a schema-valid model part paraphrased verbatim, instead of retrying the range to stuck", async () => {
+		const f = transcript("paraphrase", [claudeLine("user", "Keep the UTF-8 bound and/or the 8 KB cap; follow AM-09 for the `pending` range.")]);
+		const server = fakeServer();
+		const runner = fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: "Keep the UTF-8 bound and the 8 KB cap.", pos: 0 }], entities: ["AM-09", "pending"] } });
+		const r = await am.processSession(trigger("claude-code", "sess-paraphrase", f), { server, runner });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.equal(runner.calls, 1);
+		assert.ok(server.storedText().includes("and/or"));
+	});
+
+	it("redacts a quoted structured secret before literals, prompt or upload, including pending text an older client kept", async () => {
+		const value = "synthetic-only-value-42", tail = "synthetic-only/private-value-42";
+		// An escaped quote stays inside the value; stopping there would leave a path-shaped tail for the literal append.
+		const escaped = JSON.stringify({ api_key: `ignored-prefix" ${tail}` });
+		assert.equal(am.redact(`{"api_key":"${value}"} {'github_token': '${value}'} ${escaped}`), `{"api_key":[REDACTED]} {'github_token':[REDACTED]} {"api_key":[REDACTED]}`);
+		const f = transcript("structured", [claudeLine("user", `Inspect the diagnostic sample.\n{"api_key":"${value}"}\n${escaped}`)]);
+		const seen = [];
+		const runner = { available: true, calls: 0, async run(sub) { this.calls++; seen.push(JSON.stringify(sub.messages)); return { kind: "ok", part: { ...emptyPart(), asks: [{ text: "Inspect the diagnostic sample.", pos: 0 }] } }; } };
+		// An older client's pending copy still holding the value: the same range is consolidated from re-redacted text.
+		const server = fakeServer(), offline = { ...server, ingest: async () => { throw new Error("network down"); } };
+		await am.processSession(trigger("claude-code", "sess-structured", f), { server: offline, runner: null });
+		const pending = path.join(am.home(), "pending");
+		const kept = fs.readdirSync(pending).find((x) => x.endsWith(".txt"));
+		fs.writeFileSync(path.join(pending, kept), JSON.stringify(JSON.parse(fs.readFileSync(path.join(pending, kept), "utf8")).map((m) => ({ ...m, text: `${m.text}\n{"api_key":"${value}"}\n${escaped}` }))));
+		const r = await am.processSession(trigger("claude-code", "sess-structured", f), { server, runner });
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.equal(runner.calls, 1);
+		for (const secret of [value, tail]) {
+			assert.ok(!seen.join("").includes(secret));
+			assert.ok(!JSON.stringify(server.log).includes(secret));
+			assert.ok(!fs.readdirSync(path.join(am.home(), "spool"), { recursive: true }).some((x) => fs.readFileSync(path.join(am.home(), "spool", x), "utf8").includes(secret)));
+		}
+	});
+
 	it("L2: a run started before the debounce deadline waits for it and then captures", async () => {
 		const f = transcript("debounce", [claudeLine("user", "Use the other timeout.")]);
 		enqueue("sess-debounce", f);

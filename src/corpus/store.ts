@@ -22,6 +22,11 @@ export type { Op, PlanHeader, RefreshCommand } from "./refresh";
 
 /** 90% of the 10 GB Paid object limit. */
 const SIZE_LIMIT = 9_000_000_000;
+/**
+ * Search-index batches (200 documents each) one restore step rebuilds. A count, not a time: a deployed Worker's clock advances
+ * only on I/O, and this rebuild is synchronous, so a time bound never ends it before the whole index is done.
+ */
+const FTS_BATCHES = 250;
 
 export const CORPUS_MIGRATIONS: Migration[] = [[
 	...Object.values(FAMILIES).flatMap((f) => [f.ddl, ...f.indexes]),
@@ -115,6 +120,8 @@ function applyChunk(sql: SqlStorage, c: CorpusChunk): ChunkReceipt {
 }
 
 export class CorpusStore extends DurableObject<Env> {
+	/** discardRestore calls on this instance: a restore step that awaited across one may belong to an aborted restore. */
+	private discards = 0;
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		// A cleared generation keeps only its closed marker; it is never migrated again.
@@ -241,36 +248,47 @@ export class CorpusStore extends DurableObject<Env> {
 	/**
 	 * Internal RPC from AccountStore's open corpus restore: applies a verified corpus export, one chunk per transaction with its
 	 * progress, into this empty generation, then rebuilds the contentless search index from the restored documents and checks
-	 * every table's row count. Identity, schema version and the closed marker stay this generation's.
+	 * every table's row count, each phase in steps of its own: chunks for about ten seconds, at most FTS_BATCHES index batches,
+	 * then the final checks. Identity, schema version and the closed marker stay this generation's.
 	 */
 	async restoreStep(who: ProfileRef, r: { id: string; exportId: string }): Promise<Outcome<{ applied: number; chunks: number; done: boolean }>> {
 		try {
+			const discards = this.discards;
 			const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "restoreAuthority">;
 			const auth = await account.restoreAuthority(who, r.id, "corpus");
 			if (!auth.ok) return auth;
+			if (this.discards !== discards) return fail("forbidden", "this corpus restore was aborted or replaced");
 			const sql = this.ctx.storage.sql;
 			assertOpen(sql);
 			this.bind(who);
+			const meta = (k: string) => sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = ?`, k).toArray()[0]?.value;
+			// An abort may discard this restore during any await below; every write is preceded, in the same turn, by this check that
+			// no discard ran, the generation is still bound and open, and its marker is the one this step began with (none if first).
+			const had = meta("restore_id");
+			const current = (id: string | undefined) => {
+				if (this.discards !== discards || closedState(sql) || meta("generation") !== who.generation || meta("restore_id") !== id) throw Fail.of("forbidden", "this corpus restore was aborted or replaced");
+			};
 			const m = await readManifest(this.env, `corpus-${who.profile}`, r.exportId, who.userId);
 			if (!m.ok) return m;
 			if (m.value.profile !== who.profile || m.value.schema_version !== CORPUS_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
-			const meta = (k: string) => sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = ?`, k).toArray()[0]?.value;
-			if (!meta("restore_id")) {
+			current(had);
+			if (!had) {
 				if (exportTables(sql, { control: [] }).some((t) => t !== META && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a corpus restore needs an empty corpus generation");
 				// A restore begins into an empty generation: any export of it is moot and ends before restore rows land; the alarm deletes its objects.
 				const cancelled = cancelExport(this.ctx.storage, this.spec(), "a restore began into this corpus generation");
 				sql.exec(`INSERT INTO ${META} (key, value) VALUES ('restore_id', ?), ('restore_next', '0'), ('restore_fts', '0')`, r.id);
 				if (cancelled) await this.ctx.storage.setAlarm(Date.now());
-			} else if (meta("restore_id") !== r.id) return fail("validation", "this corpus generation belongs to another restore");
+			} else if (had !== r.id) return fail("validation", "this corpus generation belongs to another restore");
 			const kept = (k: unknown) => ["user_id", "profile", "generation", "schema_version", "closed"].includes(String(k)) || String(k).startsWith("restore_");
 			const adjust = (table: string, cols: string[], row: unknown[]) => (table === META && kept(row[cols.indexOf("key")]) ? null : row);
 			// Version 2 (journaled): baseline rows were read at different moments, so every chunk replaces; a delta deletes first.
 			const journaled = m.value.version === 2;
 			const all = { run: (q: string, ...p: SqlStorageValue[]) => sql.exec(q, ...p).toArray(), spent: () => false };
-			const started = Date.now(), live = () => Date.now() - started < 10_000;
+			const started = Date.now(), live = () => Date.now() - started < 10_000, from = Number(meta("restore_next"));
 			// Chunks hold at most 500 rows and 512 KB, the scale of one uploaded corpus chunk, so each applies in one transaction.
 			while (Number(meta("restore_next")) < m.value.chunks.length && live()) {
 				const at = Number(meta("restore_next")), c = prKeyFree(await readChunk(this.env, m.value, at));
+				current(r.id);
 				this.ctx.storage.transactionSync(() => {
 					if (Number(meta("restore_next")) !== at) return;
 					if (journaled && c.deletes?.length) {
@@ -282,16 +300,19 @@ export class CorpusStore extends DurableObject<Env> {
 					sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('restore_next', ?)`, String(at + 1));
 				});
 			}
+			current(r.id); // the rest of this step is synchronous
 			const applied = Number(meta("restore_next"));
-			if (applied < m.value.chunks.length) return ok({ applied, chunks: m.value.chunks.length, done: false });
+			// A step that applied chunks ends here, so the index rebuild and the final checks each start in a step of their own.
+			if (applied < m.value.chunks.length || applied > from) return ok({ applied, chunks: m.value.chunks.length, done: false });
 			// The search index is contentless and never exported: it is rebuilt from the restored documents, as an upload builds it.
-			while (meta("restore_fts") !== "done" && live()) this.ctx.storage.transactionSync(() => {
+			let batches = 0;
+			while (meta("restore_fts") !== "done" && batches++ < FTS_BATCHES) this.ctx.storage.transactionSync(() => {
 				const after = Number(meta("restore_fts"));
 				const docs = sql.exec<{ id: number; key: string; repo: string; title: string; detail: string }>("SELECT rowid AS id, key, repo, title, detail FROM corpus_search_documents WHERE rowid > ? ORDER BY rowid LIMIT 200", after).toArray();
 				for (const d of docs) sql.exec("INSERT INTO corpus_search_fts (rowid, key, repo, title, detail) VALUES (?, ?, ?, ?, ?)", d.id, d.key, d.repo, d.title, d.detail);
 				sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('restore_fts', ?)`, docs.length < 200 ? "done" : String(docs.at(-1)!.id));
 			});
-			if (meta("restore_fts") !== "done") return ok({ applied, chunks: m.value.chunks.length, done: false });
+			if (batches > 0) return ok({ applied, chunks: m.value.chunks.length, done: false });
 			if (!meta("restore_done")) {
 				for (const [t, n] of Object.entries(m.value.counts)) {
 					if (t !== META && sql.exec<{ n: number }>(`SELECT count(*) AS n FROM "${t}"`).one().n !== n) return fail("validation", `restored ${t} does not match the manifest row count`);
@@ -308,6 +329,7 @@ export class CorpusStore extends DurableObject<Env> {
 
 	/** Internal RPC from an aborted corpus restore: clears what it wrote and leaves an empty, migrated generation. */
 	async discardRestore(who: ProfileRef, id: string): Promise<void> {
+		this.discards++;
 		const sql = this.ctx.storage.sql;
 		const want: Record<string, string> = { user_id: who.userId, profile: who.profile, generation: who.generation };
 		const still = () => !closedState(sql) && sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'restore_id'`).toArray()[0]?.value === id
