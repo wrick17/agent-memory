@@ -1066,8 +1066,22 @@ This source passed the affected [verification](/private/tmp/am-union-verify-terr
 
 The USER one-factor witness supports the reviewed narrow environment correction; it does not prove live model access or token validity. The reviewed source includes that correction, exact pre-init `ui_invalidate` / `ui.render` exception, and capture diagnostic/path-period fixes. At the frozen source pins, prior affected verification is reused: 153 Worker, 57 capture and seven runner cases, with typecheck, lint and build/load checks. The private Work runner passed offline preflight; the prior two query invocations were spent without operations. A new grant remains pending, and the recorded 20-hour Work lease interval holds a live run. [Preflight](/private/tmp/am-p1-work-preflight-terra-20261102/receipt.json).
 
-Profile and Account encrypted chunk verification passed at the counts recorded in [import verification](import-verification.md#bounded-runtime-and-source-checkpoint-2026-11-02). Corpus repair prefetch later stopped at chunk 4037 with an unknown failure; 1,656 chunks remain missing and integrity/restore/wipe remain open. Canonical and the installed global client remain on their previous releases; source adoption is not runtime or feature completion. Reset-instance late-R2 settlement and timing remain unverified.
+Profile and Account encrypted chunk verification passed at the counts recorded in [import verification](import-verification.md#bounded-runtime-and-source-checkpoint-2026-11-02). At that checkpoint Corpus repair prefetch stopped at chunk 4037 with an unknown failure and 1,656 chunks missing; the later integrity result is recorded below. Canonical and the installed global client remain on their previous releases; source adoption is not runtime or feature completion. Reset-instance late-R2 settlement and timing remain unverified.
 
 ## Bounded acceptance follow-up, 2026-11-02
 
 The Corpus repair attempt stopped after 2,236 newly validated and published chunks, with 1,656 missing; no HTTP, Cloudflare or timeout classification was recorded for the failed download. [Receipt](/private/tmp/am-corpus-prefetch-v2-zkXi0Iu7/run-Tt5ggo/receipt.json). Exact replay after a routing-rule change and the bounded granted-device Work/Me recall, explore and company-free checks passed at the scopes in [import verification](import-verification.md#bounded-acceptance-follow-up-2026-11-02). These do not establish native owner OAuth or full Corpus recovery.
+
+## Integrity and self-host acceptance follow-up, 2026-11-02
+
+The full Corpus encrypted export passed authenticated manifest, SHA and count checks across all 7,549 chunks for the approved 2,564,965 stored rows. No whole-table hash is established. Profile and Account chunk checks retain their 74- and 18-chunk scopes. New-fixture recovery run 50 is active; full restore and wipe are not yet accepted. Reset-instance late-R2 settlement and timing remain unverified.
+
+The canonical check found all 1,374 planned IDs at their expected heads, eight supersedes links and 20 frozen Corpus projections. At that checkpoint the corrected full semantic/text auditor was adopted in source only and had not run; the later canonical result is recorded below. The isolated same-account own-deployment setup criterion is accepted at the scope of the [setup and ordinary-flow evidence](import-verification.md#own-deployment-and-integrity-follow-up-2026-11-02). The schedule is off in that fixture. Natural OAuth refresh, full recovery, cross-machine use and physical cutover remain open.
+
+The global client `f3adba81` and Git `d90bbe2a` were delivered earlier. This auditor and guide source batch is uncommitted. BothQ remains running and readable, with no ordinary dual writes.
+
+## Canonical audit and export attribution source, 2026-11-02
+
+The corrected canonical semantic/text audit passed 1,374 records and 5,291 texts, with 5,699 revisions, 4,173 requests and zero semantic mismatches or drift. Wrapper provenance was classified as other for 1,374 records; eight supersedes links remain separately evidenced. [Audit and scope](import-verification.md#canonical-audit-and-scheduled-export-attribution-2026-11-02).
+
+The adopted scheduling source records future manual or scheduled triggers and per-store export state, generation and ID; recovery status adds the latest failed export. A Corpus export in progress stays running in that metadata. The dashboard does not render the new fields, and the November 1 event cannot be attributed retrospectively. Profile restore passed; Corpus restore remained in progress at 6,953 of 7,549 chunks with zero findings at 02:13:47 UTC. Account restore, full recovery, wipe and cutover remain open.

@@ -1,6 +1,6 @@
 // Encrypted export and restore from an export (section 18): one real workerd, SQLite and local R2 roundtrip, plus the
 // refusals that guard against data loss and stray writes. Synthetic key and data only.
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, createScheduledController, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AccountRecovery, Recovery } from "../src/account/store";
@@ -12,6 +12,7 @@ import { fail, type Outcome } from "../src/domain/types";
 import { accountStub, profileStub } from "../src/mcp";
 import type { ProfileStore } from "../src/profile/store";
 import { wipePorts, wipeProfile } from "../src/wipe";
+import worker from "../src/worker";
 import { call, contextFor, devicePrincipal, deviceToken, journal, OWNER, outcome } from "./helpers";
 
 const admin = (cmd: Parameters<ReturnType<typeof accountStub>["admin"]>[0]) => accountStub(env, OWNER).admin(cmd);
@@ -1156,5 +1157,45 @@ describe("restore drill", () => {
 		expect(await (await env.BACKUPS.get(`generations/${begun.scratch}.json`))!.json()).toMatchObject({ state: "retired" });
 		const restore = await value<Recovery>(admin({ op: "beginRestore", profile: "personal", export: "latest" }));
 		expect(await value(admin({ op: "abortRestore", id: restore.id }))).toMatchObject({ state: "aborted" });
+	});
+});
+
+// Last in this file: a full scheduled export touches every active store of the shared account.
+describe("scheduled export attribution", () => {
+	it("binds the platform's scheduled event to the stored result with each store's generation and export id; a manual run is manual; a corpus is due and running, then skipped as recent", async () => {
+		const c = await contextFor();
+		await call(c, "save_memory", { name: "Scheduled probe", type: "reference", description: "s", content: "scheduled body", profile: "personal" }); // a bound profile exports
+		const name = `sx${crypto.randomUUID().slice(0, 6)}`, g = crypto.randomUUID().slice(0, 8);
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, st) => {
+			const now = new Date().toISOString();
+			st.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${g}`, g, now);
+			st.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, name, now);
+		});
+		await runInDurableObject(env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g}`)), (_i, st) => {
+			for (const [k, v] of [["user_id", OWNER], ["profile", name], ["generation", g]]) st.storage.sql.exec("INSERT INTO corpus_store_meta (key, value) VALUES (?, ?)", k, v);
+			st.storage.sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name) VALUES (2, 'org/alpha', 1, 1, 'dev')");
+		});
+		type Store = { generation: string | null; state: string; export_id: string | null; due?: boolean; export_generation?: string | null };
+		const status = () => value<{ last_export: { trigger: Record<string, unknown>; stores: Record<string, Store> } | null; last_export_failed: unknown }>(admin({ op: "restoreStatus" }));
+
+		const ctx = createExecutionContext();
+		await worker.scheduled!(createScheduledController({ scheduledTime: Date.parse("2026-11-03T03:17:00Z"), cron: "17 3 * * *" }), env, ctx);
+		await waitOnExecutionContext(ctx);
+		const nightly = (await status()).last_export!;
+		expect(nightly.trigger).toEqual({ kind: "scheduled", scheduled_time: "2026-11-03T03:17:00.000Z", cron: "17 3 * * *" });
+		expect(nightly.stores.personal).toMatchObject({ generation: await personal(), state: "completed" });
+		expect(await listExports(env, "profile-personal")).toContain(nightly.stores.personal!.export_id);
+		expect(nightly.stores.account).toMatchObject({ generation: null, state: "completed" });
+		expect(await listExports(env, "account")).toContain(nightly.stores.account!.export_id);
+		// The corpus was due (no complete export yet) and its export is running, named by its id, not claimed as saved.
+		const corpus = nightly.stores[`corpus-${name}`]!;
+		expect(corpus).toMatchObject({ generation: g, state: "running", due: true });
+		expect(await settled(name, g, corpus.export_id!)).toBe(corpus.export_id);
+
+		// A manual run says so, and the corpus is skipped as covered by that recent export of generation g.
+		await value(admin({ op: "export" }));
+		const manual = (await status()).last_export!;
+		expect(manual.trigger).toEqual({ kind: "manual" });
+		expect(manual.stores[`corpus-${name}`]).toEqual({ generation: g, state: "skipped_recent", export_id: corpus.export_id, due: false, export_generation: g });
 	});
 });

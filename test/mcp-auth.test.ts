@@ -1192,7 +1192,9 @@ it("recovery conflict read and choice are owner only: a device token gets 403 an
 		const r = await exports.default.fetch(new Request(origin + path, { method, headers: { authorization: `Bearer ${t}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
 		return { status: r.status, body: await r.json() as any }; // response bodies are checked field by field
 	};
-	expect((await http("/api/backups/export", "POST", { profile: "personal" })).status).toBe(200);
+	// A public body cannot claim scheduled provenance: the stored latest result is manual.
+	expect((await http("/api/backups/export", "POST", { profile: "personal", trigger: { scheduled_time: 0, cron: "17 3 * * *" } })).status).toBe(200);
+	expect((await http("/api/recovery")).body.last_export).toMatchObject({ trigger: { kind: "manual" }, stores: { personal: { state: "completed" } } });
 	const begun = await http("/api/profiles/personal/restore", "POST", { export: "latest" });
 	expect(begun.status).toBe(200);
 	const id = begun.body.id as string, device = (await deviceToken(`recovery-${crypto.randomUUID().slice(0, 8)}`, ["read", "write"], ["personal"], "personal")).token;

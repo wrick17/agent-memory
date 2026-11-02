@@ -16,14 +16,14 @@ const m = await import("./migrate.mjs");
 const u = await import("./upload.mjs");
 
 const dt = { $neo4j: "DateTime", iso: "2026-01-02T03:04:05+00:00" };
-const record = (i, scope = "personal") => ({ eid: `e${i}`, labels: ["Decision", "Entity"], anchors: [], steps: [], relationships: [], has_revision_links: 0, revisions: [], requests: [],
-	props: { name: `Note ${i}`, content: `note ${i}`, _created: dt, _updated: dt, _version: 1 }, fingerprint: { version: 1 }, attempts: 1, bothq_type: "project",
+const record = (i, scope = "personal", content = `note ${i}`) => ({ eid: `e${i}`, labels: ["Decision", "Entity"], anchors: [], steps: [], relationships: [], has_revision_links: 0, revisions: [], requests: [],
+	props: { name: `Note ${i}`, content, _created: dt, _updated: dt, _version: 1 }, fingerprint: { version: 1 }, attempts: 1, bothq_type: "project",
 	resolved_scope: scope, legacy_id: uuid5(`${scope}:project:note ${i}`) });
 
 /** A planned export with `count` records: two commands each, so more than 50 commands make two batches. */
-async function plannedExport(count = 30, rehearsal = "test", scopeOf = () => "personal") {
+async function plannedExport(count = 30, rehearsal = "test", scopeOf = () => "personal", contentOf = (i) => `note ${i}`) {
 	const dir = fs.mkdtempSync(path.join(tmp, "export-"));
-	const records = Array.from({ length: count }, (_, i) => record(i, scopeOf(i)));
+	const records = Array.from({ length: count }, (_, i) => record(i, scopeOf(i), contentOf(i)));
 	const jsonl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "");
 	fs.mkdirSync(path.join(dir, "bothq"));
 	fs.mkdirSync(path.join(dir, "markdown"));
@@ -183,9 +183,10 @@ describe("upload closure fixes", () => {
 describe("upload audit", () => {
 	/**
 	 * Pages per profile from the plan's own rows. `tamper` changes one stored snapshot byte; `status` changes one stored
-	 * node's status without a new revision; `copy` puts a copy of a record into a second profile.
+	 * node's status without a new revision; `copy` puts a copy of a record into a second profile; `text` changes one stored
+	 * text body of the record with that id; `chain` stores another import chain's wrapper hash for every record.
 	 */
-	function fakeAudit(dir, { sub = "plan-rehearsal-test", tamper, status, copy, paged, hosted } = {}) {
+	function fakeAudit(dir, { sub = "plan-rehearsal-test", tamper, status, copy, paged, hosted, text, chain } = {}) {
 		const recs = new Map();
 		for (const c of m.readJsonl(path.join(dir, sub, "commands.jsonl"))) {
 			if (c.op === "stage") {
@@ -203,6 +204,10 @@ describe("upload audit", () => {
 		const ids = [...recs.keys()].sort();
 		if (tamper !== undefined) { const r = recs.get(ids[tamper]); r.revisions[0] = { ...r.revisions[0], snapshot: `${r.revisions[0].snapshot} ` }; }
 		if (status !== undefined) { const r = recs.get(ids[status]); r.stored = { ...r.node, status: "retired" }; }
+		if (text !== undefined) { const r = recs.get(text); r.texts[0] = { ...r.texts[0], body: `${r.texts[0].body} ` }; }
+		if (chain) for (const [id, r] of recs) r.record_sha256 = sha256(`another chain ${id}`);
+		// The server's text cursor is the (part, revision, seq_no, chunk) tuple, compared element by element.
+		const textAfter = (x, cursor) => { const k = [x.part, x.revision, x.seq_no, x.chunk]; const i = k.findIndex((v, j) => v !== cursor[j]); return i >= 0 && k[i] > cursor[i]; };
 		const rowsIn = (profile) => ids.filter((id) => recs.get(id).profile === profile || (copy && copy.into === profile && id === ids[copy.index]));
 		const digestsOf = (r) => ({ revisions: r.revisions.map(revisionDigest).sort((a, b) => a.revision - b.revision),
 			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })).sort((a, b) => (a.request_id < b.request_id ? -1 : 1)) });
@@ -211,9 +216,9 @@ describe("upload audit", () => {
 			assert.equal([u.pathname, init.redirect, init.method ?? "GET"].join(" "), "/v1/import/audit manual GET");
 			if (record) {
 				const r = recs.get(record), table=u.searchParams.get("rows"), rows = table==="texts" ? r.texts.map(textDigest) : digestsOf(r)[table], limit = Number(u.searchParams.get("limit"));
-				const page = rows.filter((x) => after === null || (table==="texts" ? JSON.stringify([x.part,x.revision,x.seq_no,x.chunk]) > after : "revision" in x ? x.revision > Number(after) : x.request_id > after)).slice(0, limit);
+				const page = rows.filter((x) => after === null || (table==="texts" ? textAfter(x, JSON.parse(after)) : "revision" in x ? x.revision > Number(after) : x.request_id > after)).slice(0, limit);
 				const last = page.at(-1);
-				return Response.json({ record_id: record, node_revision: r.stored.revision, ...(r.node.attrs.import_review ? {record_sha256:r.record_sha256,node_sha256:nodeDigest(r.stored)} : {}), rows: page, next_after: page.length === limit ? table==="texts" ? JSON.stringify([last.part,last.revision,last.seq_no,last.chunk]) : String(last.revision ?? last.request_id) : null });
+				return Response.json({ record_id: record, node_revision: r.stored.revision, ...(r.node.attrs.import_review || table==="texts" ? {record_sha256:r.record_sha256,node_sha256:nodeDigest(r.stored)} : {}), rows: page, next_after: page.length === limit ? table==="texts" ? JSON.stringify([last.part,last.revision,last.seq_no,last.chunk]) : String(last.revision ?? last.request_id) : null });
 			}
 			// Small pages, as a server stopping at its row bound returns them.
 			const page = rowsIn(profile).filter((id) => !after || id > after).slice(0, 7);
@@ -239,6 +244,30 @@ describe("upload audit", () => {
 		const changed=await u.audit({exportDir:dir,config:cfg,fetchImpl:async(url,init)=>{const r=await fetchImpl(url,init),d=await r.json();if(new URL(url).searchParams.get("rows")==="texts")d.rows[0].body_raw_utf8_sha256=sha256("changed");return Response.json(d);}});assert.equal(changed.mismatches.texts,1);
 		const raced=await u.audit({exportDir:dir,config:cfg,fetchImpl:async(url,init)=>{const r=await fetchImpl(url,init),d=await r.json();if(new URL(url).searchParams.get("rows")==="texts")d.record_sha256="0".repeat(64);return Response.json(d);}});assert.equal(raced.status,"drift");
 		assert.equal(textRowsDigest(m.planRecords(path.join(dir,"plan"))[0].texts.map(textDigest)).length,64);
+	});
+
+	it("checks every record's stored text, including none and past chunk 9, and reports another chain's wrapper hash only as provenance", async () => {
+		const dir = await plannedExport(12, "test", undefined, (i) => (i === 0 ? "" : i === 1 ? "x".repeat(170000) : `note ${i}`));
+		const cfg = u.loadConfig(config()), recs = m.planRecords(path.join(dir, "plan-rehearsal-test"));
+		const empty = recs.find((r) => r.texts.length === 0), long = recs.find((r) => r.texts.length === 11);
+		assert.ok(empty && long && recs.every((r) => !r.node.attrs.import_review));
+		// Text pages of two rows, so the cursor crosses chunk 9 to 10; the record with no text still gets its one empty page.
+		const faithful = fakeAudit(dir), reads = [];
+		const small = async (url, init) => { const x = new URL(url); if (x.searchParams.get("rows") === "texts") { x.searchParams.set("limit", "2"); reads.push(x.searchParams.get("record")); } return faithful(x, init); };
+		const clean = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: small });
+		assert.deepEqual([clean.status, clean.mismatches.texts, clean.drift, clean.provenance.record_sha256_other], ["ok", 0, 0, 0]);
+		assert.deepEqual([reads.filter((id) => id === empty.id).length, reads.filter((id) => id === long.id).length], [1, 6]);
+		const reportPath = path.join(dir, "plan-rehearsal-test", "audit-memory-rehearsal.example.json"), report = () => JSON.parse(fs.readFileSync(reportPath, "utf8"));
+		// Another chain's stored wrapper hashes with every stored row equal: the audit passes and lists each hash apart.
+		const other = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { chain: true }) });
+		assert.deepEqual([other.status, Object.values(other.mismatches).every((n) => n === 0), other.drift, other.provenance.record_sha256_other], ["ok", true, 0, 12]);
+		assert.equal(report().mismatches.record, undefined);
+		assert.equal(report().provenance.record_sha256.other.observed[long.id], sha256(`another chain ${long.id}`));
+		// A matching wrapper hash never stands in for text: one changed stored body fails under either chain.
+		for (const chain of [false, true]) {
+			const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir, { chain, text: long.id }) });
+			assert.deepEqual([changed.status, changed.mismatches.texts, report().mismatches.texts.ids], ["mismatch", 1, [long.id]]);
+		}
 	});
 
 	it("passes a faithful server over several pages, and names the one record whose stored bytes changed", async () => {
@@ -300,12 +329,15 @@ describe("upload audit", () => {
 		assert.equal((await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl: fakeAudit(dir) })).status, "ok");
 		for (const field of ["created_at", "updated_at"]) {
 			const faithful = fakeAudit(dir);
+			// The changed stored row, as the summary and the text page anchor both report it.
+			let stored;
 			const fetchImpl = async (url, init) => {
 				const page = await (await faithful(url, init)).json();
-				for (const record of page.records) {
-					const stored = { ...node, created_at: record.node.created_at, updated_at: record.node.updated_at, [field]: "2040-12-31T00:00:00Z" };
+				for (const record of page.records ?? []) {
+					stored = { ...node, created_at: record.node.created_at, updated_at: record.node.updated_at, [field]: "2040-12-31T00:00:00Z" };
 					record.node = { ...record.node, [field]: stored[field], row_sha256: nodeDigest(stored) };
 				}
+				if (page.rows) page.node_sha256 = nodeDigest(stored);
 				return Response.json(page);
 			};
 			const changed = await u.audit({ exportDir: dir, rehearsal: "test", config: cfg, fetchImpl });

@@ -97,14 +97,15 @@ export async function upload({ exportDir, rehearsal = null, config, fetchImpl = 
 
 /**
  * Read-only check of what the server stored for an uploaded plan (migration verification 1 and 2,
- * docs/import-integrity-design.md). Pages GET /v1/import/audit and compares every record's stored hashes and row digests
- * with the same digests computed from the plan's commands. Writes a private report beside the upload state; returns
- * counts and record ids by class, never content.
+ * docs/import-integrity-design.md). Pages GET /v1/import/audit and compares every record's stored node, text, revision and
+ * request digests with the same digests computed from the plan's records; the stored record_sha256 is reported as
+ * provenance only. Writes a private report beside the plan; returns counts and record ids by class, never content.
  */
 export async function audit({ exportDir, rehearsal = null, config, fetchImpl = fetch }) {
 	if (Boolean(rehearsal) !== config.rehearsal) throw new Error(rehearsal ? "a rehearsal plan is audited only on the rehearsal server" : "a routed plan is never audited on the rehearsal server");
 	const dir = path.join(exportDir, rehearsal ? `plan-rehearsal-${rehearsal}` : "plan");
-	// The same checked plan the upload sent: its manifest, commands and schedule must match, and so must the upload state.
+	// The checked plan: its manifest, commands and schedule must match. An upload state, if present, must match too; its
+	// absence does not block a read-only audit of an existing deployment and is reported as provenance.
 	const check = dryRun({ exportDir, rehearsal });
 	const state = readJson(path.join(dir, `upload-${new URL(config.server).host}.json`));
 	if (state && state.commands_sha256 !== check.commands_sha256) throw new Error("the plan changed since it was uploaded to this server; audit the plan that was uploaded");
@@ -114,7 +115,8 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 	for (const r of planRecords(dir)) {
 		expected.set(key(r.route.profile, r.id), { id: r.id, profile: r.route.profile, record_sha256: r.record_sha256,
 			node: r.node, node_sha256: nodeDigest(r.node), ...attrsDigest(r.node.attrs), revisions: r.revisions.map(revisionDigest),
-			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })), ...(r.node.attrs.import_review ? {texts:r.texts.map(textDigest),identity_sha256:identityDigest(r.node.scope,r.node.memory_type,normalizeName(r.node.name))} : {}) });
+			requests: r.requests.map((q) => requestDigest({ ...q, source: requestSource(q) })), texts: r.texts.map(textDigest),
+			...(r.node.attrs.import_review ? {identity_sha256:identityDigest(r.node.scope,r.node.memory_type,normalizeName(r.node.name))} : {}) });
 	}
 	if (!expected.size) throw new Error("the plan has no records to audit");
 	const get = async (query) => {
@@ -154,25 +156,29 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 			f[rows] = { ...f[rows], count: all.length, sha256: rowsDigest(all) };
 		}
 	}
+	// Every record's stored text rows, including a record with none (one empty page): the stored wrapper hash is never
+	// evidence of its text. The page anchors must equal the summary's, or the record moved while it was read.
 	for (const [k,e] of expected) {
-		if (!e.texts) continue;
 		const f=found.get(k);if(!f)continue;
 		const all=[];let after=null;
 		do {
 			const page=await get({profile:e.profile,record:e.id,rows:"texts",after,limit:200});
-			if (page.node_revision !== f.node?.revision || page.record_sha256 !== f.record_sha256 || page.node_sha256 !== f.node?.row_sha256) f.moved_while_read=true;
+			if (page.node_revision !== (f.node?.revision ?? null) || page.record_sha256 !== f.record_sha256 || page.node_sha256 !== f.node?.row_sha256) f.moved_while_read=true;
 			all.push(...page.rows);if(page.next_after!==null && page.next_after===after)throw new Error("text audit did not advance");after=page.next_after;
 		} while(after!==null);
 		f.texts=all;
 	}
 
-	const mismatches = { missing: [], extra: [], state: [], record: [], node: [], attrs: [], source: [], revisions: [], requests: [], ...(readJson(path.join(dir,"manifest.json"))?.version===2 ? {identity:[],texts:[]} : {}) }, drift = [];
+	// Semantic classes only, each key present exactly when it was checked. The stored record_sha256 is a claimed wrapper
+	// (the server never recomputes it), so it is provenance: reported apart, never a mismatch and never a pass.
+	const mismatches = { missing: [], extra: [], state: [], node: [], attrs: [], source: [], revisions: [], requests: [], texts: [], ...(readJson(path.join(dir,"manifest.json"))?.version===2 ? {identity:[]} : {}) }, drift = [];
+	const chain = { plan: 0, other: {} };
 	for (const [k, e] of expected) {
 		const f = found.get(k), id = e.id;
 		if (!f) { mismatches.missing.push(id); continue; }
 		const check = (cls, ok) => { if (!ok) mismatches[cls].push(id); };
 		check("state", f.state === "published" && f.node !== null);
-		check("record", f.record_sha256 === e.record_sha256);
+		if (f.record_sha256 === e.record_sha256) chain.plan++; else chain.other[id] = f.record_sha256;
 		// As published, and as stored now: unless a hosted write moved its revision on, the node row must equal the plan's node.
 		// Publish stores the time of publication for a missing created_at or updated_at.
 		const now = f.node && { ...e.node, created_at: e.node.created_at ?? f.published_at, updated_at: e.node.updated_at ?? f.published_at };
@@ -182,17 +188,21 @@ export async function audit({ exportDir, rehearsal = null, config, fetchImpl = f
 		check("source", f.node?.source_sha256 === e.source_sha256);
 		check("revisions", f.revisions.count === e.revisions.length && f.revisions.sha256 === rowsDigest(e.revisions));
 		check("requests", f.requests.count === e.requests.length && f.requests.sha256 === rowsDigest(e.requests));
-		if(e.texts){check("identity",f.node?.identity_sha256===e.identity_sha256);check("texts",f.texts && textRowsDigest(f.texts)===textRowsDigest(e.texts));}
+		check("texts", textRowsDigest(f.texts) === textRowsDigest(e.texts));
+		if (e.identity_sha256) check("identity", f.node?.identity_sha256 === e.identity_sha256);
 		// Hosted changes since the import are drift: listed, and they fail the audit, while the imported rows are still checked exactly.
 		if (f.revisions.hosted || f.requests.hosted || moved || f.moved_while_read) drift.push(id);
 	}
 	for (const [k, f] of found) if (!expected.has(k)) mismatches.extra.push(`${f.profile}/${f.record_id}`);
 	const bad = Object.values(mismatches).reduce((n, ids) => n + ids.length, 0);
-	// Full match only: a mismatch, or any hosted change since the import, makes the audit unsuccessful.
-	const report = { server: config.server, at: new Date().toISOString(), status: bad ? "mismatch" : drift.length ? "drift" : "ok", records: expected.size, found: found.size, totals,
-		mismatches: Object.fromEntries(Object.entries(mismatches).map(([k, ids]) => [k, { count: ids.length, ids }])), drift: { count: drift.length, ids: drift } };
+	// Full semantic match only: a mismatch, or any hosted change since the import, makes the audit unsuccessful.
+	const other = Object.keys(chain.other);
+	const provenance = { upload_state: state ? "matches" : "absent", record_sha256: { plan: chain.plan, other: { count: other.length, ids: other, observed: chain.other } } };
+	const report = { version: 2, server: config.server, at: new Date().toISOString(), status: bad ? "mismatch" : drift.length ? "drift" : "ok", records: expected.size, found: found.size, totals,
+		mismatches: Object.fromEntries(Object.entries(mismatches).map(([k, ids]) => [k, { count: ids.length, ids }])), drift: { count: drift.length, ids: drift }, provenance };
 	writePrivate(path.join(dir, `audit-${new URL(config.server).host}.json`), JSON.stringify(report, null, 2));
-	return { status: report.status, records: report.records, found: report.found, mismatches: Object.fromEntries(Object.entries(mismatches).map(([k, ids]) => [k, ids.length])), drift: drift.length };
+	return { status: report.status, records: report.records, found: report.found, mismatches: Object.fromEntries(Object.entries(mismatches).map(([k, ids]) => [k, ids.length])), drift: drift.length,
+		provenance: { upload_state: provenance.upload_state, record_sha256_plan: chain.plan, record_sha256_other: other.length } };
 }
 
 /**

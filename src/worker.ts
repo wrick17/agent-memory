@@ -38,8 +38,9 @@ export default {
 		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/settings.js" || pathname === "/" || pathname === "/app" || pathname === "/app.js") return api(request, env);
 		return new Response("not found", { status: 404 });
 	},
-	// The nightly export of every active profile and the account (section 18); a failure is kept as last_export_failed.
-	async scheduled(_event, env, ctx): Promise<void> {
-		if (env.OWNER_USER_ID) ctx.waitUntil(accountStub(env, env.OWNER_USER_ID).admin({ op: "export" }));
+	// The nightly export of every active profile and the account (section 18); a failure is kept as last_export_failed. The
+	// platform's own scheduledTime and cron travel as internal trigger metadata, which no public route can set.
+	async scheduled(event, env, ctx): Promise<void> {
+		if (env.OWNER_USER_ID) ctx.waitUntil(accountStub(env, env.OWNER_USER_ID).admin({ op: "export", trigger: { scheduled_time: event.scheduledTime, cron: event.cron } }));
 	},
 } satisfies ExportedHandler<Env>;

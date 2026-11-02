@@ -22,6 +22,7 @@ A local `audit` command compares them with the same digests computed from the pl
 |---|---|
 | `GET /v1/import/audit?profile=P&after=ID&limit=N` (N ≤ 50, default 20; records in `record_id` order) | `{ profile, totals, records[], next_after }` |
 | `GET /v1/import/audit?profile=P&record=ID&rows=revisions\|requests&after=K&limit=N` (N ≤ 200) | `{ record_id, node_revision, rows[], next_after }` |
+| `GET /v1/import/audit?profile=P&record=ID&rows=texts&after=K&limit=N` (N ≤ 200; imported `body` and `entry` rows in `(part, revision, seq_no, chunk)` order; `K` is the last row's key as JSON, compared as a tuple) | `{ record_id, node_revision, record_sha256, node_sha256, rows[], next_after }`; a record with no text returns `rows: []` and `next_after: null` |
 
 `totals` counts `import_records` by state, imported revisions (`actor = 'migration'`) and imported requests (`legacy_op` set).
 
@@ -72,6 +73,8 @@ Each summary also carries the node as stored now: `row_sha256`, the stored row r
 The offline probe `/tmp/am-l4-design-3uiSra/integrity-defs-probe.mjs` builds these row objects from the rehearsal plan's commands, as `stage` and `publish` store them. It reproduces Terra's fixture (`expected-integrity-v1.json`, SHA-256 `89101631…a253f`) for all 1,330 records, 4,678 revisions and 3,182 requests, with 0 mismatches in node, record, attrs, source, profile, revision or request digests. So the definitions are right. The hosted run will show whether the stored bytes are.
 
 ## Limits
+
+- **The stored `record_sha256` is provenance, not evidence** (2026-11-02). Stage stores the hash the command claims; the server never recomputes it from the rows. The client reports it apart and decides the status from the row, node, attribute, source and identity digests, with every record's texts compared.
 
 - **What a match proves:** that the stored rows equal what the plan sent. Agreement between the plan and BothQ remains the export's own checks.
 - **Drift fails the audit:** a record changed by hosted writes after the import keeps its imported digests, which are still checked, with a `hosted` count. It is listed as drift, and any drift makes the audit unsuccessful (status `drift`, nonzero exit). *Corrected 2026-10-29:* the first version reported drift and still passed.

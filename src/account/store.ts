@@ -45,7 +45,8 @@ export type AccountCommand =
 	| { op: "wipePlan"; profile: string }
 	// Backups and restore from an export (section 18): owner only, one recovery at a time.
 	/** `corpus` also exports the profiles' corpora now; the nightly run exports each corpus once a week. */
-	| { op: "export"; profile?: string; corpus?: boolean }
+	/** `trigger`: set only by the Worker's scheduled handler, from the platform event; every other export is manual. */
+	| { op: "export"; profile?: string; corpus?: boolean; trigger?: { scheduled_time: number; cron: string } }
 	| { op: "listExports"; profile?: string; corpus?: boolean }
 	| { op: "beginRestore"; profile: string; export: string }
 	/** Point-in-time restore of a profile's current generation to `at`, or the reversal of restore `undo` by its recorded undo bookmark. */
@@ -914,6 +915,16 @@ export class AccountStore extends DurableObject<Env> {
 					cmd.profile ?? null, cmd.profile ?? null).toArray();
 				if (cmd.profile && !rows.length) return fail("not_found", `profile '${cmd.profile}' is not active`);
 				const results: Record<string, unknown> = {};
+				// What each store did this run, beside the unchanged results: the generation it exported (the account has none), the export
+				// id it wrote or is still writing, and for a corpus whether it was due (newest complete export older than about a week).
+				const stores: Record<string, { generation: string | null; state: "completed" | "running" | "empty" | "failed" | "skipped_recent"; export_id: string | null;
+					due?: boolean; export_generation?: string | null }> = {};
+				const mark = (store: string, generation: string | null, r: Outcome<{ id: string; state?: string }>, extra: { due?: boolean } = {}) => {
+					stores[store] = { generation, ...extra, ...(r.ok ? { state: r.value.state === "running" ? "running" : "completed", export_id: r.value.id }
+						: { state: r.error.code === "not_found" ? "empty" : "failed", export_id: null }) };
+				};
+				const trigger = cmd.trigger ? { kind: "scheduled", scheduled_time: Number.isFinite(cmd.trigger.scheduled_time) ? new Date(cmd.trigger.scheduled_time).toISOString() : null,
+					cron: typeof cmd.trigger.cron === "string" ? cmd.trigger.cron.slice(0, 64) : null } : { kind: "manual" };
 				// A store whose export throws (an object reset) is recorded as failed like any other, so last_export_failed keeps it.
 				const caught = <T>(p: Promise<Outcome<T>>): Promise<Outcome<T>> => p.catch((e: unknown) => fail("unavailable", `export failed: ${(e as Error)?.message ?? String(e)}`));
 				for (const p of rows) {
@@ -922,30 +933,41 @@ export class AccountStore extends DurableObject<Env> {
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
 					const r = await caught(this.profileAt(ref).exportNow(ref));
 					results[p.name] = r.ok ? r.value : r.error.code === "not_found" ? "empty" : { error: r.error };
+					mark(p.name, p.generation, r);
 				}
 				if (!cmd.profile) {
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
 					const a = await caught(this.exportAccount(userId));
 					results.account = a.ok ? a.value : { error: a.error };
+					mark("account", null, a);
 				}
 				// The corpus weekly (section 18), also kept two: once its newest complete export is older than about a week, or when asked.
 				const week = new Date(Date.now() - 6.5 * 86_400_000).toISOString().replace(/[-:.]/g, "");
 				for (const p of this.env.CORPUS_STORE ? rows.filter((x) => x.name !== "me") : []) {
-					if (!cmd.corpus && ((await listExports(this.env, `corpus-${p.name}`)).at(-1) ?? "") >= week) continue;
+					const newest = (await listExports(this.env, `corpus-${p.name}`)).at(-1), due = (newest ?? "") < week;
+					if (!cmd.corpus && !due) {
+						// Not due: name the recent complete export that covers it, with the generation its manifest records.
+						const m = await readManifest(this.env, `corpus-${p.name}`, newest!, userId);
+						stores[`corpus-${p.name}`] = { generation: p.generation, state: "skipped_recent", export_id: newest!, due, export_generation: m.ok ? m.value.generation ?? null : null };
+						continue;
+					}
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
 					const ref = { userId, profile: p.name, generation: p.generation };
 					// Starts or reports the corpus's background export; it lists as complete once its manifest lands.
 					const c = await caught(this.corpusAt(ref).exportNow(ref));
 					results[`corpus-${p.name}`] = c.ok ? c.value : c.error.code === "not_found" ? "empty" : { error: c.error };
+					mark(`corpus-${p.name}`, p.generation, c, { due });
 				}
 				const failed = Object.values(results).some((v) => typeof v === "object" && v !== null && "error" in v);
-				this.write(() => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", JSON.stringify({ at: now(), results })));
+				this.write(() => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", JSON.stringify({ at: now(), trigger, results, stores })));
 				return failed ? fail("unavailable", "an export failed", { results }) : ok(results);
 			}
 			case "listExports":
 				return ok(await listExports(this.env, cmd.profile ? `${cmd.corpus ? "corpus" : "profile"}-${cmd.profile}` : "account"));
 			case "restoreStatus":
-				return ok({ recovery: this.recovery() ?? null, last_export: JSON.parse(this.meta("last_export") ?? "null") as unknown });
+				// The latest attempt may be the failed one: both records are read, each with its own `at` and trigger.
+				return ok({ recovery: this.recovery() ?? null, last_export: JSON.parse(this.meta("last_export") ?? "null") as unknown,
+					last_export_failed: JSON.parse(this.meta("last_export_failed") ?? "null") as unknown });
 			case "recoveryConflicts":
 				return this.recoveryConflicts(userId, cmd);
 			case "resolveConflict":

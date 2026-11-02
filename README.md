@@ -14,14 +14,14 @@ Move, wipe preview and copying eligible current text to another profile are depl
 
 The graph includes an unsaved what-if view with local draft items and a metadata comparison. It is deployed with public TLS and control checks; browser acceptance remains open. [Evidence](docs/combined-verification-2026-10-30.md#what-if-graph-deployment-2026-11-01).
 
-The hosted Work profile and Account passed earlier recovery drills. Full-size Profile and Account encrypted chunk checks passed on the new test fixture. Corpus repair stopped with missing chunks; full restore and wipe checks remain pending. [Evidence](docs/import-verification.md#full-size-export-source-checkpoint-2026-11-02).
+The hosted Work profile and Account passed earlier recovery drills. Full-size Profile, Corpus and Account encrypted chunk checks passed on the new test fixture; full restore and wipe checks remain pending. [Evidence](docs/import-verification.md#full-size-export-source-checkpoint-2026-11-02).
 
-Main Personal Claude and Codex capture hooks are enabled. Work Claude SessionEnd, T3 Codex, and one MacBook capture suffix passed bounded checks. The MacBook test hooks were removed and its earlier pending range is retained; complete cross-machine capture remains open. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data, independent setup and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
+Main Personal Claude and Codex capture hooks are enabled. Work Claude SessionEnd, T3 Codex, and one MacBook capture suffix passed bounded checks. The MacBook test hooks were removed and its earlier pending range is retained; complete cross-machine capture remains open. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
 
 ## Completed development milestones
 
 - [x] Lifecycle, daily server and observed-count source delivered with local verification; feed collection is no longer a product goal.
-- [x] Imported and audited 1,374 approved Work records, then completed the guarded final refresh. The 119 held records were not imported.
+- [x] Imported and semantically audited 1,374 approved Work records, then completed the guarded final refresh. The 119 held records were not imported.
 - [x] Restored the hosted Work profile and Account; created and verified the new Agent Memory task journal.
 - [x] Deployed the dashboard and verified a synthetic Work reference save, retry, edit and history in the owner browser session.
 - [x] Deployed the whole Work graph and verified its live metadata, search, selection and navigation controls.
@@ -42,7 +42,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 ### Bring existing memory
 
 - [x] Import and check an older copy of BothQ and curated memory files (owner trial).
-- [x] Migrate and audit the latest approved Work library: 1,374 records migrated; 119 remain held.
+- [x] Migrate and semantically audit the latest approved Work library: 1,374 records migrated; 119 remain held.
 - [x] Run the guarded final anchored refresh while preserving checked history and requests. This is not ongoing automatic synchronization.
 
 ### Automatic memory, journals, and preferences
@@ -68,7 +68,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 ### Setup, recovery, and everyday use
 
 - [x] Sign in to the private memory service with an isolated client (owner trial).
-- [ ] Set up and run your own independent deployment. A separate test deployment passed sign-in and selected memory checks; everyday setup remains unfinished.
+- [x] Set up and run an isolated deployment with its own resources and audience (same-account fixture).
 - [ ] Back up and restore memories in everyday use. Hosted profile and account recovery passed. The scheduled event and nearby Account/Work manifests were observed; literal manifest correlation and full recovery remain open.
 - [ ] Use and verify the same memories across multiple machines.
 - [ ] Switch everyday Claude, Codex, and headless agents to Agent Memory after migration and acceptance checks.
