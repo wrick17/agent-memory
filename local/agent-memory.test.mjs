@@ -461,12 +461,93 @@ describe("review regressions", () => {
 		// The bounds themselves are unchanged: exactly 160 and 280 characters pass, one more fails.
 		assert.equal(reject({ asks: [{ text: "x".repeat(160), pos: 0 }], decisions: [{ text: "y".repeat(280), pos: 0 }] }), null);
 		assert.equal(reject({ asks: [{ text: "x".repeat(161), pos: 0 }] }), "bad_items:asks:length");
-		const ask = "Ship the amber widget for the review session demo and keep the decision log beside the sample folder for later.".padEnd(161, ".");
+		const ask = "Ship the amber widget for the review session demo and keep the decision log beside the sample folder for later.";
 		const f = transcript("why", [claudeLine("user", "Ship it."), claudeLine("assistant", "Done.")]);
-		const r = await am.processSession(trigger("claude-code", "sess-why", f), { server: fakeServer(), runner: fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: ask, pos: 0 }] } }) });
+		const r = await am.processSession(trigger("claude-code", "sess-why", f), { server: fakeServer(), runner: fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: ask, pos: -1 }] } }) });
 		const range = Object.values(JSON.parse(fs.readFileSync(path.join(am.home(), "state", "claude-code", "sess-why.json"), "utf8")).ranges)[0];
-		assert.deepEqual([Object.values(r.outcomes)[0], range.status, range.reason, r.consolidated_to], ["stuck", "stuck", "bad_items:asks:length", 0]);
+		assert.deepEqual([Object.values(r.outcomes)[0], range.status, range.reason, r.consolidated_to], ["stuck", "stuck", "bad_items:asks:position", 0]);
 		assert.ok(!JSON.stringify(range).includes("amber"));
+	});
+
+	it("tells the model every bound the validator and the hosted schema enforce", () => {
+		const server = fs.readFileSync(new URL("../src/profile/capture.ts", import.meta.url), "utf8");
+		assert.deepEqual([am.LIMITS.ask, am.LIMITS.item], /const ASK_MAX = (\d+), ITEM_MAX = (\d+);/.exec(server).slice(1).map(Number));
+		const props = am.PART_SCHEMA.properties, reject = (part) => am.rejectPart({ ...emptyPart(), ...part }, { messages: [] });
+		for (const k of ["asks", "decisions", "corrections"]) {
+			const { text, pos } = props[k].items.properties;
+			assert.equal(text.maxLength, k === "asks" ? am.LIMITS.ask : am.LIMITS.item);
+			assert.equal(pos.minimum, 0);
+			assert.equal(reject({ [k]: [{ text: "x".repeat(text.maxLength), pos: 0 }] }), null);
+			assert.equal(reject({ [k]: [{ text: "x".repeat(text.maxLength + 1), pos: 0 }] }), `bad_items:${k}:length`);
+		}
+		const max = props.entities.items.maxLength;
+		assert.ok(["commits", "prs", "tests"].every((k) => props.outcomes.properties[k].items.maxLength === max));
+		assert.equal(reject({ entities: ["x".repeat(max)], outcomes: { commits: [], prs: [], tests: ["y".repeat(max)] } }), null);
+		assert.equal(reject({ entities: ["x".repeat(max + 1)] }), "bad_entities");
+		assert.equal(reject({ outcomes: { commits: [], prs: [], tests: ["y".repeat(max + 1)] } }), "bad_outcomes");
+		assert.ok(Object.values(props.dropped.properties).every((c) => c.minimum === 0));
+	});
+
+	it("cuts an over-long model ask with a marker instead of retrying the range to stuck", async () => {
+		const f = transcript("long-ask", [claudeLine("user", "Ship it."), claudeLine("assistant", "Done.")]);
+		const server = fakeServer(), runner = fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: "Ship the amber widget. ".repeat(20), pos: 0 }] } });
+		const r = await am.processSession(trigger("claude-code", "sess-long-ask", f), { server, runner });
+		assert.deepEqual([Object.values(r.outcomes)[0], r.consolidated_to, runner.calls], ["consolidated", fs.statSync(f).size, 1]);
+		const [ask] = JSON.parse([...server.parts].find(([k]) => k.includes("|consolidated|"))[1].body).asks;
+		assert.equal(ask.text.length, am.LIMITS.ask);
+		assert.ok(ask.text.endsWith("…"));
+	});
+
+	it("keeps a path literal longer than an entity as its marked excerpt, without breaking the entities", async () => {
+		const long = `src/${Array.from({ length: 1200 }, (_, i) => `dir${i}`).join("/")}/file.ts`;
+		assert.ok(long.length > 5000);
+		const f = transcript("long-path", [claudeLine("user", `Open ${long} and fix it.`), claudeLine("assistant", "Done.")]);
+		const server = fakeServer(), runner = fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: "Open the long path and fix it.", pos: 0 }] } });
+		const r = await am.processSession(trigger("claude-code", "sess-long-path", f), { server, runner });
+		assert.deepEqual([Object.values(r.outcomes)[0], r.consolidated_to, runner.calls], ["consolidated", fs.statSync(f).size, 1]);
+		const body = JSON.parse([...server.parts].find(([k]) => k.includes("|consolidated|"))[1].body);
+		assert.equal(am.bodyProblem(body), null);
+		assert.ok(body.entities.includes(`${long.slice(0, am.LIMITS.item - 1)}…`));
+		assert.ok(am.literals([{ role: "owner", text: long }]).every((l) => l.length <= am.LIMITS.item));
+	});
+
+	it("retries a range stuck under an older digest revision once on the next start, and not again after", async () => {
+		const f = transcript("old-stuck", [claudeLine("user", "Never squash release commits.")]);
+		const server = fakeServer(), file = path.join(am.home(), "state", "claude-code", "sess-old-stuck.json");
+		await am.processSession(trigger("claude-code", "sess-old-stuck", f), { server, runner: fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: "x", pos: -1 }] } }) });
+		const runner = keepAllRunner();
+		enqueue("sess-start-1", transcript("start-1", []), "SessionStart");
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(runner.calls, 0, "a range stuck under the current revision is not swept");
+		// A state an older client left: the same stuck range, without a revision stamp.
+		const st = JSON.parse(fs.readFileSync(file, "utf8"));
+		for (const range of Object.values(st.ranges)) delete range.digest_rev;
+		fs.writeFileSync(file, JSON.stringify(st));
+		enqueue("sess-start-2", transcript("start-2", []), "SessionStart");
+		const r = await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(r.results["claude-code-sess-old-stuck.json"].consolidated_to, fs.statSync(f).size);
+		assert.ok(server.storedText().includes("Never squash release commits."));
+	});
+
+	it("settles the trigger of a range whose recovery stays stuck, so later drains do not call the model again, and keeps its data", async () => {
+		const f = transcript("still-stuck", [claudeLine("user", "Never squash release commits.")]);
+		const server = fakeServer(), runner = fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: "x", pos: -1 }] } });
+		const file = path.join(am.home(), "state", "claude-code", "sess-still-stuck.json");
+		await am.processSession(trigger("claude-code", "sess-still-stuck", f), { server, runner });
+		const st = JSON.parse(fs.readFileSync(file, "utf8"));
+		for (const range of Object.values(st.ranges)) delete range.digest_rev;
+		fs.writeFileSync(file, JSON.stringify(st));
+		const calls = runner.calls;
+		enqueue("sess-start-a", transcript("start-a", []), "SessionStart");
+		await am.run({ server, runner, debounceMs: 0 });
+		// One recovery pass: a subrange under the 2 KB floor gets LIMITS.attempts model calls; the second drain makes none.
+		assert.equal(runner.calls - calls, am.LIMITS.attempts);
+		await am.run({ server, runner, debounceMs: 0 });
+		assert.equal(runner.calls - calls, am.LIMITS.attempts, "the second drain does not call the model");
+		assert.deepEqual(fs.readdirSync(queueDir()), []);
+		const [id, range] = Object.entries(JSON.parse(fs.readFileSync(file, "utf8")).ranges)[0];
+		assert.deepEqual([range.status, range.digest_rev], ["stuck", 2]);
+		assert.ok(fs.existsSync(path.join(am.home(), "pending", `${id.replace(/[^A-Za-z0-9._-]/g, "_")}.txt`)), "the pending text is kept");
 	});
 
 	it("does not require the sentence period after an unquoted path, and keeps quoted and backticked literals exact", () => {

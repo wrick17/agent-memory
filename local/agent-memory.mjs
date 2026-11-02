@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024, sweep: 64 };
 const DEBOUNCE_MS = 45_000, DEBOUNCE_MAX_MS = 600_000, PENDING_SOURCE_DAYS = 7, EPOCH_BYTES = 4096;
 const CLIENTS = new Set(["claude-code", "codex"]);
+// The consolidation rules' revision. A range stuck under an older revision is retried once by the sweep, then stamped.
+const DIGEST_REV = 2;
 
 export const home = () => process.env.AGENT_MEMORY_HOME || path.join(os.homedir(), ".agent-memory");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
@@ -287,8 +289,13 @@ export function literals(messages) {
 		for (const x of m.text.match(/(?:~|\.{1,2})?\/?[\w.-]+(?:\/[\w.-]+)+|\b[\w-]+\.(?:ts|tsx|js|mjs|jsx|json|md|py|toml|ya?ml|sh|css|html|sql|go|rs|txt|lock)\b/g) ?? []) out.add(x.replace(/(?<=[\w-])\.$/, ""));
 		for (const x of m.text.match(ENTITY) ?? []) out.add(x);
 	}
-	return [...out];
+	// A literal longer than an entity may be (a pasted path runs to kilobytes) is kept as its marked excerpt: the full text could
+	// not fit the 8 KB part, and the excerpt is checked and kept like any other literal, so it is never silently lost.
+	return [...new Set([...out].map((l) => cut(l, LIMITS.item)))];
 }
+
+/** The excerpt lists and their per-text bounds, shared by bodyProblem and PART_SCHEMA so the two cannot drift. */
+const ITEM_FIELDS = [["asks", LIMITS.ask], ["decisions", LIMITS.item], ["corrections", LIMITS.item]];
 
 /**
  * The hosted digest schema (BODY in src/profile/capture.ts), mirrored: no field outside it at any level, every string at most
@@ -311,7 +318,7 @@ export function bodyProblem(p) {
 	};
 	const list = (xs) => Array.isArray(xs) && xs.every((x) => str(x, LIMITS.item));
 	if (!only(p, ["asks", "decisions", "corrections", "outcomes", "entities", "dropped"])) return "bad_shape";
-	for (const [k, max] of [["asks", LIMITS.ask], ["decisions", LIMITS.item], ["corrections", LIMITS.item]]) {
+	for (const [k, max] of ITEM_FIELDS) {
 		const why = itemProblem(p[k], max);
 		if (why) return `bad_items:${k}:${why}`;
 	}
@@ -438,6 +445,9 @@ export async function consolidate(range, messages, { runner, server, dir, repo }
 			if (out.kind === "runtime_warning") return { status: "unavailable", reason: "runtime_warning", parts: kept.concat(made) };
 			if (out.kind !== "ok") { why = out.kind; continue; }
 			const part = redactDeep(out.part);
+			// The schema bounds every string. An excerpt a model still overruns is cut with a marker, as the heuristic digest cuts
+			// it; an over-long identifier in outcomes or entities is still refused.
+			for (const [k, max] of ITEM_FIELDS) for (const x of Array.isArray(part?.[k]) ? part[k] : []) if (typeof x?.text === "string") x.text = cut(x.text, max);
 			// The required literals are known here, not to the model: add any it paraphrased, verbatim, rather than retry to stuck.
 			if (!bodyProblem(part)) part.entities.push(...missingLiterals(part, sub));
 			const body = JSON.stringify(part);
@@ -605,18 +615,18 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 			let held;
 			try { held = (await server.state([id], repo))?.[id]; } catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 			if (held?.consolidated) { r.status = "consolidated"; delete r.reason; outcomes[id] = "consolidated"; continue; }
-			r.status = "stuck"; r.reason = "pending_text_missing"; outcomes[id] = "stuck";
+			Object.assign(r, { status: "stuck", reason: "pending_text_missing", digest_rev: DIGEST_REV }); outcomes[id] = "stuck";
 			continue;
 		}
 		let result;
 		try { result = await consolidate({ id, start: r.start, end: r.end }, messages, { runner, server, dir: pendingDir, repo }); } catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
-		if (result.status !== "ready") { r.status = result.status === "stuck" ? "stuck" : "pending"; r.reason = result.reason ?? result.status; outcomes[id] = r.status; continue; }
+		if (result.status !== "ready") { Object.assign(r, { status: result.status === "stuck" ? "stuck" : "pending", reason: result.reason ?? result.status, digest_rev: DIGEST_REV }); outcomes[id] = r.status; continue; }
 		try {
 			const session = { client: t.client, id: t.session };
 			const fresh = result.parts.filter((p) => !p.remote);
 			if (fresh.length) {
 				const up = await server.ingest({ session, ...where, digests: fresh.map((p) => ({ range_id: id, capture_status: "consolidated", part_id: p.part_id, sha256: p.sha256, body: p.body })), manifests: [] });
-				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { r.status = "stuck"; r.reason = up.find((x) => x.status === "refused")?.reason; outcomes[id] = "stuck"; continue; }
+				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { Object.assign(r, { status: "stuck", reason: up.find((x) => x.status === "refused")?.reason, digest_rev: DIGEST_REV }); outcomes[id] = "stuck"; continue; }
 			}
 			const m = await server.ingest({ session, ...where, digests: [], manifests: [{ range_id: id, parts: result.parts.map(({ part_id, sha256 }) => ({ part_id, sha256 })) }] });
 			if (m[0]?.status !== "stored" && m[0]?.status !== "replayed") { r.reason = m[0]?.reason; outcomes[id] = "pending"; continue; }
@@ -669,7 +679,8 @@ function sweep(now, debounceMs) {
 		let size;
 		try { size = fs.statSync(s.transcript_path).size; } catch { continue; }
 		// Same size and same checked prefix is current; a changed prefix is queued so processSession starts the new epoch.
-		if (size === st.digested_to && Number.isInteger(st.prefix_len) && prefixHash(s.transcript_path, st.prefix_len) === st.prefix_hash) continue;
+		const retry = Object.values(st.ranges ?? {}).some((r) => r?.status === "stuck" && r.digest_rev !== DIGEST_REV);
+		if (!retry && size === st.digested_to && Number.isInteger(st.prefix_len) && prefixHash(s.transcript_path, st.prefix_len) === st.prefix_hash) continue;
 		// Linked, never renamed, into place: a trigger a hook wrote meanwhile is kept.
 		const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
 		writePrivate(tmp, JSON.stringify({ client, session: s.session, gen: randomBytes(6).toString("hex"), event: "sweep", transcript_path: s.transcript_path,
@@ -718,7 +729,9 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 				let r;
 				try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
 				results[f] = r;
-				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused");
+				// A range stuck under the current rules fails the same way until its transcript grows (a new trigger or the sweep) or
+				// DIGEST_REV changes (the sweep), so its trigger settles; its pending text and range state stay for that retry.
+				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused" || o === "stuck");
 				if (settled || r.status === "source_missing_expired") fs.rmSync(claimed, { force: true });
 				else unclaim(claimed, path.join(qdir, f));
 			}
@@ -805,13 +818,15 @@ extends = ":read-only"
 enabled = false
 `;
 
+/** The output schema the model is held to: the hosted digest schema's bounds (LIMITS, ITEM_FIELDS), so it is told every limit. */
+const bounded = { type: "string", maxLength: LIMITS.item }, count = { type: "integer", minimum: 0 };
 export const PART_SCHEMA = {
 	type: "object", additionalProperties: false, required: ["asks", "decisions", "corrections", "outcomes", "entities", "dropped"],
 	properties: Object.fromEntries([
-		...["asks", "decisions", "corrections"].map((k) => [k, { type: "array", items: { type: "object", additionalProperties: false, required: ["text", "pos"], properties: { text: { type: "string" }, pos: { type: "integer" } } } }]),
-		["outcomes", { type: "object", additionalProperties: false, required: ["commits", "prs", "tests"], properties: { commits: { type: "array", items: { type: "string" } }, prs: { type: "array", items: { type: "string" } }, tests: { type: "array", items: { type: "string" } } } }],
-		["entities", { type: "array", items: { type: "string" } }],
-		["dropped", { type: "object", additionalProperties: false, required: ["asks", "decisions", "corrections"], properties: { asks: { type: "integer" }, decisions: { type: "integer" }, corrections: { type: "integer" } } }],
+		...ITEM_FIELDS.map(([k, max]) => [k, { type: "array", items: { type: "object", additionalProperties: false, required: ["text", "pos"], properties: { text: { type: "string", maxLength: max }, pos: count } } }]),
+		["outcomes", { type: "object", additionalProperties: false, required: ["commits", "prs", "tests"], properties: { commits: { type: "array", items: bounded }, prs: { type: "array", items: bounded }, tests: { type: "array", items: bounded } } }],
+		["entities", { type: "array", items: bounded }],
+		["dropped", { type: "object", additionalProperties: false, required: ["asks", "decisions", "corrections"], properties: { asks: count, decisions: count, corrections: count } }],
 	]),
 };
 
