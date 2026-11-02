@@ -4,7 +4,7 @@
 // generation, and nothing reopens a cleared one.
 import { DurableObject } from "cloudflare:workers";
 import { Fail, fail, ok, type Outcome, type ProfileRef } from "../domain/types";
-import { applyRows, exportStore, exportTables, readChunk, readManifest } from "../backup";
+import { applyRows, beginExport, cancelExport, dropCancelled, exportFenced, settleExports, exportJob, exportStep, exportTables, lastExport, readChunk, readManifest, type StoreSpec } from "../backup";
 import { migrate, type Migration } from "../storage";
 import { chunkHash, checkChunk as checkBulkChunk, chunkTerms as bulkTerms, FAMILIES, manifest, named, requestIdOf, SCANS, scanManifest, SEARCH_DDL, VIEWS, type Family, type Key, type Value } from "./families";
 import { get, runSql, search, type CorpusQuery, type Head } from "./query";
@@ -43,6 +43,8 @@ export interface CorpusChunk { table: string; schema_sha256: string; source: { f
 export interface ChunkReceipt { status: "stored" | "replayed"; request_id: string; table: string; rows: number; last_key: Key | null; complete: boolean; sha256: string; rows_written?: number }
 export interface CorpusStatus { tables: { table: string; rows: number; last_key: Key | null; complete: boolean; as_of: string; refresh: string; source_sha256: string }[] }
 const refreshing = () => Fail.of("busy", "the corpus is refreshing; it reopens when the refresh publishes", { reason: "corpus_refreshing" });
+/** The export's fallback fence (at most 30 s, section 18 step 3): writes to exported state wait; reads keep flowing. */
+const assertNotExporting = (sql: SqlStorage) => { if (exportFenced(sql, META)) throw Fail.of("busy", "the corpus export is catching up; retry shortly", { reason: "corpus_exporting", retry_after: 5 }); };
 
 const closedState = (sql: SqlStorage) => {
 	sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);
@@ -68,6 +70,7 @@ const assertOpen = (sql: SqlStorage) => { if (closedState(sql)) throw Fail.of("p
 function applyChunk(sql: SqlStorage, c: CorpusChunk): ChunkReceipt {
 	assertOpen(sql);
 	if (refreshActive(sql)) throw refreshing();
+	assertNotExporting(sql);
 	// A dated snapshot keeps its own cut ledger, request ids and publication; no partitions, row hashes or search documents.
 	if (isSnapshot(c.table)) return applySnapshotChunk(sql, c, () => sql.databaseSize > SIZE_LIMIT);
 	const { f, rows, keys } = checkChunk(c);
@@ -185,23 +188,54 @@ export class CorpusStore extends DurableObject<Env> {
 		try {
 			await this.access(who);
 			this.bind(who);
-			return ok(this.ctx.storage.transactionSync(() => { assertOpen(this.ctx.storage.sql); return refresh(this.ctx.storage.sql, who, cmd); }));
+			return ok(this.ctx.storage.transactionSync(() => {
+				assertOpen(this.ctx.storage.sql);
+				if (cmd.command !== "inspect") assertNotExporting(this.ctx.storage.sql);
+				return refresh(this.ctx.storage.sql, who, cmd);
+			}));
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
-	/** Internal RPC from AccountStore: this generation's weekly encrypted export (section 18), under the bounded write pause. */
-	async exportNow(who: ProfileRef): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+	/**
+	 * Internal RPC from AccountStore: starts this generation's weekly encrypted export (section 18), or reports the running one.
+	 * The export runs in bounded alarm steps while writes flow (backup.ts exportStep, journal deltas and a bounded cut); its manifest
+	 * lands last, so it lists as complete only when done. `last` is the previous export's outcome.
+	 */
+	async exportNow(who: ProfileRef): Promise<Outcome<{ id: string; state: "running"; chunks: number; rows: number; last?: Record<string, unknown> }>> {
 		const sql = this.ctx.storage.sql;
 		if (closedState(sql)) return fail("profile_wiped", "this corpus generation is closed");
 		const bound = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray();
 		if (!bound.length) return fail("not_found", "this corpus generation holds nothing to export");
 		const want: Record<string, string> = { user_id: who.userId, profile: who.profile, generation: who.generation };
 		if (bound.some((r) => r.value !== want[r.key])) return fail("validation", "corpus object identity mismatch");
+		const last = lastExport(sql, META), running = exportJob(sql, META);
+		const view = (j: NonNullable<typeof running>) => ok({ id: j.id, state: "running" as const, chunks: j.n, rows: Object.values(j.counts).reduce((a, b) => a + b, 0), ...(last ? { last } : {}) });
+		if (running) return view(running);
 		if (refreshActive(sql)) return fail("busy", "the corpus is refreshing; export after it publishes", { reason: "corpus_refreshing" });
 		if (restoring(sql)) return fail("busy", "this corpus generation is being restored");
-		// shortcut: the whole-store pause of backup.ts, bounded by blockConcurrencyWhile's 30 s; a corpus too large for it fails and is retried next week.
-		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env,
-			{ store: `corpus-${who.profile}`, userId: who.userId, metaTable: META, control: Object.keys(SNAPSHOTS).map(stageName), profile: who.profile, generation: who.generation, rowid: true }));
+		const job = beginExport(this.ctx.storage, this.spec());
+		await this.ctx.storage.setAlarm(Date.now());
+		return view(job);
+	}
+
+	/** This bound generation's export: every table but the stages, rowids included. */
+	private spec(): StoreSpec {
+		const m = Object.fromEntries(this.ctx.storage.sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray().map((r) => [r.key, r.value]));
+		return { store: `corpus-${m.profile}`, userId: m.user_id!, metaTable: META, control: Object.keys(SNAPSHOTS).map(stageName), profile: m.profile!, generation: m.generation!, rowid: true };
+	}
+	private exportStep() {
+		const sql = this.ctx.storage.sql;
+		return exportStep(this.ctx.storage, this.env, this.spec(), () => (closedState(sql) ? "this corpus generation is closed" : null));
+	}
+
+	/** The export job's steps, back to back; a transient failure retries after 30 s, and a stop ends the job. */
+	async alarm(): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		closedState(sql); // a cleared generation may have no meta table
+		await dropCancelled(this.ctx.storage, this.env, META);
+		if (!exportJob(sql, META)) return;
+		const r = await this.exportStep();
+		if (exportJob(sql, META)) await this.ctx.storage.setAlarm(Date.now() + (r.ok ? 0 : 30_000));
 	}
 
 	/**
@@ -223,10 +257,15 @@ export class CorpusStore extends DurableObject<Env> {
 			const meta = (k: string) => sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = ?`, k).toArray()[0]?.value;
 			if (!meta("restore_id")) {
 				if (exportTables(sql, { control: [] }).some((t) => t !== META && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a corpus restore needs an empty corpus generation");
+				// A restore begins into an empty generation: any export of it is moot and ends before restore rows land; the alarm deletes its objects.
+				const cancelled = cancelExport(this.ctx.storage, this.spec(), "a restore began into this corpus generation");
 				sql.exec(`INSERT INTO ${META} (key, value) VALUES ('restore_id', ?), ('restore_next', '0'), ('restore_fts', '0')`, r.id);
+				if (cancelled) await this.ctx.storage.setAlarm(Date.now());
 			} else if (meta("restore_id") !== r.id) return fail("validation", "this corpus generation belongs to another restore");
-			const adjust = (table: string, cols: string[], row: unknown[]) =>
-				table === META && (["user_id", "profile", "generation", "schema_version", "closed"].includes(String(row[cols.indexOf("key")])) || String(row[cols.indexOf("key")]).startsWith("restore_")) ? null : row;
+			const kept = (k: unknown) => ["user_id", "profile", "generation", "schema_version", "closed"].includes(String(k)) || String(k).startsWith("restore_");
+			const adjust = (table: string, cols: string[], row: unknown[]) => (table === META && kept(row[cols.indexOf("key")]) ? null : row);
+			// Version 2 (journaled): baseline rows were read at different moments, so every chunk replaces; a delta deletes first.
+			const journaled = m.value.version === 2;
 			const all = { run: (q: string, ...p: SqlStorageValue[]) => sql.exec(q, ...p).toArray(), spent: () => false };
 			const started = Date.now(), live = () => Date.now() - started < 10_000;
 			// Chunks hold at most 500 rows and 512 KB, the scale of one uploaded corpus chunk, so each applies in one transaction.
@@ -234,7 +273,12 @@ export class CorpusStore extends DurableObject<Env> {
 				const at = Number(meta("restore_next")), c = prKeyFree(await readChunk(this.env, m.value, at));
 				this.ctx.storage.transactionSync(() => {
 					if (Number(meta("restore_next")) !== at) return;
-					applyRows(all, c, 0, c.rows.length, adjust, { n: 0 }, c.table === META);
+					if (journaled && c.deletes?.length) {
+						if (!/^[a-z_][a-z0-9_]*$/.test(c.table) || !c.key?.length || !c.key.every((n) => /^[a-z_][a-z0-9_]*$/.test(n))) throw Fail.of("validation", "export chunk names an invalid table or key");
+						const del = `DELETE FROM "${c.table}" WHERE (${c.key.map((n) => (n === "rowid" ? n : `"${n}"`)).join(", ")}) = (${c.key.map(() => "?").join(", ")})`;
+						for (const k of c.deletes) if (!(c.table === META && kept(k[0]))) sql.exec(del, ...(k as SqlStorageValue[]));
+					}
+					applyRows(all, c, 0, c.rows.length, adjust, { n: 0 }, journaled || c.table === META);
 					sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('restore_next', ?)`, String(at + 1));
 				});
 			}
@@ -265,10 +309,14 @@ export class CorpusStore extends DurableObject<Env> {
 	/** Internal RPC from an aborted corpus restore: clears what it wrote and leaves an empty, migrated generation. */
 	async discardRestore(who: ProfileRef, id: string): Promise<void> {
 		const sql = this.ctx.storage.sql;
-		if (closedState(sql) || sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'restore_id'`).toArray()[0]?.value !== id) return;
-		const bound = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray();
 		const want: Record<string, string> = { user_id: who.userId, profile: who.profile, generation: who.generation };
-		if (bound.some((r) => r.value !== want[r.key])) return;
+		const still = () => !closedState(sql) && sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'restore_id'`).toArray()[0]?.value === id
+			&& !sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray().some((r) => r.value !== want[r.key]);
+		if (!still()) return;
+		// Settles any in-flight export step and deletes cancelled exports' objects; deleteAll below would lose their markers.
+		await dropCancelled(this.ctx.storage, this.env, META);
+		// Rechecked after that await, in the same turn as the clear: a concurrent abort may have finished and new data been accepted.
+		if (!still()) return;
 		await this.ctx.storage.deleteAll();
 		migrate(this.ctx.storage, META, CORPUS_MIGRATIONS);
 	}
@@ -285,6 +333,11 @@ export class CorpusStore extends DurableObject<Env> {
 		if (op === "close") {
 			if (closedState(sql) !== "wiped") sql.exec(`INSERT OR REPLACE INTO ${META} (key, value) VALUES ('closed', 'wiping')`);
 			return ok({ closed: closedState(sql)! });
+		}
+		// No export put may land after this clear and the account's export deletion: a closed job's step stops and deletes first.
+		await settleExports(this.ctx.storage);
+		if (sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray().some((r) => r.value !== want[r.key])) {
+			return { ok: false, error: { code: "validation", message: "corpus object identity mismatch" } };
 		}
 		await this.ctx.storage.deleteAll();
 		sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);

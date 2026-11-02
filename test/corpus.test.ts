@@ -1,6 +1,6 @@
 // AM-14 corpus vertical: the real Worker fetch with CORPUS on, its CorpusStore objects, and the local uploader core.
 // Synthetic rows only. The source is a throwaway CorpusStore SQLite, whose tables carry the retained original DDL byte for byte.
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256 } from "../src/domain/ids";
@@ -19,6 +19,14 @@ const FILE = "ab".repeat(32);
 const sha = (n: number) => n.toString(16).padStart(40, "0");
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 type Json = Record<string, any>;
+
+/** A corpus export runs in alarm steps: runs them until export `id` of the profile's current corpus lists as complete. */
+async function settled(profile: string, generation: string, id: string): Promise<string> {
+	const { listExports } = await import("../src/backup");
+	const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${profile}:${generation}`));
+	for (let i = 0; i < 20 && !(await listExports(env, `corpus-${profile}`)).includes(id); i++) await runDurableObjectAlarm(store);
+	return id;
+}
 
 /** A fresh active profile on the owner's account, an import token and a read token for it alone, and the env with CORPUS on. */
 async function isolated() {
@@ -1046,7 +1054,7 @@ describe("corpus dated snapshots", () => {
 		expect(await receipts(p.generation, B)).toBe(7);
 		// Export with C loading: stages are not exported; the restored C is abandoned with its receipts before the generation opens.
 		expect(await load("c", C3, LATER, stopAfter(1))).toMatchObject({ status: "stopped" });
-		const exportId = (await admin({ op: "export", profile: p.name, corpus: true }))[`corpus-${p.name}`].id as string;
+		const exportId = await settled(p.name, p.generation, (await admin({ op: "export", profile: p.name, corpus: true }))[`corpus-${p.name}`].id as string);
 		const m = await readManifest(env, `corpus-${p.name}`, exportId, OWNER);
 		expect(m.ok && Object.keys(m.value.counts).filter((t) => t.startsWith("corpus_stage_"))).toEqual([]);
 		expect(m.ok && m.value.counts.corpus_snapshots).toBe(3);
@@ -1166,7 +1174,8 @@ describe("corpus v5 record snapshots", () => {
 			sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g, `${OWNER}:${p.name}:${g}`, p.name);
 			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g, p.name, new Date().toISOString());
 		});
-		const exportNow = async () => ((await admin({ op: "export", profile: p.name, corpus: true })).value as Json)[`corpus-${p.name}`].id as string;
+		let live = p.generation;
+		const exportNow = async () => settled(p.name, live, ((await admin({ op: "export", profile: p.name, corpus: true })).value as Json)[`corpus-${p.name}`].id as string);
 		const first = await exportNow(), g2 = rand();
 		await move(g2);
 		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: first })).toMatchObject({ ok: true });
@@ -1175,6 +1184,7 @@ describe("corpus v5 record snapshots", () => {
 		expect((await get("pr", "acme/web#12", g2)).value).toMatchObject({ found: true, pull_requests: [{ rowid: 6 }] });
 		expect((await get("ticket", "XP-1", g2)).value.commits).toHaveLength(3);
 		await runInDurableObject(env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${p.name}:${g2}`)), (_i, s) => s.storage.sql.exec("UPDATE pull_requests SET \"pr_key:1\" = 'builder'"));
+		live = g2;
 		const second = await exportNow(), g3 = rand();
 		await move(g3);
 		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: second })).toMatchObject({ ok: true });
@@ -1267,7 +1277,7 @@ describe("corpus schema-6 delivery snapshots", () => {
 		if (!old.ok) throw new Error(old.error.message);
 		expect(await admin({ op: "beginCorpusRestore", profile: p.name, export: old.value.id })).toMatchObject({ ok: false, error: { code: "validation", message: expect.stringContaining("schema version") } });
 		const exported = await admin({ op: "export", profile: p.name, corpus: true });
-		const id = exported.value[`corpus-${p.name}`].id;
+		const id = await settled(p.name, p.generation, exported.value[`corpus-${p.name}`].id);
 		const m = await readManifest(env, `corpus-${p.name}`, id, OWNER);
 		expect(m.ok && m.value.schema_version).toBe(6);
 		for (const t of DELIVERY) expect(m.ok && m.value.counts[t]).toBe(1);

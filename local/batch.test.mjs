@@ -14,7 +14,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-batch-test-"));
 let n = 0;
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
 const { batch, mcpJob, OPS_SCHEMA } = await import("./batch.mjs");
-const { claudeExec } = await import("./agent-memory.mjs");
+const { claudeEnv, claudeExec } = await import("./agent-memory.mjs");
 beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
 
 const ALL_OPS = ["save", "link", "end_link", "supersede", "flag", "dismiss"];
@@ -352,6 +352,43 @@ describe("Claude Code runner: gated, and decided only at process close", () => {
 		assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"], "no item operation");
 		assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: "batch_skipped", reason: "bad_events" });
 		assert.equal(report.profiles.work.status, "discarded");
+	});
+
+	it("ignores only the exact ui_invalidate notice before the gate init; any other early or later notice still fails closed", async () => {
+		const invalidate = (extra = {}) => frame({ type: "system", subtype: "ui_invalidate", event: "ui.render", instances: [{ surface: "x", component: "y", instance_id: "z" }], ...extra });
+		const proc = fakeClaude({ gate: invalidate() + gateOk, out: answer });
+		const { server } = await run(proc);
+		assert.equal(proc.lines.length, 2);
+		assert.deepEqual(server.calls[1].args.results, [{ item_id: 1, ops: [{ op: "dismiss" }] }]);
+		const job = { prompt: "do it\n<items>\n[]\n</items>\n", schema: {}, model: MODEL, effort: "low" };
+		const gateNotice = frame({ type: "system", subtype: "informational", content: "x" });
+		for (const gate of [gateNotice + gateOk, invalidate({ event: "other" }) + gateOk, init + invalidate() + frame({ type: "result", subtype: "success", is_error: false, num_turns: 0, duration_api_ms: 0 })]) {
+			const p = fakeClaude({ gate, out: answer });
+			assert.deepEqual(await claudeExec({ claude: "x", runDir: tmp, env: {}, spawnFn: p.spawnFn })(job), { kind: "runtime_warning" });
+			assert.equal(p.lines.length, 1, "no untrusted text after a rejected gate");
+		}
+		const later = fakeClaude({ out: invalidate() + answer });
+		assert.deepEqual(await claudeExec({ claude: "x", runDir: tmp, env: {}, spawnFn: later.spawnFn })(job), { kind: "runtime_warning" });
+		assert.equal(later.lines.length, 2);
+	});
+
+	it("spawns Claude with only PATH, HOME, the OS-account USER and its config dir, inheriting no ambient identity or credential", async () => {
+		const planted = { USER: "planted-user", LOGNAME: "planted-user", ANTHROPIC_API_KEY: "planted", ANTHROPIC_AUTH_TOKEN: "planted", CLAUDE_CODE_OAUTH_TOKEN: "planted",
+			CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1", CLAUDE_SECURESTORAGE_CONFIG_DIR: "/planted", AGENT_MEMORY_WORK_TOKEN: "planted", MCP_TIMEOUT: "1" };
+		const saved = Object.fromEntries(Object.keys(planted).map((k) => [k, process.env[k]]));
+		Object.assign(process.env, planted);
+		try {
+			const proc = fakeClaude({ out: answer });
+			let seen;
+			const spawnFn = (cmd, args, opts) => { seen = opts; return proc.spawnFn(cmd, args, opts); };
+			const job = { prompt: "do it\n<items>\n[]\n</items>\n", schema: {}, model: MODEL, effort: "low" };
+			const out = await claudeExec({ claude: "x", runDir: tmp, env: claudeEnv({ claude_config_dir: "/Users/someone/.plaude" }), spawnFn })(job);
+			assert.equal(out.kind, "ok");
+			assert.deepEqual(seen.env, { PATH: saved.PATH ?? process.env.PATH ?? "/usr/bin:/bin", HOME: os.homedir(), USER: os.userInfo().username, CLAUDE_CONFIG_DIR: "/Users/someone/.plaude" });
+			assert.notEqual(seen.env.USER, "planted-user");
+		} finally {
+			for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+		}
 	});
 
 	it("writes no untrusted text when the gate init exposes a tool, and waits for the killed process on a timeout", async () => {

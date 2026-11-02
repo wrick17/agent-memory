@@ -444,9 +444,39 @@ describe("review regressions", () => {
 		assert.ok(!server.storedText().includes(text));
 		assert.equal(am.rejectPart({ ...emptyPart(), outcomes: { commits: [], prs: [], tests: [text] } }, { messages: [] }), "bad_outcomes");
 		assert.equal(am.rejectPart({ ...emptyPart(), whole_message: "x" }, { messages: [] }), "bad_shape");
-		assert.equal(am.rejectPart({ ...emptyPart(), asks: [{ text: "a", pos: 1, raw: "x" }] }, { messages: [] }), "bad_items");
-		assert.equal(am.rejectPart({ ...emptyPart(), corrections: [{ text: "Use token=abc123secret", pos: 1 }] }, { messages: [] }), "bad_items");
+		assert.equal(am.rejectPart({ ...emptyPart(), asks: [{ text: "a", pos: 1, raw: "x" }] }, { messages: [] }), "bad_items:asks:shape");
+		assert.equal(am.rejectPart({ ...emptyPart(), corrections: [{ text: "Use token=abc123secret", pos: 1 }] }, { messages: [] }), "bad_items:corrections:redaction");
 		assert.equal(am.rejectPart({ ...emptyPart(), corrections: [{ text: "Use token=[REDACTED]", pos: 1 }] }, { messages: [] }), null);
+	});
+
+	it("names the failed item check in a stuck range's reason, with the same gates and no part text", async () => {
+		const reject = (part) => am.rejectPart({ ...emptyPart(), ...part }, { messages: [] });
+		assert.equal(reject({ asks: "x" }), "bad_items:asks:array");
+		assert.equal(reject({ decisions: [{ text: 7, pos: 1 }] }), "bad_items:decisions:type");
+		assert.equal(reject({ decisions: [{ text: "x".repeat(281), pos: 1 }] }), "bad_items:decisions:length");
+		assert.equal(reject({ corrections: [{ text: "x", pos: -1 }] }), "bad_items:corrections:position");
+		assert.equal(reject({ corrections: [{ text: "x" }] }), "bad_items:corrections:position");
+		// The bounds themselves are unchanged: exactly 160 and 280 characters pass, one more fails.
+		assert.equal(reject({ asks: [{ text: "x".repeat(160), pos: 0 }], decisions: [{ text: "y".repeat(280), pos: 0 }] }), null);
+		assert.equal(reject({ asks: [{ text: "x".repeat(161), pos: 0 }] }), "bad_items:asks:length");
+		const ask = "Ship the amber widget for the review session demo and keep the decision log beside the sample folder for later.".padEnd(161, ".");
+		const f = transcript("why", [claudeLine("user", "Ship it."), claudeLine("assistant", "Done.")]);
+		const r = await am.processSession(trigger("claude-code", "sess-why", f), { server: fakeServer(), runner: fixedRunner({ kind: "ok", part: { ...emptyPart(), asks: [{ text: ask, pos: 0 }] } }) });
+		const range = Object.values(JSON.parse(fs.readFileSync(path.join(am.home(), "state", "claude-code", "sess-why.json"), "utf8")).ranges)[0];
+		assert.deepEqual([Object.values(r.outcomes)[0], range.status, range.reason, r.consolidated_to], ["stuck", "stuck", "bad_items:asks:length", 0]);
+		assert.ok(!JSON.stringify(range).includes("amber"));
+	});
+
+	it("does not require the sentence period after an unquoted path, and keeps quoted and backticked literals exact", () => {
+		const owner = (text) => ({ messages: [{ role: "owner", text, pos: 0, next: text.length + 1 }] });
+		const sub = owner("Read ~/notes/work/agents.md. Then open src/.. and a/b- too.");
+		assert.deepEqual(am.literals(sub.messages), ["~/notes/work/agents.md", "src/..", "a/b-"]);
+		const ask = [{ text: "Read the agents notes", pos: 0 }];
+		assert.equal(am.rejectPart({ ...emptyPart(), asks: ask, entities: ["~/notes/work/agents.md", "src/..", "a/b-"] }, sub), null);
+		assert.equal(am.rejectPart({ ...emptyPart(), asks: ask, entities: ["~/notes/work/agents", "src/..", "a/b-"] }, sub), "missing_literal");
+		const quoted = owner('Use `docs/x.md.` and "notes/y.md." as written.');
+		assert.ok(["docs/x.md.", "notes/y.md."].every((l) => am.literals(quoted.messages).includes(l)));
+		assert.equal(am.rejectPart({ ...emptyPart(), asks: ask, entities: ["docs/x.md", "notes/y.md"] }, quoted), "missing_literal");
 	});
 
 	it("L2: a run started before the debounce deadline waits for it and then captures", async () => {

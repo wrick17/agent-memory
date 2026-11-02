@@ -280,7 +280,9 @@ export function literals(messages) {
 		if (m.role !== "owner") continue;
 		for (const x of m.text.matchAll(/`([^`\n]{1,120})`/g)) out.add(x[1]);
 		for (const x of m.text.matchAll(/"([^"\n]{2,120})"/g)) out.add(x[1]);
-		for (const x of m.text.match(/(?:~|\.{1,2})?\/?[\w.-]+(?:\/[\w.-]+)+|\b[\w-]+\.(?:ts|tsx|js|mjs|jsx|json|md|py|toml|ya?ml|sh|css|html|sql|go|rs|txt|lock)\b/g) ?? []) out.add(x);
+		// An unquoted path ending a sentence takes in the sentence's period; that period is not part of the path. Quoted or
+		// backticked text above is kept exactly, and "..", "/." and a trailing hyphen stay as written.
+		for (const x of m.text.match(/(?:~|\.{1,2})?\/?[\w.-]+(?:\/[\w.-]+)+|\b[\w-]+\.(?:ts|tsx|js|mjs|jsx|json|md|py|toml|ya?ml|sh|css|html|sql|go|rs|txt|lock)\b/g) ?? []) out.add(x.replace(/(?<=[\w-])\.$/, ""));
 		for (const x of m.text.match(ENTITY) ?? []) out.add(x);
 	}
 	return [...out];
@@ -293,10 +295,24 @@ export function literals(messages) {
 export function bodyProblem(p) {
 	const only = (v, keys) => !!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
 	const str = (s, max) => typeof s === "string" && s.length <= max && redact(s) === s;
-	const items = (xs, max) => Array.isArray(xs) && xs.every((x) => only(x, ["text", "pos"]) && str(x.text, max) && Number.isInteger(x.pos) && x.pos >= 0);
+	// The first failed check, as a fixed code: the reason is kept in local state, so it names no text, value or unknown key.
+	const itemProblem = (xs, max) => {
+		if (!Array.isArray(xs)) return "array";
+		for (const x of xs) {
+			if (!only(x, ["text", "pos"])) return "shape";
+			if (typeof x.text !== "string") return "type";
+			if (x.text.length > max) return "length";
+			if (redact(x.text) !== x.text) return "redaction";
+			if (!Number.isInteger(x.pos) || x.pos < 0) return "position";
+		}
+		return null;
+	};
 	const list = (xs) => Array.isArray(xs) && xs.every((x) => str(x, LIMITS.item));
 	if (!only(p, ["asks", "decisions", "corrections", "outcomes", "entities", "dropped"])) return "bad_shape";
-	if (!items(p.asks, LIMITS.ask) || !items(p.decisions, LIMITS.item) || !items(p.corrections, LIMITS.item)) return "bad_items";
+	for (const [k, max] of [["asks", LIMITS.ask], ["decisions", LIMITS.item], ["corrections", LIMITS.item]]) {
+		const why = itemProblem(p[k], max);
+		if (why) return `bad_items:${k}:${why}`;
+	}
 	if (!only(p.outcomes, ["commits", "prs", "tests"]) || !Object.values(p.outcomes).every(list)) return "bad_outcomes";
 	if (!list(p.entities)) return "bad_entities";
 	if (!only(p.dropped, ["asks", "decisions", "corrections"]) || !["asks", "decisions", "corrections"].every((k) => Number.isInteger(p.dropped[k]) && p.dropped[k] >= 0)) return "bad_dropped";
@@ -846,7 +862,7 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	// Section 21's Claude Code alternative, batch only: opt-in, with both tier models named explicitly as Claude models.
 	const claudeModels = [config.batch_luna_model, config.batch_terra_model].every((m) => typeof m === "string" && m.startsWith("claude-"));
 	const batchExec = config.batch_runner === "claude" && claudeModels
-		? claudeExec({ claude: config.claude_bin || "claude", runDir, env: { PATH: env.PATH, HOME: env.HOME, ...(config.claude_config_dir ? { CLAUDE_CONFIG_DIR: config.claude_config_dir } : {}) } })
+		? claudeExec({ claude: config.claude_bin || "claude", runDir, env: claudeEnv(config) })
 		: undefined;
 	return {
 		available: true, classification: "denied", cleanup,
@@ -858,6 +874,13 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 		},
 	};
 }
+
+/**
+ * The Claude batch child's whole environment: nothing ambient is inherited. USER is the OS account (getpwuid through Node), the
+ * account Claude Code's Keychain lookup needs to find the stored login of CLAUDE_CONFIG_DIR; without it the CLI reports none.
+ */
+export const claudeEnv = (config) => ({ PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: os.homedir(), USER: os.userInfo().username,
+	...(config.claude_config_dir ? { CLAUDE_CONFIG_DIR: config.claude_config_dir } : {}) });
 
 /** Same proved CODEX_HOME, config and cwd for captures and batch items. Check the config before and after every exec. */
 export function confinedExec({ exec, codex, runDir, env, configFile, configSha, schemaDir }) {
@@ -923,6 +946,9 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 			if (phase === "stopped") return;
 			// Nothing may follow the query result: a second result, a notice or any other frame discards it.
 			if (phase === "after") return fail("runtime_warning");
+			// Claude Code 2.1.316 may announce a UI-surface render invalidation before its first init. It is a notice to UI clients
+			// only (no tool, config or execution state); the exact notice is ignored there, and anywhere else it fails like any other.
+			if (phase === "gate" && !init && e.type === "system" && e.subtype === "ui_invalidate" && e.event === "ui.render") return;
 			if (e.type === "system" && e.subtype === "init") {
 				if (phase === "gate" && !init) {
 					const empty = Array.isArray(e.tools) && !e.tools.length && Array.isArray(e.mcp_servers) && !e.mcp_servers.length;

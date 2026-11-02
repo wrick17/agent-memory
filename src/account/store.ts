@@ -914,16 +914,18 @@ export class AccountStore extends DurableObject<Env> {
 					cmd.profile ?? null, cmd.profile ?? null).toArray();
 				if (cmd.profile && !rows.length) return fail("not_found", `profile '${cmd.profile}' is not active`);
 				const results: Record<string, unknown> = {};
+				// A store whose export throws (an object reset) is recorded as failed like any other, so last_export_failed keeps it.
+				const caught = <T>(p: Promise<Outcome<T>>): Promise<Outcome<T>> => p.catch((e: unknown) => fail("unavailable", `export failed: ${(e as Error)?.message ?? String(e)}`));
 				for (const p of rows) {
 					const ref = { userId, profile: p.name, generation: p.generation };
 					// Rechecked before each store: an export started before a wipe finishes earlier than the wipe's own replacement.
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
-					const r = await this.profileAt(ref).exportNow(ref);
+					const r = await caught(this.profileAt(ref).exportNow(ref));
 					results[p.name] = r.ok ? r.value : r.error.code === "not_found" ? "empty" : { error: r.error };
 				}
 				if (!cmd.profile) {
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
-					const a = await this.exportAccount(userId);
+					const a = await caught(this.exportAccount(userId));
 					results.account = a.ok ? a.value : { error: a.error };
 				}
 				// The corpus weekly (section 18), also kept two: once its newest complete export is older than about a week, or when asked.
@@ -932,7 +934,8 @@ export class AccountStore extends DurableObject<Env> {
 					if (!cmd.corpus && ((await listExports(this.env, `corpus-${p.name}`)).at(-1) ?? "") >= week) continue;
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
 					const ref = { userId, profile: p.name, generation: p.generation };
-					const c = await this.corpusAt(ref).exportNow(ref);
+					// Starts or reports the corpus's background export; it lists as complete once its manifest lands.
+					const c = await caught(this.corpusAt(ref).exportNow(ref));
 					results[`corpus-${p.name}`] = c.ok ? c.value : c.error.code === "not_found" ? "empty" : { error: c.error };
 				}
 				const failed = Object.values(results).some((v) => typeof v === "object" && v !== null && "error" in v);

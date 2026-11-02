@@ -1,6 +1,7 @@
 // Encrypted exports to R2 and restore from an export (section 18), first vertical. The export is the approved bounded
 // write pause: the store blocks every other event while it snapshots, so the export is the store's exact state at `seq`.
-// shortcut: whole-store pause, bounded by blockConcurrencyWhile's 30 s; upgrade to the total-key cursor export before a store outgrows it.
+// shortcut: profiles and the account use the whole-store pause, bounded by blockConcurrencyWhile's 30 s; upgrade them to the total-key
+// cursor export before one outgrows it. The corpus, which has outgrown it, uses the fenced resumable export (exportStep).
 import { sha256 } from "./domain/ids";
 import { Fail, fail, ok, type Outcome } from "./domain/types";
 
@@ -14,12 +15,31 @@ export const KEEP = 2;
 export interface StoreSpec { store: string; userId: string; metaTable: string; control: readonly string[]; first?: readonly string[]; profile?: string; generation?: string; rowid?: boolean }
 export interface ChunkRef { key: string; table: string; rows: number; sha256: string }
 export interface Manifest {
-	version: 1; id: string; store: string; userId: string; profile?: string; generation?: string;
+	/** 2: a journaled resumable export (exportStep), restored in order with replace and delta deletes. */
+	version: 1 | 2; id: string; store: string; userId: string; profile?: string; generation?: string;
 	schema_version: number; seq: number; at: string; counts: Record<string, number>; chunks: ChunkRef[];
 }
-interface Chunk { table: string; columns: string[]; rows: unknown[][] }
+/** A delta chunk (version 2) also names its key columns and the keys deleted at its read; each key appears once per chunk. */
+interface Chunk { table: string; columns: string[]; rows: unknown[][]; key?: string[]; deletes?: unknown[][] }
 
 const enc = new TextEncoder();
+/** UTF-8 bytes of a value's JSON: every chunk and cut budget counts these, not UTF-16 string length. */
+const jsonBytes = (v: unknown) => enc.encode(JSON.stringify(v)).length;
+/**
+ * Packs items into chunks of at most CHUNK_ROWS items whose whole JSON (header, items and separators) stays within CHUNK_BYTES;
+ * an item larger than that goes alone. `make` builds a chunk from its items.
+ */
+function pack<T>(items: T[], make: (part: T[]) => Chunk, measure?: (it: T) => unknown): Chunk[] {
+	const out: Chunk[] = [], head = jsonBytes(make([]));
+	let part: T[] = [], size = head;
+	for (const it of items) {
+		const b = jsonBytes(measure ? measure(it) : it) + 1;
+		if (part.length && (part.length >= CHUNK_ROWS || size + b > CHUNK_BYTES)) { out.push(make(part)); part = []; size = head; }
+		part.push(it); size += b;
+	}
+	if (part.length) out.push(make(part));
+	return out;
+}
 async function backupKey(env: Env): Promise<CryptoKey> {
 	if (!env.BACKUP_KEY || env.BACKUP_KEY.length < 32) throw Fail.of("unavailable", "BACKUP_KEY is not configured (at least 32 characters)");
 	const base = await crypto.subtle.importKey("raw", enc.encode(env.BACKUP_KEY), "HKDF", false, ["deriveKey"]);
@@ -48,7 +68,7 @@ async function unseal(key: CryptoKey, objectKey: string, bytes: Uint8Array): Pro
 export function exportTables(sql: SqlStorage, spec: Pick<StoreSpec, "control" | "first">): string[] {
 	const all = sql.exec<{ name: string; sql: string | null }>("SELECT name, sql FROM sqlite_master WHERE type = 'table'").toArray();
 	const virtual = all.filter((t) => /^CREATE VIRTUAL/i.test(t.sql ?? "")).map((t) => t.name);
-	const names = all.map((t) => t.name).filter((n) => !n.startsWith("sqlite_") && !n.startsWith("_cf_") && n !== "__miniflare_do_name" && n !== "deleted_rows"
+	const names = all.map((t) => t.name).filter((n) => !n.startsWith("sqlite_") && !n.startsWith("_cf_") && n !== "__miniflare_do_name" && n !== "deleted_rows" && n !== JOURNAL
 		&& !spec.control.includes(n) && !virtual.some((v) => n === v || n.startsWith(`${v}_`)));
 	const first = spec.first ?? [];
 	return [...first.filter((n) => names.includes(n)), ...names.filter((n) => !first.includes(n)).sort()];
@@ -90,8 +110,9 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 				const page = [...cur.raw()];
 				for (const row of page) {
 					if (row.some((v) => v instanceof ArrayBuffer)) throw Fail.of("unavailable", `table ${table} holds a blob, which this export does not encode`);
-					const size = JSON.stringify(row).length;
-					if (rows.length && (rows.length >= CHUNK_ROWS || bytes + size > CHUNK_BYTES)) { await put({ table, columns, rows }); rows = []; bytes = 0; }
+					const size = jsonBytes(row) + 1;
+					if (rows.length && (rows.length >= CHUNK_ROWS || bytes + size > CHUNK_BYTES)) { await put({ table, columns, rows }); rows = []; }
+					if (!rows.length) bytes = jsonBytes({ table, columns, rows: [] }); // each chunk's header, with the real column names
 					rows.push(row); bytes += size; counts[table]++;
 				}
 				if (page.length < CHUNK_ROWS) break;
@@ -108,6 +129,281 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 	} catch (e) {
 		if (e instanceof Fail) return { ok: false, error: e.failure };
 		return fail("unavailable", `export failed: ${(e as Error).message}`);
+	}
+}
+
+/**
+ * A resumable export (the corpus, whose size outgrows the 30 s pause; contract CONTRACT-v2): a baseline of keyset pages read while
+ * writes flow, then deltas from a change journal that triggers fill only while the job runs, then one synchronous cut. The job's
+ * durable progress lives in the store's meta table under `export_*` keys, which are never exported or journaled. A write fence
+ * (exportFenced) is only the fallback when catch-up falls behind, and it lapses by the clock after 30 s.
+ */
+export interface ExportJob { id: string; at: string; schema: number; phase: "baseline" | "delta" | "publishing"; table: number; after: unknown[] | null; jc: number; over: number;
+	fence_until: number | null; n: number; counts: Record<string, number> }
+const JOURNAL = "export_journal";
+const STEP_MS = 10_000, STEP_CHUNKS = 200, DRAIN = 1_000, CUT_ROWS = 8_000, CUT_BYTES = 2 * 1024 * 1024, FENCE_MS = 30_000, FENCE_AFTER = 50;
+const pad = (n: number, w: number) => String(n).padStart(w, "0");
+
+export function exportJob(sql: SqlStorage, metaTable: string): ExportJob | undefined {
+	const raw = sql.exec<{ value: string }>(`SELECT value FROM ${metaTable} WHERE key = 'export_job'`).toArray()[0]?.value;
+	return raw ? JSON.parse(raw) as ExportJob : undefined;
+}
+/** Whether the fallback fence holds: only within its 30 s, whatever the export's steps do. */
+export const exportFenced = (sql: SqlStorage, metaTable: string) => { const f = exportJob(sql, metaTable)?.fence_until; return f != null && Date.now() < f; };
+/** The outcome of the store's last finished or stopped resumable export, if any. */
+export const lastExport = (sql: SqlStorage, metaTable: string) => {
+	const raw = sql.exec<{ value: string }>(`SELECT value FROM ${metaTable} WHERE key = 'export_last'`).toArray()[0]?.value;
+	return raw ? JSON.parse(raw) as Record<string, unknown> : undefined;
+};
+
+/** How a table is read and keyed: rowid tables by their rowid (a hidden one selected as `rowid`), others by their primary key. */
+function shapeOf(sql: SqlStorage, table: string): { cols: string; order: string; key: string[]; at: (r: "NEW" | "OLD") => string } {
+	const { order, hidden } = orderOf(sql, table);
+	if (order === "rowid") {
+		const pk = hidden ? "rowid" : sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) WHERE pk > 0", table).one().name;
+		return { cols: hidden ? "rowid AS rowid, *" : "*", order, key: [pk], at: (r) => `json_array(${r}.rowid)` };
+	}
+	const names = order.split(", ").map((c) => c.slice(1, -1));
+	return { cols: "*", order, key: names, at: (r) => `json_array(${names.map((n) => `${r}."${n}"`).join(", ")})` };
+}
+const keyWhere = (key: string[]) => `(${key.map((k) => (k === "rowid" ? "rowid" : `"${k}"`)).join(", ")}) = (${key.map(() => "?").join(", ")})`;
+const notOwn = (r: string) => `${r}.key NOT LIKE 'export\\_%' ESCAPE '\\'`;
+
+/** Drops the change journal and its triggers. */
+export function endCapture(sql: SqlStorage): void {
+	for (const t of sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'export\\_cap\\_%' ESCAPE '\\'").toArray()) sql.exec(`DROP TRIGGER "${t.name}"`);
+	sql.exec(`DROP TABLE IF EXISTS ${JOURNAL}`);
+}
+
+/**
+ * Starts the job in one transaction: the change journal and one AFTER INSERT/UPDATE/DELETE trigger set per exported table, so
+ * every later write records its keys (an update its old key and any new one) in its own transaction. The caller has checked
+ * that the store may export and that no job runs.
+ */
+export function beginExport(storage: DurableObjectStorage, spec: StoreSpec): ExportJob {
+	const sql = storage.sql, at = new Date().toISOString();
+	const job: ExportJob = { id: `${at.replace(/[-:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`, at, phase: "baseline", table: 0, after: null, jc: 0, over: 0, fence_until: null, n: 0, counts: {},
+		schema: Number(sql.exec<{ value: string }>(`SELECT value FROM ${spec.metaTable} WHERE key = 'schema_version'`).one().value) };
+	storage.transactionSync(() => {
+		endCapture(sql);
+		sql.exec(`CREATE TABLE ${JOURNAL} (jseq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, key TEXT NOT NULL)`);
+		exportTables(sql, spec).forEach((t, i) => {
+			const { at: k } = shapeOf(sql, t), meta = t === spec.metaTable, put = (r: "NEW" | "OLD") => `INSERT INTO ${JOURNAL} (tbl, key) VALUES ('${t}', ${k(r)});`;
+			sql.exec(`CREATE TRIGGER export_cap_${i}_i AFTER INSERT ON "${t}"${meta ? ` WHEN ${notOwn("NEW")}` : ""} BEGIN ${put("NEW")} END`);
+			sql.exec(`CREATE TRIGGER export_cap_${i}_d AFTER DELETE ON "${t}"${meta ? ` WHEN ${notOwn("OLD")}` : ""} BEGIN ${put("OLD")} END`);
+			sql.exec(`CREATE TRIGGER export_cap_${i}_u AFTER UPDATE ON "${t}"${meta ? ` WHEN ${notOwn("OLD")} OR ${notOwn("NEW")}` : ""} BEGIN ${put("OLD")}
+				INSERT INTO ${JOURNAL} (tbl, key) SELECT '${t}', ${k("NEW")} WHERE ${k("NEW")} IS NOT ${k("OLD")}; END`);
+		});
+		sql.exec(`DELETE FROM ${spec.metaTable} WHERE key LIKE 'export\\_refs:%' ESCAPE '\\'`);
+		sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES ('export_job', ?)`, JSON.stringify(job));
+	});
+	return job;
+}
+
+/**
+ * Ends a running job (a restore begins into this store) and records `export_drop:<id>` in the same transaction, so its objects
+ * are deleted by dropCancelled whether or not a step is running; a running step also deletes them when it sees the job gone.
+ * True when a job was cancelled: the caller arms the alarm that runs dropCancelled.
+ */
+export function cancelExport(storage: DurableObjectStorage, spec: Pick<StoreSpec, "store" | "metaTable">, why: string): boolean {
+	const job = exportJob(storage.sql, spec.metaTable);
+	if (!job) return false;
+	storage.transactionSync(() => {
+		endCapture(storage.sql);
+		storage.sql.exec(`DELETE FROM ${spec.metaTable} WHERE key = 'export_job' OR key LIKE 'export\\_refs:%' ESCAPE '\\'`);
+		storage.sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES ('export_last', ?), (?, ?)`,
+			JSON.stringify({ id: job.id, at: new Date().toISOString(), state: "failed", error: why }), `export_drop:${job.id}`, spec.store);
+	});
+	return true;
+}
+
+/** The export steps in flight on each store object: no cleanup or clear may run under a put that can still land. */
+const stepping = new WeakMap<object, Set<Promise<unknown>>>();
+/** Waits until no export step of this store object is in flight; a step that finds its job gone has then deleted or marked its objects. */
+export async function settleExports(storage: DurableObjectStorage): Promise<void> {
+	for (let s = stepping.get(storage); s?.size; s = stepping.get(storage)) await Promise.allSettled([...s]);
+}
+
+/**
+ * Deletes the objects of every cancelled or abandoned export recorded in the store, after any in-flight step has settled, and
+ * consumes each marker only after its objects are gone; a failure keeps the remaining markers for the next run.
+ */
+export async function dropCancelled(storage: DurableObjectStorage, env: Env, metaTable: string): Promise<void> {
+	const sql = storage.sql;
+	await settleExports(storage);
+	for (const m of sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${metaTable} WHERE key LIKE 'export\\_drop:%' ESCAPE '\\'`).toArray()) {
+		await dropExportId(env, m.value, m.key.slice("export_drop:".length));
+		sql.exec(`DELETE FROM ${metaTable} WHERE key = ?`, m.key);
+	}
+}
+
+/**
+ * Synchronously reads up to `limit` journal entries after `after` and each distinct key's current row: present is an upsert,
+ * absent a delete. Run in one turn, so no write lands between an entry and its row.
+ */
+function readDelta(sql: SqlStorage, metaTable: string, after: number, limit: number) {
+	const entries = sql.exec<{ jseq: number; tbl: string; key: string }>(`SELECT jseq, tbl, key FROM ${JOURNAL} WHERE jseq > ? ORDER BY jseq LIMIT ?`, after, limit).toArray();
+	const by = new Map<string, Set<string>>();
+	for (const e of entries) by.set(e.tbl, (by.get(e.tbl) ?? new Set()).add(e.key));
+	const chunks: Chunk[] = [];
+	for (const [table, keys] of by) {
+		const s = shapeOf(sql, table), columns = sql.exec(`SELECT ${s.cols} FROM "${table}" LIMIT 0`).columnNames;
+		const own = table === metaTable ? ` AND ${notOwn(table)}` : "";
+		const ops: { row?: unknown[]; del?: unknown[] }[] = [];
+		for (const k of keys) {
+			const kv = JSON.parse(k) as SqlStorageValue[], row = [...sql.exec(`SELECT ${s.cols} FROM "${table}" WHERE ${keyWhere(s.key)}${own}`, ...kv).raw()][0];
+			if (row?.some((v) => v instanceof ArrayBuffer)) throw Fail.of("unavailable", `table ${table} holds a blob, which this export does not encode`);
+			ops.push(row ? { row } : { del: kv });
+		}
+		chunks.push(...pack(ops, (part) => ({ table, columns, key: s.key, rows: part.flatMap((o) => (o.row ? [o.row] : [])), deletes: part.flatMap((o) => (o.del ? [o.del] : [])) }), (o) => o.row ?? o.del));
+	}
+	return { chunks, bytes: chunks.reduce((bytes, chunk) => bytes + jsonBytes(chunk), 0), last: entries.at(-1)?.jseq ?? after };
+}
+
+/**
+ * One bounded step of the store's export job (about ten seconds or 200 chunks). Each page or delta batch is put before its
+ * progress commits, so a step that dies repeats it under the same chunk numbers. `halted` names the store's own reason to stop
+ * (its closed marker). A stopped job or a permanent failure deletes the job's objects, ends capture and lifts any fence; a
+ * transient error leaves the job for the next step. Rowid tables always carry their rowid, as `rowid: true`.
+ */
+export function exportStep(storage: DurableObjectStorage, env: Env, spec: StoreSpec, halted: () => string | null): ReturnType<typeof step> {
+	const run = step(storage, env, spec, halted), set = stepping.get(storage) ?? new Set();
+	stepping.set(storage, set.add(run));
+	const done = () => { set.delete(run); };
+	run.then(done, done);
+	return run;
+}
+async function step(storage: DurableObjectStorage, env: Env, spec: StoreSpec, halted: () => string | null):
+	Promise<Outcome<{ id: string; done: boolean; chunks: number; rows: number }>> {
+	const sql = storage.sql, start = exportJob(sql, spec.metaTable);
+	if (!start) return fail("not_found", "no export is running");
+	let job: ExportJob = start;
+	const id = job.id, prefix = `exports/${spec.store}/${id}/`, mine = () => exportJob(sql, spec.metaTable)?.id === id;
+	const schema = () => Number(sql.exec<{ value: string }>(`SELECT value FROM ${spec.metaTable} WHERE key = 'schema_version'`).toArray()[0]?.value);
+	// Once publishing, the cut is taken and its chunks are final: only a close or a cancel still stops it.
+	const stop = () => halted() ?? (!mine() ? "the export was cancelled" : job.phase === "publishing" ? null : schema() !== job.schema ? "the store migrated during the export"
+		: job.fence_until !== null && Date.now() >= job.fence_until ? "catch-up did not reach the cut within the 30-second write fence" : null);
+	const finish = (last: Record<string, unknown>) => storage.transactionSync(() => {
+		if (!mine()) return; // a cleared or cancelled store keeps nothing of the job
+		endCapture(sql);
+		sql.exec(`DELETE FROM ${spec.metaTable} WHERE key = 'export_job' OR key LIKE 'export\\_refs:%' ESCAPE '\\'`);
+		sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES ('export_last', ?)`, JSON.stringify({ id, at: new Date().toISOString(), ...last }));
+	});
+	/**
+	 * Durable ownership first: the exact-ID marker commits (with the job's end) before any delete, and goes only once the objects
+	 * are gone; a failed delete keeps it and arms the alarm that retries (dropCancelled). This holds in a store cleared meanwhile.
+	 */
+	const abandon = async (why: string) => {
+		const marker = `export_drop:${id}`;
+		storage.transactionSync(() => {
+			sql.exec(`CREATE TABLE IF NOT EXISTS ${spec.metaTable} (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`);
+			sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES (?, ?)`, marker, spec.store);
+		});
+		finish({ state: "failed", error: why });
+		try {
+			await dropExportId(env, spec.store, id);
+			sql.exec(`DELETE FROM ${spec.metaTable} WHERE key = ?`, marker);
+		} catch { await storage.setAlarm(Date.now() + 30_000); }
+		return fail("unavailable", `export ${id} stopped: ${why}`);
+	};
+	const save = (next: ExportJob) => sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES ('export_job', ?)`, JSON.stringify(next));
+	const backlog = () => sql.exec<{ n: number }>(`SELECT count(*) AS n FROM ${JOURNAL} WHERE jseq > ?`, job.jc).one().n;
+	const rowsOf = (c: Record<string, number>) => Object.values(c).reduce((a, b) => a + b, 0);
+	try {
+		const key = await backupKey(env), tables = exportTables(sql, spec), began = Date.now();
+		const refsKey = `export_refs:${pad(job.n, 6)}`, refs: Omit<ChunkRef, "key">[] = [];
+		const putAll = async (chunks: Chunk[]) => {
+			const out: Omit<ChunkRef, "key">[] = [];
+			for (const c of chunks) {
+				const plain = JSON.stringify(c), k = `${prefix}${pad(job.n + out.length, 5)}.enc`;
+				await env.BACKUPS.put(k, await seal(key, k, plain));
+				out.push({ table: c.table, rows: c.rows.length, sha256: sha256(plain) });
+			}
+			return out;
+		};
+		// Chunk numbers and refs advance with the cursor in one transaction.
+		const commit = (next: ExportJob, put: Omit<ChunkRef, "key">[]) => storage.transactionSync(() => {
+			if (!mine()) return false;
+			refs.push(...put);
+			save(next);
+			sql.exec(`INSERT OR REPLACE INTO ${spec.metaTable} (key, value) VALUES (?, ?)`, refsKey, JSON.stringify(refs));
+			return true;
+		});
+		/**
+		 * Publication from durable state alone (the refs and the publishing job): the same manifest whenever it is repeated, then
+		 * retention, then completion. No chunk is read or written again after the publishing commit.
+		 */
+		const publish = async () => {
+			const chunks: ChunkRef[] = sql.exec<{ value: string }>(`SELECT value FROM ${spec.metaTable} WHERE key LIKE 'export\\_refs:%' ESCAPE '\\' ORDER BY key`).toArray()
+				.flatMap((r) => JSON.parse(r.value) as Omit<ChunkRef, "key">[]).map((c, i) => ({ key: `${prefix}${pad(i, 5)}.enc`, ...c }));
+			if (chunks.length !== job.n) throw Fail.of("unavailable", "the export's chunk list does not match its progress");
+			const manifest: Manifest = { version: 2, id, store: spec.store, userId: spec.userId, ...(spec.profile ? { profile: spec.profile, generation: spec.generation! } : {}),
+				schema_version: job.schema, seq: 0, at: job.at, counts: job.counts, chunks }; // a journaled export is fixed by its cut, not a write sequence
+			const mk = `${prefix}manifest.enc`;
+			await env.BACKUPS.put(mk, await seal(key, mk, JSON.stringify(manifest)));
+			// A store closed or cleared meanwhile keeps no export.
+			if (halted() || !mine()) return await abandon(halted() ?? "the export was cancelled");
+			await retain(env, spec.store);
+			finish({ state: "done", chunks: chunks.length, rows: rowsOf(job.counts) });
+			return ok({ id, done: true, chunks: chunks.length, rows: rowsOf(job.counts) });
+		};
+		while (Date.now() - began < STEP_MS && refs.length < STEP_CHUNKS) {
+			const why = stop();
+			if (why) return await abandon(why);
+			if (job.phase === "publishing") return await publish();
+			let next: ExportJob, put: Omit<ChunkRef, "key">[];
+			if (job.phase === "baseline") {
+				if (job.table >= tables.length) { next = { ...job, phase: "delta" }; put = []; } else {
+					// A page is one synchronous read while writes flow: a key changed after its page is journaled and read again as a delta.
+					const table = tables[job.table]!, s = shapeOf(sql, table);
+					const filter = job.after === null ? "" : `WHERE (${s.key.map((k) => (k === "rowid" ? k : `"${k}"`)).join(", ")}) > (${s.key.map(() => "?").join(", ")})`;
+					const own = table === spec.metaTable ? `${filter ? `${filter} AND` : "WHERE"} ${notOwn(table)}` : filter;
+					const cur = sql.exec(`SELECT ${s.cols} FROM "${table}" ${own} ORDER BY ${s.order} LIMIT ${CHUNK_ROWS}`, ...((job.after ?? []) as SqlStorageValue[]));
+					const columns = cur.columnNames, page = [...cur.raw()], at = s.key.map((c) => columns.indexOf(c));
+					if (page.some((row) => row.some((v) => v instanceof ArrayBuffer))) throw Fail.of("unavailable", `table ${table} holds a blob, which this export does not encode`);
+					put = await putAll(pack(page, (rows) => ({ table, columns, rows })));
+					const last = page.at(-1);
+					next = { ...job, n: job.n + put.length, counts: { ...job.counts, [table]: (job.counts[table] ?? 0) + page.length },
+						...(page.length < CHUNK_ROWS ? { table: job.table + 1, after: null } : { after: at.map((i) => last![i]) }) };
+				}
+			} else if (backlog() <= CUT_ROWS) {
+				// The cut: everything after jc and its rows in this one synchronous turn, the instant C of the export.
+				const cut = readDelta(sql, spec.metaTable, job.jc, CUT_ROWS);
+				if (cut.bytes <= CUT_BYTES) {
+					const counts = { ...job.counts };
+					for (const t of sql.exec<{ tbl: string }>(`SELECT DISTINCT tbl FROM ${JOURNAL}`).toArray().map((r) => r.tbl)) {
+						counts[t] = sql.exec<{ n: number }>(`SELECT count(*) AS n FROM "${t}"${t === spec.metaTable ? ` WHERE ${notOwn(t)}` : ""}`).one().n;
+					}
+					if (job.fence_until !== null) { job = { ...job, fence_until: null, over: 0 }; save(job); } // writes resume now
+					const tail = await putAll(cut.chunks);
+					// The publishing commit freezes the cut: its tail refs and counts commit together, before any manifest exists.
+					const frozen: ExportJob = { ...job, phase: "publishing", jc: cut.last, n: job.n + tail.length, counts, fence_until: null, over: 0 };
+					if (!commit(frozen, tail)) return await abandon("the export was cancelled");
+					job = frozen;
+					return await publish();
+				}
+				const d = readDelta(sql, spec.metaTable, job.jc, DRAIN);
+				put = await putAll(d.chunks);
+				next = { ...job, jc: d.last, n: job.n + put.length };
+			} else {
+				const d = readDelta(sql, spec.metaTable, job.jc, DRAIN);
+				put = await putAll(d.chunks);
+				next = { ...job, jc: d.last, n: job.n + put.length };
+			}
+			if (!commit(next, put)) return await abandon("the export was cancelled");
+			job = next;
+		}
+		// Fallback (section 18 step 3): 50 steps in a row that end over the cut bound fence writes for at most 30 s.
+		if (job.phase === "delta" && mine()) {
+			const over = backlog() > CUT_ROWS ? job.over + 1 : 0;
+			job = { ...job, over, fence_until: job.fence_until ?? (over >= FENCE_AFTER ? Date.now() + FENCE_MS : null) };
+			save(job);
+		}
+		return ok({ id, done: false, chunks: job.n, rows: rowsOf(job.counts) });
+	} catch (e) {
+		// A published manifest is never deleted for an error: publication retries until it completes (or a close or cancel stops it).
+		if (e instanceof Fail && job.phase !== "publishing") return abandon(e.failure.message).catch(() => ({ ok: false as const, error: e.failure }));
+		return fail("unavailable", `export step failed: ${(e as Error).message}`);
 	}
 }
 
@@ -166,7 +462,7 @@ export async function readManifest(env: Env, store: string, id: string, userId: 
 		const mk = `exports/${store}/${chosen}/manifest.enc`, obj = await env.BACKUPS.get(mk);
 		if (!obj) return fail("not_found", `export ${chosen} of ${store} has no manifest`);
 		const m = JSON.parse(await unseal(await backupKey(env), mk, new Uint8Array(await obj.arrayBuffer()))) as Manifest;
-		if (m.version !== 1 || m.id !== chosen || m.store !== store || m.userId !== userId) return fail("validation", "export manifest does not match this store");
+		if ((m.version !== 1 && m.version !== 2) || m.id !== chosen || m.store !== store || m.userId !== userId) return fail("validation", "export manifest does not match this store");
 		if (!m.chunks.every((c, i) => c.key === `exports/${store}/${chosen}/${String(i).padStart(5, "0")}.enc`)) return fail("validation", "export manifest names foreign chunks");
 		return ok(m);
 	} catch (e) {

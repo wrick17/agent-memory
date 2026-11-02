@@ -14,9 +14,9 @@ Move, wipe preview and copying eligible current text to another profile are depl
 
 The graph includes an unsaved what-if view with local draft items and a metadata comparison. It is deployed with public TLS and control checks; browser acceptance remains open. [Evidence](docs/combined-verification-2026-10-30.md#what-if-graph-deployment-2026-11-01).
 
-The hosted Work profile and Account both passed recovery drills. [Evidence](docs/combined-verification-2026-10-30.md#hosted-work-import-and-recovery-2026-10-31).
+The hosted Work profile and Account passed earlier recovery drills. Full-size Profile and Account encrypted chunk checks passed on the new test fixture. Corpus repair stopped with missing chunks; full restore and wipe checks remain pending. [Evidence](docs/import-verification.md#full-size-export-source-checkpoint-2026-11-02).
 
-Personal Claude and Codex capture hooks are enabled. Work Claude SessionEnd and T3 Codex capture passed bounded manifest and context checks; automatic capture across triggers and machines remains unaccepted. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data, independent setup and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
+Main Personal Claude and Codex capture hooks are enabled. Work Claude SessionEnd, T3 Codex, and one MacBook capture suffix passed bounded checks. The MacBook test hooks were removed and its earlier pending range is retained; complete cross-machine capture remains open. The Work-only device refused Personal-routed captures; no Personal access was granted. Sign-in and model selection succeeded, but all eight diagnostic requests are spent. The eighth omitted Content-Type and encountered an undocumented event; the production MIME gate would refuse it. A separate synthetic native PART check passed at a limited scope ([evidence](docs/combined-verification-2026-10-30.md#synthetic-native-part-check-2026-11-01)). The hosted Work corpus now contains the five approved projections, with private keys held out; search, exact gets and a synthetic graph explore passed ([evidence](docs/import-verification.md#completion-evidence-follow-up-2026-11-01)). Broader corpus data, independent setup and full cross-machine use remain open. BothQ remains running and readable as a legacy archive; its ordinary bridges are fenced. Its shutdown-condition backup proof is complete at the [verified restore scope](docs/combined-verification-2026-10-30.md#legacy-backup-proof-2026-11-01).
 
 ## Completed development milestones
 
@@ -69,7 +69,7 @@ A checked item works for the stated scope. **Owner trial** means it was exercise
 
 - [x] Sign in to the private memory service with an isolated client (owner trial).
 - [ ] Set up and run your own independent deployment. A separate test deployment passed sign-in and selected memory checks; everyday setup remains unfinished.
-- [ ] Back up and restore memories in everyday use. Hosted profile and account recovery passed. Account and Work completion manifests were observed near 03:17; scheduled-trigger attribution and decrypted integrity remain open.
+- [ ] Back up and restore memories in everyday use. Hosted profile and account recovery passed. The scheduled event and nearby Account/Work manifests were observed; literal manifest correlation and full recovery remain open.
 - [ ] Use and verify the same memories across multiple machines.
 - [ ] Switch everyday Claude, Codex, and headless agents to Agent Memory after migration and acceptance checks.
 
@@ -94,7 +94,7 @@ Codex may open a browser during setup. Sign-in uses Clerk; scoped device access 
 
 ## Privacy and capture
 
-The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Personal capture hooks are enabled; bounded Work Claude and T3 Codex capture passed, while full capture parity remains pending. The separate own-app model path remains blocked after eight diagnostic requests.
+The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Personal capture hooks are enabled; bounded Main and T3 capture passed, while MacBook capture and full parity remain pending. The separate own-app model path remains blocked after eight diagnostic requests.
 
 ## Explore the project
 

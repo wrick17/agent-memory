@@ -398,7 +398,6 @@ describe("dashboard About you", () => {
 		b.go("#/profiles/work");
 		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
 		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
-		expect(DASHBOARD_HTML(env)).toMatch(/Not built yet<\/h2>\n<p>Recovery covers restore from an export only/);
 		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
 	});
 

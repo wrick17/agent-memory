@@ -28,9 +28,7 @@ a[aria-current]{font-weight:600}.prefs{list-style:none;padding:0}.prefs>li{borde
 <body><nav aria-label="Dashboard"><a href="#/">Graph</a><a href="#/memories">Memories</a><a href="#/draft">Write</a><a href="#/activity">Activity</a><a href="#/timeline">Timeline</a><a href="#/journals">Journals</a><a href="#/path">Paths</a><a href="#/work">Work</a><a href="#/about">About you</a><a href="#/review">Review</a><a href="#/backups">Backups</a><a href="#/profiles">Profiles</a><a href="#/routing">Routing</a><a href="#/move">Moves</a><a href="#/wipe">Wipe</a><a href="/settings">Settings</a></nav>
 <main><h1>Agent Memory</h1>
 <p id="status" role="status">Loading sign-in…</p><div id="signin"></div>
-<div id="view" hidden></div>
-<section id="planned" hidden aria-labelledby="planned-h"><h2 id="planned-h">Not built yet</h2>
-<p>Recovery covers restore from an export only: point-in-time and corpus recovery are not built.</p></section></main>
+<div id="view" hidden></div></main>
 <script defer crossorigin="anonymous" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
 <script defer crossorigin="anonymous" data-clerk-publishable-key="${esc(env.CLERK_PUBLISHABLE_KEY)}" src="${esc(env.CLERK_FRONTEND_API)}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
 <script defer src="/app.js"></script></body></html>`;
@@ -1306,7 +1304,9 @@ export async function dashboardMain(win: any): Promise<void> {
 			typed.addEventListener("input", () => { b.disabled = typed.value !== expected; });
 			return typed;
 		};
-		const summary = (v: J) => typeof v === "string" ? v : v?.error ? `failed: ${recorded(v.error.message)}` : v && typeof v === "object" ? `saved${v.id ? ` (${String(v.id)})` : ""}${typeof v.rows === "number" ? `, ${v.rows} rows` : ""}` : recorded(v);
+		const summary = (v: J) => typeof v === "string" ? v : v?.error ? `failed: ${recorded(v.error.message)}`
+			: v?.state === "running" ? `running in the background (${String(v.id)}); it lists as an export once complete${v.last?.state === "failed" ? `; the previous one failed: ${recorded(v.last.error)}` : ""}`
+			: v && typeof v === "object" ? `saved${v.id ? ` (${String(v.id)})` : ""}${typeof v.rows === "number" ? `, ${v.rows} rows` : ""}` : recorded(v);
 		const results = (parent: Node, r: J) => { const ul = el("ul", parent); for (const [k, v] of Object.entries(r ?? {})) el("li", ul, `${k}: ${summary(v)}`); };
 		say("Loading recovery status…");
 		// A restore gives its profile a new generation, so the drill and new restores take the profile list read now, not at startup.
@@ -1359,7 +1359,7 @@ export async function dashboardMain(win: any): Promise<void> {
 			drillView(rec, !!r);
 			if (r) return; // exports and new restores are refused while a recovery is open
 			el("h3", forms, "Export now");
-			note(forms, "Exports are encrypted on the server. Two complete exports are kept per store, so a new one replaces the oldest. Each profile pauses its writes for up to 30 seconds while it is exported.");
+			note(forms, "Exports are encrypted on the server. Two complete exports are kept per store, so a new one replaces the oldest. Each profile pauses its writes for up to 30 seconds while it is exported. A corpus exports in the background while uploads continue; only if it cannot catch up do its uploads wait, for at most 30 seconds.");
 			const exRow = el("p", forms);
 			btn(exRow, "Export everything", () => act("/api/backups/export", "export everything", {}, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
 			const exProfile = choose(forms, "export-profile", "Or export one profile", active().map((q) => [q.name, q.name]));
@@ -2881,7 +2881,6 @@ export async function dashboardMain(win: any): Promise<void> {
 	};
 	status("Signed in.");
 	$("view").hidden = false;
-	$("planned").hidden = false;
 	render(false);
 	win.addEventListener("hashchange", () => render(true));
 }

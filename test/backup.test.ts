@@ -1,10 +1,10 @@
 // Encrypted export and restore from an export (section 18): one real workerd, SQLite and local R2 roundtrip, plus the
 // refusals that guard against data loss and stray writes. Synthetic key and data only.
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AccountRecovery, Recovery } from "../src/account/store";
-import { readChunk, readManifest, type Manifest } from "../src/backup";
+import { listExports, readChunk, readManifest, type Manifest } from "../src/backup";
 import { driveTransfer, transferPorts } from "../src/transfer";
 import { settleRule, type SettleFacts } from "../src/profile/settle";
 import { canonicalJson, sha256 } from "../src/domain/ids";
@@ -26,6 +26,12 @@ async function stepUntilChecked(): Promise<Recovery> {
 		if (r.state !== "restoring" && r.state !== "settling" && r.state !== "checking") return r;
 	}
 	throw new Error("restore did not finish");
+}
+/** A corpus export runs in alarm steps: runs them until export `id` of that corpus lists as complete. */
+async function settled(profile: string, generation: string, id: string): Promise<string> {
+	const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${profile}:${generation}`));
+	for (let i = 0; i < 20 && !(await listExports(env, `corpus-${profile}`)).includes(id); i++) await runDurableObjectAlarm(store);
+	return id;
 }
 const personal = async () => (await value<{ name: string; generation: string }[]>(admin({ op: "listProfiles" }))).find((p) => p.name === "personal")!.generation;
 
@@ -404,6 +410,136 @@ describe("recovery settlement by the fixed transfer rules", () => {
 	});
 });
 
+describe("corpus resumable export", () => {
+	it("captures changes during a paged export into a bounded cut, resumes after a failed put, fences only as the 30 s fallback, and stops on a close", async () => {
+		await contextFor();
+		const { beginExport, cancelExport, exportJob, exportStep, lastExport } = await import("../src/backup");
+		const { SNAPSHOTS, stageName } = await import("../src/corpus/snapshots");
+		const name = `rx${crypto.randomUUID().slice(0, 6)}`, g = crypto.randomUUID().slice(0, 8), who = { userId: OWNER, profile: name, generation: g }, META = "corpus_store_meta";
+		await accountSql((sql) => {
+			const now = new Date().toISOString();
+			sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${g}`, g, now);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, name, now);
+		});
+		const store = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g}`));
+		const on = <T,>(f: (s: DurableObjectState) => T) => runInDurableObject(store, (_i, s) => f(s));
+		await on((s) => {
+			for (const [k, v] of [["user_id", OWNER], ["profile", name], ["generation", g]]) s.storage.sql.exec(`INSERT INTO ${META} (key, value) VALUES (?, ?)`, k, v);
+			for (let i = 1; i <= 1203; i++) s.storage.sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name) VALUES (?, 'org/alpha', ?, ?, ?)", i * 2, i, i, `dev-${i}`);
+		});
+		const spec = { store: `corpus-${name}`, userId: OWNER, metaTable: META, control: Object.keys(SNAPSHOTS).map(stageName), profile: name, generation: g, rowid: true };
+		const failingPut = (n: number) => { let puts = 0; return { ...env, BACKUPS: { put: (k: string, v: Uint8Array) => (++puts === n ? Promise.reject(new Error("r2 down")) : env.BACKUPS.put(k, v)),
+			list: (o: R2ListOptions) => env.BACKUPS.list(o), head: (k: string) => env.BACKUPS.head(k), delete: (k: string[]) => env.BACKUPS.delete(k) } } as unknown as Env; };
+		const objects = async (id: string) => (await env.BACKUPS.list({ prefix: `exports/corpus-${name}/${id}/` })).objects.length;
+		const chunk = { table: "contributors", schema_sha256: "0".repeat(64), source: { file_sha256: "ab".repeat(32) }, as_of: "2026-08-12T13:30:59.154Z", columns: [], after: null, rows: [], final: false, sha256: "0".repeat(64) };
+
+		const contributors = (st: DurableObjectStub<import("../src/corpus/store").CorpusStore>) => runInDurableObject(st, (_i, s) => s.storage.sql.exec("SELECT rowid AS id, repo, rank, commits, name FROM contributors ORDER BY rowid").toArray());
+		const capture = () => on((s) => s.storage.sql.exec("SELECT name FROM sqlite_master WHERE name = 'export_journal' OR name LIKE 'export_cap_%'").toArray().length);
+
+		const id = await on((s) => beginExport(s.storage, spec).id);
+		// Writes and reads flow while it runs, and a second export request joins it.
+		expect(await store.importChunk(who, chunk)).not.toMatchObject({ error: { code: "busy" } });
+		expect(await store.query(who, { action: "sql", sql: "SELECT count(*) FROM contributors" })).toMatchObject({ ok: true, value: { rows: [[1203]] } });
+		expect(await value<Record<string, unknown>>(admin({ op: "export", profile: name, corpus: true }))).toMatchObject({ [`corpus-${name}`]: { id, state: "running" } });
+		// The second put fails: the first page's chunk and cursor are kept, and the next step resumes after them.
+		expect(await on((s) => exportStep(s.storage, failingPut(2), spec, () => null))).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await on((s) => exportJob(s.storage.sql, META))).toMatchObject({ id, phase: "baseline", n: 1, after: [1000] });
+		// Changes behind and ahead of the baseline cursor: update, delete, delete-and-reinsert, rowid change, a new low key, a later
+		// update, and meta rows (its own export_* keys are never journaled or exported).
+		await on((s) => {
+			const sql = s.storage.sql;
+			sql.exec("UPDATE contributors SET name = 'changed' WHERE rowid = 2");
+			sql.exec("DELETE FROM contributors WHERE rowid = 4");
+			sql.exec("DELETE FROM contributors WHERE rowid = 6");
+			sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name) VALUES (6, 'org/alpha', 6, 6, 'reborn')");
+			sql.exec("UPDATE contributors SET rowid = 99999 WHERE rowid = 8");
+			sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name) VALUES (1, 'org/alpha', 0, 0, 'new-low')");
+			sql.exec("UPDATE contributors SET name = 'late' WHERE rowid = 2400");
+			sql.exec(`INSERT INTO ${META} (key, value) VALUES ('probe', 'x'), ('export_probe', 'y')`);
+			// 24 rows of 90,000 UTF-8 bytes ahead of the cursor: their baseline page and their delta both outgrow the UTF-16 length budget.
+			sql.exec("UPDATE contributors SET name = ? WHERE rowid BETWEEN 1100 AND 1146", "文".repeat(30_000));
+		});
+		expect(await on((s) => s.storage.sql.exec("SELECT count(*) AS n FROM export_journal WHERE key LIKE '%export_probe%'").one().n)).toBe(0);
+		// Retention fails after the manifest landed: the job stays publishing, and its retry publishes the same cut, not a later one.
+		let lists = 0;
+		const listFailsOnce = { ...env, BACKUPS: { put: (k: string, v: Uint8Array) => env.BACKUPS.put(k, v), head: (k: string) => env.BACKUPS.head(k), delete: (k: string[]) => env.BACKUPS.delete(k),
+			list: (o: R2ListOptions) => (++lists === 1 ? Promise.reject(new Error("r2 list down")) : env.BACKUPS.list(o)) } } as unknown as Env;
+		expect(await on((s) => exportStep(s.storage, listFailsOnce, spec, () => null))).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await on((s) => exportJob(s.storage.sql, META))).toMatchObject({ id, phase: "publishing" });
+		const expected = await contributors(store);
+		await on((s) => s.storage.sql.exec("UPDATE contributors SET name = 'after-cut' WHERE rowid = 10"));
+		expect(await on((s) => exportStep(s.storage, env, spec, () => null))).toMatchObject({ ok: true, value: { id, done: true } });
+		const m = await readManifest(env, `corpus-${name}`, id, OWNER);
+		if (!m.ok) throw new Error(m.error.message);
+		expect(m.value).toMatchObject({ version: 2, counts: { contributors: expected.length } });
+		const read = await Promise.all(m.value.chunks.map((_c, i) => readChunk(env, m.value, i)));
+		expect(read.filter((c) => c.table === META).flatMap((c) => c.rows.map((r) => String(r[c.columns.indexOf("key")]))).some((k) => k.startsWith("export_"))).toBe(false);
+		const utf8 = new TextEncoder();
+		for (const c of read) if (c.rows.length + (c.deletes?.length ?? 0) > 1) expect(utf8.encode(JSON.stringify(c)).length).toBeLessThanOrEqual(512 * 1024);
+		expect(await capture()).toBe(0);
+		expect(await on((s) => [exportJob(s.storage.sql, META), lastExport(s.storage.sql, META)])).toMatchObject([undefined, { id, state: "done" }]);
+
+		// The fallback fence: writes wait inside its 30 s and flow once it lapses; a job past it fails, deleting only its own objects.
+		const late = await on((s) => beginExport(s.storage, spec).id);
+		await on((s) => exportStep(s.storage, failingPut(2), spec, () => null));
+		expect(await objects(late)).toBe(1);
+		const fence = (until: number) => on((s) => s.storage.sql.exec(`UPDATE ${META} SET value = json_set(value, '$.fence_until', ?) WHERE key = 'export_job'`, until));
+		await fence(Date.now() + 30_000);
+		expect(await store.importChunk(who, chunk)).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "corpus_exporting", retry_after: 5 } } });
+		expect(await store.refresh(who, { command: "finish", plan_id: "x" })).toMatchObject({ ok: false, error: { code: "busy", details: { reason: "corpus_exporting" } } });
+		expect(await store.query(who, { action: "sql", sql: "SELECT count(*) FROM contributors" })).toMatchObject({ ok: true });
+		await fence(Date.now() - 1);
+		expect(await store.importChunk(who, chunk)).not.toMatchObject({ error: { code: "busy" } });
+		expect(await on((s) => exportStep(s.storage, env, spec, () => null))).toMatchObject({ ok: false, error: { message: expect.stringContaining("30-second write fence") } });
+		expect(await objects(late)).toBe(0);
+		expect(await capture()).toBe(0);
+		expect(await value<string[]>(admin({ op: "listExports", profile: name, corpus: true }))).toEqual([id]);
+
+		// A cancel (a restore beginning) with no step running: the store's alarm deletes exactly that export's objects from its marker.
+		const cancelled = await on((s) => beginExport(s.storage, spec).id);
+		await on((s) => exportStep(s.storage, failingPut(2), spec, () => null));
+		expect(await objects(cancelled)).toBe(1);
+		expect(await on((s) => cancelExport(s.storage, spec, "a restore began"))).toBe(true);
+		await on((s) => s.storage.setAlarm(Date.now() + 60_000)); // not due, so only the run below fires it
+		expect(await runDurableObjectAlarm(store)).toBe(true);
+		expect(await objects(cancelled)).toBe(0);
+		expect(await on((s) => s.storage.sql.exec(`SELECT count(*) AS n FROM ${META} WHERE key LIKE 'export_drop:%'`).one().n)).toBe(0);
+		expect(await value<string[]>(admin({ op: "listExports", profile: name, corpus: true }))).toEqual([id]);
+
+		// A close (a wipe's first step) stops the running export through the store's alarm, which deletes what it wrote.
+		const closed = await on((s) => beginExport(s.storage, spec).id);
+		await on((s) => exportStep(s.storage, failingPut(2), spec, () => null));
+		expect(await objects(closed)).toBe(1);
+		await store.wipe(who, "close");
+		await on((s) => s.storage.setAlarm(Date.now() + 60_000)); // not due, so only the run below fires it
+		expect(await runDurableObjectAlarm(store)).toBe(true);
+		expect(await objects(closed)).toBe(0);
+		expect(await on((s) => [exportJob(s.storage.sql, META), lastExport(s.storage.sql, META)])).toMatchObject([undefined, { id: closed, state: "failed" }]);
+		expect(await value<string[]>(admin({ op: "listExports", profile: name, corpus: true }))).toEqual([id]);
+
+		// The journaled export restores into a fresh generation as exactly the state at its cut.
+		const g2 = crypto.randomUUID().slice(0, 8);
+		await accountSql((sql) => {
+			sql.exec("UPDATE profiles SET generation = ?, object_name = ? WHERE name = ?", g2, `${OWNER}:${name}:${g2}`, name);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'restore', 'active', ?, 1)", g2, name, new Date().toISOString());
+			sql.exec("UPDATE generations SET state = 'retired' WHERE id = ?", g);
+		});
+		await value(admin({ op: "beginCorpusRestore", profile: name, export: id }));
+		expect(await value(admin({ op: "restoreStep" }))).toMatchObject({ state: "ready" });
+		expect(await value(admin({ op: "openRestore" }))).toMatchObject({ state: "opened" });
+		const restored = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g2}`));
+		expect(await contributors(restored)).toEqual(expected);
+		expect(expected.find((r) => r.id === 2)).toMatchObject({ name: "changed" });
+		expect(expected.map((r) => r.id)).toEqual(expect.arrayContaining([1, 6, 99999]));
+		expect(expected.some((r) => r.id === 4 || r.id === 8)).toBe(false);
+		expect(expected.filter((r) => r.name === "文".repeat(30_000))).toHaveLength(24);
+		expect(expected.find((r) => r.id === 10)).not.toMatchObject({ name: "after-cut" });
+		expect(await runInDurableObject(restored, (_i, s) => s.storage.sql.exec(`SELECT value FROM ${META} WHERE key = 'probe'`).toArray())).toEqual([{ value: "x" }]);
+		expect(await admin({ op: "wipeProfile", profile: name, typed: name })).toMatchObject({ ok: true });
+		expect(await value<string[]>(admin({ op: "listExports", profile: name, corpus: true }))).toEqual([]);
+	});
+});
+
 describe("corpus export and restore", () => {
 	it("exports a corpus encrypted with its own rowids, keeps two, restores into an empty generation with search, and refuses wiped or non-empty targets", async () => {
 		await contextFor();
@@ -426,7 +562,7 @@ describe("corpus export and restore", () => {
 			sql.exec("INSERT INTO source_files (rowid, repo, path, blob_sha, size, scanned, skip_reason) VALUES (13, 'org/alpha', 'a.ts', 'b1', 10, 1, NULL)");
 			sql.exec("INSERT INTO pattern_findings (rowid, finding_id, category, title) VALUES (29, 'f-1', 'lineage', 'quokka finding')");
 		});
-		const exportCorpus = async () => (await value<Record<string, { id: string }>>(admin({ op: "export", profile: name, corpus: true })))[`corpus-${name}`]!.id;
+		const exportCorpus = async () => settled(name, g1, (await value<Record<string, { id: string }>>(admin({ op: "export", profile: name, corpus: true })))[`corpus-${name}`]!.id);
 		const first = await exportCorpus();
 		for (const o of (await env.BACKUPS.list({ prefix: `exports/corpus-${name}/${first}/` })).objects) {
 			expect(new TextDecoder().decode(await (await env.BACKUPS.get(o.key))!.arrayBuffer())).not.toContain("quokka-marker");
@@ -907,7 +1043,7 @@ describe("restore drill", () => {
 			if (!sql.exec("SELECT 1 FROM corpus_store_meta WHERE key = 'user_id'").toArray().length) for (const [k, v] of [["user_id", OWNER], ["profile", "personal"], ["generation", generation]]) sql.exec("INSERT INTO corpus_store_meta (key, value) VALUES (?, ?)", k, v);
 			sql.exec("INSERT OR IGNORE INTO repos (rowid, full_name, owner, name, archived, private, commit_count, ref_count, empty) VALUES (3, 'org/race', 'org', 'race', 0, 1, 1, 1, 0)");
 		});
-		await value(admin({ op: "export", corpus: true }));
+		await settled("personal", generation, (await value<Record<string, { id: string }>>(admin({ op: "export", corpus: true })))["corpus-personal"]!.id);
 		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER));
 		/** Holds the account's first read of a manifest under `prefix` until released: the begin's await, made wide. */
 		const hold = async (prefix: string) => {
