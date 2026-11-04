@@ -6,6 +6,7 @@ import type { RecallHit } from "../src/domain/types";
 import { sha256 } from "../src/domain/ids";
 import { call, contextFor, deviceToken, outcome } from "./helpers";
 import { ingest, type IngestBatch } from "../src/profile/capture";
+import { runWrite } from "../src/profile/write";
 import { listSessions, sessionDetail } from "../src/profile/sessions";
 import { mergeSessions, parseSessionsCursor } from "../src/sessions";
 import type { SessionRow } from "../src/viewer/types";
@@ -267,6 +268,23 @@ describe("capture_memory and review_candidates", () => {
 });
 
 describe("sessions (S1)", () => {
+	it("recalls only an accepted manifest's consolidated parts, now and as of a time", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		const one = (word: string) => JSON.stringify({ asks: [{ text: word, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const range = `codex:rc-${tag}:0a1b2c3d:0-10`;
+			const whole = part("0-10", one(`kept${tag}`), "consolidated", range), a = part("0-5", one(`dropped${tag}`), "consolidated", range), b = part("5-10", one(`dropped${tag}`), "consolidated", range);
+			expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `rc-${tag}` }, digests: [whole, a, b],
+				manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] }).map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+		});
+		const at = new Date(Date.now() + 1000).toISOString();
+		for (const extra of [{}, { as_of: at }]) {
+			const hits = async (word: string) => (await call<CaptureRecall>(c, "recall_memories", { keyword: word, profile: "test", include_captures: true, ...extra })).results.map((r) => r.memory_id);
+			expect(await hits(`kept${tag}`), JSON.stringify(extra)).toHaveLength(1);
+			expect(await hits(`dropped${tag}`), JSON.stringify(extra)).toEqual([]);
+		}
+	});
+
 	const S1 = "codex:s1-main:0a1b2c3d", body = (asks: [string, number][], decisions: [string, number][], commits: string[] = [], entities: string[] = []) => JSON.stringify({
 		asks: asks.map(([text, pos]) => ({ text, pos })), decisions: decisions.map(([text, pos]) => ({ text, pos })), corrections: [], outcomes: { commits }, entities, dropped: { asks: 0, decisions: 0, corrections: 0 } });
 	const p1 = body([["First ask", 10]], [["Pick the queue", 900]]), p2 = body([], [["Retry twice", 3000]], ["Pushed 0a1b2c3d4e"], ["https://github.com/acme/sessions"]);
@@ -352,6 +370,41 @@ describe("sessions (S1)", () => {
 		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
 			const produced = sessionDetail(st.storage.sql, ids.main)!.produced;
 			expect(produced.map((p) => [p.title, p.via]).sort()).toEqual([["Queue pick", "evidence"], ["Queue retry rule", "evidence"]]);
+		});
+	});
+
+	it("reads only the manifest's parts, and keeps the last upload apart from owner actions", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const one = (ask: string) => JSON.stringify({ asks: [{ text: ask, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const sql = st.storage.sql, run = (b: IngestBatch) => ingest(st.storage, {} as never, b).map((r) => r.status);
+			// Overlapping consolidated parts are all stored; the accepted manifest selects 0-10 alone.
+			const tiling = { client: "codex" as const, id: "s1-tiling" }, range = "codex:s1-tiling:0a1b2c3d:0-10";
+			const whole = part("0-10", one("Whole range"), "consolidated", range), a = part("0-5", one("First half"), "consolidated", range), b = part("5-10", one("Second half"), "consolidated", range);
+			expect(run({ session: tiling, digests: [whole, a, b], manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] })).toEqual(["stored", "stored", "stored", "stored"]);
+			const t = listSessions(sql, { client: "codex", limit: 100 }).rows.find((r) => r.session === "s1-tiling")!;
+			expect(sessionDetail(sql, t.id)!.events.map((e) => e.label)).toEqual(["Whole range"]);
+			expect(t.counts).toMatchObject({ asks: 1, parts: 1 });
+			// An owner action is not an upload: pinning a session last uploaded two hours ago keeps it completed, in place, with that time.
+			const pinned = { client: "codex" as const, id: "s1-pinned" };
+			expect(run({ session: pinned, digests: [part("-", one("Pinned ask"), "heuristic", "codex:s1-pinned:0a1b2c3d:0-10")], manifests: [] })).toEqual(["stored"]);
+			const earlier = new Date(Date.now() - 2 * 3_600_000).toISOString();
+			const id = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'session:codex:s1-pinned'").one().id;
+			// As if that upload happened two hours ago: the node, its stored part and any recorded upload time say so.
+			sql.exec("UPDATE nodes SET updated_at = ?, attrs = CASE WHEN json_extract(attrs, '$.last_upload_at') IS NULL THEN attrs ELSE json_set(attrs, '$.last_upload_at', ?) END WHERE id = ?", earlier, earlier, id);
+			sql.exec("UPDATE texts SET created_at = ? WHERE node_id = ? AND part = 'capture'", earlier, id);
+			const order = () => listSessions(sql, { limit: 100 }).rows.map((r) => r.id);
+			const before = { row: listSessions(sql, { limit: 100 }).rows.find((r) => r.id === id)!, order: order() };
+			expect(before.row).toMatchObject({ status: "completed", last_upload_at: earlier });
+			for (const action of ["pin", "unpin"] as const) runWrite(st.storage, { userId: ref.userId, profile: "test", generation: ref.generation }, { op: "owner", args: { memory_id: id, action } },
+				{ actor: "owner", platform: "test", routedBy: "test", userId: ref.userId, payloadHash: `owner-${action}` });
+			expect(sql.exec<{ updated_at: string }>("SELECT updated_at FROM nodes WHERE id = ?", id).one().updated_at > earlier).toBe(true);
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === id)).toMatchObject({ status: "completed", last_upload_at: earlier });
+			expect(order()).toEqual(before.order);
+			expect(listSessions(sql, { status: "active", limit: 100 }).rows.map((r) => r.id)).not.toContain(id);
+			// A real upload still moves it: a new part makes it active and newest.
+			expect(run({ session: pinned, digests: [part("-", one("Pinned later"), "heuristic", "codex:s1-pinned:0a1b2c3d:10-20")], manifests: [] })).toEqual(["stored"]);
+			expect(listSessions(sql, { limit: 100 }).rows[0]).toMatchObject({ id, status: "active" });
 		});
 	});
 
