@@ -84,16 +84,22 @@ export async function corpus(c: ToolContext, a: CorpusInput): Promise<Outcome<un
 }
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
+/**
+ * A repo column equal to the corpus's own spelling of `name`. GitHub names are case-insensitive: uploads lowercase their keys while
+ * the corpus keeps the checkout remote's case. The small repos table resolves the spelling once, so each count stays an exact,
+ * index-backed comparison; with no repos row the name is used as written.
+ */
+const repoIs = (column: string, name: string) => `${column} = coalesce((SELECT full_name FROM repos WHERE lower(full_name) = lower(${lit(name)}) LIMIT 1), ${lit(name)})`;
 /** The corpus rows a graph node's key names (the work-upload and capture key builders): which kind, its corpus key, and per-table filters. */
 function probeOf(node: { kind?: string; key?: string | null } | undefined): { kind: string; key: string; where: [string, string][] } | null {
 	const key = node?.key ?? "", all = (tables: string[], w: string) => tables.map((t) => [t, w] as [string, string]);
 	let m: RegExpExecArray | null;
 	if (node?.kind === "project" && (m = /^github:([^#]+)$/.exec(key)))
-		return { kind: "repo", key: m[1]!, where: [["repos", `full_name = ${lit(m[1]!)}`], ...all(["commits", "refs", "commit_paths", "contributors"], `repo = ${lit(m[1]!)}`)] };
+		return { kind: "repo", key: m[1]!, where: [["repos", repoIs("full_name", m[1]!)], ...all(["commits", "refs", "commit_paths", "contributors"], repoIs("repo", m[1]!))] };
 	if (node?.kind === "commit" && (m = /^git:(.+)@([0-9a-f]{7,64})$/.exec(key)))
-		return { kind: "commit", key: `${m[1]}@${m[2]}`, where: all(["commits", "commit_paths"], `repo = ${lit(m[1]!)} AND sha = ${lit(m[2]!)}`) };
+		return { kind: "commit", key: `${m[1]}@${m[2]}`, where: all(["commits", "commit_paths"], `${repoIs("repo", m[1]!)} AND sha = ${lit(m[2]!)}`) };
 	if (node?.kind === "pr" && (m = /^github:(.+)#(\d{1,15})$/.exec(key)))
-		return { kind: "pr", key: `${m[1]}#${Number(m[2])}`, where: all(["pull_requests", "pr_tickets", "pr_commit_links"], `repo = ${lit(m[1]!)} AND number = ${Number(m[2])}`) };
+		return { kind: "pr", key: `${m[1]}#${Number(m[2])}`, where: all(["pull_requests", "pr_tickets", "pr_commit_links"], `${repoIs("repo", m[1]!)} AND number = ${Number(m[2])}`) };
 	if ((node?.kind === "ticket" || node?.kind === "bug" || node?.kind === "feature") && (m = /^jira:(.+)$/.exec(key)))
 		return { kind: "ticket", key: m[1]!, where: all(["tickets", "ticket_episodes", "pr_tickets", "session_ticket_links"], `ticket = ${lit(m[1]!)}`) };
 	if (node?.kind === "session" && (m = /^session:codex:(.+)$/.exec(key)))
