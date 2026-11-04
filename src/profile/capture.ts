@@ -77,15 +77,16 @@ function sessionNode(sql: SqlStorage, s: IngestBatch["session"], seq: number, no
 	const found = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", key).toArray()[0];
 	if (found) {
 		assertArchiveEndpoints(sql,found.id,found.id,"");
-		sql.exec("UPDATE nodes SET updated_at = ?, seq = ? WHERE id = ?", now, seq, found.id);
+		sql.exec("UPDATE nodes SET updated_at = ?, attrs = json_set(attrs, '$.last_upload_at', ?), seq = ? WHERE id = ?", now, now, seq, found.id);
 		return found.id;
 	}
 	const id = sha256(key).slice(0, 32);
 	const hash = sha256(key);
-	// first_at is the first upload, kept as written; updated_at moves with every stored part or manifest (the last upload).
+	// first_at is the first upload, kept as written; last_upload_at moves with every stored part or manifest, and only then (an owner
+	// pin or flag also moves updated_at).
 	sql.exec(`INSERT INTO nodes (id, kind, key, scope, name, norm_name, attrs, status, origin, revision, content_hash, card_hash, embed_hash,
-		recorded_at, created_at, updated_at, seq) VALUES (?, 'session', ?, '', ?, ?, json_object('first_at', ?), 'active', 'upload', 1, ?, ?, ?, ?, ?, ?, ?)`,
-		id, key, key, key.toLowerCase(), now, hash, hash, hash, now, now, now, seq);
+		recorded_at, created_at, updated_at, seq) VALUES (?, 'session', ?, '', ?, ?, json_object('first_at', ?, 'last_upload_at', ?), 'active', 'upload', 1, ?, ?, ?, ?, ?, ?, ?)`,
+		id, key, key, key.toLowerCase(), now, now, hash, hash, hash, now, now, now, seq);
 	return id;
 }
 
