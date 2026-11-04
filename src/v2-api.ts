@@ -7,13 +7,14 @@ import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
 import { corpusFiles, corpusFilesSql, embeddingsOn, type SearchCounts } from "./profile/store";
 import { corpusOn, corpusStub } from "./corpus-tools";
+import { assembleSnapshot } from "./viewer/snapshot";
 import { eventStream, parseCursor, STREAM_MAX_MS } from "./viewer/events";
 import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
 import { healthReport } from "./health";
 import { mayUse } from "./routing";
 import { parseEvalRun } from "./eval";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
-import type { ActivitySummary, FeedItem, LeaseFacts, Page, ProjectProfile, SessionRow, ViewerCursor } from "./viewer/types";
+import type { ActivitySummary, FeedItem, LeaseFacts, Page, ProfileSnapshotPart, ProjectProfile, SessionRow, ViewerCursor } from "./viewer/types";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
@@ -132,6 +133,20 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		}));
 		return json(healthReport(a.value as AccountHealth, per.flatMap((x) => (x.lease ? [{ profile: x.profile, facts: x.lease }] : [])),
 			per.map((x) => (x.counts ? { usage: x.counts } : null)), embeddingsOn(env)));
+	}
+	// #13 viewer snapshot: one part from every active profile; any failed profile read fails the request, never a smaller total.
+	if (path === "/api/viewer/snapshot" && method === "GET") {
+		const a = await account.admin({ op: "accountHealth" });
+		if (!a.ok) return reply(a);
+		const parts: ProfileSnapshotPart[] = [];
+		for (const r of await Promise.all(ctx.profiles.map((x) => profileStub(env, x).readV2(x, { kind: "viewer_part", day: today() })))) {
+			if (!r.ok) return reply(r);
+			parts.push(r.value as ProfileSnapshotPart);
+		}
+		const h = a.value as AccountHealth, live = h.devices.filter((d) => !d.revoked).map((d) => d.body), meta = env.CF_VERSION_METADATA;
+		return json(assembleSnapshot(parts,
+			{ checks: h.checks, devices_reporting: live.length, inject_devices: live.filter((b) => b.inject).length, scheduled_devices: live.filter((b) => b.launchd_loaded).length },
+			{ version: meta.id, deployed_at: meta.timestamp, at: new Date().toISOString(), embeddings: embeddingsOn(env), corpus: corpusOn(env) }));
 	}
 	// #14 live events: owner only (this function runs after the owner check). The stream ends at the token's exp or after five
 	// minutes; a failed profile read ends it, and the next cursor names only the owner's active profiles.

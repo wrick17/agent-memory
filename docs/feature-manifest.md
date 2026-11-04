@@ -187,3 +187,13 @@ Source ready, not deployed. Depends on the v2 request plumbing and #11 above for
 - The cursor holds each profile's activity sequence, so a reconnect resumes without losing intervening activity; an invalid cursor is refused. A failed profile read ends the stream instead of skipping that profile.
 - The stream ends at the authenticating token's `exp` or after five minutes, whichever is earlier, and a cancelled request stops polling.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved stream tests run in the combined phase.
+
+### v2 viewer snapshot and version metadata (#13), 2026-11-04
+
+Source ready, not deployed. Depends on #9, #11, #12 and #14 above.
+
+- `GET /api/viewer/snapshot` (owner only) returns the time, version and deploy time, profiles, the event cursor, counts, usage, health, recent sessions, the feed, layers and feature flags. Each profile's part is one synchronous read, so its sequence, feed and counts come from one state of the store.
+- Usage comes from the UTC day's `recall_totals` and activity, the store's actual SQL size, and nodes whose current card is embedded. The version and deploy time come from the new `CF_VERSION_METADATA` binding (`version_metadata` in `wrangler.jsonc`, including the test and rehearsal environments).
+- Availability is reported honestly: no uptime, MCP call or failure metrics, semantic latency, confidence percentages or tool counts are made up. A feature with no confirming device report reads as inactive.
+- A failed profile read fails the request instead of returning a smaller total.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved snapshot tests run in the combined phase.
