@@ -1356,6 +1356,8 @@ describe("dashboard timeline, journals and paths", () => {
 });
 
 describe("dashboard knowledge graph", () => {
+	// The zoom buttons show + and −; their accessible names say Zoom in and Zoom out.
+	const named = (root: El, label: string) => find(root, "button").find((x) => x.attrs["aria-label"] === label)!;
 	// A realistic metadata-only library: 1,374 memories of every type, two entities, and links of every kind the read can send.
 	const TYPES = ["project", "feedback", "reference", "user", "procedural"];
 	const nodes = [...Array.from({ length: 1374 }, (_, i) => ({ id: `r${i}`, kind: i % 7 ? "document" : "decision", type: TYPES[i % 5], scope: i % 3 ? "repo-a" : null,
@@ -1425,8 +1427,9 @@ describe("dashboard knowledge graph", () => {
 		expect(b.seen.fetched.some((x) => x.includes("/nodes/"))).toBe(false);
 		typeIn(byId(b.view(), "graph-q"), "Record 1");
 		click(button(b.view(), "Record 1"));
-		expect(text(b.view()).replace(/\s+/g, " ")).toContain("to · part_of · Agent Memory");
-		expect(text(b.view()).replace(/\s+/g, " ")).toContain("from · authored · Owner");
+		// Relations show a direction arrow with a hidden Outgoing or Incoming label, the relation, a kind glyph and the record.
+		expect(text(b.view()).replace(/\s+/g, " ")).toMatch(/→ Outgoing part_of \S+ Agent Memory/);
+		expect(text(b.view()).replace(/\s+/g, " ")).toMatch(/← Incoming authored \S+ Owner/);
 		click(button(b.view(), "Owner"));
 		await settle();
 		slow.open();
@@ -1479,7 +1482,7 @@ describe("dashboard knowledge graph", () => {
 		typeIn(byId(b.view(), "graph-q"), "Record 1");
 		click(button(b.view(), "Record 1"));
 		canvas.ctx.texts = [];
-		click(button(b.view(), "Zoom out"));
+		click(named(b.view(), "Zoom out"));
 		await settle();
 		const texts = canvas.ctx.texts, inside = (t: Ctx["texts"][number]) => t.x >= 0 && t.x + t.w <= 390 && t.y >= 0 && t.y <= 420;
 		const headings = texts.filter((t) => t.font.startsWith("600"));
@@ -1499,12 +1502,13 @@ describe("dashboard knowledge graph", () => {
 		const [screen, dotLayer] = made;
 		expect(made).toHaveLength(2); // the visible canvas and its one dot layer, reused
 		const stamped = screen!.ctx.images;
-		// The last layer drawing held every active record (1,376 arcs) in three fills, one per colour.
+		// The last layer drawing held every active record in one fill per kind shape (five): the 1,374 memories are circles (arcs),
+		// the project and the person are drawn as other shapes.
 		dotLayer!.ctx.arcs = 0; dotLayer!.ctx.fills = 0;
 		click(button(b.view(), "Fit"));
-		click(button(b.view(), "Zoom in"));
+		click(named(b.view(), "Zoom in"));
 		await settle();
-		expect([dotLayer!.ctx.arcs, dotLayer!.ctx.fills]).toEqual([1376, 3]);
+		expect([dotLayer!.ctx.arcs, dotLayer!.ctx.fills]).toEqual([1374, 5]);
 		expect(screen!.attrs["data-drawn"]).toBe("1376");
 		// A pan stamps the layer once and draws no record on the visible canvas, nor redraws the layer.
 		const before = { layer: dotLayer!.ctx.arcs, screen: screen!.ctx.arcs, images: screen!.ctx.images };
@@ -1536,7 +1540,7 @@ describe("dashboard knowledge graph", () => {
 				const [x, y] = [lum(rgb(t.color)), lum([...surface])].sort((p, q) => q - p);
 				expect((x! + 0.05) / (y! + 0.05)).toBeGreaterThanOrEqual(4.5);
 			}
-			expect(canvas.ctx.fillStyles).toContain(dark ? "#3987e5" : "#2a78d6");
+			expect(canvas.ctx.fillStyles).toContain(dark ? "#5b9ee9" : "#2a78d6"); // the memory hue in each theme
 			const before = reads;
 			for (const key of ["ArrowLeft", "ArrowUp", "ArrowRight"]) { canvas.on.keydown!({ key, preventDefault() {} } as never); await settle(); }
 			expect(reads).toBe(before); // frames read no computed style
@@ -1560,7 +1564,7 @@ describe("dashboard knowledge graph", () => {
 		expect(status(b).textContent).toBe(saved); // the saved graph's own counts do not move
 		const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
 		canvas.ctx.texts = [];
-		click(button(b.view(), "Zoom in"));
+		click(named(b.view(), "Zoom in"));
 		await settle();
 		expect(canvas.ctx.texts.some((x) => x.t === "What-if: Try caching")).toBe(true);
 		// Another profile's graph shows none of it; back in work it is still there, in this tab only.
@@ -1575,7 +1579,7 @@ describe("dashboard knowledge graph", () => {
 		canvas.ctx.texts = [];
 		const now = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
 		now.ctx.texts = [];
-		click(button(b.view(), "Zoom in"));
+		click(named(b.view(), "Zoom in"));
 		await settle();
 		expect(now.ctx.texts.some((x) => x.t.startsWith("What-if"))).toBe(false);
 		expect(b.seen.posted).toEqual([]);
