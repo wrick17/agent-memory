@@ -20,7 +20,7 @@ import { foldStep } from "../src/profile/compact";
 import { Tx, readContent, runWrite } from "../src/profile/write";
 import { commitArgs, prArgs, ticketArgs, uploadTerms } from "../src/profile/work-upload";
 import { ackPart, FINISH_READS, installMirror, markRegistered, partHash, planHash, receiptSeq, sealPlan, terminal, type Binding, type Parts } from "../src/profile/daily-proof";
-import { call, contextFor, deviceToken, outcome, OWNER } from "./helpers";
+import { call, contextFor, deviceToken, outcome, OWNER, tempDir } from "./helpers";
 // @ts-expect-error -- the untyped Node client, run here as the real local caller of the job ingest route.
 import { uploadPRs } from "../local/pr-upload.mjs";
 // @ts-expect-error -- the untyped Node client, run here as the real local caller of the job ingest route.
@@ -570,7 +570,7 @@ describe("PR uploads", () => {
 			if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 			return r.data;
 		};
-		const stateFile = `/tmp/am-pr-${p.name}/prs.json`;
+		const stateFile = `${tempDir("am-pr-")}/prs.json`;
 		const out = await uploadPRs({ repo: p.ns, profile: p.name, since: ago(24 * 60), stateFile, gh: { account: "wrick17", run }, ownerLogin: "owner-login", send });
 		expect(out).toEqual({ status: "acknowledged", prs: 1, incomplete: [] });
   expect(calls).toHaveLength(1);
@@ -727,7 +727,8 @@ describe("Jira ticket uploads", () => {
 			if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 			return r.data;
 		};
-		const run = () => uploadTickets({ keys: [`${P}-1`, `${P}-2`, `${P}-3`], stateFile: `/tmp/am-jira-${P}/tickets.json`, connector, ownerAccountId: owner, send });
+		const stateFile = `${tempDir("am-jira-")}/tickets.json`;
+		const run = () => uploadTickets({ keys: [`${P}-1`, `${P}-2`, `${P}-3`], stateFile, connector, ownerAccountId: owner, send });
 		expect(await run()).toEqual({ status: "acknowledged", tickets: 2, incomplete: [], missing: [`${P}-3`], invalid: [] });
 		expect(calls).toEqual([{ keys: [`${P}-1`, `${P}-2`, `${P}-3`], fields: FIELDS }]);
 		expect(JSON.stringify(sent)).not.toMatch(/example\.com|hunter2|Private Person|secret description|secret comment|avatar/);
@@ -1145,7 +1146,8 @@ describe("Jira reciprocal link source order", () => {
 			return JSON.stringify({ issues: [{ key: f.A, fields: { summary: "Endpoint", issuetype: { name: "Task" }, updated: T0,
 				status: { name: "To Do", statusCategory: { key: "new" } }, priority: null, duedate: null, assignee: null, reporter: null, issuelinks: [] } }] });
 		} };
-		const run = () => uploadTickets({ keys: [f.A], stateFile: "/tmp/am-jira-" + stem + "/pending.json", connector, ownerAccountId: "owner-id", now: () => T5,
+		const jiraDir = tempDir("am-jira-");
+		const run = () => uploadTickets({ keys: [f.A], stateFile: `${jiraDir}/pending.json`, connector, ownerAccountId: "owner-id", now: () => T5,
 			send: async (body: unknown) => {
 				sent.push(JSON.stringify(body));
 				const r = await post(f.w.token, body);

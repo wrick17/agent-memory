@@ -1,4 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { env } from "cloudflare:workers";
 import type { Principal } from "../src/account/store";
 import type { Outcome } from "../src/domain/types";
@@ -53,4 +56,15 @@ export async function registered(...names: string[]) {
 		return { who, stub: env.PROFILE.get(env.PROFILE.idFromName(`${userId}:${profile}:${who.generation}`)) };
 	};
 	return { userId, account, of, ...of(refs[0]!.profile) };
+}
+
+/**
+ * A new private directory in the runtime's temp dir, for local client state a test writes. Under the Workers runtime
+ * os.tmpdir() is workerd's in-memory /tmp, so nothing reaches the host disk; under Node it is the caller's TMPDIR.
+ * Never a fixed host path.
+ */
+export function tempDir(prefix: string): string {
+	const root = path.resolve(os.tmpdir()), dir = fs.mkdtempSync(path.join(root, prefix));
+	if (path.dirname(path.resolve(dir)) !== root) throw new Error(`temp dir ${dir} is outside ${root}`);
+	return dir;
 }
