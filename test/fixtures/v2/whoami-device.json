@@ -1,0 +1,11 @@
+{
+	"kind": "device",
+	"device_id": "dev_fixture_mac",
+	"scopes": [
+		"ingest",
+		"maintenance"
+	],
+	"profiles": [
+		"demo"
+	]
+}

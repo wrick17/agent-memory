@@ -1,0 +1,6 @@
+{
+	"from": "2026-10-01", "to": "2026-10-07", "active_days": 0, "sessions": 0, "observations": 0, "busiest_day": null,
+	"days": [],
+	"kinds": { "asks": 0, "decisions": 0, "corrections": 0, "commits": 0, "tests": 0, "prs": 0 },
+	"top_files": [], "busiest_sessions": [], "latest": []
+}

@@ -1,0 +1,39 @@
+{
+	"rows": [
+		{
+			"id": "evc_fixture_0",
+			"query": "stable export order",
+			"expected": [
+				"00000000-0000-5000-8000-0000000000c2"
+			],
+			"evidence": [
+				{
+					"kind": "node",
+					"ref": "00000000-0000-5000-8000-0000000000c2"
+				}
+			],
+			"status": "accepted",
+			"created_at": "2026-10-30T03:12:00Z"
+		},
+		{
+			"id": "evc_fixture_2",
+			"query": "typecheck before commit",
+			"expected": [
+				"00000000-0000-5000-8000-0000000000c7"
+			],
+			"evidence": [
+				{
+					"kind": "node",
+					"ref": "00000000-0000-5000-8000-0000000000c7"
+				},
+				{
+					"kind": "session",
+					"ref": "fixture-session-1"
+				}
+			],
+			"status": "accepted",
+			"created_at": "2026-11-01T03:12:00Z"
+		}
+	],
+	"next_cursor": null
+}

@@ -1,0 +1,27 @@
+[
+	{
+		"event": "change",
+		"id": "fixture-opaque-events-cursor-2",
+		"data": {
+			"kind": "MEMORY",
+			"profile": "demo",
+			"id": "1043",
+			"summary": "Saved: Export retains two snapshots",
+			"at": "2026-11-02T09:16:00Z",
+			"target": "00000000-0000-5000-8000-0000000000c6"
+		}
+	},
+	{
+		"event": "health",
+		"id": "fixture-opaque-events-cursor-2",
+		"data": [
+			{
+				"check_id": "batch_overdue",
+				"subject": "demo",
+				"state": "ok",
+				"detail": "Batch completed 2026-11-02T09:16:30Z.",
+				"at": "2026-11-02T09:16:30Z"
+			}
+		]
+	}
+]

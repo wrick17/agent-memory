@@ -1,0 +1,6 @@
+{
+	"projects": [
+		{ "key": "github.com/example/fixture-app", "name": "fixture-app", "sessions": 2, "last_activity": "2026-11-02T09:12:00Z" },
+		{ "key": "github.com/example/fixture-notes", "name": "fixture-notes", "sessions": 0, "last_activity": null }
+	]
+}
