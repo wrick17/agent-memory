@@ -105,6 +105,8 @@ export function render(s, { frontend, host, integrated, workersDev }) {
 		name: s.worker,
 		account_id: s.account_id,
 		main: "src/worker.ts",
+		// src/dashboard.ts imports the shared replay player's exact bytes as text; the same rule as wrangler.jsonc, relative to main.
+		rules: [{ type: "Text", globs: ["../local/*-player.js"], fallthrough: true }],
 		compatibility_date: COMPATIBILITY_DATE,
 		// global_fetch_strictly_public: the Worker fetches Clerk's signing keys from the public Frontend API, even when that
 		// host is a CNAME in the Worker's own zone.
