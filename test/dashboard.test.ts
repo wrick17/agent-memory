@@ -2305,6 +2305,27 @@ describe("dashboard Memories tab", () => {
 		expect(files.map((f) => [f.record.content.text.length, f.record.content.chars, f.record.content.complete])).toEqual([[4000, 5000, false], [5000, 5000, true]]);
 		expect([files[1]!.record.id, files[1]!.record.node.id]).toEqual(["m1", "m1"]); // the rest of the record is as read
 	});
+
+	it("closes an open bulk confirmation when the selection changes, so an unchecked record is never forgotten", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box.checked = true;
+		box.on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined();
+		box.checked = false; // the owner changes their mind
+		box.on.change!();
+		expect(text(b.view())).toContain("0 selected.");
+		const stale = button(b.view(), "Forget 1");
+		if (stale) click(stale); // a confirmation left open would forget the unchecked record
+		await settle();
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+		expect(stale).toBeUndefined();
+	});
 });
 
 describe("dashboard Audit tab and Admin pages", () => {
