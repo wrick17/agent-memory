@@ -216,7 +216,7 @@ export function healthTab(am: Am): void {
 		// Dash pattern and marker shape tell the series apart, so the legend does not rely on color.
 		const STYLE: Record<string, { dash: string; mark: string }> = { lexical: { dash: "", mark: "square" }, vector: { dash: "6 4", mark: "circle" }, hybrid: { dash: "2 3", mark: "diamond" } };
 		const series = new Map<string, EvalRun[]>();
-		for (const r of sorted) series.set(`${r.channels} k=${r.k}`, [...(series.get(`${r.channels} k=${r.k}`) ?? []), r]);
+		for (const r of sorted) { const key = `${r.profile} ${r.channels} k=${r.k}`; series.set(key, [...(series.get(key) ?? []), r]); } // profiles never share a line
 		let ly = 12;
 		for (const [name, rs] of series) {
 			const st = STYLE[rs[0]!.channels] ?? { dash: "1 2", mark: "circle" };

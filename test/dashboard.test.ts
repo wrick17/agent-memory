@@ -2547,4 +2547,21 @@ describe("dashboard Overview and Health tabs", () => {
 		expect(text(b.view())).toContain("work: leased");
 		expect(text(b.view())).not.toContain("work: parked");
 	});
+
+	it("draws one recall-quality line per profile when All profiles holds runs from two", async () => {
+		const run = (profile: string, at: string, v: number) => ({ id: `${profile}-${at}`, device_id: "d1", profile, at, channels: "hybrid", k: 5, cases: 3,
+			recall_all_at_k: v, any_hit_at_k: v, mrr: v });
+		const b = browser({ signedIn: true, hash: "#health", api: (path) => {
+			if (path === "/api/health") return Response.json({ error: { code: "unavailable", message: "down" } }, { status: 503 });
+			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [run("work", "2026-11-03T10:00:00Z", 1), run("personal", "2026-11-04T10:00:00Z", 0)] });
+			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
+		} });
+		Object.assign(b.win.document, { createElementNS: (_ns: string, tag: string) => make(tag) }); // the chart is SVG
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const svg = find(b.view(), "svg")[0]!;
+		expect(find(svg, "polyline")).toHaveLength(2);
+		const legend = find(svg, "text").map((x) => x.textContent).filter((t) => t.includes("k=5"));
+		expect(legend).toEqual([expect.stringMatching(/^work hybrid k=5:/), expect.stringMatching(/^personal hybrid k=5:/)]);
+	});
 });
