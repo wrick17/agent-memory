@@ -15,10 +15,11 @@ import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPr
 import { ownerModel } from "./owner-model";
 import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
 import { noteRecall, recallStrength } from "./recall-stats";
-import type { EvalCandidateQuery, EvalCandidateStatus, OwnerQueue, RecallOptions, SessionQuery } from "../viewer/types";
+import type { ActivitySummaryQuery, EvalCandidateQuery, EvalCandidateStatus, OwnerQueue, RecallOptions, SessionQuery } from "../viewer/types";
 import { listSessions, sessionDetail } from "./sessions";
 import { enqueueIn } from "./maintenance";
 import { leaseFacts } from "../health";
+import { activitySummary, listProjects, projectProfile } from "./insights";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -38,6 +39,7 @@ import { recoveryCopy, settleFacts, settleStep, undoPreflight, type RecoveryCopy
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { BATCH_GAP_MS } from "./maintenance";
+export { corpusFiles, corpusFilesSql } from "./insights";
 export { APPEND_MAX, NOTE_MAX } from "./write";
 export type { ImportStep } from "./import";
 export type { OpOutcome } from "./maintenance";
@@ -58,7 +60,8 @@ export type V2Read =
 	| { kind: "eval_candidates"; q: EvalCandidateQuery } | { kind: "accepted_candidates"; cursor: string | null; limit: number }
 	| { kind: "recall_strength"; ids: string[]; day: string }
 	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string }
-	| { kind: "lease_facts" } | { kind: "search_counts" };
+	| { kind: "lease_facts" } | { kind: "search_counts" }
+	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string };
 /** #11: one profile's search index counts for GET /api/health: live recall texts, and nodes whose current card is embedded. */
 export interface SearchCounts { lexical_documents: number; vectors: number }
 
@@ -792,6 +795,9 @@ export class ProfileStore extends DurableObject<Env> {
 				case "sessions": return ok(listSessions(sql, q.q));
 				case "session": { const d = sessionDetail(sql, q.id); return d ? ok(d) : fail("not_found", "no such session"); }
 				case "lease_facts": return ok(leaseFacts(sql, new Date().toISOString()));
+				case "activity_summary": return ok(activitySummary(sql, q.q));
+				case "projects": return ok(listProjects(sql));
+				case "project_profile": { const p = projectProfile(sql, q.key, new Date().toISOString()); return p ? ok(p) : fail("not_found", "no such project"); }
 				case "search_counts": return ok({
 					lexical_documents: sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE live = 1 AND lane = 'recall'").one().n,
 					vectors: sql.exec<{ n: number }>(`SELECT count(*) AS n FROM nodes WHERE ${HAS_VECTOR}`).one().n,

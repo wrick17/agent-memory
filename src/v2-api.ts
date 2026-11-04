@@ -5,13 +5,14 @@ import { authenticate } from "./auth";
 import { z } from "zod";
 import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
-import { embeddingsOn, type SearchCounts } from "./profile/store";
+import { corpusFiles, corpusFilesSql, embeddingsOn, type SearchCounts } from "./profile/store";
+import { corpusOn, corpusStub } from "./corpus-tools";
 import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
 import { healthReport } from "./health";
 import { mayUse } from "./routing";
 import { parseEvalRun } from "./eval";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
-import type { LeaseFacts, Page, SessionRow } from "./viewer/types";
+import type { ActivitySummary, LeaseFacts, Page, ProjectProfile, SessionRow } from "./viewer/types";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
@@ -183,6 +184,38 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		if (sub !== "maintenance/queue") return reply(await profileStub(env, ref).queueOwner(ref, { kind: "unprocessed_capture", session: decodeURIComponent(sub.split("/")[1]!) }));
 		const b = z.object({ kind: z.literal("unlinked"), ids: z.array(z.string().min(1).max(128)).min(1).max(40) }).strict().safeParse(await request.json().catch(() => null));
 		return b.success ? reply(await profileStub(env, ref).queueOwner(ref, b.data)) : invalid("send JSON with kind unlinked and 1 to 40 ids");
+	}
+	// #15 insights. File paths live only in the corpus, read here when it is on (me has none). A corpus read that fails fails the
+	// request, so an unreadable corpus is never shown as "no files"; with the corpus off the lists stay empty, as the types say.
+	const files = async (r: ProfileRef, sql: string | null): Promise<Outcome<{ path: string; count: number }[]>> => {
+		if (!sql || !corpusOn(env) || r.profile === "me") return { ok: true, value: [] };
+		const q = await corpusStub(env, r).query(r, { action: "sql", sql });
+		return q.ok ? { ok: true, value: corpusFiles(q.value) } : q;
+	};
+	if (p && method === "GET" && sub === "activity-summary") {
+		if (!ref) return notActive();
+		const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+		const q = z.object({ from: day, to: day }).strict().safeParse(params);
+		if (!q.success) return invalid("from and to as YYYY-MM-DD");
+		const r = await profileStub(env, ref).readV2(ref, { kind: "activity_summary", q: q.data });
+		if (!r.ok) return reply(r);
+		// The summary's own from: the first day it counted in full, which is later than asked when its read budget ran out.
+		// When the budget dropped every requested day, from is after to: no day was counted in full, so no file list is read.
+		const s = r.value as ActivitySummary, f = s.from > s.to ? { ok: true as const, value: [] } : await files(ref, corpusFilesSql({ from: s.from, to: s.to }));
+		return f.ok ? json({ ...s, top_files: f.value }) : reply(f);
+	}
+	if (p && method === "GET" && sub === "projects") {
+		if (!ref) return notActive();
+		const r = await profileStub(env, ref).readV2(ref, { kind: "projects" });
+		return r.ok ? json({ projects: r.value }) : reply(r);
+	}
+	const proj = /^projects\/([^/]+)\/profile$/.exec(sub);
+	if (p && method === "GET" && proj) {
+		if (!ref) return notActive();
+		const r = await profileStub(env, ref).readV2(ref, { kind: "project_profile", key: decodeURIComponent(proj[1]!) });
+		if (!r.ok) return reply(r);
+		const pp = r.value as ProjectProfile, f = await files(ref, corpusFilesSql({ project: pp.key, now: new Date().toISOString() }));
+		return f.ok ? json({ ...pp, files: f.value }) : reply(f);
 	}
 	if (p && sub === "recall-strength" && method === "GET") {
 		if (!ref) return notActive();
