@@ -90,7 +90,7 @@ export function activityTab(am: Am): void {
 		const body = am.el("div", root);
 		am.loading(body, 6);
 
-		let year: View | null = null;
+		let year: View | null = null, painting = 0;
 		const dayCache = new Map<string, View>();
 		const load = async (a: string, b: string) => combine(a, b, await am.eachProfile(only, async (p) => (await am.call(path(p.name, a, b))) as ActivitySummary));
 
@@ -101,15 +101,17 @@ export function activityTab(am: Am): void {
 		/** Repaints the body, keeping focus on the control with the same data-f key when it is still there. */
 		const repaint = async () => {
 			const focused = am.doc.activeElement?.getAttribute?.("data-f");
+			const req = ++painting, day = filters.day; // filters only replace the address, so a later pick does not change pageVersion
 			let shown: View = year!;
-			if (filters.day) {
-				let d = dayCache.get(filters.day);
+			if (day) {
+				let d = dayCache.get(day);
 				if (!d) {
-					msg.textContent = `Loading ${filters.day}…`;
-					d = await load(filters.day, filters.day);
+					msg.textContent = `Loading ${day}…`;
+					d = await load(day, day);
 					if (version !== am.pageVersion) return;
+					dayCache.set(day, d);
+					if (req !== painting) return;
 					msg.textContent = "";
-					dayCache.set(filters.day, d);
 				}
 				shown = d;
 			}

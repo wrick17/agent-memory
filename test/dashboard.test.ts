@@ -2080,6 +2080,40 @@ describe("dashboard Sessions and Replay tabs", () => {
 	});
 });
 
+describe("dashboard Activity tab", () => {
+	it("shows the day picked last when an earlier day's read answers late, and keeps each day's own answer", async () => {
+		const iso = (t: number) => new Date(t).toISOString().slice(0, 10), dayB = iso(Date.now()), dayA = iso(Date.now() - 86_400_000);
+		const g: Record<string, ReturnType<typeof gate>> = { [dayA]: gate(), [dayB]: gate() };
+		const summary = (from: string, to: string, note: string) => ({ from, to, active_days: 2, sessions: 1, observations: 2, busiest_day: dayB,
+			days: [{ day: dayA, count: 1 }, { day: dayB, count: 1 }], kinds: { asks: 2, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [],
+			busiest_sessions: [], latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] });
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: async (path) => {
+			const u = new URL(path, "https://x");
+			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+			const from = u.searchParams.get("from")!, to = u.searchParams.get("to")!;
+			if (from !== to) return Response.json(summary(from, to, "the whole year"));
+			await g[from]!.wait;
+			return Response.json(summary(from, to, `asked on ${from}`));
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const day = (d: string) => find(b.view(), "button").find((x) => x.attrs["data-day"] === d)!;
+		day(dayA).on.click!();
+		day(dayB).on.click!();
+		g[dayB]!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g[dayA]!.open(); // the older pick answers last
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`What agents did on ${dayB}`);
+		expect(text(b.view())).toContain(`asked on ${dayB}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayA}`);
+		day(dayA).on.click!(); // A's own answer was kept for A
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`asked on ${dayA}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
+	});
+});
+
 describe("dashboard Memories tab", () => {
 	// From the Memories tab author's smoke: the list, server strength, the record link, and Forget with Undo.
 	const row = (id: string, name: string) => ({ memory_id: id, profile: "work", name, type: "feedback", scope: "repo:x", status: "active", revision: 3, passage: `${name} passage`,
