@@ -575,10 +575,17 @@ export function memoriesTab(am: Am): void {
 			let text = c.text === null || c.text === undefined ? "" : String(c.text), complete = c.complete !== false;
 			const actions = el("div", panel);
 			actions.setAttribute("class", "actions");
-			const editable = n.memory_type && n.memory_type !== "procedural" && n.kind !== "journal" && n.status === "active" && complete && !cut.includes("description");
+			// Editing needs the whole text, so eligibility is checked again when "Load the full content" finishes.
+			const kindOk = n.memory_type && n.memory_type !== "procedural" && n.kind !== "journal" && n.status === "active" && !cut.includes("description");
+			const editable = () => kindOk && complete;
 			const editBtn = btn(actions, "Edit", () => edit());
-			if (editable) writes.push(editBtn);
-			else { editBtn.disabled = true; editBtn.setAttribute("title", "Editing needs an active, non-procedural, non-journal memory with its whole text shown."); }
+			const allowEdit = () => {
+				if (!editable()) { editBtn.disabled = true; editBtn.setAttribute("title", "Editing needs an active, non-procedural, non-journal memory with its whole text shown."); return; }
+				(editBtn as J).removeAttribute("title");
+				writes.push(editBtn);
+				editBtn.disabled = busy;
+			};
+			allowEdit();
 			am.copy(actions, "Copy ID", () => id);
 			am.copy(actions, "Copy MCP call", () => am.mcpCall("get_memory", { memory_id: id }));
 			am.copy(actions, "Copy MCP curl", () => am.mcpCurl("get_memory", { memory_id: id }));
@@ -601,7 +608,8 @@ export function memoriesTab(am: Am): void {
 				btn(box, "Cancel", () => { (box as J).remove(); forget.hidden = false; forget.focus(); });
 				ask.focus();
 			});
-			btn(actions, "Export JSON", () => download(`memory-${id}.json`, { exported_at: new Date().toISOString(), profile: pn, strength, record: r }));
+			// The export carries the text loaded so far and whether that is all of it, in the record's own content shape.
+			btn(actions, "Export JSON", () => download(`memory-${id}.json`, { exported_at: new Date().toISOString(), profile: pn, strength, record: text === String(c.text ?? "") ? r : { ...r, content: { ...c, text, complete } } }));
 			writes.push(pin, forget);
 			if (busy) setBusy(true);
 
@@ -654,7 +662,7 @@ export function memoriesTab(am: Am): void {
 						cursor = typeof page.content?.cursor === "string" ? page.content.cursor : null;
 						full.textContent = "Load the next part";
 						full.hidden = !cursor;
-						if (!cursor) { complete = true; copyText.textContent = "Copy text"; part.textContent = `Showing all ${text.length} characters.`; }
+						if (!cursor) { complete = true; copyText.textContent = "Copy text"; part.textContent = `Showing all ${text.length} characters.`; allowEdit(); }
 					} catch (err) { if (current()) st.textContent = `Could not load the content: ${why(err)}`; }
 					full.disabled = false;
 				});
@@ -663,7 +671,7 @@ export function memoriesTab(am: Am): void {
 			// Edit in place: one new revision through the save tool, bound to the revision shown, so a newer change is refused, not overwritten.
 			let sent: { body: string; request_id: string } | null = null;
 			const edit = () => {
-				if (!editable) return;
+				if (!editable()) return;
 				editBox.replaceChildren();
 				const f = el("form", editBox);
 				f.setAttribute("aria-label", `Edit ${name}`);
