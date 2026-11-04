@@ -138,6 +138,8 @@ export function activityTab(am: Am): void {
 			}
 			if (complete(y) && y.observations === 0) {
 				am.empty(body, `No observations ${all ? "in any profile" : `in ${only}`} in the last 12 months. They appear when a device's capture hooks upload session digests, or when you import past transcripts.`, "agent-memory backfill");
+				// Most touched files come from corpus commits, which are read apart from observations, so they still show.
+				if (y.top_files.length) { const files = am.el("section", body); cls(files, "panel"); fileList(files, y); }
 				return;
 			}
 			whenPanel(y);
@@ -273,6 +275,8 @@ export function activityTab(am: Am): void {
 					buttons.push(b);
 				}
 			}
+			// The grid is built a weekday row at a time; the keys move by date, so the list is put in date order (every day has a button).
+			buttons.sort((a, b) => (a.getAttribute("data-day") < b.getAttribute("data-day") ? -1 : 1));
 			if (!buttons.some((b) => b.getAttribute("tabindex") === "0")) buttons[buttons.length - 1]?.setAttribute("tabindex", "0");
 			// Left and right move a week, up and down a day; Home and End jump to the first and last day.
 			table.addEventListener("keydown", (e: J) => {

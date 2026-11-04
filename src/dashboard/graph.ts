@@ -52,7 +52,7 @@ export function graphTab(am: Am): void {
 		list.push(id);
 		g.groups.set(group, list);
 		g.dirty = true;
-		for (const e of g.pending.get(id) ?? []) link2(g, e);
+		for (const e of g.pending.get(id) ?? []) if (e.b) link2(g, e); else g.nodes.get(id)!.opaque++; // b "": a link out of this profile
 		g.pending.delete(id);
 	};
 	/** A link joins the drawing once both ends are loaded records; until then it waits, so no end is invented. */
@@ -70,7 +70,13 @@ export function graphTab(am: Am): void {
 		if (!id || !a || !b) return;
 		// A far end that is not a record shown here (another profile, a moved record, a capture) is counted on its record, never drawn.
 		if (it.dst.readable !== true) {
-			if (!g.edges.has(`x:${id}`)) { g.edges.set(`x:${id}`, { id: `x:${id}`, a, b: "", rel: str(it.rel) ?? "" }); g.opaque++; const n = g.nodes.get(a); if (n) n.opaque++; }
+			if (!g.edges.has(`x:${id}`)) {
+				const e = { id: `x:${id}`, a, b: "", rel: str(it.rel) ?? "" }, n = g.nodes.get(a);
+				g.edges.set(e.id, e);
+				g.opaque++;
+				// Edges and nodes page in parallel: a source not loaded yet gets the count when addNode takes it from pending.
+				if (n) n.opaque++; else g.pending.set(a, [...(g.pending.get(a) ?? []), e]);
+			}
 			return;
 		}
 		link2(g, { id, a, b, rel: str(it.rel) ?? "relates_to" });
