@@ -263,10 +263,11 @@ AND date(c.committer_date) BETWEEN ${lit(from)} AND ${lit(to)}`;
  */
 export function corpusFilesSql(scope: ActivitySummaryQuery | { project: string; now: string }): string | null {
 	if ("project" in scope) {
-		const m = /^github:([a-z0-9][\w.-]*\/[\w.-]+)$/.exec(scope.project), nowMs = Date.parse(scope.now);
+		// GitHub names are case-insensitive and keys keep the case they were written with; the corpus side is compared as lower(c.repo).
+		const m = /^github:([a-z0-9][\w.-]*\/[\w.-]+)$/i.exec(scope.project), nowMs = Date.parse(scope.now);
 		if (!m || !Number.isFinite(nowMs)) return null;
 		const to = new Date(nowMs).toISOString().slice(0, 10);
-		return FILES_SELECT(`lower(c.repo) = ${lit(m[1]!)} AND ${dated(addDays(to, -FILE_DAYS), to)}`);
+		return FILES_SELECT(`lower(c.repo) = ${lit(m[1]!.toLowerCase())} AND ${dated(addDays(to, -FILE_DAYS), to)}`);
 	}
 	checkRange(scope);
 	return FILES_SELECT(dated(scope.from, scope.to));
