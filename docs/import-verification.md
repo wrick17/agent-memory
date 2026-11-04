@@ -4,6 +4,12 @@
 
 The reviewed profile-selection source passed typecheck and lint. The Worker rerun passed 569 tests across 17 files; the separate local stage passed 222 tests. The earlier combined run failed one recall assertion and reported two graph RPC teardown errors. After isolation of new test fixtures, the Worker rerun exited successfully, but its runtime log still reported an unresolved Vitest worker teardown RPC error and an undisposed RPC result warning. This is local evidence only; fixture and canonical release checks remain pending.
 
+## Profile selection fixture verification, 2026-11-04
+
+The #3-only source commit `5097672d772d36014d1ad4129d298bb43ae5117a` was deployed to the isolated fixture as Worker version `ab697c01-4958-48fe-8e92-ad836c97a962`. The downloaded Worker bundle matched the dry build, SHA-256 `a1968910ca301046ee68c93428acf53d58f3bda58c3dae695bb9066d89631d6b`. Synthetic explicit Me saves containing the owner name and a GitHub release URL were read back exactly; request replay, history, an invalid target refusal and an unauthenticated 401 passed. An omitted-profile request returned `route_required` with no configured fixture routing rules. The fixture did not establish precedence over a matching routing rule or a valid but unauthorized device.
+
+The Test import audit retained 1,374 published records, 5,699 revisions and 4,173 request receipts. Profile generations, export inventories and fixture deployment controls matched the predeployment readings; no recovery was active. Synthetic records remain. The prior fixture Worker version `c76a3b8e-1958-4072-917a-91f82db97bc8` is available for code rollback. These checks do not establish canonical behavior or restore data by rolling back code.
+
 ## Held-record Work migration, 2026-11-02
 
 The owner-approved held-record migration added 112 Work records: 86 with assigned identities and 26 redacted copies. The Personal journal remains held because production permits imports only into Work. The already-hosted redactor-flagged records remain unchanged. The other privacy holds, possible duplicates, `raw_memories.md` and 178 absent sources keep their prior accounting.
