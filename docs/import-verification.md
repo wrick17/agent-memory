@@ -548,7 +548,7 @@ Fresh scoped backup checks passed 30 cases with typecheck and lint; author evide
 
 ### Final combined run, 2026-11-04
 
-**On the final integrated v2 source with every review fix, 645 of 645 Worker tests and 137 of 137 local CLI tests passed.**
+**On the integrated v2 source at the I39 receipt, before the later #69, #76, #78 and #80 fixes, 645 of 645 Worker tests and 137 of 137 local CLI tests passed.**
 
 | Run | Result | Log SHA-256 |
 |---|---|---|
