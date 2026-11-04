@@ -1632,6 +1632,19 @@ describe("dashboard knowledge graph", () => {
 		expect(b.seen.posted).toEqual([]);
 		expect(b.seen.fetched.some((x) => /\/(save|move|review|delete|wipe|forget)/.test(x))).toBe(false);
 	});
+
+	it("fills a deep-linked record's linked projects and memories once the graph has loaded", async () => {
+		const more = [...edges, { id: 5, rel: "relates_to", ...at("r1", "r5") }];
+		const b = browser({ signedIn: true, hash: "#graph/r1?profile=work", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", more, path) : undefined) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		await settle();
+		const panel = text(b.view()).replace(/\s+/g, " ");
+		expect(panel).toContain("Projects: Agent Memory");
+		expect(panel).not.toContain("none linked");
+		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
+		expect(panel).not.toContain("No linked memories");
+	});
 });
 
 describe("dashboard review", () => {
