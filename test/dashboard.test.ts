@@ -2221,6 +2221,27 @@ describe("dashboard Activity tab", () => {
 		b.listeners.pagehide!();
 		stream.close();
 	});
+
+	it("moves its rolling year forward on Refresh after UTC midnight, with today's cell", async () => {
+		const reads: string[] = [], realNow = Date.now;
+		Date.now = () => Date.parse("2026-11-04T23:59:30Z");
+		try {
+			const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
+				const u = new URL(path, "https://x");
+				if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+				reads.push(u.searchParams.get("to")!);
+				return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, { observations: 1, sessions: 1, active_days: 1 }));
+			} });
+			await dashboardMain(b.win);
+			for (let i = 0; i < 3; i++) await settle();
+			const day = (d: string) => find(b.view(), "button").some((x) => x.attrs["data-day"] === d);
+			expect([reads.at(-1), day("2026-11-04"), day("2026-11-05")]).toEqual(["2026-11-04", true, false]);
+			Date.now = () => Date.parse("2026-11-05T00:00:30Z"); // the tab stays open past midnight
+			click(button(b.view(), "Refresh")); // the minute poll runs the same refresh
+			for (let i = 0; i < 3; i++) await settle();
+			expect([reads.at(-1), day("2026-11-05")]).toEqual(["2026-11-05", true]);
+		} finally { Date.now = realNow; }
+	});
 });
 
 describe("dashboard Memories tab", () => {
@@ -2563,5 +2584,29 @@ describe("dashboard Overview and Health tabs", () => {
 		expect(find(svg, "polyline")).toHaveLength(2);
 		const legend = find(svg, "text").map((x) => x.textContent).filter((t) => t.includes("k=5"));
 		expect(legend).toEqual([expect.stringMatching(/^work hybrid k=5:/), expect.stringMatching(/^personal hybrid k=5:/)]);
+	});
+
+	it("keeps health checks that stream in while the first report is loading, instead of painting the older report over them", async () => {
+		const held = gate();
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const check = (state: string, at: string) => ({ check_id: "capture_stale", subject: "laptop", state, detail: `capture ${state}`, at });
+		const b = browser({ signedIn: true, hash: "#health", api: async (path) => {
+			if (path === "/api/health") { await held.wait; return Response.json({ verdict: "ok", checks: [check("ok", "2026-11-04T10:00:00Z")], devices: [], consolidation: [],
+				backups: { last_export_at: null, retained: [] }, search: { lexical_documents: 0, vectors: 0, embeddings: false, semantic_ms: 3000 } }); } // read before the sweep
+			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [] });
+			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
+			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		stream.enqueue(new TextEncoder().encode(`event: health\ndata: ${JSON.stringify([check("fail", "2026-11-04T10:05:00Z")])}\nid: 2\n\n`)); // a newer sweep
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain("1 failed.");
+		held.open();
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("1 failed."); // the newer check stays; the stream will not send it again
+		expect(text(b.view())).not.toContain("Every check passed");
+		b.listeners.pagehide!();
+		stream.close();
 	});
 });

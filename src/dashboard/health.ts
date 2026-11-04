@@ -315,7 +315,7 @@ export function healthTab(am: Am): void {
 		if (s) checksView(checksBox, s.health.checks, names); else loading(checksBox, 2);
 		const rest = el("div", root);
 		const wait = loading(rest, 6);
-		let focus: Node | undefined;
+		let focus: Node | undefined, streamed: HealthCheck[] | null = null;
 
 		void (async () => {
 			const [rep, runs] = await Promise.allSettled([call("/api/health") as Promise<HealthReport>,
@@ -325,8 +325,8 @@ export function healthTab(am: Am): void {
 			const report: HealthReport | Error = rep.status === "fulfilled" ? rep.value : rep.reason instanceof Error ? rep.reason : new Error(String(rep.reason));
 			if (!(report instanceof Error)) {
 				for (const d of report.devices) if (d.device_name) names.set(d.device_id, d.device_name);
-				checksView(checksBox, report.checks, names);
-			} else if (!s) { checksBox.replaceChildren(); note(checksBox, `Could not read the health checks: ${why(report)}`); }
+				checksView(checksBox, streamed ?? report.checks, names); // the stream sends a check again only when it changes
+			} else if (!s && !streamed) { checksBox.replaceChildren(); note(checksBox, `Could not read the health checks: ${why(report)}`); }
 			mounted = { version, paint: (rows) => checksView(checksBox, rows, names), feed: engine(rest, report) };
 			if (!(report instanceof Error)) {
 				search(rest, report);
@@ -343,8 +343,8 @@ export function healthTab(am: Am): void {
 			// #health/consolidation: focus the section once it exists (the heading render returned is the tab's).
 			if (focus) { focus.setAttribute("tabindex", "-1"); focus.focus(); }
 		})();
-		// Until the report arrives, health events repaint the snapshot's checks box.
-		mounted = { version, paint: (rows) => checksView(checksBox, rows, names) };
+		// Until the report arrives, health events repaint the snapshot's checks box and are kept as newer than the report.
+		mounted = { version, paint: (rows) => { streamed = rows; checksView(checksBox, rows, names); } };
 		return h;
 	} });
 }
