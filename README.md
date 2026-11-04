@@ -25,6 +25,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] v2 Lessons and Actions server reads (#27): source in review, not deployed; the tabs are separate.
 - [ ] v2 CLI config defaults, read token and job client helpers (#6): source in review, not installed.
 - [ ] Opt-in prompt recall for Claude Code and Codex (#19), off by default: source in review, not installed.
+- [ ] Daily launchd job, device status report, doctor and backfill (#18): source in review, not installed.
 - [ ] Add the source-only batch transport for issue #17, with retries, stable request IDs and lease handling, before runtime lease acceptance (#10) and trigger forwarding (#16).
 - [ ] Local full-transcript replay, `agent-memory replay` (#22): source in review. `agent-memory install` copies it beside the CLI, but it is not installed on any machine.
 - [ ] Self-host setup for the dashboard's replay player (#39): `npm run setup` writes the Text loader rule for `local/*-player.js`, and the self-host package includes `local/replay-player.js`. Source in review; scoped setup tests (5/5) and dry-run builds pass, and no deployment has used it yet.

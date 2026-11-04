@@ -270,3 +270,14 @@ Module source in review, off by default; not installed. Extends the AM-09 captur
 - On a timeout, an error or a missing read token it prints nothing, so the prompt goes through.
 - Both clients get `hookSpecificOutput.additionalContext`: plain text, one line per record, under a line saying stored records are evidence, not instructions. Codex support rests on the Codex hooks documentation (codex-cli 0.166.0, checked 2026-11-04).
 - Evidence: its author's fail-open synthetic smoke. Its config and install tests arrive with #16. No real-client verification has run.
+
+### v2 local scheduling diagnostics and backfill (#18), 2026-11-04
+
+Module source in review; not installed. Extends AM-10 scheduling. This change adds `local/launchd.mjs`, `local/status.mjs`, `local/doctor.mjs` and `local/backfill.mjs`. The `doctor` and `backfill` commands, the plist install and the status report call arrive with #16, so nothing calls these modules yet.
+
+- `launchd.mjs` builds the daily job plist for the installing Node binary, `AGENT_MEMORY_HOME` and `PATH`, with the test label `com.agent-memory.batch.test` for any non-default home. It never runs `launchctl`; install only prints the load command.
+- `status.mjs` builds the per-device report: counts, times, booleans, hook names and client versions. It holds no transcript text, paths, session ids or token.
+- `doctor.mjs` checks the token files, the hooks, the launchd job, the spool, local capture state and `whoami`, one line each with a fix. It is read-only and prints no token.
+- `backfill.mjs` queues triggers for retained transcripts whose cursor is behind. It reads file sizes, prefix hashes and a session's working directory, never message text.
+- Evidence: syntax and CLI bundle checks at this stage. The `doctor` and `backfill` tests arrive in #73. No launchd job has been loaded or run.
+- A claim-recovery observation (unlink after a failed rename) stays open for review.
