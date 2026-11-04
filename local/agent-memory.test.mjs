@@ -2,22 +2,38 @@
 // follows the /v1/ingest contract (the real server contract is tested in test/capture.test.ts). Probe tests use the real
 // `codex sandbox` when it is installed on macOS.
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import childProcess, { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
+
+// The status report and doctor ask launchd whether the batch job is loaded (launchd.mjs). No test runs the real launchctl:
+// every launchctl call in this process, by name or by path, is recorded here and answered "not loaded".
+const launchctlCalls = [], realSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = function (cmd, args, ...rest) {
+	if (path.basename(String(cmd)) !== "launchctl") return realSpawnSync.call(this, cmd, args, ...rest);
+	launchctlCalls.push(args);
+	return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: 1, signal: null };
+};
+syncBuiltinESMExports();
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-local-test-"));
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
 const am = await import("./agent-memory.mjs");
 const { batch } = await import("./batch.mjs");
+// The file stops here unless the module's launchctl check reaches the recorder above.
+assert.equal((await import("./launchd.mjs")).launchdLoaded("com.agent-memory.guard", { platform: "darwin" }), false);
+assert.deepEqual(launchctlCalls.splice(0), [["print", `gui/${process.getuid()}/com.agent-memory.guard`]]);
 const sha = (s) => createHash("sha256").update(s).digest("hex");
 let n = 0;
-beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
+beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); launchctlCalls.length = 0; });
+// Only the read-only check of this test home's job label ever reaches launchctl.
+afterEach(() => { for (const a of launchctlCalls) assert.deepEqual(a, ["print", `gui/${process.getuid()}/com.agent-memory.batch.test`]); });
 
 /** The /v1/ingest and /v1/capture contract in memory, with switches to simulate a crash or an outage. */
 function fakeServer() {
@@ -409,8 +425,8 @@ describe("confined runtime", () => {
 
 	it("proves the denial on this Mac with the real `codex sandbox`, and classifies weakened, missing and DNS probes", async (t) => {
 		// Resolve the native dependency only when this test actually runs, so filtered synthetic checks launch no child.
-		const codex = spawnSync("codex", ["--version"], { encoding: "utf8" });
-		const real = process.platform === "darwin" && codex.status === 0 && fs.existsSync(path.join(os.homedir(), ".codex", "auth.json"));
+		// The login is checked first, so under a synthetic HOME this test starts no codex child at all.
+		const real = process.platform === "darwin" && fs.existsSync(path.join(os.homedir(), ".codex", "auth.json")) && spawnSync("codex", ["--version"], { encoding: "utf8" }).status === 0;
 		if (!real) { t.skip("codex sandbox not available"); return; }
 		const r = await am.confinedRunner({});
 		assert.deepEqual([r.available, r.classification], [true, "denied"], r.reason);
@@ -1432,6 +1448,8 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		const idle = await am.run({ server, runner: { available: false, run() { throw new Error("no runner"); } }, trigger: "scheduled" });
 		assert.equal(idle.status, "idle");
 		assert.equal(idle.results.status, "sent");
+		assert.equal(reports[0].launchd_loaded, false);
+		assert.deepEqual(launchctlCalls, process.platform === "darwin" ? [["print", `gui/${process.getuid()}/com.agent-memory.batch.test`]] : []);
 		assert.deepEqual(Object.keys(reports[0]).sort(), ["clients", "hooks", "inject", "last_digest_at", "launchd_loaded", "missing_sources", "oldest_pending_at",
 			"oldest_spool_at", "pending_ranges", "refused_since_last", "spool_bytes", "spool_files", "stuck_ranges"]);
 		am.writePrivate(path.join(am.home(), "batch", "last.json"), JSON.stringify({ at: new Date().toISOString(), profiles: { work: { status: "completed" } } }));
@@ -1476,5 +1494,50 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0, trigger: "scheduled" });
 		assert.equal(r.results["claude-code-nospace.json"].status, "done");
 		assert.ok(server.log.some((b) => b.session.id === "nospace"));
+	});
+});
+
+describe("doctor and backfill (#18)", () => {
+	it("doctor passes an installed setup with registered hooks and a private job token, and gives the bootstrap fix for an unloaded job", async () => {
+		const fakeHome = fs.mkdtempSync(path.join(tmp, "user-home-")), saved = { HOME: process.env.HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME };
+		Object.assign(process.env, { HOME: fakeHome, CLAUDE_CONFIG_DIR: path.join(fakeHome, ".claude"), CODEX_HOME: path.join(fakeHome, ".codex") });
+		try {
+			const r = am.install({ platform: "darwin" });
+			// The owner adds the printed hooks; doctor only reads them.
+			am.writePrivate(path.join(fakeHome, ".claude", "settings.json"), JSON.stringify({ hooks: r.claude.hooks }));
+			am.writePrivate(path.join(fakeHome, ".codex", "config.toml"), r.codex);
+			am.writePrivate(path.join(am.home(), "job-token"), "device-job-token");
+			const { doctorChecks, formatChecks } = await import("./doctor.mjs");
+			const server = { whoami: async () => ({ kind: "device", device_id: "dev-1", scopes: ["ingest", "maintenance"] }) };
+			const checks = await doctorChecks({ config: am.loadConfig(), server, platform: "darwin" });
+			assert.deepEqual(checks.map((c) => [c.id, c.ok]), [["job_token", true], ["read_token", true], ["hooks", true], ["launchd", false], ["spool", true], ["capture", true], ["whoami", true]]);
+			// The launchctl recorder answers "not loaded", so doctor prints the bootstrap command for the job install wrote.
+			assert.equal(checks[3].fix, `Run: ${r.launchd.load}`);
+			assert.ok(!formatChecks(checks).includes("device-job-token"), "doctor never prints the token");
+			am.writePrivate(path.join(fakeHome, ".codex", "config.toml"), r.codex.split("\n\n").filter((h) => !h.includes("PreCompact")).join("\n\n"));
+			const gap = (await doctorChecks({ config: am.loadConfig(), server, platform: "darwin" })).find((c) => c.id === "hooks");
+			assert.deepEqual([gap.ok, gap.detail], [false, "codex is missing PreCompact"]);
+		} finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+	});
+
+	it("backfill queues each client's transcripts that are behind, the next run captures them, and a second backfill finds them current", async () => {
+		const stores = fs.mkdtempSync(path.join(tmp, "stores-")), env = { CLAUDE_CONFIG_DIR: path.join(stores, "claude"), CODEX_HOME: path.join(stores, "codex") };
+		const claude = path.join(env.CLAUDE_CONFIG_DIR, "projects", "-w", "bf-claude.jsonl"), id = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+		const codex = path.join(env.CODEX_HOME, "sessions", "2026", "11", "04", `rollout-2026-11-04T10-00-00-${id}.jsonl`);
+		fs.mkdirSync(path.dirname(claude), { recursive: true });
+		fs.mkdirSync(path.dirname(codex), { recursive: true });
+		fs.writeFileSync(claude, claudeLine("user", "We decided to backfill the Claude session.", { cwd: tmp }));
+		fs.writeFileSync(codex, JSON.stringify({ type: "session_meta", payload: { id, cwd: tmp } }) + "\n" + codexLine("user_message", "We decided to backfill the Codex session."));
+		const { backfill } = await import("./backfill.mjs");
+		const first = backfill({ env });
+		assert.deepEqual([first.queued, first.current, first.already_queued], [2, 0, 0]);
+		assert.match(first.warning, /cleanupPeriodDays \(30 days/);
+		const server = fakeServer();
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		assert.equal(r.results["claude-code-bf-claude.json"].status, "done");
+		assert.equal(r.results[`codex-${id}.json`].status, "done");
+		assert.deepEqual([...new Set(server.log.map((b) => b.session.id))].sort(), [id, "bf-claude"].sort());
+		const again = backfill({ env });
+		assert.deepEqual([again.queued, again.current], [0, 2]);
 	});
 });
