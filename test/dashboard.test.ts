@@ -2166,6 +2166,38 @@ describe("dashboard Activity tab", () => {
 		expect(file().attrs["aria-pressed"]).toBe("true");
 		expect(b.win.location.hash).toBe("#activity?profile=work&file=src%2Fa.ts");
 	});
+
+	it("reads the summaries again while it is open, so a capture upload shows without Refresh, and stops after leaving the tab", async () => {
+		let note = "asked before the capture";
+		const reads: string[] = [];
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
+			// The live stream stays up, as it does while a capture uploads: nothing pauses it.
+			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
+			const u = new URL(path, "https://x");
+			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+			reads.push(path);
+			const to = u.searchParams.get("to")!;
+			return Response.json(year(u.searchParams.get("from")!, to, { observations: 1, sessions: 1, active_days: 1, latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] }));
+		} });
+		// A capture adds digest parts but no activity row, so no live event comes; the page's own timer is held here and run by hand.
+		const later: [() => unknown, number][] = [];
+		Object.assign(b.win, { setTimeout: (f: () => unknown, ms: number) => later.push([f, ms]), clearTimeout() {} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("asked before the capture");
+		note = "asked after the capture";
+		const tick = async () => { const i = later.findIndex(([, ms]) => ms === 60_000); expect(i).toBeGreaterThanOrEqual(0); const [due] = later.splice(i, 1); await due![0](); for (let j = 0; j < 2; j++) await settle(); };
+		await tick();
+		expect(text(b.view())).toContain("asked after the capture");
+		b.go("#/memories");
+		const before = reads.length;
+		await tick();
+		expect(reads.length).toBe(before); // no read once Activity is gone
+		expect(later.some(([, ms]) => ms === 60_000)).toBe(false); // and no further reload is scheduled
+		b.listeners.pagehide!();
+		stream.close();
+	});
 });
 
 describe("dashboard Memories tab", () => {
