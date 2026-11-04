@@ -102,6 +102,22 @@ describe("local transcripts", () => {
 		assert.equal(codex[2].detail.truncated, undefined);
 		assert.deepEqual(leaks(JSON.stringify(codex)), []);
 	});
+
+	it("keeps Claude text and tool blocks in source order with the same filters", () => {
+		const file = path.join(tmp, "mixed.jsonl");
+		fs.writeFileSync(file, jsonl([
+			{ type: "assistant", timestamp: ts(0), message: { content: [{ type: "text", text: "First." }, { type: "thinking", thinking: "PRIVATE-THINKING" },
+				{ type: "tool_use", id: "t1", name: "Bash", input: { command: "npm test" } }, { type: "text", text: `Second. password=${PW}` }] } },
+			{ type: "user", timestamp: ts(5), message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "tests failed" },
+				{ type: "text", text: "Please fix that failure.<system-reminder>REMINDER-TEXT</system-reminder>" }, { type: "text", text: "<environment_context>INJECTED-CONTEXT</environment_context>" }] } },
+			// A record the hook drops as a whole keeps its text out even when a later block alone would pass.
+			{ type: "user", timestamp: ts(6), message: { content: [{ type: "text", text: "<command-name>INJECTED-CONTEXT" }, { type: "text", text: "META-ONLY" }] } },
+		]));
+		const events = readFull("claude-code", file);
+		assert.deepEqual(events.map((e) => [e.kind, e.label]), [["response", "First."], ["tool_call", "Bash"], ["response", "Second. password=[REDACTED]"],
+			["tool_result", "Bash result"], ["prompt", "Please fix that failure."]]);
+		assert.deepEqual(leaks(JSON.stringify(events)), []);
+	});
 });
 
 function get(port, p, { method = "GET", headers = {} } = {}) {

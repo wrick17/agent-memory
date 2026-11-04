@@ -127,15 +127,19 @@ export function readFull(client, file) {
 	for (const line of lines) {
 		const o = line.obj, offset = at(o);
 		// Prompts and responses use the hook's own filters: injected context, reminders, thinking and meta records stay out.
-		for (const m of extract(client, [line])) push(m.role === "owner" ? "prompt" : "response", m.text, offset, { role: m.role });
+		const say = (l) => { for (const m of extract(client, [l])) push(m.role === "owner" ? "prompt" : "response", m.text, offset, { role: m.role }); };
 		if (client === "claude-code") {
-			if ((o.type !== "user" && o.type !== "assistant") || o.isMeta || o.isSidechain || !Array.isArray(o.message?.content)) continue;
+			if ((o.type !== "user" && o.type !== "assistant") || o.isMeta || o.isSidechain || !Array.isArray(o.message?.content)) { say(line); continue; }
+			// Blocks in source order, each text block through extract alone; a record the hook drops as a whole stays dropped.
+			const keep = extract(client, [line]).length > 0;
 			for (const b of o.message.content) {
-				if (b?.type === "tool_use") call(offset, b.id, String(b.name ?? "tool"), b.input);
+				if (b?.type === "text") { if (keep) say({ ...line, obj: { ...o, message: { ...o.message, content: [b] } } }); }
+				else if (b?.type === "tool_use") call(offset, b.id, String(b.name ?? "tool"), b.input);
 				else if (b?.type === "tool_result") result(offset, b.tool_use_id, b.content, b.is_error === true);
 			}
 			continue;
 		}
+		say(line); // a Codex record is either a message or a tool item, never both
 		const p = o.payload;
 		if (o.type === "response_item") {
 			if (p?.type === "function_call" || p?.type === "custom_tool_call") call(offset, p.call_id, String(p.name ?? "tool"), p.arguments ?? p.input);

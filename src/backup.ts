@@ -10,6 +10,8 @@ declare global { interface Env { BACKUP_KEY?: string } }
 export const CHUNK_ROWS = 500;
 export const CHUNK_BYTES = 512 * 1024;
 export const KEEP = 2;
+/** Workers queue a seventh connection waiting for response headers, R2 puts included; so whole-store exports overlap six puts. */
+const PUTS = 6;
 
 /**
  * `rowid`: also export each rowid table's own rowid, for stores whose rows are keyed by it (the corpus families). `preserve`: the owner's
@@ -89,8 +91,11 @@ const writeSeq = (sql: SqlStorage, metaTable: string) => Number(sql.exec<{ value
 /**
  * Run inside blockConcurrencyWhile. Reads every exported table in bounded pages, puts each encrypted chunk, then the manifest,
  * then keeps the two newest complete exports. Never throws: a throw there would reset the object.
+ * Up to PUTS chunk puts overlap, so the pause lasts about chunks / 6 puts, not one put per chunk; the manifest waits for all of them.
+ * shortcut: the whole export must still finish inside the 30 s pause; move profiles to the resumable export (exportStep) when one nears it.
  */
 export async function exportStore(storage: DurableObjectStorage, env: Env, spec: StoreSpec): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+	const inFlight: Promise<unknown>[] = [];
 	try {
 		const sql = storage.sql, key = await backupKey(env), at = new Date().toISOString();
 		const id = `${at.replace(/[-:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`, prefix = `exports/${spec.store}/${id}/`;
@@ -99,8 +104,11 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 		const chunks: ChunkRef[] = [], counts: Record<string, number> = {};
 		const put = async (c: Chunk) => {
 			const plain = JSON.stringify(c), k = `${prefix}${String(chunks.length).padStart(5, "0")}.enc`;
-			await env.BACKUPS.put(k, await seal(key, k, plain));
 			chunks.push({ key: k, table: c.table, rows: c.rows.length, sha256: sha256(plain) });
+			const p = env.BACKUPS.put(k, await seal(key, k, plain));
+			p.catch(() => {}); // handled where it is awaited below; this only keeps a later rejection from being reported as unhandled
+			inFlight.push(p);
+			if (inFlight.length >= PUTS) await inFlight.shift();
 		};
 		for (const table of exportTables(sql, spec)) {
 			const { order, hidden } = orderOf(sql, table), cols = spec.rowid && hidden ? "rowid AS rowid, *" : "*";
@@ -122,6 +130,7 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 			}
 			if (rows.length) await put({ table, columns, rows });
 		}
+		await Promise.all(inFlight);
 		if (writeSeq(sql, spec.metaTable) !== seq) return fail("busy", "a write landed during the export; retry");
 		const manifest: Manifest = { version: 1, id, store: spec.store, userId: spec.userId, ...(spec.profile ? { profile: spec.profile, generation: spec.generation! } : {}),
 			schema_version: schema, seq, at, counts, chunks };
@@ -130,6 +139,8 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 		if (!spec.preserve) await retain(env, spec.store);
 		return ok({ id, seq, chunks: chunks.length, rows: Object.values(counts).reduce((a, b) => a + b, 0) });
 	} catch (e) {
+		// Every started put settles before the pause lifts: one landing later could outlive a wipe's cleanup of this export.
+		await Promise.allSettled(inFlight);
 		if (e instanceof Fail) return { ok: false, error: e.failure };
 		return fail("unavailable", `export failed: ${(e as Error).message}`);
 	}
