@@ -21,7 +21,13 @@ it("scores the synthetic cases on all three channels, counts no recall hits, and
 	for (const m of fixture.memories) ids.set(m.name, (await call<{ memory_id: string }>(owner, "save_memory", { ...m, profile: PROFILE })).memory_id);
 	const ref = owner.account.profiles.find((p) => p.profile === PROFILE)!;
 	const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`));
-	await runDurableObjectAlarm(stub); // embeds the cards, so the vector channel can find them
+	// Each alarm embeds at most 16 cards and re-arms while more are due, so one alarm can leave some of the 24 unindexed, and vector
+	// or hybrid scoring would record false misses. Run alarms until every fixture card is embedded; an alarm already in flight reports
+	// ran: false, so wait briefly for it. Bounded, and asserted before any scoring.
+	const unembedded = () => runInDurableObject(stub, (_i, s) => [...ids.values()].filter((id) =>
+		!s.storage.sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status = 'active' AND embed_hash = card_hash", id).toArray().length));
+	for (let i = 0; i < 50 && (await unembedded()).length; i++) if (!(await runDurableObjectAlarm(stub))) await new Promise((r) => setTimeout(r, 20));
+	expect(await unembedded(), "fixture cards still waiting for an embedding").toEqual([]);
 	const idOf = (name: string) => {
 		const id = ids.get(name);
 		if (!id) throw new Error(`the fixture names no record called ${name}`);
