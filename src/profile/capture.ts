@@ -21,7 +21,15 @@ const SPAN = /^(\d+)-(\d+)$/;
 
 export interface DigestPart { range_id: string; capture_status: "heuristic" | "consolidated"; part_id: string; sha256: string; body: string }
 export interface Manifest { range_id: string; parts: { part_id: string; sha256: string }[] }
-export interface IngestBatch { session: { client: "claude-code" | "codex"; id: string }; digests: DigestPart[]; manifests: Manifest[] }
+/**
+ * session.ended (sticky: a replay or an older batch never clears it) and session.files_changed (the runner's cumulative distinct
+ * edited-file count; keep the largest) are optional, as v1 runners omit them. device_id is set only by the Worker, from the
+ * authenticated job token; no public body field can set it. S1 stores them on the session node.
+ */
+export interface IngestBatch {
+	session: { client: "claude-code" | "codex"; id: string; ended?: boolean; files_changed?: number };
+	digests: DigestPart[]; manifests: Manifest[]; device_id?: string;
+}
 export type ItemResult = { range_id: string; part_id: string; status: "stored" | "replayed" | "refused"; reason?: string };
 
 export function parseRange(rangeId: string): { client: string; session: string; epoch: string; start: number; end: number } | null {
@@ -42,6 +50,7 @@ const BODY = z.object({
 	entities: z.array(short), dropped: z.object({ asks: count, decisions: count, corrections: count }).strict(),
 }).strict();
 type Body = z.infer<typeof BODY>;
+export type DigestBody = Body;
 
 /** Every string in a value, at any depth. */
 const strings = (v: unknown): string[] => typeof v === "string" ? [v] : Array.isArray(v) ? v.flatMap(strings) : v && typeof v === "object" ? Object.values(v).flatMap(strings) : [];
@@ -66,12 +75,17 @@ export const sessionKey = (s: IngestBatch["session"]) => `session:${s.client}:${
 function sessionNode(sql: SqlStorage, s: IngestBatch["session"], seq: number, now: string): string {
 	const key = sessionKey(s);
 	const found = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", key).toArray()[0];
-	if (found) {assertArchiveEndpoints(sql,found.id,found.id,"");return found.id;}
+	if (found) {
+		assertArchiveEndpoints(sql,found.id,found.id,"");
+		sql.exec("UPDATE nodes SET updated_at = ?, seq = ? WHERE id = ?", now, seq, found.id);
+		return found.id;
+	}
 	const id = sha256(key).slice(0, 32);
 	const hash = sha256(key);
-	sql.exec(`INSERT INTO nodes (id, kind, key, scope, name, norm_name, status, origin, revision, content_hash, card_hash, embed_hash,
-		recorded_at, created_at, updated_at, seq) VALUES (?, 'session', ?, '', ?, ?, 'active', 'upload', 1, ?, ?, ?, ?, ?, ?, ?)`,
-		id, key, key, key.toLowerCase(), hash, hash, hash, now, now, now, seq);
+	// first_at is the first upload, kept as written; updated_at moves with every stored part or manifest (the last upload).
+	sql.exec(`INSERT INTO nodes (id, kind, key, scope, name, norm_name, attrs, status, origin, revision, content_hash, card_hash, embed_hash,
+		recorded_at, created_at, updated_at, seq) VALUES (?, 'session', ?, '', ?, ?, json_object('first_at', ?), 'active', 'upload', 1, ?, ?, ?, ?, ?, ?, ?)`,
+		id, key, key, key.toLowerCase(), now, hash, hash, hash, now, now, now, seq);
 	return id;
 }
 
@@ -167,10 +181,32 @@ export function ingest(storage: DurableObjectStorage, _who: Who, batch: IngestBa
 			return result("stored");
 		}));
 	}
+	sessionMeta(storage, batch, out.some((r) => r.status === "stored"));
 	// Mentions of this session written before it was uploaded link to it, in a budgeted transaction of their own; any still
 	// waiting resolve on the session's next upload.
 	resolveMentionsAlone(storage, sessionKey(batch.session), "upload");
 	return out;
+}
+
+/**
+ * The batch's session facts on an existing session node, in their own transaction after its items, so a replayed or digest-free
+ * SessionEnd batch still records the end. ended is sticky and files_changed keeps the largest count, so an older or repeated
+ * batch never lowers either. device_id comes only from the authenticated token; it follows the device that last stored a part,
+ * and a replay only fills it in when absent. Upload times are not touched here.
+ */
+function sessionMeta(storage: DurableObjectStorage, batch: IngestBatch, stored: boolean): void {
+	const sql = storage.sql, s = batch.session;
+	storage.transactionSync(() => {
+		const node = sql.exec<{ id: string; attrs: string }>("SELECT id, attrs FROM nodes WHERE key = ? AND kind = 'session' AND status = 'active'", sessionKey(s)).toArray()[0];
+		// A moving, incoming or moved node is not active, so a transfer or archive in progress is never written here.
+		if (!node || sizeLevel(sql.databaseSize) === "shrink_only") return;
+		const attrs = JSON.parse(node.attrs) as Record<string, unknown>, next = { ...attrs };
+		if (batch.device_id && (stored || typeof attrs.device_id !== "string")) next.device_id = batch.device_id;
+		if (s.ended === true) next.ended = true;
+		if (s.files_changed !== undefined && !(typeof attrs.files_changed === "number" && attrs.files_changed >= s.files_changed)) next.files_changed = s.files_changed;
+		const text = JSON.stringify(next);
+		if (text !== JSON.stringify(attrs)) sql.exec("UPDATE nodes SET attrs = ?, seq = ? WHERE id = ?", text, nextSeq(sql, "profile_meta"), node.id);
+	});
 }
 
 /**

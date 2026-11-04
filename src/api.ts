@@ -65,7 +65,9 @@ const CSP = (env: Env) => {
 
 const rangeId = z.string().max(256);
 const ingestSchema = z.object({
-	session: z.object({ client: z.enum(["claude-code", "codex"]), id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/) }).strict(),
+	// #12: ended and files_changed are optional, so a v1 runner's body is unchanged. Only the count is sent, never a path.
+	session: z.object({ client: z.enum(["claude-code", "codex"]), id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/),
+		ended: z.boolean().optional(), files_changed: z.number().int().min(0).max(100_000).optional() }).strict(),
 	repo: z.object({ remote: z.string().max(512).optional(), path: z.string().max(1024).optional() }).strict().optional(),
 	profile: z.string().regex(PROFILE_NAME).optional(),
 	digests: z.array(z.object({ range_id: rangeId, capture_status: z.enum(["heuristic", "consolidated"]), part_id: z.string().max(64),
@@ -130,7 +132,8 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile)!;
 	if (work) return workUpload(env, ctx.value, ref, route.value.routedBy, input);
 	const res = path === "/v1/ingest"
-		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [] })
+		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [],
+			...(ctx.value.caller.deviceId ? { device_id: ctx.value.caller.deviceId } : {}) })
 		: await profileStub(env, ref).captureState(ref, input.range_ids);
 	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
 }
@@ -143,7 +146,9 @@ async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, ro
 	const repo = repoNamespace(input.repo?.remote ?? ""), tickets = (input.tickets ?? []).map((t) => ticketArgs(t, input.as_of!));
 	if (!repo && (input.commits?.length || input.prs?.length || input.marker || !tickets.length)) return json({ error: { code: "validation", message: "commits, PRs and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
 	if (tickets.length && ref.profile !== "work") return json({ error: { code: "forbidden", message: "Jira tickets go only to the work profile" } }, 403);
-	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [] }) : ok([]);
+	// #12: the session's device is the authenticated token's, never a body field.
+	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [],
+		...(account.caller.deviceId ? { device_id: account.caller.deviceId } : {}) }) : ok([]);
 	if (!results.ok) return json({ error: results.error }, 400);
 	if (input.marker && results.value.some((r) => r.status !== "stored" && r.status !== "replayed")) return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: [], marker: { status: "refused", reason: "capture_not_held" } });
 	const commits = (input.commits ?? []).map((c) => commitArgs(repo!, c)), prs = (input.prs ?? []).map((p) => prArgs(repo!, p, input.as_of!));
