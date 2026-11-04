@@ -1153,6 +1153,10 @@ The server stores each digest as a `capture` text on the session's `session` nod
 
 Capture must teach at least as much as Codex memory generation does today. The consolidated parts carry that learning to the hosted store even when a session is interrupted and no agent ran its task-end pass. The agent's inline consolidation adds more on top when it runs. Phase 2 checks parity on interrupted, marker-free fixtures with no inline pass (section 22).
 
+### Local full-transcript replay
+
+`agent-memory replay` is the only reader of raw transcripts and tool output outside the hook's digest pass. It runs on the recording machine and serves through 127.0.0.1 only. A 32-byte URL token, an exact Host check and a same-origin Origin check run before routing, and the CSP is self-only. Every string is redacted, and each tool input and output is cut at 8 KB after redaction. It plays events with the shared player (`local/replay-player.js`) using real transcript offsets and uploads nothing ([manifest](feature-manifest.md#local-full-transcript-replay-22-2026-11-04)).
+
 ### Other upload items, each with its own id
 
 | Item | Natural id | Rule |

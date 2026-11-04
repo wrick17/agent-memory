@@ -104,3 +104,14 @@ The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTIO
 - Events without offsets (hosted digests) advance one per second at 1x. The position line says "order only" instead of a time. Events with transcript offsets wait for the real gap divided by the speed, with no compression.
 - Keys, while mounted and visible: Space plays or pauses; Left and Right step; in the list, Up, Down, Home and End move. Fields and the rest of the page keep their own keys. `destroy()` removes the view, the key listener and the timer, and may run twice.
 - Evidence: `local/replay-player.test.mjs`, in `test:local`.
+
+### Local full-transcript replay (#22), 2026-11-04
+
+`agent-memory replay` serves full local Claude Code and Codex transcripts to a browser on the recording machine. It loads the shared player above, byte for byte. Nothing it reads is uploaded or stored in a hosted system.
+
+- Commands: `--list` prints local sessions, newest first. `--session ID` opens one session, `--port N` picks the port (default 0, a random free port), and `--help` prints usage. Bad arguments exit 2; an unknown session or a failed start exits 1.
+- Sources: `projects/<project>/<session>.jsonl` under the Claude Code home and `sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl` under the Codex home. Listed files must be regular files owned by the current user, and symlinks are not followed. Session ids are validated. Each read opens with `O_NOFOLLOW` and checks `fstat`.
+- Events: owner and assistant text comes from the hook's `extract()`, so thinking, system, meta, sidechain and injected context stay out. Tool calls and results are kept for both formats. Every label and detail is redacted, and each tool input and output is cut at 8 KB after redaction (`truncated: "true"`).
+- Server: binds 127.0.0.1 only. A random 32-byte token is the first URL path segment and is compared in constant time. Host must be exactly `127.0.0.1:<port>`, and Origin, when sent, must be the same origin. These checks run before routing or file access. Only GET and HEAD are allowed. Responses set a self-only CSP with no inline script or style, plus `no-store`, `nosniff`, `no-referrer` and frame denial. There are no redirects. Errors carry no paths or transcript text.
+- Install: `agent-memory install` also copies `replay.mjs`, `transcript-full.mjs` and `replay-player.js` beside the CLI.
+- Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, the `lsof` loopback bind, and the installed command mounting the real player.
