@@ -16,6 +16,8 @@ import { applyRows, dropExportId, dropExports, exportStore, exportTables, hasExp
 import { scrubReview, wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wipe";
 import { CORPUS_MIGRATIONS, type CorpusStore } from "../corpus/store";
 import { settleRule, type Identity, type RecoveryCopy, type SettleAction, type SettleFacts } from "../profile/store";
+import { insertEvalRun, listEvalRuns } from "../eval";
+import type { EvalRunInput } from "../viewer/types";
 
 export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
@@ -80,7 +82,10 @@ export type AccountCommand =
 	| { op: "reviewOffer"; items: ReviewOffer[]; origin?: { profile: string; generation: string } }
 	| { op: "reviewList"; kind?: ReviewKind; state?: ReviewState; exportSha?: string; after?: string; limit: number }
 	| { op: "reviewAssign"; id: string; profile: "work" | "personal" }
-	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" };
+	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" }
+	// v2 eval scores (#9): content-free; the Worker sets deviceId from the job token and checks the profile with mayUse.
+	| { op: "recordEvalRun"; deviceId: string; run: EvalRunInput }
+	| { op: "listEvalRuns"; profile?: string; limit: number };
 
 export type ReviewKind = "migration" | "collision";
 export type ReviewState = "open" | "assigned" | "resolved" | "wiped";
@@ -95,7 +100,9 @@ const reviewOut = (r: ReviewRow) => ({ ...r, payload: JSON.parse(r.payload) as R
 export interface Recovery extends Choices {
 	id: string; profile: string; export: string; from: string; to?: string; at: string; export_at: string; export_seq: number;
 	state: "restoring" | "settling" | "checking" | "ready" | "unresolved" | "opening" | PitrState;
-	after?: { node: string; request: string }; mark?: number; phase?: "precheck" | "deferred" | "index" | "sweep" | "switch";
+	after?: { node: string; request: string }; mark?: number; phase?: "precheck" | "deferred" | "index" | "sweep" | "fence" | "switch";
+	/** The last account `wiped:` key whose fence the restored generation holds (phase "fence", v2). */
+	fence_after?: string;
 	restored?: { nodes: number; requests: number }; unresolved: { kind: string; id: string }[]; unresolved_count: number;
 	/** Absent for a restore from an export into a new generation. A point-in-time restore keeps `to` = `from`; a corpus restore owns no records. */
 	kind?: "pitr" | "corpus";
@@ -593,7 +600,7 @@ export class AccountStore extends DurableObject<Env> {
 	}
 	private profileAt(ref: ProfileRef) {
 		return this.env.PROFILE.get(this.env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
-			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
+			Pick<ProfileStore, "fenceWiped" | "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
 	}
 	private corpusAt(ref: ProfileRef) {
 		return this.env.CORPUS_STORE!.get(this.env.CORPUS_STORE!.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
@@ -1216,8 +1223,18 @@ export class AccountStore extends DurableObject<Env> {
 							if (!tx.spent(0.5)) tx.run("DELETE FROM request_index WHERE request_id IN (SELECT request_id FROM request_index WHERE profile = ? AND op <> 'wiped' AND seq <= ? LIMIT 25)", r.profile, r.mark!);
 							left = tx.rows > before;
 						}
-						if (!left) { r.phase = "switch"; tx.run("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('recovery_state', ?)", JSON.stringify(r)); }
+						if (!left) { r.phase = "fence"; tx.run("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('recovery_state', ?)", JSON.stringify(r)); }
 					});
+				}
+				// v2: every permanent wipe identity becomes a local fence in the restored generation, and the eval candidates and
+				// recall counts naming one go, before it opens. The generation may predate the wipe and never have held the node.
+				while (r.phase === "fence" && Date.now() - started < 20_000) {
+					const page = this.sql.exec<{ key: string; value: string }>("SELECT key, value FROM account_meta WHERE key LIKE 'wiped:%' AND key > ? ORDER BY key LIMIT 50", r.fence_after ?? "").toArray();
+					if (!page.length) { this.advance(r, () => Object.assign(r, { phase: "switch" })); break; }
+					const f = await stub.fenceWiped(who, page.map((k) => ({ id: k.key.slice("wiped:".length), mark: k.value })));
+					if (!f.ok) return f;
+					if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status");
+					if (f.value.done) this.advance(r, () => Object.assign(r, { fence_after: page.at(-1)!.key }));
 				}
 				if (r.phase !== "switch") return ok(r);
 				// A point-in-time restore stays on its own generation; its record keeps the undo bookmark for a reversal.
@@ -2096,6 +2113,13 @@ export class AccountStore extends DurableObject<Env> {
 				}
 				return wipeProfile(this.env, { ...wipePorts(this.env, this.ctx.storage), backups: (p) => this.replaceExports(p) }, { userId, kind: "owner", scopes: ["read", "write"], profiles: "*" }, cmd.profile, cmd.typed);
 			}
+			case "recordEvalRun": {
+				const run = { ...cmd.run, id: crypto.randomUUID(), device_id: cmd.deviceId };
+				this.write(() => insertEvalRun(this.sql, run));
+				return ok({ id: run.id });
+			}
+			case "listEvalRuns":
+				return ok(listEvalRuns(this.sql, { ...(cmd.profile ? { profile: cmd.profile } : {}), limit: cmd.limit }));
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
 			case "reviewOffer": {

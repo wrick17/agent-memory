@@ -371,7 +371,9 @@ const timelineQuery = z.object({ from: z.string().min(1).max(40), to: z.string()
 const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(100).optional(),
 	actor: z.enum(["agent", "owner", "keep", "index", "maintenance", "migration", "transfer"]).optional() }).strict();
 const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
-const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor"];
+const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor", "channels", "count_hits"];
+/** #9: the Memories search picks its recall channels; count_hits false leaves recall counts alone. */
+const recallOptions = z.object({ channels: z.array(z.enum(["lexical", "vector"])).min(1).max(2).optional(), count_hits: z.boolean().optional() }).strict();
 const DASHBOARD_REVIEW = ["action", "status", "limit", "candidate_id", "into", "reason", "request_id"];
 const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free", "new_name"];
 const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
@@ -847,8 +849,11 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 			if (!held.ok) return json({ error: held.error }, held.error.code === "busy" ? 503 : 400);
 			if (!(held.value as string[]).length) return json({ error: { code: "not_found", message: "no record with this id in this profile" } }, 404);
 		}
-		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
-			{ ...b, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) });
+		const { channels, count_hits, ...args } = b;
+		const opts = recallOptions.safeParse({ ...(channels !== undefined ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) });
+		if (!opts.success) return json({ error: { code: "validation", message: "channels is lexical and/or vector; count_hits is true or false" } }, 400);
+		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner", ...(waitUntil ? { waitUntil } : {}) }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
+			{ ...args, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) }, opts.data);
 		if (r.ok) return json(r.value);
 		const code = r.error.code;
 		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" ? 409

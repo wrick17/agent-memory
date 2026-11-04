@@ -13,6 +13,9 @@ import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
 import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPreview, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
+import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
+import { noteRecall, recallStrength } from "./recall-stats";
+import type { EvalCandidateQuery, EvalCandidateStatus, RecallOptions } from "../viewer/types";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -46,6 +49,10 @@ export interface WorkBatch { repo: string | null; commits: UploadArgs[]; prs?: U
 /** A PR or ticket item also names its updated_at. `flagged`: held, but its protected node was flagged for the owner instead of changed. */
 export type WorkItemResult = { key: string; status: "stored" | "replayed" | "stale" | "flagged" | "refused"; updated_at?: string; reason?: string };
 export type MarkerResult = ReturnType<typeof putMarker>;
+/** v2 reads for the owner routes and the Worker (src/v2-api.ts); each kind calls one module function. */
+export type V2Read =
+	| { kind: "eval_candidates"; q: EvalCandidateQuery } | { kind: "accepted_candidates"; cursor: string | null; limit: number }
+	| { kind: "recall_strength"; ids: string[]; day: string };
 
 import { foldDue, foldStep } from "./compact";
 import { danglingPage, enqueueDangling } from "./dangling";
@@ -230,6 +237,36 @@ export class ProfileStore extends DurableObject<Env> {
 			open_transfers: sql.exec<{ n: number }>("SELECT count(*) AS n FROM transfers WHERE state NOT IN ('committed','aborted')").one().n,
 			open_transfer_ids: after.node === "" && after.request === "" ? sql.exec<{ id: string }>("SELECT id FROM transfers WHERE state NOT IN ('committed','aborted') ORDER BY id LIMIT 50").toArray().map((t) => t.id) : [],
 		});
+	}
+
+	/**
+	 * Internal RPC from openRestore (export restore and point-in-time), before the generation opens: restores the account's
+	 * permanent wipe identities here as local fences, and removes the v2 side rows they name. A candidate is removed in every
+	 * status when its expected ids or node evidence name a wiped id, even if this profile never held that node (the me overlay).
+	 * Bounded: done is false while rows remain for these ids, and the account calls again with the same page.
+	 */
+	async fenceWiped(who: Who, ids: { id: string; mark: string }[]): Promise<Outcome<{ done: boolean }>> {
+		const sql = this.ctx.storage.sql;
+		if (!this.who()) return ok({ done: true });
+		const has = (k: string) => sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", k).toArray().length > 0;
+		if (!this.same(who) || (has("restore_id") && !has("restore_done"))) return fail("validation", "this generation holds no finished restore");
+		const list = JSON.stringify(ids.map((i) => i.id));
+		return ok(this.ctx.storage.transactionSync(() => {
+			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+			for (const i of ids) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${i.id}`, i.mark);
+			const pages = [
+				"DELETE FROM recall_daily WHERE (node_id, day) IN (SELECT node_id, day FROM recall_daily WHERE node_id IN (SELECT value FROM json_each(?1)) LIMIT 100)",
+				`DELETE FROM eval_candidates WHERE id IN (SELECT c.id FROM eval_candidates c WHERE EXISTS (SELECT 1 FROM json_each(c.expected_json) x WHERE x.value IN (SELECT value FROM json_each(?1)))
+					OR EXISTS (SELECT 1 FROM json_each(c.evidence_json) e WHERE json_extract(e.value, '$.kind') = 'node' AND json_extract(e.value, '$.ref') IN (SELECT value FROM json_each(?1))) LIMIT 40)`];
+			for (const q of pages) {
+				for (let before = -1; before !== tx.rows;) {
+					if (tx.spent(0.5)) return { done: false };
+					before = tx.rows;
+					tx.run(q, list);
+				}
+			}
+			return { done: true };
+		}));
 	}
 
 	/** Internal RPC from an aborted restore, after the account retired this generation: clears what the restore wrote. */
@@ -683,7 +720,53 @@ export class ProfileStore extends DurableObject<Env> {
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
-	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
+	/** Recall hit counts (#9): one transaction at one sequence; only recall_daily and recall_totals change, never nodes. */
+	async noteRecall(who: Who, ids: string[], tokens: number): Promise<Outcome<null>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql, day = new Date().toISOString().slice(0, 10);
+			this.ctx.storage.transactionSync(() => noteRecall(sql, nextSeq(sql, "profile_meta"), day, ids, tokens));
+			return ok(null);
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** The owner accepts or dismisses one eval candidate (#9). */
+	async decideEvalCandidate(who: Who, id: string, status: Exclude<EvalCandidateStatus, "pending">): Promise<Outcome<unknown>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql;
+			const c = this.ctx.storage.transactionSync(() => decideCandidate(sql, nextSeq(sql, "profile_meta"), id, status));
+			return c ? ok(c) : fail("not_found", "no such eval candidate");
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** v2 reads. An object never bound answers from its empty tables without binding. */
+	async readV2(who: Who, q: V2Read): Promise<Outcome<unknown>> {
+		try {
+			await this.access(who);
+			this.bind(who, true);
+			const sql = this.ctx.storage.sql;
+			switch (q.kind) {
+				case "eval_candidates": return ok(listCandidates(sql, q.q));
+				case "accepted_candidates": return ok(acceptedCandidates(sql, q.cursor, q.limit));
+				case "recall_strength": return ok(recallStrength(sql, q.ids, q.day));
+			}
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** opts (v2): the recall channels; omitted, both, as recall_memories always ran. */
+	async read(who: Who, q: ReadQuery, opts?: RecallOptions): Promise<Outcome<unknown>> {
 		try {
 			await this.access(who);
 			this.bind(who, ["import_audit", "batch_status", "owner_model", "board", "entity", "journals", "journal", "map", "graph", "page_timeline", "activity", "shown", "archive", "markers", "wipe_preview"].includes(q.kind));
@@ -699,7 +782,7 @@ export class ProfileStore extends DurableObject<Env> {
 					// Ownership probe: a record still landing or a tombstone left behind never claims the id.
 					return ok(sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status IN ('active','retired','superseded','moving','candidate','dismissed')", q.id).toArray().length > 0);
 				case "recall":
-					return ok(await this.recall(who, q));
+					return ok(await this.recall(who, q, opts?.channels));
 				case "import_audit":
 					return ok(audit(sql, q));
 				case "explore":
@@ -749,11 +832,11 @@ export class ProfileStore extends DurableObject<Env> {
 	 * the lexical channels run while it is in flight, and the Vectorize query follows the embedding. Whatever has not
 	 * answered by the deadline is left out; the lexical results return, and diagnostics name the stage that missed.
 	 */
-	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>): Promise<RecallPage> {
+	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>, want: NonNullable<RecallOptions["channels"]> = ["lexical", "vector"]): Promise<RecallPage> {
 		const diagnostics: Record<string, string> = {};
 		let stage: "embedding" | "vector" = "embedding";
 		// Vectors hold only current cards, so a read at as_of is lexical over the text stored by then.
-		const semantic = q.semantic && !q.asOf && this.env.AI && this.env.VECTORS ? (async () => {
+		const semantic = q.semantic && want.includes("vector") && !q.asOf && this.env.AI && this.env.VECTORS ? (async () => {
 			const out = (await this.env.AI!.run(EMBED_MODEL, { text: [q.keyword] })) as { data?: number[][] };
 			const vector = out.data?.[0];
 			if (!vector?.length) throw new Error("empty embedding");
@@ -764,10 +847,11 @@ export class ProfileStore extends DurableObject<Env> {
 		})() : undefined;
 		// An answer or failure that arrives after the deadline is dropped, never left unhandled.
 		semantic?.catch(() => undefined);
-		const channels = lexicalChannels(this.ctx.storage.sql, q, diagnostics);
+		// channels ["vector"] leaves out the exact, literal and full-text channels; graph expansion still seeds from what fused.
+		const channels = want.includes("lexical") ? lexicalChannels(this.ctx.storage.sql, q, diagnostics) : {};
 		let vectorUsed = false;
 		if (!semantic) {
-			diagnostics.embedding = q.asOf ? "off:as_of" : q.semantic ? "unavailable" : "off";
+			diagnostics.embedding = q.asOf ? "off:as_of" : !want.includes("vector") ? "off:channels" : q.semantic ? "unavailable" : "off";
 			diagnostics.vector = "off";
 		} else {
 			const timeout = Symbol("timeout");

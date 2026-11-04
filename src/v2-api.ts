@@ -2,13 +2,19 @@
 // before api.ts's owner check; owner routes only after it, so /api/* stays owner-only and device tokens never reach them.
 import type { AccountContext, AccountStore, Principal } from "./account/store";
 import { authenticate } from "./auth";
-import { type Outcome } from "./domain/types";
-import { accountStub } from "./mcp";
+import { z } from "zod";
+import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
+import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
+import { mayUse } from "./routing";
+import { parseEvalRun } from "./eval";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
 export const reply = (r: Outcome<unknown>) => (r.ok ? json(r.value) : json({ error: r.error }, STATUS[r.error.code] ?? 400));
 export const invalid = (message: string) => json({ error: { code: "validation", message } }, 400);
+const forbidden = (message: string) => json({ error: { code: "forbidden", message } }, 403);
+const profileName = z.string().regex(PROFILE_NAME);
+const issues = (e: z.ZodError) => e.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500);
 type Waiter = (p: Promise<unknown>) => void;
 
 /** A device token (or an OAuth owner token on the resource audience) with its account context; revoked or disabled devices fail in context(). */
@@ -18,12 +24,23 @@ async function deviceCaller(request: Request, env: Env): Promise<Response | Acco
 	const ctx = await accountStub(env, env.OWNER_USER_ID!).context(auth.principal as Principal);
 	return ctx.ok ? ctx.value : json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 }
+/** The job token: a device holding ingest and maintenance. Its device id comes from the token, never from a body. */
+const isJob = (c: AccountContext) => c.caller.kind === "device" && !!c.caller.deviceId && c.caller.scopes.includes("ingest") && c.caller.scopes.includes("maintenance");
+/** An active profile the caller named and may use; never inferred. */
+const usable = (c: AccountContext, profile: string): ProfileRef | undefined => (mayUse(c.caller, profile) ? c.profiles.find((x) => x.profile === profile) : undefined);
+
+async function boundedJson(request: Request, max: number): Promise<Response | { value: unknown }> {
+	if (!(request.headers.get("content-type") ?? "").includes("application/json")) return invalid("send application/json");
+	const text = await request.text();
+	if (new TextEncoder().encode(text).length > max) return json({ error: { code: "validation", message: `body over ${max} bytes` } }, 413);
+	try { return { value: JSON.parse(text) as unknown }; } catch { return invalid("body is not JSON"); }
+}
 
 /**
  * Device routes. Null for any other path. /v1/whoami answers here only for an am_ device token: an enabled device gets its own
  * id, scopes and profiles; the owner's reply stays in api.ts unchanged.
  */
-export async function deviceV2(request: Request, env: Env, url: URL, _waitUntil: Waiter | undefined): Promise<Response | null> {
+export async function deviceV2(request: Request, env: Env, url: URL, waitUntil: Waiter | undefined): Promise<Response | null> {
 	const path = url.pathname, method = request.method;
 	if (path === "/v1/whoami" && method === "GET") {
 		if (!/^Bearer\s+am_/i.test(request.headers.get("authorization") ?? "")) return null;
@@ -31,11 +48,82 @@ export async function deviceV2(request: Request, env: Env, url: URL, _waitUntil:
 		if (c instanceof Response) return c;
 		return json({ kind: "device", device_id: c.caller.deviceId, scopes: c.caller.scopes, profiles: c.caller.profiles === "*" ? c.known : c.caller.profiles });
 	}
+	// #9 recall for injection and eval: the read scope (a job token has none). Same read set and routing as recall_memories.
+	if (path === "/v1/recall" && method === "POST") {
+		const c = await deviceCaller(request, env);
+		if (c instanceof Response) return c;
+		if (!c.caller.scopes.includes("read")) return forbidden("this token cannot read");
+		const body = await boundedJson(request, 64_000);
+		if (body instanceof Response) return body;
+		const p = recallRequestSchema.safeParse(body.value);
+		if (!p.success) return invalid(issues(p.error));
+		const { channels, count_hits, ...a } = p.data;
+		return reply(await recall({ env, caller: c.caller, account: c, platform: `${c.caller.kind}:${c.caller.deviceName ?? "unknown"}`, ...(waitUntil ? { waitUntil } : {}) },
+			a, { ...(channels ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) }));
+	}
+	// #9 accepted candidates for `agent-memory eval export-candidates`: the read scope, an explicit profile the token may use.
+	if (path === "/v1/eval/candidates" && method === "GET") {
+		const c = await deviceCaller(request, env);
+		if (c instanceof Response) return c;
+		if (!c.caller.scopes.includes("read")) return forbidden("this token cannot read");
+		const q = z.object({ profile: profileName, cursor: z.string().min(1).max(2048).optional(), limit: z.coerce.number().int().min(1).max(100).optional() }).strict()
+			.safeParse(Object.fromEntries(url.searchParams));
+		if (!q.success) return invalid("profile is required; cursor; limit 1 to 100");
+		const ref = usable(c, q.data.profile);
+		if (!ref) return forbidden(`this token cannot use profile '${q.data.profile}'`);
+		return reply(await profileStub(env, ref).readV2(ref, { kind: "accepted_candidates", cursor: q.data.cursor ?? null, limit: q.data.limit ?? 100 }));
+	}
+	// #9 eval scores and counts from the job token, for an explicit profile it may use.
+	if (path === "/v1/eval/runs" && method === "POST") {
+		const c = await deviceCaller(request, env);
+		if (c instanceof Response) return c;
+		if (!isJob(c)) return forbidden("send this with the job token");
+		const body = await boundedJson(request, 8_000);
+		if (body instanceof Response) return body;
+		const run = parseEvalRun(body.value);
+		if (!run.ok) return reply(run);
+		if (!usable(c, run.value.profile)) return forbidden(`this token cannot use profile '${run.value.profile}'`);
+		return reply(await accountStub(env, env.OWNER_USER_ID!).admin({ op: "recordEvalRun", deviceId: c.caller.deviceId!, run: run.value }));
+	}
 	return null;
 }
 
 /** Owner routes; api.ts calls this only after its owner check. Null for any other path. */
-export async function ownerV2(_request: Request, _env: Env, _url: URL, _ctx: AccountContext, _account: Pick<AccountStore, "admin">,
+export async function ownerV2(request: Request, env: Env, url: URL, ctx: AccountContext, account: Pick<AccountStore, "admin">,
 	_claims: Record<string, unknown> | undefined, _waitUntil: Waiter | undefined): Promise<Response | null> {
+	const path = url.pathname, method = request.method, params = Object.fromEntries(url.searchParams);
+	const p = /^\/api\/profiles\/([^/]+)\/(.+)$/.exec(path);
+	const ref = p && profileName.safeParse(p[1]).success ? ctx.profiles.find((x) => x.profile === p[1]) : undefined;
+	const sub = p?.[2] ?? "";
+	const notActive = () => json({ error: { code: "not_found", message: `profile '${p![1]}' is not active` } }, 404);
+	const today = () => new Date().toISOString().slice(0, 10);
+
+	// #9 eval runs, candidates and recall strength.
+	if (path === "/api/eval/runs" && method === "GET") {
+		const q = z.object({ profile: profileName.optional(), limit: z.coerce.number().int().min(1).max(500).optional() }).strict().safeParse(params);
+		if (!q.success) return invalid("profile, limit 1 to 500");
+		const r = await account.admin({ op: "listEvalRuns", ...(q.data.profile ? { profile: q.data.profile } : {}), limit: q.data.limit ?? 100 });
+		return r.ok ? json({ runs: r.value }) : reply(r);
+	}
+	const cand = /^eval-candidates(?:\/([^/]+))?$/.exec(sub);
+	if (p && cand) {
+		if (!ref) return notActive();
+		if (cand[1] && method === "POST") {
+			const b = z.object({ action: z.enum(["accept", "dismiss"]) }).strict().safeParse(await request.json().catch(() => null));
+			if (!b.success) return invalid("send JSON with action accept or dismiss");
+			return reply(await profileStub(env, ref).decideEvalCandidate(ref, decodeURIComponent(cand[1]), b.data.action === "accept" ? "accepted" : "dismissed"));
+		}
+		if (cand[1] || method !== "GET") return null;
+		const q = z.object({ status: z.enum(["pending", "accepted", "dismissed", "all"]).optional(), cursor: z.string().min(1).max(2048).optional(),
+			limit: z.coerce.number().int().min(1).max(100).optional() }).strict().safeParse(params);
+		return q.success ? reply(await profileStub(env, ref).readV2(ref, { kind: "eval_candidates", q: q.data })) : invalid("status, cursor, limit 1 to 100");
+	}
+	if (p && sub === "recall-strength" && method === "GET") {
+		if (!ref) return notActive();
+		const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
+		if (!ids.length || ids.length > 100 || ids.some((i) => i.length > 128)) return invalid("ids: 1 to 100 comma-separated ids");
+		const r = await profileStub(env, ref).readV2(ref, { kind: "recall_strength", ids, day: today() });
+		return r.ok ? json({ strength: r.value }) : reply(r);
+	}
 	return null;
 }
