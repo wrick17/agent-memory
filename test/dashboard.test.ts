@@ -1646,6 +1646,24 @@ describe("dashboard knowledge graph", () => {
 		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
 		expect(panel).not.toContain("No linked memories");
 	});
+
+	it("queues only memories with no link when a link to another profile arrives before its record", async () => {
+		const nodesHeld = gate();
+		const mem = (id: string) => ({ id, kind: "document", type: "feedback", name: `Memory ${id}`, status: "active" });
+		const b = browser({ signedIn: true, hash: "#/graph", api: async (path) => {
+			if (path.startsWith("/api/profiles/work/graph?part=edges")) return pageOf("edges", [{ id: 1, rel: "relates_to", ...at("m1", "far", false) }], path);
+			if (path.startsWith("/api/profiles/work/graph?part=nodes")) { await nodesHeld.wait; return pageOf("nodes", [mem("m1"), mem("m2")], path); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle(); // the edges page lands first; m1 is not loaded yet
+		nodesHeld.open();
+		await loaded(b);
+		click(button(b.view(), "Queue link maintenance"));
+		expect(text(b.view())).toContain("Queue 1 unlinked active memory for link maintenance?");
+		click(button(b.view(), "Queue 1")); // only m2: m1's one link goes to a record in another profile
+		await settle();
+		expect(b.seen.bodies.at(-1)).toEqual({ kind: "unlinked", ids: ["m2"] });
+	});
 });
 
 describe("dashboard review", () => {
@@ -2112,6 +2130,42 @@ describe("dashboard Activity tab", () => {
 		expect(text(b.view())).toContain(`asked on ${dayA}`);
 		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
 	});
+
+	// One profile's year as the activity-summary route answers it; `extra` replaces fields.
+	const year = (from: string, to: string, extra: Record<string, unknown> = {}) => ({ from, to, active_days: 0, sessions: 0, observations: 0, busiest_day: null, days: [],
+		kinds: { asks: 0, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [], busiest_sessions: [], latest: [], ...extra });
+	const yearApi: (extra?: Record<string, unknown>) => Api = (extra) => (path) => {
+		const u = new URL(path, "https://x");
+		if (u.pathname === "/api/profiles/work/activity-summary") return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, extra));
+	};
+
+	it("moves through the heatmap by date: Up and Down a day, Left and Right a week, Home and End to the first and last day", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ observations: 1, sessions: 1, active_days: 1 }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const cells = find(b.view(), "button").filter((x) => x.attrs["data-day"]), days = cells.map((x) => x.attrs["data-day"]!).sort();
+		const cell = (d: string) => cells.find((x) => x.attrs["data-day"] === d)!, table = find(b.view(), "table")[0]!;
+		const press = (key: string, from: string) => { table.on.keydown!({ key, target: cell(from), preventDefault() {} } as never); return active?.attrs["data-day"]; };
+		const last = days.at(-1)!, back = (n: number) => days[days.length - 1 - n];
+		let at = last; // the roving stop: today
+		const seen = ["ArrowUp", "ArrowLeft", "ArrowRight", "ArrowDown", "Home", "End"].map((k) => (at = press(k, at)!));
+		expect(seen).toEqual([back(1), back(8), back(1), last, days[0], last]);
+		expect(cells.filter((x) => x.attrs.tabindex === "0").map((x) => x.attrs["data-day"])).toEqual([last]); // still one roving stop
+	});
+
+	it("lists the corpus's most touched files when a year has no observations, and keeps them selectable", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ top_files: [{ path: "src/a.ts", count: 3 }] }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("No observations in work in the last 12 months.");
+		const file = () => find(b.view(), "button").find((x) => x.attrs["data-f"] === "file:src/a.ts")!;
+		expect(file()).toBeDefined(); // a selectable file filter
+		expect(file().attrs["aria-pressed"]).toBe("false");
+		file().on.click!();
+		await settle();
+		expect(file().attrs["aria-pressed"]).toBe("true");
+		expect(b.win.location.hash).toBe("#activity?profile=work&file=src%2Fa.ts");
+	});
 });
 
 describe("dashboard Memories tab", () => {
@@ -2207,6 +2261,52 @@ describe("dashboard Memories tab", () => {
 		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
 		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
 		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+	});
+
+	// A record longer than one entity read: the first 4,000 characters, then "Load the full content" pages the rest.
+	const FULL = `${"a".repeat(4000)}${"b".repeat(1000)}`;
+	const longApi = (saved: unknown[] = []): Api => (path, _m, body) => {
+		if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "Long")], next_cursor: null, truncated: false, lexical_only: false });
+		if (path === "/api/profiles/work/nodes/m1") return Response.json({ ...record, content: { text: FULL.slice(0, 4000), chars: FULL.length, complete: false } });
+		if (path === "/api/profiles/work/nodes/m1?content=all") return Response.json({ content: { content: FULL, cursor: null } });
+		if (path === "/api/profiles/work/save") { saved.push(body); return Response.json({ name: HOSTILE, revision: 4 }); }
+	};
+
+	it("enables Edit once the full content has loaded, and edits the whole text", async () => {
+		const saved: unknown[] = [];
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi(saved) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		expect(button(panel(), "Edit").disabled).toBe(true); // only the first 4,000 characters are shown
+		click(button(panel(), "Load the full content"));
+		await settle();
+		expect(button(panel(), "Edit").disabled).toBe(false);
+		expect(button(panel(), "Edit").getAttribute("title")).toBeNull();
+		click(button(panel(), "Edit"));
+		const content = find(panel(), "textarea").find((x) => x.attrs.id === "mem-edit-content")!;
+		expect(content.value).toBe(FULL);
+		find(panel(), "form").find((x) => x.attrs["aria-label"]?.startsWith("Edit "))!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(saved).toMatchObject([{ memory_id: "m1", expected_revision: 3, content: FULL }]);
+	});
+
+	it("exports the loaded text with its completeness: the shown part before Load the full content, all of it after", async () => {
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi() });
+		const files: { record: { id: string; node: { id: string }; content: { text: string; chars: number; complete: boolean } } }[] = [];
+		const doc = b.win.document as unknown as { createElement(t: string): El }, make = doc.createElement;
+		doc.createElement = (t: string) => Object.assign(make(t), { click() {} }); // a download link's click saves nothing here
+		Object.assign(b.win, { Blob: class { constructor(readonly parts: string[]) {} },
+			URL: { createObjectURL: (x: { parts: string[] }) => { files.push(JSON.parse(x.parts[0]!)); return "blob:x"; }, revokeObjectURL() {} } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		click(button(panel(), "Export JSON"));
+		click(button(panel(), "Load the full content"));
+		await settle();
+		click(button(panel(), "Export JSON"));
+		expect(files.map((f) => [f.record.content.text.length, f.record.content.chars, f.record.content.complete])).toEqual([[4000, 5000, false], [5000, 5000, true]]);
+		expect([files[1]!.record.id, files[1]!.record.node.id]).toEqual(["m1", "m1"]); // the rest of the record is as read
 	});
 });
 
