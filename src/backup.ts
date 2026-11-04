@@ -95,12 +95,13 @@ const writeSeq = (sql: SqlStorage, metaTable: string) => Number(sql.exec<{ value
  * shortcut: the whole export must still finish inside the 30 s pause; move profiles to the resumable export (exportStep) when one nears it.
  */
 export async function exportStore(storage: DurableObjectStorage, env: Env, spec: StoreSpec): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+	const inFlight: Promise<unknown>[] = [];
 	try {
 		const sql = storage.sql, key = await backupKey(env), at = new Date().toISOString();
 		const id = `${at.replace(/[-:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`, prefix = `exports/${spec.store}/${id}/`;
 		const seq = writeSeq(sql, spec.metaTable);
 		const schema = Number(sql.exec<{ value: string }>(`SELECT value FROM ${spec.metaTable} WHERE key = 'schema_version'`).one().value);
-		const chunks: ChunkRef[] = [], counts: Record<string, number> = {}, inFlight: Promise<unknown>[] = [];
+		const chunks: ChunkRef[] = [], counts: Record<string, number> = {};
 		const put = async (c: Chunk) => {
 			const plain = JSON.stringify(c), k = `${prefix}${String(chunks.length).padStart(5, "0")}.enc`;
 			chunks.push({ key: k, table: c.table, rows: c.rows.length, sha256: sha256(plain) });
@@ -138,6 +139,8 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 		if (!spec.preserve) await retain(env, spec.store);
 		return ok({ id, seq, chunks: chunks.length, rows: Object.values(counts).reduce((a, b) => a + b, 0) });
 	} catch (e) {
+		// Every started put settles before the pause lifts: one landing later could outlive a wipe's cleanup of this export.
+		await Promise.allSettled(inFlight);
 		if (e instanceof Fail) return { ok: false, error: e.failure };
 		return fail("unavailable", `export failed: ${(e as Error).message}`);
 	}

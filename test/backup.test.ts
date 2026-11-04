@@ -4,7 +4,7 @@ import { createExecutionContext, createScheduledController, runDurableObjectAlar
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountRecovery, Recovery } from "../src/account/store";
-import { listExports, readChunk, readManifest, type Manifest } from "../src/backup";
+import { dropExportId, listExports, readChunk, readManifest, type Manifest } from "../src/backup";
 import { driveTransfer, transferPorts } from "../src/transfer";
 import { settleRule, type SettleFacts } from "../src/profile/settle";
 import { canonicalJson, requestHash, sha256 } from "../src/domain/ids";
@@ -105,14 +105,14 @@ describe("export and restore", () => {
 				`lat-${String(i).padStart(6, "0")}`, JSON.stringify({ body: filler }));
 		});
 		let inFlight = 0, peak = 0;
-		const r = await runInDurableObject(stub, (instance) => {
-			const real = env.BACKUPS;
-			(instance as unknown as { env: Env }).env = { ...env, BACKUPS: { list: (o: R2ListOptions) => real.list(o), head: (k: string) => real.head(k), get: (k: string) => real.get(k), delete: (k: string[]) => real.delete(k),
+		const r = await runInDurableObject(stub, async (instance) => {
+			const real = env.BACKUPS, self = instance as unknown as { env: Env }, original = self.env;
+			self.env = { ...env, BACKUPS: { list: (o: R2ListOptions) => real.list(o), head: (k: string) => real.head(k), get: (k: string) => real.get(k), delete: (k: string[]) => real.delete(k),
 				put: async (k: string, v: Uint8Array) => {
 					peak = Math.max(peak, ++inFlight);
 					try { await new Promise((done) => setTimeout(done, 800)); return await real.put(k, v); } finally { inFlight--; }
 				} } } as unknown as Env;
-			return (instance as unknown as ProfileStore).exportNow({ userId: OWNER, profile: "personal", generation: g });
+			try { return await (instance as unknown as ProfileStore).exportNow({ userId: OWNER, profile: "personal", generation: g }); } finally { self.env = original; } // later tests share this instance
 		});
 		expect(r).toMatchObject({ ok: true, value: { rows: expect.any(Number) } });
 		if (!r.ok) return;
@@ -125,6 +125,42 @@ describe("export and restore", () => {
 		expect(m.value.chunks.map((c) => c.key)).toEqual(m.value.chunks.map((_c, i) => `exports/profile-personal/${r.value.id}/${String(i).padStart(5, "0")}.enc`));
 		expect((await Promise.all(m.value.chunks.map((_c, i) => readChunk(env, m.value, i)))).reduce((n, c) => n + c.rows.length, 0)).toBe(r.value.rows);
 	}, 90_000);
+
+	it("a failed chunk put ends the export only after every started put settles, so a cleanup right after leaves no late object", async () => {
+		await call(await contextFor(), "save_memory", { name: "Drain probe", type: "reference", description: "d", content: "drain body", profile: "personal" });
+		const g = await personal(), stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:personal:${g}`)), filler = "x".repeat(6_000);
+		// About ten chunks: a rejected first put surfaces at the seventh start (the bounded wait), a rejected last put in the final wait.
+		await runInDurableObject(stub, (_i, s) => {
+			for (let i = 0; i < 800; i++) s.storage.sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, 1, 'saved', ?, 'agent', '2026-11-04T00:00:00Z', 1)",
+				`drain-${String(i).padStart(6, "0")}`, JSON.stringify({ body: filler }));
+		});
+		for (const failing of ["first", "last"] as const) {
+			const keys: string[] = [];
+			let pending = 0;
+			const r = await runInDurableObject(stub, async (instance) => {
+				const real = env.BACKUPS, self = instance as unknown as { env: Env }, original = self.env;
+				self.env = { ...env, BACKUPS: { list: (o: R2ListOptions) => real.list(o), head: (k: string) => real.head(k), get: (k: string) => real.get(k), delete: (k: string[]) => real.delete(k),
+					put: async (k: string, v: Uint8Array) => {
+						keys.push(k);
+						const n = keys.length;
+						if (failing === "first" ? n === 1 : k.endsWith("00009.enc")) throw new Error("r2 put refused");
+						pending++;
+						try { await new Promise((done) => setTimeout(done, 1_500)); return await real.put(k, v); } finally { pending--; }
+					} } } as unknown as Env;
+				try {
+					const out = await (instance as unknown as ProfileStore).exportNow({ userId: OWNER, profile: "personal", generation: g });
+					return { out, pendingAtReturn: pending };
+				} finally { self.env = original; } // later tests share this instance
+			});
+			expect([failing, r.out]).toMatchObject([failing, { ok: false, error: { code: "unavailable" } }]);
+			expect([failing, r.pendingAtReturn]).toEqual([failing, 0]);
+			// What a wipe does once the pause lifts: delete every listed object of the export. Nothing may land afterwards.
+			const id = keys[0]!.split("/")[2]!;
+			await dropExportId(env, "profile-personal", id);
+			await new Promise((done) => setTimeout(done, 1_700));
+			expect([failing, (await env.BACKUPS.list({ prefix: `exports/profile-personal/${id}/` })).objects.length]).toEqual([failing, 0]);
+		}
+	}, 60_000);
 
 	it("leaves Miniflare's object-name table out of the export and the fresh-generation check, and still refuses populated application tables", async () => {
 		const c = await contextFor();
