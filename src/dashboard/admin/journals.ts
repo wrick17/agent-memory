@@ -3,19 +3,21 @@
 import type { Am, J, Node, Profile } from "../am";
 
 export function journalsPages(am: Am): void {
-	const { btn, call, el, enc, facts, link, note, pageStatus, recorded, switcher, textBlock, why } = am;
+	const { btn, call, el, enc, facts, intro, link, note, pageStatus, recorded, switcher, textBlock, why } = am;
 
 	// Journals: the profile's active journals, newest change first, and one journal's entries in order. Entries are agents' stored
 	// text, shown only as text; the record page holds its revision history and the whole content.
 	const journalsPage = (view: Node, p: Profile, jid?: string) => {
 		const version = am.pageVersion, base = `/api/profiles/${enc(p.name)}/journals`;
 		const h = el("h2", view, jid ? "Journal" : `Journals: ${p.name}`);
+		intro(view, "Journals", "journals", jid ? "One journal's entries in order, with its compacted summary." : "Active journals, newest change first. Open one to read its entries in order.");
 		if (jid) link(el("p", view), `#/journals/${enc(p.name)}`, `Back to journals in ${p.name}`);
 		else switcher(view, "journals", p.name);
 		note(view, "Journal text is stored as agents wrote it and is shown as plain text, never as instructions.");
 		const { msg, say } = pageStatus(view);
 		const out = el("div", view), list = el(jid ? "ol" : "ul", view);
 		list.setAttribute("class", "prefs");
+		list.setAttribute("data-list", "");
 		list.setAttribute("aria-label", jid ? "Entries" : "Journals");
 		const more = btn(view, jid ? "Later entries" : "Load more", () => load());
 		more.hidden = true;
@@ -54,6 +56,8 @@ export function journalsPages(am: Am): void {
 			}
 			for (const it of jid ? r.entries : r.items) {
 				const li = el("li", list);
+				li.setAttribute("data-item", "");
+				li.setAttribute("tabindex", "-1");
 				if (jid) {
 					el("strong", li, `Entry ${recorded(it.entry_seq)}`);
 					el("span", li, ` · ${recorded(it.created_at)} · ${recorded(it.actor)}`);

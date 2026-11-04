@@ -3,7 +3,7 @@
 import type { Am, Failure, J, Node } from "../am";
 
 export function routingPages(am: Am): void {
-	const { act, btn, call, choose, el, facts, input, note, pageStatus, recorded, render, why } = am;
+	const { act, btn, call, choose, el, facts, input, intro, note, pageStatus, recorded, render, why } = am;
 
 	// Routing (sections 6 and 15): the stored rules, edited as one list and saved whole after a preview, and a read-only test of
 	// where a remote or path routes. The server renumbers the rules and the last save wins, so the list is read again after saving.
@@ -12,11 +12,13 @@ export function routingPages(am: Am): void {
 	let rulesDraft: { rows: RuleRow[]; text?: string; unsure?: boolean } | null = null;
 	const routingPage = (view: Node) => {
 		const version = am.pageVersion, h = el("h2", view, "Routing");
-		note(view, "A write from a repository goes to the profile of the first enabled rule that matches it, by priority. Saving replaces the whole list and renumbers it; if another tab or device saves too, the last save wins. Nothing is ever routed into me.");
+		intro(view, "Routing", "routing", "The calling agent chooses each write's profile. These rules apply only to older calls that leave the profile out: such a write goes to the profile of the first enabled rule that matches its repository, by priority. Saving replaces the whole list and renumbers it; if another tab or device saves too, the last save wins. Nothing is ever routed into me.");
 		const { msg, say } = pageStatus(view);
 		const box = el("section", view), tester = el("section", view);
 		box.setAttribute("aria-label", "Routing rules");
 		tester.setAttribute("aria-label", "Test a route");
+		box.setAttribute("class", "panel");
+		tester.setAttribute("class", "panel");
 		// The test is read only: the server's own resolver over the stored rules, never the unsaved list.
 		el("h3", tester, "Test where a repository routes");
 		note(tester, "Uses the saved rules, not unsaved edits. Nothing is written.");
@@ -53,6 +55,7 @@ export function routingPages(am: Am): void {
 			el("h3", box, `Rules (${rows.length} ${rulesDraft ? "in this tab's unsaved list" : "saved"})`);
 			if (rulesDraft?.text) note(box, rulesDraft.text, "warn");
 			const tools = el("p", box), list = el("ol", box), problems = el("ul", box), row = el("p", box), shown = el("p", box);
+			tools.setAttribute("class", "toolbar");
 			let previewed = !!rulesDraft?.unsure; // an unconfirmed save may be sent again exactly as it was
 			const body = () => ({ rules: rows.map((x) => ({ priority: Number(x.priority.trim()), match: x.match, pattern: x.pattern.trim(), profile: x.profile, enabled: x.enabled })) });
 			const invalid = () => [...(rows.length > 128 ? ["At most 128 rules."] : []), ...rows.flatMap((x, i) => [

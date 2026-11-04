@@ -3,7 +3,7 @@
 import type { Am, Draft, Node, Profile } from "../am";
 
 export function draftPages(am: Am): void {
-	const { act, btn, choose, el, enc, facts, input, link, note, outcomes, pageStatus, recorded, render, switcher, textBlock, win } = am;
+	const { act, btn, choose, el, enc, facts, input, intro, link, note, outcomes, pageStatus, recorded, render, switcher, textBlock, win } = am;
 	const drafts = new Map<string, Draft>();
 	const whatIf = new Map<string, { name: string; target: string; targetName: string }[]>(); // per profile, this tab only; never sent
 	// What-if changes to saved records and links (graph page): added links, removed saved links, removed records. Per profile, this
@@ -25,6 +25,7 @@ export function draftPages(am: Am): void {
 	// change to the draft needs a new preview, and a preview of a body already sent reuses that request id. Nothing retries by itself.
 	const draftPage = (view: Node, p: Profile) => {
 		const h = el("h2", view, `Write: ${p.name}`);
+		intro(view, "Write", "write", "Drafts a memory, previews exactly what is sent, and saves only when you choose Save.");
 		switcher(view, "draft", p.name);
 		const d = drafts.get(p.name) ?? { name: "", type: "project", scope: "", description: "", content: "", target: "", targetName: "", reason: "" };
 		const editing = !!d.memory_id, was = d.recordName ?? d.name; // `name` follows the field; `recordName` is the record's name when the edit began
@@ -36,6 +37,7 @@ export function draftPages(am: Am): void {
 			link(el("p", view), `#/memory/${enc(d.copyOf.profile)}/${enc(d.copyOf.id)}`, "Back to the original");
 		} else el("p", view, "A new memory you state yourself. Nothing is saved until you preview it and choose Save.");
 		const form = el("form", view);
+		form.setAttribute("class", "panel");
 		const name = input(form, "draft-name", "Name");
 		name.setAttribute("maxlength", "512");
 		name.value = d.name;
@@ -67,6 +69,7 @@ export function draftPages(am: Am): void {
 			el("span", l, " This holds no company or work details (required for me)");
 		}
 		const row = el("p", form);
+		row.setAttribute("class", "toolbar");
 		el("button", row, "Preview").setAttribute("type", "submit");
 		const save = btn(row, "Save", () => commit());
 		save.disabled = true;
@@ -74,13 +77,16 @@ export function draftPages(am: Am): void {
 		const { msg, say } = pageStatus(view);
 		const preview = el("section", view);
 		preview.setAttribute("aria-label", "Preview");
+		preview.setAttribute("class", "panel");
+		preview.hidden = true;
 		let payload = d.preview;
 		const keep = (extra: Partial<Draft>) => drafts.set(p.name, { ...(drafts.get(p.name) ?? d), name: name.value, type: type.value, scope: scope.value, description: desc.value,
 			content: content.value, reason: reason?.value ?? "", companyFree: free?.checked === true, ...extra });
-		const stale = () => { payload = undefined; save.disabled = true; preview.replaceChildren(); keep({ preview: undefined }); };
+		const stale = () => { payload = undefined; save.disabled = true; preview.replaceChildren(); preview.hidden = true; keep({ preview: undefined }); };
 		for (const f of [name, type, scope, desc, content, reason, free]) f?.addEventListener("input", stale);
 		free?.addEventListener("change", stale);
 		const show = (x: Record<string, unknown>) => {
+			preview.hidden = false;
 			el("h3", preview, "Preview (not saved)");
 			const link0 = (x.links as { reason: string }[] | undefined)?.[0];
 			facts(preview, [["Profile", p.name], ["Change", editing ? `New revision of “${was}” (now ${d.expected_revision})` : d.copyOf ? `A new record, copied from “${d.copyOf.name}” in ${d.copyOf.profile}` : "A new memory"],

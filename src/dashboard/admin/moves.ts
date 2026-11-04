@@ -3,7 +3,7 @@
 import type { Am, Failure, J, Move, Node, Profile } from "../am";
 
 export function movesPages(am: Am): void {
-	const { act, active, btn, call, choose, el, enc, facts, link, note, pageStatus, recorded, why, win } = am;
+	const { act, active, btn, call, choose, el, enc, facts, intro, link, note, pageStatus, recorded, why, win } = am;
 
 	// Moves (sections 9 and 15): one record to another active profile through save_memory's transfer. Each move's exact request,
 	// request id included, is kept for this session, so it can be sent again after a lost answer even once the record has left
@@ -35,8 +35,8 @@ export function movesPages(am: Am): void {
 		const version = am.pageVersion;
 		if (id === undefined) {
 			const h = el("h2", view, "Moves");
+			intro(view, "Moves", "moves", "Moves asked for in this browser tab. Open a record and choose “Move to another profile” to start one.");
 			pageStatus(view);
-			el("p", view, "Moves asked for in this browser tab. Open a record and choose “Move to another profile” to start one.");
 			const list = [...moves.values()];
 			for (const m of list) moveView(view, m);
 			if (!list.length) note(view, "No moves yet in this tab.");
@@ -44,6 +44,7 @@ export function movesPages(am: Am): void {
 		}
 		const key = `${p.name}:${id}`, prior = moves.get(key);
 		const h = el("h2", view, "Move a record");
+		intro(view, "Moves", "moves", "One record to another active profile, with its whole history. Preview it first; nothing moves until you choose Move.");
 		link(el("p", view), "#/move", "All moves in this tab");
 		const { msg, say } = pageStatus(view);
 		if (prior) moveView(view, prior);
@@ -70,6 +71,7 @@ export function movesPages(am: Am): void {
 				"Only the move happens: no other change rides along. Search by meaning may take a while to catch up.",
 				"Moving into me needs your statement that it holds no company or work details; the server also checks its text and refuses a move it cannot accept."]) el("li", ul, t);
 			const form = el("form", body);
+			form.setAttribute("class", "panel");
 			const to = choose(form, "move-to", "Move to", [["", "Choose a profile"], ...active().filter((q) => q.name !== p.name).map((q) => [q.name, q.name] as [string, string])]);
 			const freeLabel = el("label", form);
 			freeLabel.setAttribute("class", "field");
@@ -116,6 +118,7 @@ export function movesPages(am: Am): void {
 	const COPY_MAX = 64_000; // the save tool's content limit
 	const copyPage = (view: Node, p: Profile, id: string | undefined) => {
 		const version = am.pageVersion, h = el("h2", view, "Save a copy");
+		intro(view, "Save a copy", "moves", "Re-saves a record as a new record in another profile, before a wipe removes it. You review the copy in Write before it is saved.");
 		if (id === undefined) { el("p", view, "Open a record and choose “Save a copy in another profile”."); return h; }
 		const base = `/api/profiles/${enc(p.name)}/nodes/${enc(id)}`, back = copyBack.get(`${p.name}:${id}`);
 		if (back) link(el("p", view), `#/wipe/${enc(back)}`, `Back to the wipe of ${back}`);

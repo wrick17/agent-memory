@@ -3,7 +3,7 @@
 import type { Am, Failure, Node, Profile } from "../am";
 
 export function aboutPages(am: Am): void {
-	const { active, call, day, el, facts, render } = am;
+	const { active, call, day, el, facts, intro, render } = am;
 	// About you (sections 12 and 15): one active profile's preferences from the owner-model read, in the server's order, one
 	// bounded page per click. Every action waits for the server, shows its answer, then reloads; nothing is retried by itself.
 	type Pref = { id: string; name: string; description: string; origin: string; pinned: boolean; flagged: string | null; updated_at: string;
@@ -22,7 +22,7 @@ export function aboutPages(am: Am): void {
 			a.setAttribute("href", `#/about/${encodeURIComponent(q.name)}`);
 			if (q.name === p.name) a.setAttribute("aria-current", "page");
 		}
-		el("p", view, "Preferences you stated come first, then ones agents inferred, with their evidence. Pin protects one from background cleanup; Forget moves it to the archive, and Undo brings it back.");
+		intro(view, "About you", "about", "Preferences you stated come first, then ones agents inferred, with their evidence. Pin protects one from background cleanup; Forget moves it to the archive, and Undo brings it back.");
 		const msg = am.statusEl = el("p", view);
 		msg.setAttribute("role", "status");
 		msg.setAttribute("tabindex", "-1");
@@ -62,9 +62,15 @@ export function aboutPages(am: Am): void {
 		const list = el("ul", view);
 		list.setAttribute("class", "prefs");
 		list.setAttribute("aria-label", "Preferences");
+		list.setAttribute("data-list", "");
 		const item = (it: Pref) => {
 			const li = el("li", list), name = String(it.name || "(no name)");
+			li.setAttribute("data-item", "");
+			li.setAttribute("tabindex", "-1");
 			el("h3", li, name);
+			const chips = el("p", li);
+			for (const [t, c] of [[it.origin === "stated" ? "Stated" : it.origin === "inferred" ? "Inferred" : String(it.origin), it.origin === "stated" ? "c-ok" : "c-blue"],
+				...(it.pinned ? [["Pinned", "c-teal"]] : []), ...(it.flagged ? [["Flagged", "c-warn"]] : [])]) el("span", chips, t).setAttribute("class", `chip ${c}`);
 			if (it.description) el("p", li, String(it.description));
 			facts(li, [
 				["Origin", it.origin === "stated" ? "Stated" : it.origin === "inferred" ? "Inferred" : `Recorded as ${String(it.origin)}, not stated`],

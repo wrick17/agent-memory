@@ -3,7 +3,8 @@
 import type { Am, J, Node, Profile } from "../am";
 
 export function profilesPages(am: Am): void {
-	const { call, day, el, enc, facts, link, recorded, state, users, why } = am;
+	const { call, day, el, enc, facts, intro, link, recorded, state, users, why } = am;
+	const chip = (parent: Node, text: string, cls = "") => el("span", parent, text).setAttribute("class", `chip${cls ? ` ${cls}` : ""}`);
 	const batchRow = (p: string): [string, string, boolean?] => {
 		const b = am.batches.get(p);
 		if (!b || b instanceof Error) return ["Daily batch", `Unavailable${b ? `: ${b.message}` : ""}`, true];
@@ -14,9 +15,11 @@ export function profilesPages(am: Am): void {
 
 	const home = (view: Node) => {
 		const h = el("h2", view, "Profiles"), version = am.pageVersion;
+		intro(view, "Profiles", "profiles", "Each profile's status, devices, daily batch and recent changes. Open one for its devices and its pages.");
 		// Account-wide facts from bounded reads: the recovery status (with the last export) and the first page of the review list.
 		const acct = el("dl", view);
 		acct.setAttribute("aria-label", "Account summary");
+		acct.setAttribute("class", "panel");
 		const say = (dl: Node, k: string, v: string, na = false) => { if (version !== am.pageVersion) return; el("dt", dl, k); const dd = el("dd", dl, v); if (na) dd.setAttribute("class", "na"); };
 		void (async () => {
 			const [rec, rev] = await Promise.allSettled([call("/api/recovery"), call("/api/review?limit=100")]);
@@ -34,7 +37,10 @@ export function profilesPages(am: Am): void {
 		for (const p of am.profiles) {
 			const card = el("section", cards);
 			card.setAttribute("class", "card");
-			link(el("h3", card), `#/profiles/${encodeURIComponent(p.name)}`, p.name);
+			const title = el("h3", card);
+			link(title, `#/profiles/${encodeURIComponent(p.name)}`, p.name);
+			el("span", title, " ");
+			chip(title, p.status, p.status === "active" ? "c-ok" : "c-warn");
 			const can = users(p.name), active = can.filter((d) => state(d) === "active");
 			facts(card, [
 				["Status", p.status],
@@ -70,22 +76,31 @@ export function profilesPages(am: Am): void {
 
 	const profilePage = (view: Node, p: Profile) => {
 		const h = el("h2", view, `Profile: ${p.name}`);
+		intro(view, p.name, "profiles", "This profile's devices and every page that reads or changes it.");
 		facts(view, [["Status", p.status], ["Created", day(p.created_at)]]);
-		el("h3", view, "Devices that may use it");
+		const devs = el("section", view);
+		devs.setAttribute("class", "panel");
+		devs.setAttribute("aria-label", "Devices");
+		el("h3", devs, "Devices that may use it");
 		const can = users(p.name);
 		if (can.length) {
-			const table = el("table", view), head = el("tr", el("thead", table)), body = el("tbody", table);
+			const table = el("table", devs), head = el("tr", el("thead", table)), body = el("tbody", table);
 			for (const c of ["Name", "Kind", "Scopes", "Default here", "Last used", "State"]) el("th", head, c).setAttribute("scope", "col");
 			for (const d of can) {
 				const tr = el("tr", body);
 				[d.name, d.kind, d.scopes.join(", "), d.default_profile === p.name ? "yes" : "no", day(d.last_used_at), state(d)].forEach((t) => el("td", tr, t));
 			}
-		} else el("p", view, "No device may use this profile.");
-		const more = el("p", view);
+		} else el("p", devs, "No device may use this profile.");
+		const more = el("p", devs);
 		link(more, "/settings", "Add or revoke devices in Settings");
-		if (p.status === "active") link(el("p", view), `#/about/${encodeURIComponent(p.name)}`, "About you in this profile");
-		if (p.status === "active") link(el("p", view), `#/work/${encodeURIComponent(p.name)}`, "Work in this profile");
-		if (p.status === "active") for (const [r, t] of [["memories", "Memories"], ["map", "Map"], ["activity", "Activity and archive"], ["timeline", "Timeline"], ["journals", "Journals"], ["path", "Path finder"], ["review", "Review captured suggestions"], ["draft", "Write a memory"]]) link(el("p", view), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
+		if (p.status !== "active") return h;
+		// #/activity/NAME opens Audit with this profile chosen; the other old routes open their pages.
+		const go = el("section", view);
+		go.setAttribute("class", "panel");
+		go.setAttribute("aria-label", "Pages for this profile");
+		el("h3", go, "Pages for this profile");
+		const ul = el("ul", go);
+		for (const [r, t] of [["about", "About you"], ["work", "Work"], ["memories", "Memories"], ["map", "Map"], ["activity", "Audit and archive"], ["timeline", "Timeline"], ["journals", "Journals"], ["path", "Path finder"], ["review", "Review captured suggestions"], ["draft", "Write a memory"]]) link(el("li", ul), `#/${r}/${encodeURIComponent(p.name)}`, `${t} in this profile`);
 		return h;
 	};
 	am.pages.home = home;

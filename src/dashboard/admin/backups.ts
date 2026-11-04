@@ -3,7 +3,7 @@
 import type { Am, Failure, J, Node } from "../am";
 
 export function backupsPages(am: Am): void {
-	const { act, active, btn, call, choose, el, enc, facts, input, link, note, pageStatus, recorded, render, why } = am;
+	const { act, active, btn, call, choose, el, enc, facts, input, intro, link, note, pageStatus, recorded, render, why } = am;
 
 	// The restore drill (section 18): a profile's newest export restored into a scratch generation that never becomes live, and the
 	// account's newest export checked without being applied. The account stays open. Begin keeps its exact body, request id included,
@@ -12,6 +12,7 @@ export function backupsPages(am: Am): void {
 	const drillView = (parent: Node, recovering: boolean) => {
 		const version = am.pageVersion, sec = el("section", parent);
 		sec.setAttribute("aria-label", "Restore drill");
+		sec.setAttribute("class", "panel");
 		el("h3", sec, "Restore drill");
 		note(sec, "A drill restores a profile's newest export into a scratch copy that never becomes live, and checks the account's newest export without applying it. The account stays open and nothing live changes. Cleanup deletes only the scratch copy and its own vectors.");
 		const body = el("div", sec);
@@ -96,6 +97,7 @@ export function backupsPages(am: Am): void {
 	const conflictsView = (parent: Node, r: J) => {
 		const version = am.pageVersion, sec = el("section", parent);
 		sec.setAttribute("aria-label", "Copies to choose");
+		sec.setAttribute("class", "panel");
 		el("h3", sec, "Choose which copy to keep");
 		note(sec, "The fixed recovery rules could not decide these records: two profiles hold a copy. Keep one copy of each; the other becomes a flagged tombstone, its content and history kept in that profile's archive. Nothing is merged. The account stays closed until the recovery is opened.");
 		if (r.resolving) note(sec, `A choice for record ${String(r.resolving)} is unfinished; finish it before another.`, "warn");
@@ -181,11 +183,12 @@ export function backupsPages(am: Am): void {
 	let lastPit: { id: string; profile: string } | null = null; // the point-in-time restore last opened in this tab, to reverse by its id
 	const backupsPage = (view: Node) => {
 		const version = am.pageVersion, h = el("h2", view, "Backups and recovery");
-		note(view, "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days. Devices and routes stay in Settings.");
+		intro(view, "Backups and recovery", "backups", "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days. Devices and routes stay in Settings.");
 		link(el("p", view), "/settings", "Open Settings");
 		const { say } = pageStatus(view);
 		const rec = el("section", view);
 		rec.setAttribute("aria-label", "Recovery status");
+		rec.setAttribute("class", "panel");
 		const forms = el("div", view);
 		const confirmBox = (parent: Node, prompt: string, expected: string, go: string, onGo: () => void) => {
 			const typed = input(parent, `confirm-${go.replace(/\W+/g, "-").toLowerCase()}`, `${prompt} Type “${expected}” to confirm.`);
@@ -249,15 +252,20 @@ export function backupsPages(am: Am): void {
 			else note(rec, `Could not read the profiles again: ${why(list)}. A drill or restore begun below may be refused as stale; reload the page first.`, "warn");
 			drillView(rec, !!r);
 			if (r) return; // exports and new restores are refused while a recovery is open
-			el("h3", forms, "Export now");
-			note(forms, "Exports are encrypted on the server. Two complete exports are kept per store, so a new one replaces the oldest. Each profile pauses its writes for up to 30 seconds while it is exported. A corpus exports in the background while uploads continue; only if it cannot catch up do its uploads wait, for at most 30 seconds.");
-			const exRow = el("p", forms);
+			const exp = el("section", forms);
+			exp.setAttribute("class", "panel");
+			exp.setAttribute("aria-label", "Export now");
+			el("h3", exp, "Export now");
+			note(exp, "Exports are encrypted on the server. Two complete exports are kept per store, so a new one replaces the oldest. Each profile pauses its writes for up to 30 seconds while it is exported. A corpus exports in the background while uploads continue; only if it cannot catch up do its uploads wait, for at most 30 seconds.");
+			const exRow = el("p", exp);
 			btn(exRow, "Export everything", () => act("/api/backups/export", "export everything", {}, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
-			const exProfile = choose(forms, "export-profile", "Or export one profile", active().map((q) => [q.name, q.name]));
-			btn(el("p", forms), "Export this profile", () => act("/api/backups/export", `export ${exProfile.value}`, { profile: exProfile.value }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
+			const exProfile = choose(exp, "export-profile", "Or export one profile", active().map((q) => [q.name, q.name]));
+			btn(el("p", exp), "Export this profile", () => act("/api/backups/export", `export ${exProfile.value}`, { profile: exProfile.value }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
 
 			const restoreForm = (title: string, listPath: () => string, what: () => string, warning: string, expected: () => string, begin: (exp: string) => [string, unknown]) => {
 				const sec = el("section", forms);
+				sec.setAttribute("class", "panel");
+				sec.setAttribute("aria-label", title);
 				el("h3", sec, title);
 				note(sec, warning, "danger");
 				const pick = el("div", sec);
@@ -287,6 +295,8 @@ export function backupsPages(am: Am): void {
 
 			// Point-in-time restore of one profile in place, or the reversal of one by the undo bookmark its record keeps.
 			const pitSec = el("section", forms);
+			pitSec.setAttribute("class", "panel");
+			pitSec.setAttribute("aria-label", "Restore a profile to a point in time");
 			el("h3", pitSec, "Restore a profile to a point in time");
 			note(pitSec, "Beginning closes the whole account. The profile goes back to the chosen time, within the last 30 days; changes after it are no longer current. Its record keeps an undo, so a restore id below reverses it the same way.", "danger");
 			const pp = choose(pitSec, "pitr-profile", "Profile", active().map((q) => [q.name, q.name]));
@@ -298,7 +308,7 @@ export function backupsPages(am: Am): void {
 					(x) => ({ text: `Recovery ${recorded(x.id)} begun: ${recorded(x.state)}. The account is closed until you open or abort it below.` })));
 
 			// A profile's corpus: exported weekly and kept two; a restore fills the profile's current, empty corpus.
-			btn(el("p", forms), "Export every corpus now", () => act("/api/backups/export", "export every corpus", { corpus: true }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
+			btn(el("p", exp), "Export every corpus now", () => act("/api/backups/export", "export every corpus", { corpus: true }, (x) => ({ text: `Export finished: ${Object.entries(x ?? {}).map(([k, v]) => `${k} ${summary(v)}`).join("; ")}.` })));
 			const cp = choose(forms, "corpus-profile", "Corpus to restore", active().filter((q) => q.name !== "me").map((q) => [q.name, q.name]));
 			const corp = restoreForm("Restore a corpus", () => `/api/profiles/${enc(cp.value)}/corpus/exports`, () => `the corpus of ${cp.value}`,
 				"Beginning closes the whole account. The corpus is rebuilt from the export into the profile's current corpus, which must be empty, as after a profile restore. Aborting clears what it wrote.",

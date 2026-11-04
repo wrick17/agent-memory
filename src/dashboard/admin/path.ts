@@ -3,7 +3,7 @@
 import type { Am, J, Node, Profile } from "../am";
 
 export function pathPages(am: Am): void {
-	const { call, choose, el, enc, input, link, note, pageStatus, recorded, switcher, why } = am;
+	const { call, choose, el, enc, input, intro, link, note, pageStatus, recorded, switcher, why } = am;
 
 	// Path finder: up to 3 paths of at most 4 links between two records this profile shows, as the server searched them. Names
 	// come only from its answer: a record in another profile shows as such, never looked up here.
@@ -14,9 +14,11 @@ export function pathPages(am: Am): void {
 	};
 	const pathPage = (view: Node, p: Profile, fromId?: string) => {
 		const version = am.pageVersion, h = el("h2", view, `Path finder: ${p.name}`);
+		intro(view, "Paths", "paths", "Up to 3 chains of at most 4 links between two records, as the server searched them.");
 		switcher(view, "path", p.name);
 		note(view, "Both records must be shown in this profile. Copy a record's id from its page, or open a record and choose “Find a path from here”.");
 		const form = el("form", view);
+		form.setAttribute("class", "panel");
 		const from = input(form, "path-from", "From record id");
 		from.setAttribute("maxlength", "128");
 		from.value = fromId ?? "";
@@ -27,8 +29,10 @@ export function pathPages(am: Am): void {
 		const { msg, say } = pageStatus(view);
 		const out = el("section", view);
 		out.setAttribute("aria-label", "Paths found");
+		out.setAttribute("class", "panel");
+		out.hidden = true;
 		let request = 0;
-		const invalidate = () => { request++; out.replaceChildren(); };
+		const invalidate = () => { request++; out.replaceChildren(); out.hidden = true; };
 		for (const f of [from, to, depth]) f.addEventListener("input", invalidate);
 		form.addEventListener("submit", async (event) => {
 			event.preventDefault();
@@ -45,6 +49,7 @@ export function pathPages(am: Am): void {
 				return;
 			}
 			if (version !== am.pageVersion || id !== request) return;
+			out.hidden = false;
 			const ends = el("p", out);
 			el("span", ends, "From ");
 			endpointView(ends, p, r.from);

@@ -3,14 +3,16 @@
 import type { Am, J, Node, Profile } from "../am";
 
 export function mapPages(am: Am): void {
-	const { btn, call, choose, el, enc, facts, input, link, note, pageStatus, recorded, switcher, why } = am;
+	const { btn, call, choose, el, enc, facts, input, intro, link, note, pageStatus, recorded, switcher, why } = am;
 
 	// The map: the server's bounded walk, laid out in rings by distance from where it starts. What-if items are drawn on it
 	const SIZE = 640;
 	const mapPage = (view: Node, p: Profile, center?: string) => {
 		const version = am.pageVersion, h = el("h2", view, `Map: ${p.name}`);
+		intro(view, "Map", "map", "A bounded walk of links, in rings by distance from where it starts. What-if items are drawn on it and never saved.");
 		switcher(view, "map", p.name);
 		const form = el("form", view);
+		form.setAttribute("class", "toolbar");
 		const depth = choose(form, "map-depth", "Distance", [["1", "Direct links"], ["2", "Links of links"]]);
 		el("button", el("p", form), "Show map").setAttribute("type", "submit");
 		if (center) link(el("p", view), `#/map/${enc(p.name)}`, "Start from the newest projects instead");
@@ -50,6 +52,8 @@ export function mapPages(am: Am): void {
 			canvas.setAttribute("role", "group");
 			canvas.setAttribute("aria-label", "Relationship map; each record is a button");
 			panel.setAttribute("aria-label", "Selected record");
+			panel.setAttribute("class", "panel");
+			panel.hidden = true;
 			const edge = (a: [number, number], b: [number, number], cls: string) => {
 				const e = el("div", canvas), len = Math.hypot(b[0] - a[0], b[1] - a[1]), ang = Math.atan2(b[1] - a[1], b[0] - a[0]);
 				e.setAttribute("class", cls);
@@ -72,6 +76,7 @@ export function mapPages(am: Am): void {
 			const select = (id: string) => {
 				for (const [k, b] of buttons) b.setAttribute("aria-pressed", String(k === id));
 				panel.replaceChildren();
+				panel.hidden = false;
 				const n = nodes.get(id)!, name = String(n.name ?? "(no name)");
 				el("h3", panel, name);
 				facts(panel, [["Kind", `${recorded(n.kind)}${n.other_label ? ` (${String(n.other_label)})` : ""}`], ["Type", recorded(n.type)], ["Key", recorded(n.key)], ["Status", recorded(n.status)]]);
@@ -115,15 +120,18 @@ export function mapPages(am: Am): void {
 				el("li", ul, `${a ? String(a.name) : "not readable"} — ${String(l.rel)} → ${b ? String(b.name) : "not readable"}`);
 			}
 			if (items.length) {
-				el("h3", out, "What-if items (not saved)");
-				note(out, "These exist only on this page. Make a draft to review and save one; nothing changes on the server until you choose Save.");
-				const wl = el("ul", out);
+				const wsec = el("section", out);
+				wsec.setAttribute("class", "panel");
+				wsec.setAttribute("aria-label", "What-if items");
+				el("h3", wsec, "What-if items (not saved)");
+				note(wsec, "These exist only on this page. Make a draft to review and save one; nothing changes on the server until you choose Save.");
+				const wl = el("ul", wsec);
 				items.forEach((w, i) => {
 					const li = el("li", wl, `${w.name}, linked to “${w.targetName}”${pos.has(w.target) ? "" : " (its record is not on this map)"} `);
 					btn(li, "Make a draft", () => am.draftFromWhatIf(p.name, w, li), `Make a draft from ${w.name}`);
 					btn(li, "Remove", () => { items.splice(i, 1); load(); }, `Remove ${w.name}`);
 				});
-				btn(out, "Clear all what-if items", () => { am.whatIf.delete(p.name); load(); });
+				btn(wsec, "Clear all what-if items", () => { am.whatIf.delete(p.name); load(); });
 			}
 		};
 		form.addEventListener("submit", (event) => { event.preventDefault(); load(); });
