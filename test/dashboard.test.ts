@@ -1630,6 +1630,19 @@ describe("dashboard knowledge graph", () => {
 		expect(b.seen.posted).toEqual([]);
 		expect(b.seen.fetched.some((x) => /\/(save|move|review|delete|wipe|forget)/.test(x))).toBe(false);
 	});
+
+	it("fills a deep-linked record's linked projects and memories once the graph has loaded", async () => {
+		const more = [...edges, { id: 5, rel: "relates_to", ...at("r1", "r5") }];
+		const b = browser({ signedIn: true, hash: "#graph/r1?profile=work", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", more, path) : undefined) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		await settle();
+		const panel = text(b.view()).replace(/\s+/g, " ");
+		expect(panel).toContain("Projects: Agent Memory");
+		expect(panel).not.toContain("none linked");
+		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
+		expect(panel).not.toContain("No linked memories");
+	});
 });
 
 describe("dashboard review", () => {
@@ -2014,6 +2027,90 @@ describe("dashboard profile choice", () => {
 	});
 });
 
+describe("dashboard Sessions and Replay tabs", () => {
+	const session = (id: string, profile: string, ask: string) => ({ id, profile, session: `${id}-${profile}`, client: "codex", status: "complete", first_ask: ask,
+		events: [{ kind: "ask", text: ask, at: "2026-11-04T10:00:00Z" }], counts: {}, first_upload_at: "2026-11-04T10:00:00Z", last_upload_at: "2026-11-04T10:00:00Z" });
+
+	it("keeps the newest selection when two profiles' reads of the same session id answer out of order", async () => {
+		const g = { personal: gate(), work: gate() } as Record<string, ReturnType<typeof gate>>;
+		const b = browser({ signedIn: true, hash: "#sessions", api: async (path) => {
+			if (path.startsWith("/api/sessions?")) return Response.json({ rows: [session("s1", "personal", "Personal ask"), session("s1", "work", "Work ask")], next_cursor: null });
+			const m = /^\/api\/profiles\/(\w+)\/sessions\/s1$/.exec(path);
+			if (m) { await g[m[1]!]!.wait; return Response.json(session("s1", m[1]!, m[1] === "work" ? "Work ask" : "Personal ask")); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const rowOf = (pf: string) => find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes(` ${pf} · `))!;
+		rowOf("personal").on.click!();
+		rowOf("work").on.click!();
+		g.work!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g.personal!.open(); // the older selection answers last
+		for (let i = 0; i < 2; i++) await settle();
+		const panel = find(b.view(), "section").find((x) => x.attrs["aria-label"] === "Session detail")!;
+		expect(find(panel, "h3")[0]!.textContent).toBe("Work ask");
+		expect(text(panel)).toContain(" work · ");
+	});
+
+	it("plays only the session opened last when an earlier one answers late, and leaves no player running", async () => {
+		const g = { a: gate(), b: gate() } as Record<string, ReturnType<typeof gate>>;
+		const b = browser({ signedIn: true, hash: "#replay?profile=work", api: async (path) => {
+			if (path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows: [session("a", "work", "Session A"), session("b", "work", "Session B")], next_cursor: null });
+			const m = /^\/api\/profiles\/work\/sessions\/(a|b)$/.exec(path);
+			if (m) { await g[m[1]!]!.wait; return Response.json(session(m[1]!, "work", `Session ${m[1]!.toUpperCase()}`)); }
+		} });
+		const mounted: string[] = [], destroyed: string[] = [];
+		Object.assign(b.win, { amReplayPlayer: { mount: (_box: El, events: { text: string }[]) => { const t = events[0]!.text; mounted.push(t); return { destroy: () => { destroyed.push(t); } }; } } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const pick = find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!, form = find(b.view(), "form")[0]!;
+		pick.value = "0"; form.on.submit!({ preventDefault() {} });
+		pick.value = "1"; form.on.submit!({ preventDefault() {} });
+		g.b!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g.a!.open(); // A answers after B
+		for (let i = 0; i < 2; i++) await settle();
+		expect(mounted).toEqual(["Session B"]);
+		expect(destroyed).toEqual([]);
+		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Session B");
+		expect(find(b.view(), "h3").map((x) => x.textContent)).not.toContain("Session A");
+	});
+});
+
+describe("dashboard Activity tab", () => {
+	it("shows the day picked last when an earlier day's read answers late, and keeps each day's own answer", async () => {
+		const iso = (t: number) => new Date(t).toISOString().slice(0, 10), dayB = iso(Date.now()), dayA = iso(Date.now() - 86_400_000);
+		const g: Record<string, ReturnType<typeof gate>> = { [dayA]: gate(), [dayB]: gate() };
+		const summary = (from: string, to: string, note: string) => ({ from, to, active_days: 2, sessions: 1, observations: 2, busiest_day: dayB,
+			days: [{ day: dayA, count: 1 }, { day: dayB, count: 1 }], kinds: { asks: 2, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [],
+			busiest_sessions: [], latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] });
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: async (path) => {
+			const u = new URL(path, "https://x");
+			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+			const from = u.searchParams.get("from")!, to = u.searchParams.get("to")!;
+			if (from !== to) return Response.json(summary(from, to, "the whole year"));
+			await g[from]!.wait;
+			return Response.json(summary(from, to, `asked on ${from}`));
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const day = (d: string) => find(b.view(), "button").find((x) => x.attrs["data-day"] === d)!;
+		day(dayA).on.click!();
+		day(dayB).on.click!();
+		g[dayB]!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g[dayA]!.open(); // the older pick answers last
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`What agents did on ${dayB}`);
+		expect(text(b.view())).toContain(`asked on ${dayB}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayA}`);
+		day(dayA).on.click!(); // A's own answer was kept for A
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`asked on ${dayA}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
+	});
+});
+
 describe("dashboard Memories tab", () => {
 	// From the Memories tab author's smoke: the list, server strength, the record link, and Forget with Undo.
 	const row = (id: string, name: string) => ({ memory_id: id, profile: "work", name, type: "feedback", scope: "repo:x", status: "active", revision: 3, passage: `${name} passage`,
@@ -2087,6 +2184,26 @@ describe("dashboard Memories tab", () => {
 		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
 		expect(hrefs).toEqual(Array.from({ length: 25 }, (_, i) => `#memories/w${i}?profile=work`));
 		expect(text(b.view())).toContain("Showing 25 records");
+	});
+
+	it("drops the selection and an open bulk confirmation when a new search replaces the list", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = () => find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box().checked = true;
+		box().on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined(); // the confirmation names its one target
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the same search again: the rows are rebuilt unchecked
+		for (let i = 0; i < 2; i++) await settle();
+		expect(box().checked).toBe(false);
+		expect(text(b.view())).toContain("0 selected.");
+		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
+		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
 	});
 });
 

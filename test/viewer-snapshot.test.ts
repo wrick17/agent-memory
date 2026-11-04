@@ -3,7 +3,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { sha256 } from "../src/domain/ids";
+import { ingest } from "../src/profile/capture";
 import { OBJECT_LIMIT } from "../src/profile/housekeeping";
+import { runWrite } from "../src/profile/write";
 import { parseCursor } from "../src/viewer/events";
 import { assembleSnapshot, profilePart } from "../src/viewer/snapshot";
 import type { ProfileSnapshotPart } from "../src/viewer/types";
@@ -38,7 +41,7 @@ function seed(sql: SqlStorage, now: string) {
 	node(sql, "t1", "ticket", { attrs: JSON.stringify({ state: "open" }) });
 	node(sql, "t2", "pr", { attrs: JSON.stringify({ state: "closed" }) });
 	node(sql, "gone", "rule", { memory_type: "feedback", status: "retired", embed_hash: "c" });
-	node(sql, "s1", "session", { key: "session:claude-code:a", updated_at: now, attrs: JSON.stringify({ device_id: "dev1" }) });
+	node(sql, "s1", "session", { key: "session:claude-code:a", updated_at: now, attrs: JSON.stringify({ device_id: "dev1", last_upload_at: now }) }); // uploaded now, as ingest records it
 	node(sql, "s2", "session", { key: "session:codex:b", attrs: JSON.stringify({ ended: true }) });
 	for (const r of [1, 2]) sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES ('m1', ?, 'saved', '{}', 'owner', ?, 1)", r, OLD);
 	sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES ('gone', 1, 'saved', '{}', 'owner', ?, 1)", OLD);
@@ -62,6 +65,40 @@ function seed(sql: SqlStorage, now: string) {
 }
 
 describe("viewer snapshot", () => {
+	it("counts as vectors only nodes that embed: not sessions or bare entities marked equal to skip the embed stage", async () => {
+		await inProfile((sql) => {
+			// Every writer sets embed_hash = card_hash ("c") for a node the embed stage skips, and after a node's vector lands.
+			node(sql, "sess", "session", { key: "session:codex:v", embed_hash: "c" });
+			node(sql, "bare", "component", { embed_hash: "c" });
+			node(sql, "described", "component", { description: "a component", embed_hash: "c" });
+			node(sql, "current", "rule", { memory_type: "feedback", embed_hash: "c" });
+			node(sql, "stale", "rule", { memory_type: "feedback", embed_hash: "old" });
+			expect(profilePart(sql, "personal", day(), 0).usage.vectors).toBe(2);
+		});
+	});
+
+	it("counts only an accepted manifest's parts, and an owner pin does not make a session running", async () => {
+		const who = { userId: "snap-test", profile: "personal", generation: `g${++n}-${Date.now()}` };
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:${who.profile}:${who.generation}`)), (_i, st) => {
+			const sql = st.storage.sql, range = "codex:snap-m:0a1b2c3d:0-10";
+			const part = (id: string, asks: number) => { const b = body(asks, []); return { range_id: range, capture_status: "consolidated" as const, part_id: id, sha256: sha256(b), body: b }; };
+			const whole = part("0-10", 1), a = part("0-5", 4), b = part("5-10", 4);
+			expect(ingest(st.storage, who, { session: { client: "codex", id: "snap-m" }, digests: [whole, a, b],
+				manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] }).map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			const id = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'session:codex:snap-m'").one().id;
+			// One part, with its one ask and one decision; the unlisted 0-5 and 5-10 add nothing.
+			const fresh = profilePart(sql, who.profile, day(), 0);
+			expect(fresh.counts).toMatchObject({ observations: 2, sessions: 1, sessions_active: 1 });
+			expect(fresh.layers.find((l) => l.layer === "parts")!.count).toBe(1);
+			// Uploaded two hours ago, then pinned: still completed.
+			const earlier = new Date(Date.now() - 2 * 3_600_000).toISOString();
+			sql.exec("UPDATE nodes SET updated_at = ?, attrs = CASE WHEN json_extract(attrs, '$.last_upload_at') IS NULL THEN attrs ELSE json_set(attrs, '$.last_upload_at', ?) END WHERE id = ?", earlier, earlier, id);
+			sql.exec("UPDATE texts SET created_at = ? WHERE node_id = ? AND part = 'capture'", earlier, id);
+			runWrite(st.storage, who, { op: "owner", args: { memory_id: id, action: "pin" } }, { actor: "owner", platform: "test", routedBy: "test", userId: who.userId, payloadHash: "snap-pin" });
+			expect(profilePart(sql, who.profile, day(), 0).counts).toMatchObject({ sessions: 1, sessions_active: 0 });
+		});
+	});
+
 	it("counts stored rows in one profile, with S1's current parts and active rule, and feed ids that are activity ids", () =>
 		inProfile((sql) => {
 			seed(sql, new Date().toISOString());
