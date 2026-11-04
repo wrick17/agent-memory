@@ -1296,6 +1296,20 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		assert.equal(queuedTrigger("codex-s-end.json").ended, true);
 	});
 
+	it("keeps ended from a SessionEnd a crashed run claimed, when a later Stop replaces it and recovery drops the claim", async () => {
+		const f = transcript("ended", [claudeLine("user", "We decided to keep the end marker.")]);
+		const hook = (event) => am.hook("claude-code", JSON.stringify({ session_id: "ended", transcript_path: f, cwd: tmp, hook_event_name: event }), { spawnRun: false });
+		hook("SessionEnd");
+		// A run claims the SessionEnd, then dies before it saves the session's ended state.
+		fs.mkdirSync(path.join(am.home(), "claimed"), { recursive: true });
+		fs.renameSync(path.join(am.home(), "queue", "claude-code-ended.json"), path.join(am.home(), "claimed", "claude-code-ended.json"));
+		hook("Stop");
+		const server = fakeServer();
+		await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "claimed")), [], "recovery dropped the superseded claim");
+		assert.ok(server.log.some((b) => b.session.ended === true), "the session still reports that it ended");
+	});
+
 	it("drops an injected text block beside the owner's own text, for Claude Code and Codex, before any digest or literal", () => {
 		const claude = { pos: 0, next: 1, obj: { type: "user", message: { content: [{ type: "text", text: "owner text with `kept.ts`" }, { type: "text", text: "<environment_context>INJECTED /secret/path</environment_context>" }] } } };
 		const codex = { pos: 0, next: 1, obj: { type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "<user_instructions>INJECTED</user_instructions>" }, { type: "text", text: "do it" }] } } } };

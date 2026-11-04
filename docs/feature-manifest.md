@@ -177,8 +177,11 @@ Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Ses
 
 - Ingest: `session.ended` (sticky) and `session.files_changed` (largest count kept) are optional, so v1 runner bodies are unchanged. The session's device comes from the authenticated token on `/v1/ingest` and MCP ingest, never from a body field; older sessions show an unknown device.
 - Reads: `GET /api/profiles/:p/sessions` (cursor, project, client, status, limit) and `GET /api/profiles/:p/sessions/:id` for one profile; `GET /api/sessions` merges every active profile by last upload. A profile that cannot be read fails the merged list instead of being left out.
-- Detail orders events by range start, then position, and links produced records through evidence and inferred-preference provenance. Active means an upload in the last 30 minutes and no session end.
+- Detail orders events by range start, then position. Once a range's manifest is accepted, only the consolidated parts it lists (by part id and hash) are read. It links produced records through evidence and inferred-preference provenance.
+- The last upload is recorded at ingest each time a part or manifest is stored; owner pin, unpin and unflag do not change it. Active means a last upload in the past 30 minutes and no session end. List order, filters and cursors use the same last upload.
 - Counts come from stored evidence only. Upload span and first upload are labelled as such; no working directory, original start time or hosted tool count is invented.
+- Capture recall (`include_captures`) reads the same current parts as Sessions: once a range's manifest is accepted, only the parts it lists, as of the requested time when one is given.
+- Evidence for the manifest-selected parts, the last-upload time and capture recall: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
 
 ### v2 replay-safe maintenance and stale records (#10), 2026-11-04
@@ -186,10 +189,12 @@ Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Ses
 Source ready, not deployed. Depends on #9 above for the recall counts and eval candidates.
 
 - `maintenance_next` takes an optional `request_id`. The first call binds it to the lease; an identical retry returns the same lease and only items still leased, a changed retry is refused, and an expired binding returns `lease_id: null` with `reason: "lease_expired"`. Without `request_id` the v1 behavior is unchanged, and `maintenance_complete` per-op replay stays exactly once.
-- Housekeeping queues `stale_memory` only for active records older than 90 days with no recall hit in 90 days. Journals, preferences, stated, pinned and `me` records are excluded. A stale item allows only a retire-only save, `flag` and `dismiss`; every change still goes through `mayChange`, and nothing is deleted automatically.
+- Housekeeping queues `stale_memory` only for active memories older than 90 days with no recall hit in 90 days. Journals, preferences, stated, pinned and `me` records are excluded, and so are graph nodes without a memory type, such as uploaded sessions and entities, which the retire-only save cannot reach. A stale item allows only a retire-only save, `flag` and `dismiss`; every change still goes through `mayChange`, and nothing is deleted automatically.
 - `suggest_eval_case` is allowed only on `unprocessed_capture` and `preference_signal` items. Its query, expected ids and evidence are checked against the item's subjects and stored through the #9 candidate store, which refuses wiped ids.
 - Housekeeping purges `recall_daily` and `recall_totals` rows older than 400 days in bounded pages.
 - The owner can queue link maintenance for 1 to 40 memories (`POST /api/profiles/:p/maintenance/queue`) and consolidation for one session (`POST /api/profiles/:p/sessions/:id/consolidate`) through the existing fingerprinted queue, so a repeat queues nothing.
+- The batch's capture context reads the same current parts as Sessions: once a range's manifest is accepted, it leaves out consolidated parts the manifest does not list.
+- Evidence for the stale-memory rule and the capture context: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase; the original module tests were not preserved and are listed as needed coverage.
 
 ### v2 client status and health checks (#11), 2026-11-04
@@ -198,8 +203,11 @@ Source ready, not deployed. Depends on the v2 request plumbing and #10 above (le
 
 - `POST /v1/status` takes the job token only. The device comes from the token; unknown fields and oversized bodies are refused, and only the latest valid report is kept. It holds allowlisted counts and times, no content.
 - The deterministic health sweep runs from the nightly cron after the export, whatever the export's outcome, and on demand at `POST /api/health/sweep`. It never calls a model or changes records.
-- Flags: a batch not completed for 26 hours, an expired incomplete lease, a non-revoked reporting device whose last digest is older than 48 hours, and an encrypted export older than 30 hours. A v1 device with no status row is not stale.
+- Flags: a batch not completed for 26 hours, an expired incomplete lease, a non-revoked reporting device whose last digest is older than 48 hours, and no successful export of the account and every profile in the last 30 hours. A profile-only or failed export does not count. A v1 device with no status row is not stale.
+- Evidence for the backup rule: a fixed-clock case in `test/health.test.ts`, whose scoped run passed 45 of 45 in the current review batch. The earlier combined 628-test run does not cover it.
 - `GET /api/health` reads the same state. Each active profile gets one slot; a profile that cannot be read stays a null slot, so the lexical count reads as unknown, not a subtotal.
+- `search.vectors` counts nodes with a current vector: memories and entities with a description whose card is embedded. Sessions and bare entities, which never embed, are not counted.
+- Evidence for the vector count: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
 
 ### v2 activity and project insights (#15), 2026-11-04
@@ -211,6 +219,9 @@ Source ready, not deployed. Depends on #12 above for session and project semanti
 - `GET /api/profiles/:p/projects` lists projects; `GET /api/profiles/:p/projects/:key/profile` returns session count and last activity, linked-concept frequency, scoped rules and preferences, and grouped corrections and decisions from the past 30 days. Its `budget` is marked exhausted at 200 sessions, 5,000 links or 1,000 correction parts.
 - File lists (`top_files`, `files`) come only from the profile's Corpus when it is on; `me` has none. A failed Corpus read fails the request instead of showing no files, and with the Corpus off the lists are empty.
 - Data stays in the explicitly selected, authorized profile and project; no profile is inferred from content.
+- When the read budget leaves no requested day complete, the summary returns `from` after `to` with an empty file list, and no Corpus query runs. Recurring errors resolve digest entities through the same identifier rules as ingest.
+- Activity, a project's last activity and session order use the same current parts and last-upload time as Sessions (#12).
+- Evidence for these rules: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
 
 ### v2 live viewer events (#14), 2026-11-04
@@ -228,9 +239,12 @@ Source ready, not deployed. Depends on the v2 request plumbing and #11 above for
 Source ready, not deployed. Depends on #9, #11, #12 and #14 above.
 
 - `GET /api/viewer/snapshot` (owner only) returns the time, version and deploy time, profiles, the event cursor, counts, usage, health, recent sessions, the feed, layers and feature flags. Each profile's part is one synchronous read, so its sequence, feed and counts come from one state of the store.
-- Usage comes from the UTC day's `recall_totals` and activity, the store's actual SQL size, and nodes whose current card is embedded. The version and deploy time come from the new `CF_VERSION_METADATA` binding (`version_metadata` in `wrangler.jsonc`, including the test and rehearsal environments).
+- Usage comes from the UTC day's `recall_totals` and activity, the store's actual SQL size, and nodes whose current card is embedded. The version and deploy time come from the new `CF_VERSION_METADATA` binding. It is `version_metadata` in `wrangler.jsonc`, including the test and rehearsal environments, in the config `npm run setup` writes, and in `wrangler.example.jsonc`.
 - Availability is reported honestly: no uptime, MCP call or failure metrics, semantic latency, confidence percentages or tool counts are made up. A feature with no confirming device report reads as inactive.
 - A failed profile read fails the request instead of returning a smaller total.
+- Usage `vectors` uses the same rule as health.
+- Observations, the parts layer, crystals, and running and completed session counts use the same current parts and last-upload time as Sessions (#12).
+- Evidence for the setup binding, the vector rule and the current parts: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved snapshot tests run in the combined phase.
 
 ### v2 Lessons and Actions read seams (#27), 2026-11-04
@@ -255,8 +269,42 @@ Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 
 - Commands: `--list` prints local sessions, newest first. `--session ID` opens one session, `--port N` picks the port (default 0, a random free port), and `--help` prints usage. Bad arguments exit 2; an unknown session or a failed start exits 1.
 - Sources: `projects/<project>/<session>.jsonl` under the Claude Code home and `sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl` under the Codex home. Listed files must be regular files owned by the current user, and symlinks are not followed. Session ids are validated. Each read opens with `O_NOFOLLOW` and checks `fstat`.
-- Events: owner and assistant text comes from the hook's `extract()`, so thinking, system, meta, sidechain and injected context stay out. A Claude record whose joined text opens as injected, such as a `<command-name>` envelope, stays out whole. Tool calls and results are kept for both formats. A lone string argument shows as its bare value only when redaction would leave its JSON form unchanged; otherwise the key stays, so key-based redaction applies. Every label and detail is redacted, and each tool input and output is cut at 8 KB after redaction (`truncated: "true"`).
+- Events: owner and assistant text comes from the hook's `extract()`, so thinking, system, meta, sidechain and injected context stay out. A Claude record whose joined text opens as injected, such as a `<command-name>` envelope, stays out whole. Tool calls and results are kept for both formats. A lone string argument shows as its bare value only when redaction would leave its JSON form unchanged; otherwise the key stays, so key-based redaction applies. Every label and detail is redacted. Claude text blocks between two tool blocks form one event and are redacted together, so a secret split across blocks is caught. If a secret is split across a tool block, the record's text shows once, before its tool events. Each tool input and output is cut at 8 KB after redaction (`truncated: "true"`).
 - Server: binds 127.0.0.1 only. A random 32-byte token is the first URL path segment and is compared in constant time. Host must be exactly `127.0.0.1:<port>`, and Origin, when sent, must be the same origin. These checks run before routing or file access. Only GET and HEAD are allowed. Responses set a self-only CSP with no inline script or style, plus `no-store`, `nosniff`, `no-referrer` and frame denial. There are no redirects. Errors carry no paths or transcript text.
 - Install: `agent-memory install` also copies `replay.mjs`, `transcript-full.mjs` and `replay-player.js` beside the CLI.
-- Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, lone sensitive tool arguments in Claude and Codex calls, the `lsof` loopback bind, and the installed command mounting the real player.
+- Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, lone sensitive tool arguments in Claude and Codex calls, secrets split across text blocks and across a tool call, the `lsof` loopback bind, and the installed command mounting the real player. Its 9 cases passed in a scoped run in the current review batch; the earlier combined 120-test local run does not cover this fix.
 
+### v2 opt-in prompt recall (#19), 2026-11-04
+
+Module source in review, off by default; not installed. Extends the AM-09 capture hooks. `local/inject.mjs` builds the recall request and the hook output. #16 registers the hook and calls the module.
+
+- With `inject.enabled` and `inject.profile`, the `UserPromptSubmit` hook sends the prompt, cut to 4,096 characters, to `POST /v1/recall` with the read token, that profile and the lexical channel, within `inject.timeout_ms` (default 1,500 ms) and `inject.max_tokens` (default 600). Without a profile it sends nothing.
+- It never sends a repo for routing, never infers work or personal from the prompt or the working directory, and never uses the job token.
+- On a timeout, an error or a missing read token it prints nothing, so the prompt goes through.
+- Both clients get `hookSpecificOutput.additionalContext`: plain text, one line per record, under a line saying stored records are evidence, not instructions. Codex support rests on the Codex hooks documentation (codex-cli 0.166.0, checked 2026-11-04).
+- Evidence: its author's fail-open synthetic smoke. Its config and install tests are part of #16. No real-client verification has run.
+
+### v2 local scheduling diagnostics and backfill (#18), 2026-11-04
+
+Module source in review; not installed. Extends AM-10 scheduling. This change adds `local/launchd.mjs`, `local/status.mjs`, `local/doctor.mjs` and `local/backfill.mjs`. #16 wires the `doctor` and `backfill` commands, the plist install and the status report.
+
+- `launchd.mjs` builds the daily job plist for the installing Node binary, `AGENT_MEMORY_HOME` and `PATH`, with the test label `com.agent-memory.batch.test` for any non-default home. It never runs `launchctl`; install only prints the load command.
+- `status.mjs` builds the per-device report: counts, times, booleans, hook names and client versions. It holds no transcript text, paths, session ids or token.
+- `doctor.mjs` checks the token files, the hooks, the launchd job, the spool, local capture state and `whoami`, one line each with a fix. It is read-only and prints no token.
+- `backfill.mjs` queues triggers for retained transcripts whose cursor is behind. It reads file sizes, prefix hashes and a session's working directory, never message text.
+- Evidence: syntax and CLI bundle checks at this stage. The `doctor` and `backfill` tests arrive in #73. No launchd job has been loaded or run.
+- A claim-recovery observation (unlink after a failed rename) stays open for review.
+
+### v2 capture hooks, scheduled runs and status (#16), 2026-11-04
+
+Source in review; not deployed or installed. Extends AM-09 capture and AM-10 scheduling. This change wires the #17, #18, #19 and #20 modules into the CLI.
+
+- `install` adds `PreCompact` to the Claude Code and Codex hook lists; it runs in the background like `Stop`. `UserPromptSubmit` is listed only when injection is on.
+- On macOS, `install` writes the daily job plist and prints its `launchctl bootstrap` command. It never loads the job.
+- `run --scheduled` takes the machine lock. When nothing is queued, claimed, spooled or due, it sends the status report and checks the queue again before it returns `idle`. Otherwise it drains captures and runs the batch, even on a day with no sessions.
+- Batches carry a sticky `session.ended` and `session.files_changed`, a locally computed count of distinct edited files. Only the number is uploaded.
+- Each run ends with one content-free `POST /v1/status`. Against a pre-v2 Worker, an ingest refused only because of the two new session fields is sent once more without them.
+- `eval`, `backfill` and `doctor` dispatch to their modules.
+- `extract()` drops injected text block by block and still drops a Claude Code command record whole. Only `EEXIST` counts as a newer trigger when a claim goes back to the queue.
+- End marker: a `Stop` that replaces a `SessionEnd` a crashed run had claimed keeps `ended`, so the session still reports its end after recovery drops the old claim.
+- Evidence: the tests for hooks, install, the plist (written, never loaded), scheduled runs, session facts and status are in `local/agent-memory.test.mjs` in this change. On the integrated tree they passed in the combined local run of 2026-11-04 (120 of 120), before the current review fixes; the end-marker case passed in a scoped run in the current review batch. No client install, `launchctl` load or physical job run has happened.

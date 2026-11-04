@@ -5,7 +5,8 @@ import { verdictOf } from "../health";
 import { BOARD_KINDS } from "../profile/board";
 import { OBJECT_LIMIT } from "../profile/housekeeping";
 import { recallTotals } from "../profile/recall-stats";
-import { listSessions } from "../profile/sessions";
+import { HAS_VECTOR } from "../profile/write";
+import { CURRENT_PART, listSessions, UPLOAD } from "../profile/sessions";
 import { FEED_SELECT, formatCursor, toFeedItem, type ActivityFeedRow } from "./events";
 import type { AccountSnapshotPart, FeatureFlag, FeedItem, LayerState, ProfileSessionRow, ProfileSnapshotPart, Snapshot, SnapshotCounts, VersionInfo } from "./types";
 
@@ -16,11 +17,6 @@ const LAYERS = ["digests", "parts", "memories", "preferences", "me"] as const;
 const COUNT_KEYS = ["memories", "revisions", "observations", "sessions", "sessions_active", "lessons", "crystals", "actions", "graph_nodes", "graph_edges"] as const;
 const USAGE_KEYS = ["recalls_today", "recall_tokens_today", "writes_today", "storage_bytes", "vectors"] as const;
 
-// A session's current digest parts, as S1's currentParts selects them: a range's heuristic digest until its manifest
-// supersedes it, else its consolidated parts. Reached through nodes_kind and texts_node, never a scan of every text.
-const CURRENT_PART = `t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.chunk = 0 AND t.range_id IS NOT NULL
-	AND t.capture_part IS NOT 'manifest' AND (t.capture_status = 'heuristic' OR NOT EXISTS (SELECT 1 FROM texts h
-		WHERE h.node_id = t.node_id AND h.part = 'capture' AND h.range_id = t.range_id AND h.capture_status = 'heuristic' AND h.capture_part = '-' AND h.live = 1))`;
 const LIVE_SESSION = "n.kind = 'session' AND n.status = 'active'";
 const ENDED = "coalesce(json_extract(n.attrs, '$.ended'), 0) = 1";
 // Observations are S1's counts: asks, decisions, corrections and outcomes. Stored bodies passed checkBody; json_valid guards the rest.
@@ -42,14 +38,14 @@ export function profilePart(sql: SqlStorage, profile: string, day: string, stora
 	const nodes = one<{ memories: number; lessons: number; journals: number; graph_nodes: number; vectors: number }>(
 		`SELECT count(*) FILTER (WHERE memory_type IS NOT NULL) AS memories, count(*) FILTER (WHERE kind = 'preference') AS lessons,
 			count(*) FILTER (WHERE kind = 'journal' AND coalesce(json_extract(attrs, '$.compacted_through'), 0) > 0) AS journals,
-			count(*) AS graph_nodes, count(*) FILTER (WHERE embed_hash = card_hash) AS vectors
+			count(*) AS graph_nodes, count(*) FILTER (WHERE ${HAS_VECTOR}) AS vectors
 		FROM nodes WHERE status = 'active'`);
 	// Older versions of the active memories: revision rows below each memory's current revision.
 	const revisions = one<{ n: number }>(`SELECT count(*) AS n FROM nodes n JOIN revisions r ON r.node_id = n.id AND r.revision < n.revision
 		WHERE n.memory_type IS NOT NULL AND n.status = 'active'`).n;
 	const sessions = one<{ total: number; running: number; crystals: number }>(`SELECT count(*) AS total,
-			count(*) FILTER (WHERE n.updated_at > ? AND NOT ${ENDED}) AS running,
-			count(*) FILTER (WHERE (n.updated_at <= ? OR ${ENDED}) AND EXISTS (SELECT 1 FROM texts t WHERE t.node_id = n.id AND ${CURRENT_PART}
+			count(*) FILTER (WHERE ${UPLOAD} > ? AND NOT ${ENDED}) AS running,
+			count(*) FILTER (WHERE (${UPLOAD} <= ? OR ${ENDED}) AND EXISTS (SELECT 1 FROM texts t WHERE t.node_id = n.id AND ${CURRENT_PART}
 				AND t.capture_status = 'consolidated')) AS crystals
 		FROM nodes n WHERE ${LIVE_SESSION}`, cutoff, cutoff);
 	const digests = one<{ digests: number; parts: number; observations: number }>(`SELECT
