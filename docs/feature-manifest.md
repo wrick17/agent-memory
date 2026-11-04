@@ -123,3 +123,15 @@ Source ready, not deployed. `src/v2-api.ts` holds the v2 routes: device-token ro
 - `GET /v1/whoami` with an enabled, unrevoked `am_` device token returns only that device's `kind: "device"`, `device_id`, `scopes` and `profiles`. Revoked, disabled or unknown tokens get 401, and a request without a token gets 401. The owner's `{ claims }` reply is unchanged.
 - The Worker passes its `ExecutionContext` to `/mcp` and the API, so later v2 changes can finish work after the reply (`ToolContext.waitUntil`). Nothing uses it yet.
 - Evidence: the `v2 request plumbing` case in `test/mcp-auth.test.ts`.
+
+### v2 recall measurement and eval records (#9), 2026-11-04
+
+Source ready, not deployed. Depends on the v2 request plumbing above. Recall stays a read for records: only the `recall_daily`, `recall_totals` and `eval_candidates` side tables change, never nodes or their sequence values.
+
+- Channels: `POST /v1/recall` (read scope) and the owner's `POST /api/profiles/:p/recall` take `channels` (`lexical`, `vector`, or both; default both) and `count_hits` through the shared `recall_memories` path. The MCP tool's schema is unchanged and always runs both channels.
+- Hit counts: after the reply, each profile that returned hits counts only the returned ids and their token cost, in one transaction at one sequence. A failed count is dropped and never fails the recall. `count_hits: false` and empty-keyword inventory count nothing; ids with a `wiped:` fence or no local node add no row.
+- Strength: `GET /api/profiles/:p/recall-strength?ids=` returns 90-day hits, strength capped at 10 and the last recalled day for up to 100 ids.
+- Eval runs: `POST /v1/eval/runs` takes bounded scores and counts from the job token only, for a profile it may use, and stores them in account `eval_runs` with the token's device id. No case text or miss report is stored. The owner lists them at `GET /api/eval/runs`.
+- Eval candidates: the owner lists, accepts and dismisses at `/api/profiles/:p/eval-candidates`; a read-scoped device exports accepted ones at `GET /v1/eval/candidates?profile=`. Storage validates and redacts each candidate and refuses one naming a wiped id. The `suggest_eval_case` producer and the 400-day recall purge land with #10.
+- Wipe and restore: a profile wipe purges recall rows and candidates naming a purged node. Before a restored or point-in-time generation opens, the recovery copies every account `wiped:` identity into it as a local fence and removes the matching side rows (`fence` phase). Reads hide fenced candidates in between.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.

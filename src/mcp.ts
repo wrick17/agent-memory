@@ -16,6 +16,7 @@ import { explore, exploreSchema, GRAPH_TOOL_TEXT, timeline, timelineSchema, trac
 import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
 import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT, withCorpusCounts } from "./corpus-tools";
 import { driveTransfer, transferPorts } from "./transfer";
+import type { RecallOptions, RecallRequest } from "./viewer/types";
 
 /**
  * `actor` and `moveFrom` are set only by trusted server code (the owner-authenticated dashboard routes), never from request input;
@@ -109,6 +110,12 @@ type ReviewInput = z.infer<typeof reviewSchema>;
 type AppendInput = z.infer<typeof appendSchema>;
 type GetInput = z.infer<typeof getSchema>;
 type RecallInput = z.infer<typeof recallSchema>;
+/** POST /v1/recall (#9): recall_memories' routing fields plus channels and count_hits. recall_memories' own schema is unchanged. */
+export const recallRequestSchema = z.object({
+	keyword: z.string().min(1).max(4096), repo: repo.optional(), profile: profile.optional(),
+	limit: z.number().int().min(1).max(100).optional(), token_budget: z.number().int().min(64).max(32_000).optional(),
+	channels: z.array(z.enum(["lexical", "vector"])).min(1).max(2).optional(), count_hits: z.boolean().optional(),
+}).strict() satisfies z.ZodType<RecallRequest>;
 
 /** save_memory fields that change a record; none may ride along with a move to another profile. */
 const MOVE_FREE = ["content", "description", "why", "how_to_apply", "objective", "steps", "new_name", "scope", "retire", "supersedes", "evidence", "links"] as const;
@@ -142,7 +149,7 @@ export const TOOLS = [
 
 // Stubs typed with the stores' own signatures; every value crossing RPC is plain JSON-like data.
 export const profileStub = (env: Env, ref: ProfileRef) =>
-	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "archiveOperation" | "archiveOperationStatus" | "write" | "read" | "ingest" | "upload" | "captureState" | "importStep" | "maintenance">;
+	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "archiveOperation" | "archiveOperationStatus" | "write" | "read" | "ingest" | "upload" | "captureState" | "importStep" | "maintenance" | "noteRecall" | "decideEvalCandidate" | "readV2">;
 export const accountStub = (env: Env, userId: string) =>
 	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin" | "bindImport" | "reserveImport" | "finishTransferRequest">;
 
@@ -356,7 +363,8 @@ const unb64 = (s: string) => JSON.parse(atob(s.replace(/-/g, "+").replace(/_/g, 
 const cost = (item: unknown) => Math.max(1, Math.ceil(JSON.stringify(item).length / 4));
 const publicHit = ({ row: _row, rank: _rank, ...h }: RecallHit) => h;
 
-async function recall(c: ToolContext, a: RecallInput): Promise<Outcome<unknown>> {
+/** recall_memories, and /v1/recall with channels and count_hits (#9). The MCP tool passes no options: both channels, hits counted. */
+export async function recall(c: ToolContext, a: RecallInput, opts: RecallOptions = {}): Promise<Outcome<unknown>> {
 	if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
 	const rs = readSet(c.caller, c.account.rules, c.account.known, { ...(a.profile !== undefined ? { profile: a.profile } : {}), ...(a.repo ? { repo: a.repo } : {}) });
 	if (!rs.ok) return rs;
@@ -371,10 +379,11 @@ async function recall(c: ToolContext, a: RecallInput): Promise<Outcome<unknown>>
 
 	// Each profile starts its lexical channels at once and gets semantic results only within one shared deadline. Vectors hold
 	// only current cards, so a read at as_of stays lexical over the text stored by then.
-	const semantic = embeddingsOn(c.env) && !a.as_of;
+	const channels = opts.channels ?? ["lexical", "vector"];
+	const semantic = embeddingsOn(c.env) && !a.as_of && channels.includes("vector");
 	const diagnostics: Record<string, unknown> = semantic ? {} : { embedding: a.as_of ? "off:as_of" : "off" };
 	const deadline = Date.now() + SEMANTIC_MS;
-	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, includeCaptures: a.include_captures === true && ref.profile === rs.value.primary, semantic, deadline, expand: a.expand !== false })));
+	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, includeCaptures: a.include_captures === true && ref.profile === rs.value.primary, semantic, deadline, expand: a.expand !== false }, { channels })));
 	const merged = new Map<string, { hit: RecallHit; score: number }>();
 	for (const [i, page] of pages.entries()) {
 		if (!page.ok) return page;
@@ -400,6 +409,13 @@ async function recall(c: ToolContext, a: RecallInput): Promise<Outcome<unknown>>
 	}
 	// Preferences from below a profile's cap only fill preference positions; they never count as more results.
 	const capped = [...merged.values()].filter((m) => m.hit.rank === undefined).length;
+	// Each profile counts the hits it returned, after the reply; a failed count undercounts and never fails the recall.
+	if (opts.count_hits !== false && c.waitUntil) {
+		for (const [i, name] of names.entries()) {
+			const mine = (selected as { profile: string; memory_id: string }[]).filter((h) => h.profile === name);
+			if (mine.length) c.waitUntil(profileStub(c.env, refs[i]!).noteRecall(refs[i]!, mine.map((h) => h.memory_id), mine.reduce((n, h) => n + cost(h), 0)).catch(() => undefined));
+		}
+	}
 	return ok({ ...envelope, results: selected, estimated_tokens: used, truncated: selected.length < capped, lexical_only: !vectorUsed, diagnostics, next_cursor: null });
 }
 
@@ -468,10 +484,11 @@ export function buildServer(c: ToolContext): McpServer {
 }
 
 /** The same dispatch without the transport, for the REST API and tests. */
-export async function callTool(c: ToolContext, name: string, args: unknown): Promise<Outcome<unknown>> {
+/** opts reach recall_memories only (the owner's Memories search, #9); every other tool ignores them. */
+export async function callTool(c: ToolContext, name: string, args: unknown, opts?: RecallOptions): Promise<Outcome<unknown>> {
 	const tool = TOOLS.find((t) => t.name === name);
 	if (!tool || !c.caller.scopes.includes(tool.scope) || ("enabled" in tool && !tool.enabled(c.env))) return fail("forbidden", `tool ${name} is not available to this caller`);
 	const parsed = tool.schema.safeParse(args);
 	if (!parsed.success) return fail("validation", parsed.error.issues.map((i) => `${i.path.join(".") || "arguments"}: ${i.message}`).join("; "));
-	return (tool.run as (c: ToolContext, a: unknown) => Promise<Outcome<unknown>>)(c, parsed.data);
+	return (tool.run as (c: ToolContext, a: unknown, o?: RecallOptions) => Promise<Outcome<unknown>>)(c, parsed.data, name === "recall_memories" ? opts : undefined);
 }

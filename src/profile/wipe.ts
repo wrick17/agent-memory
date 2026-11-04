@@ -172,6 +172,10 @@ function purge(sql: SqlStorage, who: Who, w: OriginWipe): PurgeResult {
 					(SELECT 'e:' || json_extract(payload, '$.id') FROM archive WHERE source = 'edges' AND json_extract(payload, '$.src') = ?1)))
 				ORDER BY CASE source WHEN 'evidence' THEN 0 WHEN 'edges' THEN 1 ELSE 2 END LIMIT 30)`, [id, `n:${id}`]],
 			["DELETE FROM maintenance WHERE id IN (SELECT maintenance.id FROM maintenance, json_each(subjects) WHERE value = ? LIMIT 40)", [id]],
+			// v2: recall counts, and eval candidates whose expected ids or node evidence name the purged node (content-bearing).
+			["DELETE FROM recall_daily WHERE (node_id, day) IN (SELECT node_id, day FROM recall_daily WHERE node_id = ? LIMIT 100)", [id]],
+			[`DELETE FROM eval_candidates WHERE id IN (SELECT c.id FROM eval_candidates c WHERE EXISTS (SELECT 1 FROM json_each(c.expected_json) WHERE value = ?1)
+				OR EXISTS (SELECT 1 FROM json_each(c.evidence_json) e WHERE json_extract(e.value, '$.kind') = 'node' AND json_extract(e.value, '$.ref') = ?1) LIMIT 40)`, [id]],
 			["DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT p.transfer_id, p.n FROM transfer_parts p JOIN transfers t ON t.id = p.transfer_id WHERE t.node_id = ? LIMIT 60)", [id]],
 			["DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE node_id = ? LIMIT 40)", [id]],
 		];
