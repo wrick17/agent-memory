@@ -256,6 +256,10 @@ describe("self-host setup", () => {
 		assert.deepEqual(c.ai, { binding: "AI" });
 		assert.deepEqual(c.vectorize, [{ binding: "VECTORS", index_name: "am-selfhost-cards" }]);
 		assert.deepEqual(c.version_metadata, { binding: "CF_VERSION_METADATA" }, "the viewer snapshot reads the deployed version");
+		// src/dashboard.ts imports local/replay-player.js as text; without the maintainer config's exact rule the build fails.
+		const source = JSON.parse(/^\t"rules": (\[.*\]),$/m.exec(fs.readFileSync(path.resolve(import.meta.dirname, "..", "wrangler.jsonc"), "utf8"))[1]);
+		assert.deepEqual(c.rules, source);
+		assert.deepEqual(c.rules, [{ type: "Text", globs: ["../local/*-player.js"], fallthrough: true }]);
 		assert.deepEqual(c.vars, { RESOURCE_URL: "https://memory.selfhost-synthetic.dev/mcp", CLERK_ISSUER: "https://clerk.selfhost-synthetic.dev",
 			CLERK_FRONTEND_API: "https://clerk.selfhost-synthetic.dev", CLERK_PUBLISHABLE_KEY: SETTINGS.clerk_publishable_key, REQUIRED_SCOPE: "memory",
 			DASHBOARD_ORIGIN: "https://memory.selfhost-synthetic.dev", EMBEDDINGS: "on", ROUTING_DEFAULTS: SETTINGS.routing.join(","), IMPORT_PROFILES: "" });
@@ -634,8 +638,8 @@ describe("self-host setup", () => {
 		delete lock.version; delete lock.packages[""].version; delete lock.packages[""].engines;
 		assert.deepEqual(lock, sourceLock, "packaging preserves the pinned dependency graph");
 		assert.deepEqual(manifest.scripts, { setup: "node local/setup.mjs" });
-		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs", "setup.mjs"]);
-		assert.deepEqual(manifest.files, ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-judgment.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc", "npm-shrinkwrap.json"]);
+		assert.deepEqual(fs.readdirSync(path.join(stage, "local")).sort(), ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs", "replay-player.js", "setup.mjs"]);
+		assert.deepEqual(manifest.files, ["src", "local/replay-player.js", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-judgment.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc", "npm-shrinkwrap.json"]);
 		for (const file of ["wrangler.jsonc", "agent-memory.setup.json", RECEIPTS_FILE, "agent-memory.setup.lock", ".dev.vars", "research", "test"])
 			assert.equal(fs.existsSync(path.join(stage, file)), false, file);
 		const readme = fs.readFileSync(path.join(stage, "README.md"), "utf8");

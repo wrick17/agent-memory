@@ -5,8 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The corpus CLI with its only local imports (the corpus modules and src/domain); no capture installer, migrate or import files.
-const FILES = ["src", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-judgment.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc"];
+// The corpus CLI with its only local imports (the corpus modules and src/domain), and the replay player src/dashboard.ts embeds;
+// no capture installer, migrate or import files.
+const FILES = ["src", "local/replay-player.js", "local/setup.mjs", "local/corpus-cli.mjs", "local/corpus-git.mjs", "local/corpus-judgment.mjs", "local/corpus-refresh.mjs", "local/corpus-scan.mjs", "local/corpus-upload.mjs", "docs/self-host.md", "wrangler.example.jsonc"];
 
 export function stageSelfHost(root, target) {
 	fs.mkdirSync(target, { mode: 0o700 });
