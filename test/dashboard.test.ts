@@ -2208,4 +2208,42 @@ describe("dashboard Memories tab", () => {
 		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
 		expect(stale).toBeUndefined();
 	});
+
+	it("clears the selection, its checkboxes and an open confirmation when the Agent filter changes", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), { ...row("m2", "Second"), provenance: { source_platform: "codex" } }], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box.checked = true;
+		box.on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined();
+		const agent = find(b.view(), "select").find((x) => x.attrs.id === "mem-agent")!;
+		agent.value = "codex"; // First, a claude-code record, is now hidden
+		agent.on.change!();
+		expect([box.checked, text(b.view()).includes("0 selected.")]).toEqual([false, true]);
+		const stale = button(b.view(), "Forget 1");
+		if (stale) click(stale); // a confirmation left open would forget the hidden record
+		await settle();
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+		expect(stale).toBeUndefined();
+	});
+
+	it("keeps the search when the header picker changes profile", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) =>
+			path.endsWith("/recall") ? Response.json({ results: [], next_cursor: null, truncated: false, lexical_only: false }) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value = "diffs";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the tab writes ?q= into the address without a render
+		await settle();
+		expect(b.win.location.hash).toBe("#memories?profile=work&q=diffs");
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#memories?profile=personal&q=diffs"); // the tab's own address after it reads personal
+		expect(find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value).toBe("diffs");
+	});
 });
