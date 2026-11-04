@@ -1007,7 +1007,10 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	// Backups and restore from an export (section 18). One recovery at a time; it closes the account until open or abort.
 	if (url.pathname === "/api/backups/export" && request.method === "POST") {
 		const b = await body(request);
-		return run({ op: "export", ...(typeof b?.profile === "string" ? { profile: b.profile } : {}), ...(b?.corpus === true ? { corpus: true } : {}) });
+		// preserve_existing: this one manual export keeps every older export (no retention); the next default export prunes to two again.
+		if (b && "preserve_existing" in b && typeof b.preserve_existing !== "boolean") return json({ error: { code: "validation", message: "preserve_existing must be true or false" } }, 400);
+		return run({ op: "export", ...(typeof b?.profile === "string" ? { profile: b.profile } : {}), ...(b?.corpus === true ? { corpus: true } : {}),
+			...(b?.preserve_existing === true ? { preserve_existing: true } : {}) });
 	}
 	// Point-in-time restore of a profile (section 18): to a time in the last 30 days, or the reversal of an opened one by its
 	// recorded undo bookmark. It closes the account, records the bookmarks before the profile restarts, and opens only when reconciled.

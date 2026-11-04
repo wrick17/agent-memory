@@ -46,7 +46,7 @@ export type AccountCommand =
 	// Backups and restore from an export (section 18): owner only, one recovery at a time.
 	/** `corpus` also exports the profiles' corpora now; the nightly run exports each corpus once a week. */
 	/** `trigger`: set only by the Worker's scheduled handler, from the platform event; every other export is manual. */
-	| { op: "export"; profile?: string; corpus?: boolean; trigger?: { scheduled_time: number; cron: string } }
+	| { op: "export"; profile?: string; corpus?: boolean; preserve_existing?: boolean; trigger?: { scheduled_time: number; cron: string } }
 	| { op: "listExports"; profile?: string; corpus?: boolean }
 	| { op: "beginRestore"; profile: string; export: string }
 	/** Point-in-time restore of a profile's current generation to `at`, or the reversal of restore `undo` by its recorded undo bookmark. */
@@ -602,8 +602,8 @@ export class AccountStore extends DurableObject<Env> {
 	private wiping(): boolean {
 		return this.sql.exec("SELECT 1 FROM wipes WHERE json_extract(report, '$.state') <> 'done' LIMIT 1").toArray().length > 0;
 	}
-	private exportAccount(userId: string) {
-		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: [] }));
+	private exportAccount(userId: string, preserve?: true) {
+		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: [], ...(preserve ? { preserve } : {}) }));
 	}
 
 	/**
@@ -955,17 +955,19 @@ export class AccountStore extends DurableObject<Env> {
 					cron: typeof cmd.trigger.cron === "string" ? cmd.trigger.cron.slice(0, 64) : null } : { kind: "manual" };
 				// A store whose export throws (an object reset) is recorded as failed like any other, so last_export_failed keeps it.
 				const caught = <T>(p: Promise<Outcome<T>>): Promise<Outcome<T>> => p.catch((e: unknown) => fail("unavailable", `export failed: ${(e as Error)?.message ?? String(e)}`));
+				// The owner's manual keep-all export only; a scheduled run always retains two.
+				const preserve: { preserve_existing?: true } = cmd.preserve_existing === true && !cmd.trigger ? { preserve_existing: true } : {};
 				for (const p of rows) {
 					const ref = { userId, profile: p.name, generation: p.generation };
 					// Rechecked before each store: an export started before a wipe finishes earlier than the wipe's own replacement.
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
-					const r = await caught(this.profileAt(ref).exportNow(ref));
+					const r = await caught(this.profileAt(ref).exportNow(ref, preserve));
 					results[p.name] = r.ok ? r.value : r.error.code === "not_found" ? "empty" : { error: r.error };
 					mark(p.name, p.generation, r);
 				}
 				if (!cmd.profile) {
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
-					const a = await caught(this.exportAccount(userId));
+					const a = await caught(this.exportAccount(userId, preserve.preserve_existing));
 					results.account = a.ok ? a.value : { error: a.error };
 					mark("account", null, a);
 				}
@@ -982,7 +984,7 @@ export class AccountStore extends DurableObject<Env> {
 					if (this.wiping()) return fail("busy", "a profile wipe started; it replaces the exports itself");
 					const ref = { userId, profile: p.name, generation: p.generation };
 					// Starts or reports the corpus's background export; it lists as complete once its manifest lands.
-					const c = await caught(this.corpusAt(ref).exportNow(ref));
+					const c = await caught(this.corpusAt(ref).exportNow(ref, preserve));
 					results[`corpus-${p.name}`] = c.ok ? c.value : c.error.code === "not_found" ? "empty" : { error: c.error };
 					mark(`corpus-${p.name}`, p.generation, c, { due });
 				}

@@ -206,9 +206,10 @@ export class CorpusStore extends DurableObject<Env> {
 	/**
 	 * Internal RPC from AccountStore: starts this generation's weekly encrypted export (section 18), or reports the running one.
 	 * The export runs in bounded alarm steps while writes flow (backup.ts exportStep, journal deltas and a bounded cut); its manifest
-	 * lands last, so it lists as complete only when done. `last` is the previous export's outcome.
+	 * lands last, so it lists as complete only when done. `last` is the previous export's outcome. `preserve_existing`: the owner's
+	 * manual export skips retention for this job only (backup.ts StoreSpec.preserve); a default job already running refuses it.
 	 */
-	async exportNow(who: ProfileRef): Promise<Outcome<{ id: string; state: "running"; chunks: number; rows: number; last?: Record<string, unknown> }>> {
+	async exportNow(who: ProfileRef, opts: { preserve_existing?: boolean } = {}): Promise<Outcome<{ id: string; state: "running"; chunks: number; rows: number; last?: Record<string, unknown> }>> {
 		const sql = this.ctx.storage.sql;
 		if (closedState(sql)) return fail("profile_wiped", "this corpus generation is closed");
 		const bound = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM ${META} WHERE key IN ('user_id','profile','generation')`).toArray();
@@ -217,10 +218,11 @@ export class CorpusStore extends DurableObject<Env> {
 		if (bound.some((r) => r.value !== want[r.key])) return fail("validation", "corpus object identity mismatch");
 		const last = lastExport(sql, META), running = exportJob(sql, META);
 		const view = (j: NonNullable<typeof running>) => ok({ id: j.id, state: "running" as const, chunks: j.n, rows: Object.values(j.counts).reduce((a, b) => a + b, 0), ...(last ? { last } : {}) });
+		if (running && opts.preserve_existing && !running.preserve) return fail("busy", "a default export is running and will apply retention; retry after it finishes", { reason: "export_running" });
 		if (running) return view(running);
 		if (refreshActive(sql)) return fail("busy", "the corpus is refreshing; export after it publishes", { reason: "corpus_refreshing" });
 		if (restoring(sql)) return fail("busy", "this corpus generation is being restored");
-		const job = beginExport(this.ctx.storage, this.spec());
+		const job = beginExport(this.ctx.storage, { ...this.spec(), ...(opts.preserve_existing === true ? { preserve: true } : {}) });
 		await this.ctx.storage.setAlarm(Date.now());
 		return view(job);
 	}

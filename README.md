@@ -13,6 +13,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [x] Verify authenticated read, write, journal and capture flows in the actual Claude, Codex and T3 clients and machines at the recorded scope.
 - [x] Verify automatic preference learning from captured evidence, including owner controls, and enable the intended capture-to-learning path.
 - [x] Switch the agreed everyday callers and competing native-memory writes using retained rollback snapshots.
+- [ ] Release the keep-all manual export, then use it before the v2 fixture upgrade and the canonical migration.
 
 Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
 
