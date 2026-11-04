@@ -1,6 +1,6 @@
-// The one glossary every ? reads: am.help(parent, key) shows entry `key`, and the header's ? lists them all. It covers the pages
-// that exist today; a tab's ticket adds its own terms here when the tab ships. Browser code, serialized into /app.js: it may use
-// only `am`.
+// The one glossary every ? reads: am.help(parent, key) shows entry `key`, and the header's ? lists them all. Tab authors ask the
+// shell's owner for their terms; each entry uses the wording and meaning the tab gave. Browser code, serialized into /app.js: it
+// may use only `am`.
 import type { Am } from "./am";
 
 export function glossary(am: Am): void {
@@ -8,7 +8,7 @@ export function glossary(am: Am): void {
 		// Pages.
 		graph: { term: "Graph", text: "Records and the links between them, drawn for one profile. Each link keeps the reason and evidence it was made with." },
 		memories: { term: "Memories", text: "Records your agents saved: decisions, references, rules and project facts. Each edit keeps the older version." },
-		activity: { term: "Activity", text: "Every change in a profile, newest first, with who made it, and the archive of removed records. Most changes can be undone here." },
+		activity: { term: "Audit", text: "Every change your agents, imports, the batch and you made, newest first, with who made it, and the archive of removed records. Undo reverses most changes." },
 		profiles: { term: "Profiles", text: "One card per profile with its status, devices and daily batch. Each profile keeps its records apart from the others." },
 		paths: { term: "Paths", text: "Pick two records and see how they connect, with the reason on each step. It shows at most 3 paths of up to 4 hops." },
 		map: { term: "Map", text: "Records around a center and their links, up to 300 records. What-if items try links on screen without saving them." },
@@ -21,9 +21,60 @@ export function glossary(am: Am): void {
 		wipe: { term: "Wipe", text: "Permanently removes a profile's records, copies and exports after you type its name. It cannot be undone." },
 		work: { term: "Work", text: "One profile's work board: ranked items with their score reasons and the date the data is from." },
 		about: { term: "About you", text: "Preferences and rules about you, stated or inferred with evidence. Pin, forget or undo them here." },
-		backups: { term: "Backups", text: "Exports of each profile, the restore drill, and recovery after a restore." },
+		backups: { term: "Backups and recovery", text: "Exports of each profile, the restore drill, and recovery after a restore." },
+
+		// Tabs.
+		overview: { term: "Overview", text: "Counts across every profile, health at a glance, recent sessions and the live feed of changes. A link with ?profile= narrows the lists and health to that profile; the totals stay for every profile and say so." },
+		health: { term: "Health", text: "Checks on capture, search, consolidation and backups, each OK, WARN or FAIL." },
+		sessions: { term: "Sessions", text: "Agent sessions as their uploaded digests describe them: asks, decisions, corrections and outcomes. Full transcripts stay on the machine that ran them." },
+		lessons: { term: "Lessons", text: "Preferences and rules your agents follow: ones you stated, and ones an agent inferred with evidence." },
+		crystals: { term: "Crystals", text: "Summaries of finished work: journals an agent compacted into a summary, and completed sessions whose digests were consolidated." },
+		actions: { term: "Actions", text: "PRs and Jira tickets your machines uploaded, ranked by the work board's score. Their status mirrors GitHub and Jira as last uploaded." },
+		session: { term: "Session", text: "One agent session on one device, as its uploaded digests describe it. The full transcript stays on that device." },
+		replay: { term: "Replay", text: "Plays one session's events in order. Hosted sessions hold digest excerpts only; the full transcript, including which tools ran, plays on the device that recorded it." },
+		activity_tab: { term: "Activity", text: "When your agents worked over the last 12 months, the kinds of work, and the latest observations." },
+		project_profile: { term: "Project profile", text: "One project's top concepts and files, conventions, recurring errors and recent decisions, computed when you open it." },
+
+		// The header, once the server reports them.
+		version: { term: "Version", text: "The Worker version serving this page, and when it was deployed." },
+		live: { term: "Live", text: "Live while the update stream is connected. Paused shows the time of the last full numbers while it reconnects." },
+		features: { term: "Features", text: "Embeddings, corpus, capture, prompt injection and the scheduled batch, as the server reports them: on, off or inactive, the tabs each affects, and how to turn it on." },
+		embeddings: { term: "Embeddings", text: "Vectors made from each record's text so recall can search by meaning as well as by words." },
+		corpus: { term: "Corpus", text: "Uploaded code history (commits, pull requests and tickets) that agents search with the corpus tool. File paths in Activity and project profiles come from corpus commits. Paid plan only." },
+		capture: { term: "Capture", text: "Each device's hooks upload session digests. A device that stops reporting shows as stale." },
+		inject: { term: "Prompt injection", text: "An opt-in hook that recalls related memories when you send a prompt and adds them to the agent's context." },
+		scheduled_batch: { term: "Scheduled batch", text: "The daily consolidation run: it reads new captures, merges near-duplicates and links related records, leasing at most 40 items for 900 seconds at a time." },
 
 		// Terms on those pages.
+		profile_choice: { term: "Profile", text: "Which profile a tab reads. All profiles reads every active profile and labels each row with its profile; a link with ?profile=NAME reads only that one. Totals from the server always cover all profiles." },
+		recall_tokens: { term: "Recall tokens today", text: "Tokens of memory text that recalls returned today, in UTC. A recall that reads two profiles counts in each." },
+		recalls_today: { term: "Recalls today", text: "Recall requests that returned hits today, in UTC, counted once per profile they read." },
+		writes_today: { term: "Writes today", text: "Changes recorded in the activity log today, in UTC." },
+		verdict: { term: "Verdict", text: "OK when every check passed, WARN when one needs attention, FAIL when one is broken." },
+		search_index: { term: "Search index", text: "Records searchable by words, and how many also have a vector for search by meaning." },
+		vectors: { term: "Vectors", text: "Records whose embedding matches their current text, so search by meaning can find them." },
+		semantic_deadline: { term: "Semantic deadline", text: "Search by meaning gets 3 seconds. After that the recall returns word matches only and says so." },
+		storage: { term: "Storage", text: "Space the profile stores use. Each profile store may hold up to 10 GiB, so the limit shown is the sum for the stores counted." },
+		layers: { term: "Memory layers", text: "The stages captured work passes through: digests, consolidated parts, memories, preferences and the shared me profile." },
+		feed: { term: "Live feed", text: "Changes as they happen. MEMORY is a saved record, IMPORT an upload, FORGET a removal, PREFERENCE a lesson change, BATCH a consolidation run." },
+		first_upload: { term: "First upload", text: "When the first digest for this session reached the server. The session itself may have started earlier." },
+		pending_ranges: { term: "Pending ranges", text: "Captured ranges a device has not finished uploading. WARN when a range is stuck or has waited more than 7 days." },
+		consolidation: { term: "Consolidation", text: "The scheduled batch reads new captures, merges near-duplicates and links related records. It leases at most 40 items for 900 seconds at a time." },
+		lease: { term: "Lease", text: "Items the batch holds while it works. A lease expires after 900 seconds, and the items return to the queue." },
+		similarity: { term: "Similarity thresholds", text: "Cosine 0.92 or higher between records of the same kind marks a likely duplicate. Matches below 0.80 are ignored." },
+		stale: { term: "Stale", text: "Journals untouched for 7 days and memories unused for 90 days are offered for review. They are review items, never automatic deletions." },
+		eval: { term: "Recall quality", text: "Scores from agent-memory eval: the share of expected records a recall returns in its top results." },
+		eval_candidates: { term: "Eval candidates", text: "Queries the batch suggests as new test cases. Accept one to add it to the eval set." },
+		doctor: { term: "agent-memory doctor", text: "Run on a device to check its tokens, hooks, launchd job and upload spool. It reads local details that never reach the server." },
+		strength: { term: "Strength", text: "How often recalls returned this record in the last 90 days, capped at 10. A record never recalled shows 0/10." },
+		observation: { term: "Observation", text: "One digest item from a session: an ask, a decision, a correction or an outcome." },
+		observations: { term: "Observations", text: "Digest items from sessions: asks, decisions, corrections and outcomes." },
+		files_changed: { term: "Files changed", text: "Distinct files the session edited, counted on the device; the paths never leave it. Older runners do not report it." },
+		consolidated_part: { term: "Consolidated part", text: "A piece of a session's digest that the batch consolidated. A range counts as consolidated once its parts cover it with no gap." },
+		upload_span: { term: "Span of uploads", text: "Time between the first and last digest upload. It is not the session's own duration." },
+		coverage: { term: "Coverage", text: "The days a read actually reached. A read stops at its limit; days it did not reach show as not read, never as zero." },
+		budget: { term: "Read limit", text: "Project profiles are computed on request within a read limit. When it runs out, concepts and recurring errors may miss entries; sessions and last activity stay complete." },
+		origin: { term: "Origin", text: "Where a rule or preference came from: STATED from you, AGENT from an agent's save, INFERRED from evidence in sessions." },
 		revisions: { term: "Older versions", text: "Earlier versions of a memory, kept when it is edited." },
 		relations: { term: "Relations", text: "Links between records in the graph." },
 		daily_batch: { term: "Daily batch", text: "The scheduled consolidation run for a profile: the date of its last lease, and its last skip or park with the reason." },

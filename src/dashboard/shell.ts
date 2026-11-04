@@ -2,7 +2,7 @@
 // router. Browser code, serialized into /app.js as the first part: it may use only its parameter and browser globals (type
 // imports are erased). Sign-in follows settingsMain (ClerkJS 6 needs ClerkUI passed to load()). Every value from the API or
 // the URL reaches the page through textContent. It shows only real pages and no live data: no counts, versions or feature states.
-import type { Am, Batch, Device, Failure, J, LegacyPage, Node, Profile, Route, TabDef } from "./am";
+import type { Am, Batch, Device, Failure, J, LegacyPage, Node, Profile, ProfileResult, Route, TabDef } from "./am";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- browser globals; this Worker project has no DOM types
 export function shell(win: any): void {
@@ -210,7 +210,11 @@ export function shell(win: any): void {
 	const pages: Record<string, LegacyPage> = {};
 
 	// ---- Header, glossary panel, footer ----
-	const ui: { glossary?: J; theme?: J; menu?: J } = {};
+	const ui: { glossary?: J; theme?: J; menu?: J; features?: J; live?: J; sync?: J; profile?: J } = {};
+	// The live state as am.api reports it; "off" until the data client says anything. Nothing here is drawn from guesses.
+	let stream: { state: "off" | "live" | "paused"; since: string | null; asOf: string | null } = { state: "off", since: null, asOf: null };
+	const pad = (n: number) => String(n).padStart(2, "0");
+	const hhmm = (iso: string | null | undefined) => { const d = new Date(iso ?? ""); return Number.isNaN(d.getTime()) ? null : `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 	const theme = (): string => doc.documentElement?.getAttribute?.("data-theme") ?? (win.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light");
 	const paintTheme = () => {
 		if (!ui.theme) return;
@@ -220,27 +224,55 @@ export function shell(win: any): void {
 	};
 	const stored = saved("am.theme");
 	if (stored === "light" || stored === "dark") doc.documentElement?.setAttribute?.("data-theme", stored);
-	let returnTo: J; // the control that opened the glossary
+	let returnTo: J; // the control that opened the open panel
 	const shut = (d: J) => {
 		if (typeof d.close === "function") d.close(); // fires "close", which returns focus
 		else { d.hidden = true; returnTo?.focus?.(); }
 	};
 	const isOpen = (d: J) => typeof d.showModal === "function" ? d.open === true : d.hidden === false;
-	const openGlossary = () => {
-		const d = $("gloss");
+	/** Empties the dialog `id` and gives it a heading and a Close button. */
+	const panel = (id: string, title: string, term?: string) => {
+		const d = $(id);
 		d.replaceChildren();
 		const head = el("div", d);
 		cls(head, "dhead");
-		el("h2", head, "Glossary").setAttribute("id", "gloss-title");
+		const h = el("h2", head, title);
+		h.setAttribute("id", `${id}-title`);
+		if (term) help(h, term);
 		control(head, "Close", () => shut(d));
+		return d;
+	};
+	const show = (d: J, opener: J) => {
+		returnTo = opener;
+		if (typeof d.showModal === "function") { if (!d.open) d.showModal(); } else { d.hidden = false; d.querySelector?.("button")?.focus(); }
+	};
+	const FEATURES: Record<string, string> = { embeddings: "Embeddings", corpus: "Corpus", capture: "Capture per device", inject: "Prompt injection", scheduled_batch: "Scheduled batch" };
+	/** The server's feature states from the latest snapshot. The button that opens it exists only once a snapshot has loaded. */
+	const openFeatures = () => {
+		const d = panel("features", "Features", "features"), s = am.snapshot;
+		if (s && !s.flags.length) note(d, "The server reported no features.");
+		for (const f of s?.flags ?? []) {
+			const row = el("div", d);
+			cls(row, "flag");
+			const h = el("h3", row);
+			cls(el("span", h, f.state), `chip ${f.state === "on" ? "c-ok" : f.state === "off" ? "c-fail" : "c-warn"}`);
+			el("span", h, FEATURES[f.id] ?? f.id);
+			help(h, f.id);
+			el("p", row, `Affects: ${f.tabs.map((id) => tabs.find((t) => t.id === id)?.label ?? id).join(", ") || "no tab"}.`);
+			if (f.state !== "on") el("p", row, `To turn it on: ${f.how}`);
+		}
+		show(d, ui.features);
+	};
+	const openGlossary = () => {
+		const d = panel("gloss", "Glossary");
 		const dl = el("dl", d);
 		for (const [k, g] of Object.entries(am.glossary).sort((a, b) => a[1].term.localeCompare(b[1].term))) { el("dt", dl, g.term).setAttribute("id", `g-${k}`); el("dd", dl, g.text); }
 		el("h3", d, "Keys");
 		const keys = el("dl", d);
 		for (const [k, t] of [["/", "Focus this page's search box."], ["g, then a letter", `Open a page: ${entries().filter((x) => x.key).map((x) => `${x.key} ${x.label}`).join(", ")}.`],
-			["?", "Open this glossary."], ["Esc", "Close a tip, panel or menu."], ["Up, Down, Home, End", "Move through a list."]]) { el("dt", keys, k); el("dd", keys, t); }
-		returnTo = ui.glossary;
-		if (typeof d.showModal === "function") { if (!d.open) d.showModal(); } else { d.hidden = false; d.querySelector?.("button")?.focus(); }
+			["?", "Open this glossary."], ["Esc", "Close a tip, panel or menu."], ["Up, Down, Home, End", "Move through a list."],
+			...(tabs.some((x) => x.id === "replay") ? [["Space, Left, Right", "In Replay: play or pause, and step back or forward."]] : [])]) { el("dt", keys, k); el("dd", keys, t); }
+		show(d, ui.glossary);
 	};
 	const menuOpen = () => $("nav").getAttribute?.("class") === "open";
 	const setMenu = (open: boolean) => { cls($("nav"), open ? "open" : ""); ui.menu?.setAttribute("aria-expanded", String(open)); };
@@ -252,6 +284,22 @@ export function shell(win: any): void {
 		ui.menu.setAttribute("aria-controls", "nav");
 		ui.menu.setAttribute("aria-expanded", "false");
 		cls(el("span", tools, new Date().toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" })), "date");
+		ui.profile = el("select", tools);
+		ui.profile.setAttribute("id", "profile-choice");
+		ui.profile.setAttribute("aria-label", "Profile");
+		ui.profile.hidden = true;
+		ui.profile.addEventListener("change", () => {
+			if (!picked) return;
+			const to = withProfile(picked.hash, ui.profile.value || null);
+			// replaceState and one render keep focus on the select; without it the hash change renders once instead.
+			if (typeof win.history?.replaceState === "function") { win.history.replaceState(null, "", to); render(false); } else win.location.hash = to;
+		});
+		ui.features = control(tools, "", openFeatures);
+		ui.features.setAttribute("aria-haspopup", "dialog");
+		ui.features.hidden = true;
+		ui.live = el("span", tools);
+		ui.live.setAttribute("title", am.glossary.live?.text ?? "");
+		ui.live.hidden = true;
 		ui.glossary = control(tools, "?", openGlossary, "Glossary");
 		ui.glossary.setAttribute("aria-haspopup", "dialog");
 		ui.glossary.setAttribute("aria-keyshortcuts", "?");
@@ -265,23 +313,59 @@ export function shell(win: any): void {
 		});
 		paintTheme();
 		win.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener?.("change", paintTheme);
-		$("gloss").addEventListener("close", () => returnTo?.focus?.());
+		for (const id of ["gloss", "features"]) $(id).addEventListener("close", () => returnTo?.focus?.());
+		ui.sync = el("span", $("foot"));
 		el("span", $("foot"), "Keys: / search · g then a letter opens a page · ? glossary · Esc closes");
+	};
+	/**
+	 * Draws what am.api has reported: the version and feature states from the latest snapshot, the Live or Paused chip and
+	 * banner from the stream, sync times in the footer, and counts for registered tabs. Before a report each piece stays hidden.
+	 * Never moves focus.
+	 */
+	const chrome = () => {
+		const s = am.snapshot;
+		const ver = $("ver");
+		ver.textContent = s ? (s.version.length > 12 ? s.version.slice(0, 8) : s.version) : "";
+		if (s) ver.setAttribute("title", `Version ${s.version}, deployed ${s.deployed_at}`);
+		if (ui.features) {
+			const on = s ? s.flags.filter((f) => f.state === "on").length : 0;
+			ui.features.hidden = !s;
+			ui.features.textContent = !s ? "" : s.flags.length && on === s.flags.length ? "All features on" : `${on} of ${s.flags.length} features on`;
+		}
+		if (ui.live) {
+			ui.live.hidden = stream.state === "off";
+			ui.live.textContent = stream.state === "live" ? "Live" : stream.state === "paused" ? "Paused" : "";
+			cls(ui.live, `chip ${stream.state === "live" ? "c-ok" : "c-warn"}`);
+		}
+		const pause = $("pause"), asOf = hhmm(stream.asOf);
+		pause.hidden = stream.state !== "paused";
+		pause.textContent = stream.state !== "paused" ? "" : asOf ? `Live updates paused. Numbers as of ${asOf}.` : "Live updates paused. No numbers have loaded yet.";
+		const since = stream.state === "live" ? hhmm(stream.since) : null;
+		if (ui.sync) ui.sync.textContent = s ? `Agent Memory ${s.version} · full sync ${hhmm(s.at) ?? "at an unknown time"}${since ? `, live since ${since}` : ""}` : "";
+		for (const [id, span] of counts) {
+			const n = s ? tabs.find((t) => t.id === id)?.count?.(s) : null;
+			span.replaceChildren();
+			if (typeof n === "number" && Number.isFinite(n)) { el("span", span, n.toLocaleString()); cls(el("span", span, " across all profiles"), "vh"); }
+		}
 	};
 
 	// ---- Navigation: today's pages, grouped, then any registered tab in its group; Admin holds the other pages ----
-	type Entry = { id: string; group: string | null; label: string; key: string; href: string };
+	type Entry = { id: string; group: string | null; label: string; key: string; href: string; count?: TabDef["count"] };
 	// The real pages each group has today. A registered tab with the same id takes its entry's place.
-	const PAGES: Entry[] = [{ id: "graph", group: "memory", label: "Graph", key: "g", href: "#/" }, { id: "memories", group: "memory", label: "Memories", key: "m", href: "#/memories" },
-		{ id: "audit", group: "system", label: "Activity", key: "u", href: "#/activity" }];
-	const ADMIN: [string, string][] = [["Write", "#/draft"], ["Timeline", "#/timeline"], ["Journals", "#/journals"], ["Paths", "#/path"], ["Work", "#/work"], ["About you", "#/about"],
-		["Review", "#/review"], ["Backups", "#/backups"], ["Profiles", "#/profiles"], ["Routing", "#/routing"], ["Moves", "#/move"], ["Wipe", "#/wipe"], ["Settings", "/settings"]];
+	const PAGES: Entry[] = [{ id: "graph", group: "memory", label: "Graph", key: "g", href: "#/graph" }, { id: "memories", group: "memory", label: "Memories", key: "m", href: "#/memories" },
+		{ id: "audit", group: "system", label: "Audit", key: "u", href: "#/activity" }];
+	// The other pages, in the plan's order.
+	const ADMIN: [string, string][] = [["Write", "#/draft"], ["Paths", "#/path"], ["Map", "#/map"], ["Timeline", "#/timeline"], ["Journals", "#/journals"], ["Review", "#/review"],
+		["Backups and recovery", "#/backups"], ["Routing", "#/routing"], ["Profiles", "#/profiles"], ["Moves", "#/move"], ["Wipe", "#/wipe"], ["Work", "#/work"], ["About you", "#/about"],
+		["Settings", "/settings"]];
 	const GROUPS: [string, string][] = [["memory", "Memory"], ["work", "Work"], ["insight", "Insight"], ["system", "System"]];
 	const entries = (): Entry[] => [...PAGES.filter((p) => !tabs.some((t) => t.id === p.id)), ...tabs.map((t) => ({ ...t, href: `#${t.id}` }))];
-	/** The grouped nav; `current` is the href to mark. Groups with no entry are left out. */
+	/** The grouped nav; `current` is the entry id or the Admin href to mark. Groups with no entry are left out. */
+	const counts = new Map<string, Node>(); // tab id -> its count span; only registered tabs with a count have one
 	const nav = (current?: string) => {
 		const root = $("nav");
 		root.replaceChildren();
+		counts.clear();
 		const all = entries();
 		const group = (label: string | null, list: Entry[]) => {
 			if (!list.length) return;
@@ -292,7 +376,8 @@ export function shell(win: any): void {
 				const a = el("a", g, e.label);
 				a.setAttribute("href", e.href);
 				a.setAttribute("aria-keyshortcuts", `g ${e.key}`);
-				if (e.href === current) a.setAttribute("aria-current", "page");
+				if (e.id === current) a.setAttribute("aria-current", "page");
+				if (e.count) { const c = el("span", a); cls(c, "count"); c.setAttribute("title", "Across all profiles"); counts.set(e.id, c); }
 			}
 		};
 		group(null, all.filter((e) => e.group === null));
@@ -309,14 +394,14 @@ export function shell(win: any): void {
 			a.setAttribute("href", href);
 			if (href === current) a.setAttribute("aria-current", "page");
 		}
+		chrome();
 	};
 
 	// ---- Keys (see am.ts) ----
 	const visible = (e: J) => !!e && !e.disabled && !e.hidden && (typeof e.getClientRects !== "function" || e.getClientRects().length > 0);
 	const closeAll = () => {
 		let closed = closeTips();
-		const d = $("gloss");
-		if (isOpen(d)) { shut(d); closed = true; }
+		for (const id of ["gloss", "features"]) { const d = $(id); if (isOpen(d)) { shut(d); closed = true; } }
 		if (menuOpen()) { setMenu(false); ui.menu?.focus(); closed = true; }
 		const adm = doc.querySelector?.("#nav details[open]");
 		if (adm) { adm.open = false; adm.querySelector("summary")?.focus(); closed = true; }
@@ -370,9 +455,56 @@ export function shell(win: any): void {
 	};
 	// Deep links in the newer form open today's pages until their tabs register: #memories(/ID), #graph(/ID) and #audit, each
 	// with an optional ?profile=NAME (else work, as on the old routes). A registered tab with the same id takes the link over.
-	const ALIASES: Record<string, [string, string, string]> = { memories: ["memories", "memory", "#/memories"], graph: ["graph", "graph", "#/"], audit: ["activity", "activity", "#/activity"] };
-	// The nav entry an old route belongs to: #/memory/... is Memories, #/graph/... is Graph, #/copy/... is Moves.
-	const OWNER: Record<string, string> = { "": "#/", graph: "#/", memory: "#/memories", copy: "#/move" };
+	const ALIASES: Record<string, [string, string]> = { memories: ["memories", "memory"], graph: ["graph", "graph"], audit: ["activity", "activity"] };
+	// The nav entry an old route belongs to, by entry id (its tab's once registered) or Admin href: #/ and #/graph are Graph,
+	// #/memory is Memories, #/activity is Audit, #/copy is Moves; any other #/name is that Admin page.
+	const OWNER: Record<string, string> = { "": "graph", graph: "graph", memory: "memories", memories: "memories", activity: "audit", copy: "#/move" };
+	// ---- The shared profile choice (TabDef.profiles): the link's ?profile=NAME; no query is All profiles ----
+	/** `hash` with only its profile query replaced (null removes it); the tab, id and every other query key stay as they are. */
+	const withProfile = (hash: string, name: string | null) => {
+		const i = hash.indexOf("?"), path = i < 0 ? hash : hash.slice(0, i);
+		const kept = (i < 0 ? "" : hash.slice(i + 1)).split("&").filter((kv) => kv && dec(kv.split("=")[0]) !== "profile");
+		if (name !== null) kept.push(`profile=${enc(name)}`);
+		return kept.length ? `${path}?${kept.join("&")}` : path;
+	};
+	/** For a tab that opted in: an error and chooser for an unknown ?profile, or a chooser for a "one" tab with none; else nothing. */
+	const profileGate = (view: Node, def: TabDef, route: Route): Node | undefined => {
+		const named = route.query.profile, ok = active();
+		if (named === undefined ? def.profiles === "any" : ok.some((p) => p.name === named)) return undefined;
+		const h = el("h2", view, named === undefined ? `${def.label}: choose a profile` : `${def.label}: no active profile named ${named}`);
+		el("p", view, named === undefined ? `${def.label} shows one profile at a time.` : "Nothing was read. Choose an active profile:");
+		const ul = el("ul", view);
+		for (const q of ok) link(el("li", ul), withProfile(route.hash, q.name), q.name);
+		if (def.profiles === "any") link(el("li", ul), withProfile(route.hash, null), "All profiles");
+		if (!ok.length) el("p", view, "No active profiles available.");
+		return h;
+	};
+	let picked: Route | undefined; // the route the header picker belongs to
+	/** Shows the header picker for an opted-in tab's route, with its current choice; hides it everywhere else. */
+	const picker = (def: TabDef | undefined, route?: Route) => {
+		const sel = ui.profile;
+		if (!sel) return;
+		picked = def?.profiles && route ? route : undefined;
+		sel.hidden = !picked;
+		if (!picked) return;
+		sel.replaceChildren();
+		const names = active().map((p) => p.name), named = picked.query.profile;
+		el("option", sel, "All profiles").setAttribute("value", "");
+		for (const n of names) el("option", sel, n).setAttribute("value", n);
+		if (named !== undefined && !names.includes(named)) el("option", sel, `${named} (not active)`).setAttribute("value", named);
+		sel.value = named ?? "";
+	};
+	const eachProfile = async <T,>(only: string | null, fn: (p: Profile) => Promise<T>): Promise<ProfileResult<T>[]> => {
+		const ok = active(), list = only === null ? ok : ok.filter((p) => p.name === only);
+		if (only !== null && !list.length) {
+			const error: Failure = Object.assign(new Error(`No active profile named ${only}`), { code: "unknown_profile" });
+			return [{ profile: only, ok: false, error }];
+		}
+		return Promise.all(list.map(async (p): Promise<ProfileResult<T>> => {
+			try { return { profile: p.name, ok: true, value: await fn(p) }; } catch (err) { return { profile: p.name, ok: false, error: err as Failure }; }
+		}));
+	};
+
 	const render = (moveFocus: boolean) => {
 		am.pageVersion++;
 		am.pageButtons = [];
@@ -382,7 +514,9 @@ export function shell(win: any): void {
 		am.shown = am.statusEl = undefined;
 		closeTips();
 		setMenu(false);
-		const hash = win.location.hash ?? "";
+		// The site root opens a registered Overview; without one it stays the work graph, as before. Graph's own link is #/graph.
+		const raw = win.location.hash ?? "", root = raw === "" || raw === "#" || raw === "#/";
+		const hash = root && tabs.some((x) => x.id === "overview") ? "#overview" : raw;
 		let h: Node | void;
 		// A tab's deep link: #<tab>/<id>/<more>?<query>. Old #/ routes keep their pages below.
 		const t = /^#([a-z]+)(?:\/([^?]*))?(?:\?(.*))?$/.exec(hash), def = t ? tabs.find((x) => x.id === t[1]) : undefined, alias = t ? ALIASES[t[1]!] : undefined;
@@ -391,16 +525,19 @@ export function shell(win: any): void {
 			for (const kv of (t[3] ?? "").split("&").filter(Boolean)) { const [k, v = ""] = kv.split("="); query[dec(k)!] = dec(v)!; }
 			if (def) {
 				const route: Route = { tab: def.id, rest, query, hash, ...(rest[0] !== undefined ? { id: rest[0] } : {}) };
-				h = def.render(view, route);
-				nav(`#${def.id}`);
+				h = (def.profiles ? profileGate(view, def, route) : undefined) ?? def.render(view, route);
+				nav(def.id);
+				picker(def, route);
 			} else {
 				h = legacy(view, rest[0] === undefined ? alias![0] : alias![1], query.profile, rest[0]);
-				nav(alias![2]);
+				nav(t[1]);
+				picker(undefined);
 			}
 		} else {
 			h = oldRoute(view, hash);
 			const seg = /^#\/([a-z]*)/.exec(hash)?.[1] ?? "";
 			nav(OWNER[seg] ?? `#/${seg}`);
+			picker(undefined);
 		}
 		if (moveFocus && h) { h.setAttribute("tabindex", "-1"); h.focus(); }
 	};
@@ -475,17 +612,24 @@ export function shell(win: any): void {
 		$("view").hidden = false;
 		render(false);
 		win.addEventListener("hashchange", () => render(true));
+		am.api.subscribe((e) => {
+			if (e.type === "live") stream = { state: "live", since: e.since, asOf: null };
+			else if (e.type === "paused") stream = { state: "paused", since: null, asOf: e.as_of || null };
+			else if (e.type !== "snapshot") return;
+			chrome();
+		});
+		am.api.start();
 	};
 
 	const am: Am = {
-		win, doc, $, status, call,
-		profiles: [], devices: [], batches: new Map(),
+		win, doc, $, status, call, token,
+		profiles: [], devices: [], batches: new Map(), snapshot: null,
 		el, link, facts, day, state, users, active, recorded, enc, why, live, btn, input, choose, switcher, act, undoOf, pageStatus, textBlock, note, outcomes,
 		glossary: {}, help, intro, copy, curl, mcpCall, mcpCurl, empty, loading,
-		tabs, tab, pages, legacy, render, boot,
+		eachProfile, tabs, tab, pages, legacy, render, boot,
 		pageVersion: 0, pageButtons: [], pageMsg: undefined, shown: undefined, statusEl: undefined,
 		// Set by the part that owns each.
-		drafts: null!, whatIf: null!, whatIfEdits: null!, draftFromWhatIf: null!, graphs: null!, graphOf: null!, pump: null!,
+		api: null!, drafts: null!, whatIf: null!, whatIfEdits: null!, draftFromWhatIf: null!, graphs: null!, graphOf: null!, pump: null!,
 		moves: null!, sendMove: null!, moveView: null!, copyBack: null!, COPY_MAX: 0,
 	};
 	win.__am = am;

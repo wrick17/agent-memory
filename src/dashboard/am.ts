@@ -6,7 +6,7 @@
 //
 // Keys the shell handles for every page, through markup alone:
 // - "/" focuses the first [data-search] element in the view, else its first input[type=search].
-// - g then a letter opens a nav entry: g Graph, m Memories, u Activity, or a registered tab's key.
+// - g then a letter opens a nav entry: g Graph, m Memories, u Audit, or a registered tab's key.
 // - Up, Down, Home and End move focus between the visible [data-item] entries of the [data-list] that holds the focus.
 //   Each [data-item] must be focusable (a button, a link, or tabindex).
 // - Space, Left and Right click the visible button marked data-key="Space", "ArrowLeft" or "ArrowRight". Space on a
@@ -14,6 +14,8 @@
 // - Esc closes a glossary tip, the glossary panel, the narrow menu or the Admin list; with none open, it clicks the visible
 //   [data-close] button in the view (a detail panel).
 // The shell ignores keys typed into inputs, selects and text areas, except Esc.
+
+import type { FeedItem, HealthCheck, Snapshot } from "../viewer/types";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- JSON from the owner API and browser globals; this Worker project has no DOM types
 export type J = any;
@@ -41,8 +43,35 @@ export type TabDef = {
 	group: TabGroup | null; // null: before the groups (Overview)
 	label: string;
 	key: string; // g then this letter jumps here
+	count?: (s: Pick<Snapshot, "counts">) => number | null; // the nav count, read only from a loaded snapshot; null shows none
 	/** Builds the tab inside `root` (already empty). Return the heading to focus after navigation. */
 	render: (root: Node, route: Route) => Node | void;
+	/**
+	 * Opt in to the shared profile choice: the link's ?profile=NAME, and no query means All profiles. "any": All or one profile.
+	 * "one": needs one profile; with no ?profile the shell shows a chooser instead of render(). For both, an unknown or inactive
+	 * ?profile gets the shell's error and chooser, so render() never sees it. The header's profile picker shows only on these tabs.
+	 */
+	profiles?: "any" | "one";
+};
+
+/** One profile's outcome from am.eachProfile: every profile is reported, and a failure is never dropped or counted as zero. */
+export type ProfileResult<T> = { profile: string; ok: true; value: T } | { profile: string; ok: false; error: Failure };
+
+// ---- Live data (data.ts) ----
+
+/** What am.api.subscribe delivers: the stream's events (ViewerEvent, parsed) and the client's own connection state. */
+export type LiveEvent =
+	| { type: "change"; item: FeedItem } // event: change
+	| { type: "health"; checks: HealthCheck[] } // event: health
+	| { type: "snapshot"; snapshot: Snapshot } // a fresh snapshot: the first load, each reconnect and each snapshot() call
+	| { type: "paused"; as_of: string } // "Live updates paused. Numbers as of HH:MM."; as_of is "" before any snapshot loaded
+	| { type: "live"; since: string };
+
+/** The data client (src/dashboard/data.ts). */
+export type DataClient = {
+	start(): void; // called once by boot() after sign-in: the snapshot load, then the stream
+	snapshot(): Promise<Snapshot>; // GET /api/viewer/snapshot; also sets am.snapshot and emits { type: "snapshot" }
+	subscribe(fn: (e: LiveEvent) => void): () => void; // returns unsubscribe
 };
 
 // ---- Today's pages, under their old #/ routes ----
@@ -69,11 +98,15 @@ export type Am = {
 	status: (t: string) => void; // the top status line
 	/** Owner API call with the Clerk session token; throws a Failure on a non-2xx answer. */
 	call: (path: string, method?: string, data?: unknown) => Promise<J>;
+	/** A fresh Clerk session token, for the event stream's Authorization header. Never shown or copied. */
+	token: () => Promise<string>;
 
 	// Loaded by boot() before the first render.
 	profiles: Profile[];
 	devices: Device[];
 	batches: Map<string, Batch | Error>;
+	snapshot: Snapshot | null; // null until data.ts loads the first one; never a placeholder
+	api: DataClient; // data.ts sets it
 
 	// Text-only building blocks.
 	el: (tag: string, parent?: Node, text?: string) => Node;
@@ -110,6 +143,13 @@ export type Am = {
 	mcpCurl: (tool: string, args: Record<string, unknown>) => string; // the same tools/call over HTTP to /mcp, with $AGENT_MEMORY_TOKEN
 	empty: (root: Node, text: string, command?: string) => void; // what fills this page and the command that does it
 	loading: (root: Node, rows?: number) => Node; // skeleton rows; replaceChildren() on it when data arrives
+
+	/**
+	 * Runs fn for the chosen profile (`only`, from route.query.profile) or, when only is null, for every active profile in
+	 * am.profiles order, in parallel. Each profile gets its own result; a throw becomes { ok: false, error }. An `only` that is
+	 * not active returns one { ok: false } result with code "unknown_profile" and calls nothing.
+	 */
+	eachProfile: <T>(only: string | null, fn: (p: Profile) => Promise<T>) => Promise<ProfileResult<T>[]>;
 
 	// Registry and routing.
 	tabs: TabDef[];

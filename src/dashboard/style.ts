@@ -11,7 +11,8 @@
 // - Lists: .list (a scrolling list) of button.row entries, .replay-list of .replay-event entries, .prefs (a ruled list).
 //   The selected entry is [aria-current=true], [aria-selected=true] or .selected, the same in every list and table.
 // - Chips: .chip with a color class. c-amber: decision, file edit, tool call, inferred, stale. c-red: correction, forget,
-//   blocked. c-teal: memory, workflow, outcome, stated, pinned. c-blue: ask, prompt, file read, architecture, info. c-ok, c-warn,
+//   blocked. c-teal: memory, workflow, outcome, preference, stated, pinned, journal. c-blue: ask, prompt, file read,
+//   architecture, info, rule, session, version. Green: open. Muted: closed, none, other, profile, project, agent. c-ok, c-warn,
 //   c-fail. The chip-<kind> and kind-<kind> names the tabs use map onto these. A chip always carries its kind as text, so no
 //   legend relies on color alone.
 // - Meters: <meter> (any, or .bar) and .bar > i with an inline width, next to a "7/10" label. .excerpt, .mono, .muted, .na, .vh.
@@ -54,6 +55,7 @@ select,input{padding:.3rem .45rem}textarea{width:100%;min-height:8rem;padding:.4
 .navlabel{font:10px var(--mono);text-transform:uppercase;letter-spacing:.12em;color:var(--muted);align-self:center;margin-right:.1rem}
 #nav a,#nav summary{display:inline-block;padding:.55rem 0 .45rem;font:12px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--ink);text-decoration:none;border-bottom:2px solid transparent}
 #nav a:hover{border-bottom-color:var(--line)}#nav a[aria-current]{border-bottom-color:var(--accent);font-weight:700}
+#nav .count{color:var(--muted);margin-left:.35rem;font-weight:400}
 #nav details{position:relative}#nav summary{cursor:pointer;list-style:none}#nav summary::-webkit-details-marker{display:none}
 #nav summary::after{content:" \\25BE"}#nav details.current summary{border-bottom-color:var(--accent);font-weight:700}
 #nav details[open] .adminlinks{position:absolute;z-index:5;right:0;min-width:12rem;background:var(--panel);border:1px solid var(--line);padding:.3rem .8rem;display:flex;flex-direction:column}
@@ -62,6 +64,7 @@ select,input{padding:.3rem .45rem}textarea{width:100%;min-height:8rem;padding:.4
 .navgroup{flex-direction:column;align-items:flex-start}.navlabel{margin-top:.5rem}#nav details[open] .adminlinks{position:static;border:0;padding:0 0 0 .8rem}
 .top{padding:.6rem 1rem}.tools{margin-left:0}}
 
+.pause{margin:0;padding:.45rem 1.25rem;border-bottom:1px solid var(--rule);font:12px var(--mono);color:var(--warn);background:var(--panel)}
 main{flex:1;width:100%;max-width:1320px;margin:0 auto;padding:.5rem 1.25rem 2rem}
 #status{font:12px var(--mono);color:var(--muted);margin:.4rem 0}#signin:empty{display:none}
 .intro{border-left:2px solid var(--accent);padding:.15rem 0 .15rem .8rem;margin:.2rem 0 1rem;max-width:72ch}.intro strong{font-family:var(--serif)}
@@ -85,9 +88,9 @@ main{flex:1;width:100%;max-width:1320px;margin:0 auto;padding:.5rem 1.25rem 2rem
 .chip{display:inline-block;font:10px/1.6 var(--mono);text-transform:uppercase;letter-spacing:.08em;border:1px solid currentColor;padding:0 .4rem;margin:0 .3rem .2rem 0;color:var(--muted);white-space:nowrap}
 .c-amber,.c-warn,.chip-warn,.chip-decision,.chip-feedback,.chip-inferred,.chip-stale,.kind-decision,.kind-tool_call{color:var(--warn)}
 .c-red,.c-fail,.chip-fail,.chip-blocked,.chip-correction,.chip-forget,.kind-correction{color:var(--accent)}
-.c-teal,.chip-memory,.chip-procedural,.chip-stated,.chip-pinned,.chip-journal,.kind-outcome,.kind-tool_result{color:var(--teal)}
-.c-blue,.chip-info,.chip-reference,.chip-user,.chip-version,.chip-session,.kind-ask,.kind-prompt{color:var(--info)}
-.c-ok,.chip-ok,.chip-open{color:var(--ok)}
+.c-teal,.chip-memory,.chip-procedural,.chip-preference,.chip-stated,.chip-pinned,.chip-journal,.kind-outcome,.kind-tool_result{color:var(--teal)}
+.c-blue,.chip-info,.chip-reference,.chip-user,.chip-version,.chip-session,.chip-rule,.kind-ask,.kind-prompt{color:var(--info)}
+.c-ok,.chip-ok,.chip-open{color:var(--ok)}.chip-closed,.chip-none,.chip-other,.chip-profile,.chip-project,.chip-agent{color:var(--muted)}
 .bar,meter{display:inline-block;width:5rem;height:6px;background:var(--rule);border:0;vertical-align:middle;margin-right:.4rem;appearance:none;-webkit-appearance:none}
 .bar>i{display:block;height:100%;background:var(--ink)}meter::-webkit-meter-bar{background:var(--rule);border:0;border-radius:0;height:6px}
 meter::-webkit-meter-optimum-value,meter::-webkit-meter-suboptimum-value,meter::-webkit-meter-even-less-good-value{background:var(--ink);border-radius:0}
@@ -111,6 +114,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:.2rem 1rem}dt{color:var(--mut
 @keyframes pulse{50%{opacity:.25}}@media (prefers-reduced-motion:reduce){.skeleton{animation:none}}
 
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);padding:1rem 1.25rem;width:min(40rem,calc(100vw - 2rem));max-height:calc(100vh - 3rem)}
+.flag{border-top:1px solid var(--rule);padding:.6rem 0}.flag h3{margin:0 0 .2rem;font-size:1rem}.flag p{margin:.15rem 0}
 dialog::backdrop{background:rgba(0,0,0,.35)}dialog h2{margin-top:0}.dhead{display:flex;justify-content:space-between;align-items:baseline;gap:1rem}
 
 footer{border-top:1px solid var(--rule);padding:.7rem 1.25rem;display:flex;flex-wrap:wrap;gap:.3rem 1.4rem;font:11px var(--mono);color:var(--muted);letter-spacing:.04em}
