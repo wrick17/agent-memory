@@ -1632,6 +1632,19 @@ describe("dashboard knowledge graph", () => {
 		expect(b.seen.posted).toEqual([]);
 		expect(b.seen.fetched.some((x) => /\/(save|move|review|delete|wipe|forget)/.test(x))).toBe(false);
 	});
+
+	it("fills a deep-linked record's linked projects and memories once the graph has loaded", async () => {
+		const more = [...edges, { id: 5, rel: "relates_to", ...at("r1", "r5") }];
+		const b = browser({ signedIn: true, hash: "#graph/r1?profile=work", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", more, path) : undefined) });
+		await dashboardMain(b.win);
+		await loaded(b);
+		await settle();
+		const panel = text(b.view()).replace(/\s+/g, " ");
+		expect(panel).toContain("Projects: Agent Memory");
+		expect(panel).not.toContain("none linked");
+		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
+		expect(panel).not.toContain("No linked memories");
+	});
 });
 
 describe("dashboard review", () => {
@@ -2089,5 +2102,25 @@ describe("dashboard Memories tab", () => {
 		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
 		expect(hrefs).toEqual(Array.from({ length: 25 }, (_, i) => `#memories/w${i}?profile=work`));
 		expect(text(b.view())).toContain("Showing 25 records");
+	});
+
+	it("drops the selection and an open bulk confirmation when a new search replaces the list", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = () => find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box().checked = true;
+		box().on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined(); // the confirmation names its one target
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the same search again: the rows are rebuilt unchecked
+		for (let i = 0; i < 2; i++) await settle();
+		expect(box().checked).toBe(false);
+		expect(text(b.view())).toContain("0 selected.");
+		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
+		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
 	});
 });
