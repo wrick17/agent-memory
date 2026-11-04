@@ -149,13 +149,14 @@ Source ready, not deployed. Depends on #9's `/v1/recall` and `/v1/eval/*` routes
 - `--write-baseline FILE` writes only when no baseline exists, or when the channels and k match, no metric is lower and one is higher.
 - Golden filter gap, still open: `/v1/recall` takes no `type`, `kinds` or `scope`. Golden cases that set one run unfiltered. The report lists them under `unsupported_filters` and the CLI prints a warning. Golden scores can differ from the earlier filtered top-5 check until a filter contract exists.
 - CI gate: `test/eval-synthetic.test.ts` runs in `npm test`. It seeds the 24 invented records of `test/fixtures/eval/synthetic-cases.json` and runs its 22 cases (2 in golden form with a `type` filter) on all three channels through `POST /v1/recall` with a read-only device token. It fails when lexical recall_all_at_k drops below `synthetic-baseline-lexical.json`.
+- Before scoring, the gate runs the profile alarm until all 24 fixture cards are embedded and asserts it. One alarm embeds at most 16 cards, and the earlier vector baseline (0.6818) was recorded with 6 cards still unembedded (review fix, 2026-11-05).
 - The same run checks that `recall_daily` and `recall_totals` stay empty through all three eval passes. A later counted recall then adds exactly its own rows.
 - Synthetic baselines at k 5, 22 cases, recorded by `npm run eval:baseline` (only rises):
 
 | Channels | recall_all_at_k | any_hit_at_k | MRR |
 |---|---|---|---|
 | lexical | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
-| vector | 15/22 (0.6818) | 16/22 (0.7273) | 0.7273 |
+| vector | 19/22 (0.8636) | 21/22 (0.9545) | 0.8561 |
 | hybrid | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
 
 - These numbers come from invented records and the bag-of-words fake embeddings in `test/fakes.js`. They are not a live provider, semantic-quality or golden-query result. Each baseline file carries that label in `source`.
