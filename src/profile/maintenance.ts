@@ -15,6 +15,7 @@ import { captureText, readPrefix, runWrite, type Who } from "./write";
 import { manifestListed } from "./capture";
 import { reviewBoard } from "./board";
 import { insertCandidate } from "./eval-candidates";
+import { ACTIVITY_DAYS } from "./housekeeping";
 import { readableNodeIds } from "./graph";
 
 export const MAX_ITEMS = 40;
@@ -100,8 +101,11 @@ export function enqueueIn(sql: SqlStorage, tx: () => BudgetTx, items: { kind: st
 	return added;
 }
 
-/** profile_meta key binding the latest maintenance_next request_id to the lease it made: ids, a request hash and a date only. */
-const LEASE_REQUEST = "lease_request";
+/**
+ * profile_meta key prefix binding each maintenance_next request_id to the lease it made: ids, a request hash and a date only. One
+ * key per request, so a later run's lease never erases an earlier run's binding; bindings go after ACTIVITY_DAYS, as request rows do.
+ */
+const LEASE_REQUEST = "lease_request:";
 type LeaseRequest = { request_id: string; hash: string; lease_id: string; lease_until: string };
 
 /**
@@ -118,7 +122,7 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 	const hash = sha256(JSON.stringify([q.kinds?.length ? [...q.kinds].sort() : null, limit, lease]));
 	return storage.transactionSync(() => {
 		const sql = storage.sql, now = Date.now(), iso = new Date(now).toISOString();
-		const bound = q.request_id === undefined ? undefined : leaseRequest(sql);
+		const bound = q.request_id === undefined ? undefined : leaseRequest(sql, q.request_id);
 		if (bound && bound.request_id === q.request_id) {
 			if (bound.hash !== hash) throw Fail.of("idempotency_mismatch", "this request_id already leased with other arguments", { reason: "request_mismatch" });
 			if (Date.parse(bound.lease_until) < now) return { lease_id: null, items: [], next_allowed_at: cooldownUntil(sql, now), reason: "lease_expired" as const };
@@ -136,8 +140,11 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 			leaseId, until, tx.seq, JSON.stringify(items.map((i) => i.id)));
 		tx.run(`INSERT INTO cursors (stage, due_at, last_run_at) VALUES ('maintenance_batch', 0, ?)
 			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at`, iso);
-		if (q.request_id !== undefined) tx.run("INSERT INTO profile_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-			LEASE_REQUEST, JSON.stringify({ request_id: q.request_id, hash, lease_id: leaseId, lease_until: until } satisfies LeaseRequest));
+		if (q.request_id !== undefined) {
+			tx.run("DELETE FROM profile_meta WHERE key LIKE 'lease\\_request:%' ESCAPE '\\' AND json_extract(value, '$.lease_until') < ?", new Date(now - ACTIVITY_DAYS * 86_400_000).toISOString());
+			tx.run("INSERT INTO profile_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+				LEASE_REQUEST + q.request_id, JSON.stringify({ request_id: q.request_id, hash, lease_id: leaseId, lease_until: until } satisfies LeaseRequest));
+		}
 		return { lease_id: leaseId, lease_until: until, items: items.map((i) => leasedItem(sql, i)) };
 	});
 }
@@ -150,9 +157,9 @@ function leasedItem(sql: SqlStorage, i: LeaseRow) {
 		...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, subjects) } : {}) };
 }
 
-/** The stored binding, or undefined when none or unreadable (a damaged value never replays). */
-function leaseRequest(sql: SqlStorage): LeaseRequest | undefined {
-	const raw = sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", LEASE_REQUEST).toArray()[0]?.value;
+/** The request's stored binding, or undefined when none or unreadable (a damaged value never replays). */
+function leaseRequest(sql: SqlStorage, requestId: string): LeaseRequest | undefined {
+	const raw = sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", LEASE_REQUEST + requestId).toArray()[0]?.value;
 	try {
 		const v = raw ? JSON.parse(raw) as Partial<LeaseRequest> : undefined;
 		return v && typeof v.request_id === "string" && typeof v.hash === "string" && typeof v.lease_id === "string" && typeof v.lease_until === "string" ? v as LeaseRequest : undefined;
