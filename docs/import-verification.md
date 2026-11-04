@@ -10,6 +10,14 @@ The #3-only source commit `5097672d772d36014d1ad4129d298bb43ae5117a` was deploye
 
 The Test import audit retained 1,374 published records, 5,699 revisions and 4,173 request receipts. Profile generations, export inventories and fixture deployment controls matched the predeployment readings; no recovery was active. Synthetic records remain. The prior fixture Worker version `c76a3b8e-1958-4072-917a-91f82db97bc8` is available for code rollback. These checks do not establish canonical behavior or restore data by rolling back code.
 
+## Profile selection canonical verification, 2026-11-04
+
+The reviewed #3 runtime source at commit `5097672d772d36014d1ad4129d298bb43ae5117a` was deployed as canonical Worker `839a7f15-900e-409f-b44a-9d3180de530f`. The downloaded bundle matched the fixture-verified dry build, SHA-256 `a1968910ca301046ee68c93428acf53d58f3bda58c3dae695bb9066d89631d6b`. Using a canonical-audience owner login, synthetic save, exact read, history and same-request replay passed in order for Test, Work, Personal and Me. Synthetic records remain.
+
+All profile generations and account, profile and corpus export inventories matched the predeployment read. Work import-audit totals remained 1,486 records, 5,811 revisions and 4,173 requests; Personal and Test imported totals remained zero. No recovery was active. Bindings, variables, secret names, route, cron, observability and runtime settings matched the predeployment controls. Wrangler initially removed the service grouping tag; it was restored through the non-versioned settings API and verified. Previous Worker `c7b0e355-3907-4478-8aad-a01a921ab488` remains the code rollback point; code rollback does not restore data. No export was created or rotated.
+
+Local verification passed 569 Worker tests and 222 local tests, with the unresolved Vitest teardown warning recorded above. Fixture checks include matching-rule precedence, legacy routing and scoped-device refusals. These bounded checks do not claim a fully clean test harness or exhaustive production coverage.
+
 ## Held-record Work migration, 2026-11-02
 
 The owner-approved held-record migration added 112 Work records: 86 with assigned identities and 26 redacted copies. The Personal journal remains held because production permits imports only into Work. The already-hosted redactor-flagged records remain unchanged. The other privacy holds, possible duplicates, `raw_memories.md` and 178 absent sources keep their prior accounting.
