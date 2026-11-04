@@ -112,6 +112,8 @@ export function render(s, { frontend, host, integrated, workersDev }) {
 		// workers.dev needs no route or DNS record. Version preview URLs would be more public origins than RESOURCE_URL names.
 		...(workersDev ? { workers_dev: true, preview_urls: false } : { routes: [{ pattern: host, custom_domain: true }] }),
 		observability: { enabled: true },
+		// The viewer snapshot (src/v2-api.ts) reads the deployed version id and time from this binding.
+		version_metadata: { binding: "CF_VERSION_METADATA" },
 		durable_objects: { bindings: [
 			{ name: "ACCOUNT", class_name: "AccountStore" },
 			{ name: "PROFILE", class_name: "ProfileStore" },
