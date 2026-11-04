@@ -12,6 +12,7 @@ import { sha256 } from "../src/domain/ids";
 import { ingest } from "../src/profile/capture";
 import { runWrite } from "../src/profile/write";
 import { activitySummary, corpusFiles, corpusFilesSql, listProjects, projectProfile } from "../src/profile/insights";
+import { FAMILIES } from "../src/corpus/families";
 import { nextSeq } from "../src/storage";
 import { RELATIONS } from "../src/domain/types";
 
@@ -700,6 +701,22 @@ it("historical map bounds future-edge discovery reads", async () => {
 
 // v2 IN1 (#15): activity and project insights read only the selected profile's stored digests and never write.
 describe("v2 IN1: activity and project insights", () => {
+	it("lists a GitHub project's corpus files whatever the case of its key or of the corpus repo", async () => {
+		// The real corpus DDL in a disposable object, so the generated SQL runs on SQLite as the Corpus store would run it.
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`corpus-case-${crypto.randomUUID()}`)), (_i, st) => {
+			const sql = st.storage.sql, day = new Date().toISOString().slice(0, 10);
+			for (const t of ["commits", "commit_paths"]) sql.exec(FAMILIES[t]!.ddl);
+			for (const [repo, sha, path] of [["Sequoia-Engineering/Web", "a1", "src/app.ts"], ["acme/web", "b1", "lib/x.ts"], ["acme/other", "c1", "other.ts"]]) {
+				sql.exec("INSERT INTO commits (repo, sha, parents, committer_date, is_merge, is_revert) VALUES (?, ?, '[]', ?, 0, 0)", repo, sha, `${day}T00:00:00Z`);
+				sql.exec("INSERT INTO commit_paths (repo, sha, path, top_component, extension) VALUES (?, ?, ?, 'src', 'ts')", repo, sha, path);
+			}
+			const files = (project: string) => { const q = corpusFilesSql({ project, now: new Date().toISOString() }); return q === null ? null : sql.exec<{ path: string }>(q).toArray().map((r) => r.path); };
+			for (const key of ["github:Sequoia-Engineering/Web", "github:sequoia-engineering/web", "github:SEQUOIA-ENGINEERING/web"]) expect(files(key), key).toEqual(["src/app.ts"]);
+			expect(files("github:acme/Web")).toEqual(["lib/x.ts"]);
+			expect(files("github:acme/it's")).toBeNull();
+		});
+	});
+
 	it("groups corrections by entities written as uploads write them: a Jira key and an org/repo#n reference", async () => {
 		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!;
 		const tag = crypto.randomUUID().slice(0, 6).replace(/\d/g, "x").toUpperCase(), key = `github:acme/in1e-${tag.toLowerCase()}`;

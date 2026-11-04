@@ -1,6 +1,7 @@
 // `agent-memory eval` (EV1). Reads golden-query cases, calls POST /v1/recall with the read token and count_hits: false, writes the
 // report on this machine, and sends only scores and counts to POST /v1/eval/runs with the job token.
 // The profile is always the caller's explicit --profile; nothing is routed from cwd, remote or text.
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -50,6 +51,22 @@ export function writeBaseline(file, summary) {
 	// Content-free and meant to be committed with the synthetic set, so it is not private.
 	writePrivate(file, `${JSON.stringify(summary, null, 2)}\n`, 0o644);
 	return { written: true };
+}
+
+/**
+ * A default report, `dir/<stem>.json`, written whole (a temporary file is linked in) and never over an existing file: a taken
+ * name gets -2, -3 and so on. The misses exist only in this file, so a later run must not replace it. → the path written
+ */
+function writeNewReport(dir, stem, data) {
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const tmp = path.join(dir, `.${stem}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+	fs.writeFileSync(tmp, data, { mode: 0o600 });
+	try {
+		for (let n = 1; ; n++) {
+			const file = path.join(dir, `${stem}${n === 1 ? "" : `-${n}`}.json`);
+			try { fs.linkSync(tmp, file); return file; } catch (e) { if (e.code !== "EEXIST") throw e; }
+		}
+	} finally { fs.rmSync(tmp, { force: true }); }
 }
 
 function checkCandidate(row) {
@@ -137,8 +154,11 @@ export async function main(argv, prog = "agent-memory eval") {
 		const cases = readCases(expandHome(values.cases));
 		if (!cases.length) throw new Error(`${values.cases}: no cases`);
 		const report = await runEval({ cases, profile, channels, k, read: readServer(config) });
-		const out = values.out ? expandHome(values.out) : path.join(home(), "eval", `${report.at.slice(0, 10)}-${channels}.json`);
-		writePrivate(out, `${JSON.stringify(report, null, 2)}\n`);
+		const data = `${JSON.stringify(report, null, 2)}\n`;
+		// An explicit --out is replaced as before; the default name carries the full run time and never replaces an earlier report.
+		let out;
+		if (values.out) writePrivate(out = expandHome(values.out), data);
+		else out = writeNewReport(path.join(home(), "eval"), `${report.at.replace(/:/g, "")}-${channels}`, data);
 		process.stdout.write(`${report.cases} cases, ${channels}, k ${k}: recall_all_at_k ${report.recall_all_at_k.toFixed(4)}, any_hit_at_k ${report.any_hit_at_k.toFixed(4)}, `
 			+ `mrr ${report.mrr.toFixed(4)}, ${report.misses.length} misses. Report: ${out}\n`);
 		const filtered = report.unsupported_filters.length;
