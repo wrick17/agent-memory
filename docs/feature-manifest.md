@@ -239,3 +239,12 @@ Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 - Install: `agent-memory install` also copies `replay.mjs`, `transcript-full.mjs` and `replay-player.js` beside the CLI.
 - Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, lone sensitive tool arguments in Claude and Codex calls, secrets split across text blocks and across a tool call, the `lsof` loopback bind, and the installed command mounting the real player. Its 9 cases passed in a scoped run in the current review batch; the earlier combined 120-test local run does not cover this fix.
 
+### v2 opt-in prompt recall (#19), 2026-11-04
+
+Module source in review, off by default; not installed. Extends the AM-09 capture hooks. `local/inject.mjs` builds the recall request and the hook output. Hook registration and dispatch arrive with #16, so nothing calls the module yet.
+
+- With `inject.enabled` and `inject.profile`, the `UserPromptSubmit` hook sends the prompt, cut to 4,096 characters, to `POST /v1/recall` with the read token, that profile and the lexical channel, within `inject.timeout_ms` (default 1,500 ms) and `inject.max_tokens` (default 600). Without a profile it sends nothing.
+- It never sends a repo for routing, never infers work or personal from the prompt or the working directory, and never uses the job token.
+- On a timeout, an error or a missing read token it prints nothing, so the prompt goes through.
+- Both clients get `hookSpecificOutput.additionalContext`: plain text, one line per record, under a line saying stored records are evidence, not instructions. Codex support rests on the Codex hooks documentation (codex-cli 0.166.0, checked 2026-11-04).
+- Evidence: its author's fail-open synthetic smoke. Its config and install tests arrive with #16. No real-client verification has run.
