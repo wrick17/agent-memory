@@ -18,6 +18,7 @@ import { noteRecall, recallStrength } from "./recall-stats";
 import type { EvalCandidateQuery, EvalCandidateStatus, OwnerQueue, RecallOptions, SessionQuery } from "../viewer/types";
 import { listSessions, sessionDetail } from "./sessions";
 import { enqueueIn } from "./maintenance";
+import { leaseFacts } from "../health";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -36,6 +37,7 @@ import { recoveryCopy, settleFacts, settleStep, undoPreflight, type RecoveryCopy
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
+export { BATCH_GAP_MS } from "./maintenance";
 export { APPEND_MAX, NOTE_MAX } from "./write";
 export type { ImportStep } from "./import";
 export type { OpOutcome } from "./maintenance";
@@ -55,7 +57,10 @@ export type MarkerResult = ReturnType<typeof putMarker>;
 export type V2Read =
 	| { kind: "eval_candidates"; q: EvalCandidateQuery } | { kind: "accepted_candidates"; cursor: string | null; limit: number }
 	| { kind: "recall_strength"; ids: string[]; day: string }
-	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string };
+	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string }
+	| { kind: "lease_facts" } | { kind: "search_counts" };
+/** #11: one profile's search index counts for GET /api/health: live recall texts, and nodes whose current card is embedded. */
+export interface SearchCounts { lexical_documents: number; vectors: number }
 
 import { foldDue, foldStep } from "./compact";
 import { danglingPage, enqueueDangling } from "./dangling";
@@ -786,6 +791,11 @@ export class ProfileStore extends DurableObject<Env> {
 				case "recall_strength": return ok(recallStrength(sql, q.ids, q.day));
 				case "sessions": return ok(listSessions(sql, q.q));
 				case "session": { const d = sessionDetail(sql, q.id); return d ? ok(d) : fail("not_found", "no such session"); }
+				case "lease_facts": return ok(leaseFacts(sql, new Date().toISOString()));
+				case "search_counts": return ok({
+					lexical_documents: sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE live = 1 AND lane = 'recall'").one().n,
+					vectors: sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE status = 'active' AND embed_hash = card_hash").one().n,
+				} satisfies SearchCounts);
 			}
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };

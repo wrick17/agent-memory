@@ -156,3 +156,13 @@ Source ready, not deployed. Depends on #9 above for the recall counts and eval c
 - Housekeeping purges `recall_daily` and `recall_totals` rows older than 400 days in bounded pages.
 - The owner can queue link maintenance for 1 to 40 memories (`POST /api/profiles/:p/maintenance/queue`) and consolidation for one session (`POST /api/profiles/:p/sessions/:id/consolidate`) through the existing fingerprinted queue, so a repeat queues nothing.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase; the original module tests were not preserved and are listed as needed coverage.
+
+### v2 client status and health checks (#11), 2026-11-04
+
+Source ready, not deployed. Depends on the v2 request plumbing and #10 above (lease facts and the 20-hour batch gap).
+
+- `POST /v1/status` takes the job token only. The device comes from the token; unknown fields and oversized bodies are refused, and only the latest valid report is kept. It holds allowlisted counts and times, no content.
+- The deterministic health sweep runs from the nightly cron after the export, whatever the export's outcome, and on demand at `POST /api/health/sweep`. It never calls a model or changes records.
+- Flags: a batch not completed for 26 hours, an expired incomplete lease, a non-revoked reporting device whose last digest is older than 48 hours, and an encrypted export older than 30 hours. A v1 device with no status row is not stale.
+- `GET /api/health` reads the same state. Each active profile gets one slot; a profile that cannot be read stays a null slot, so the lexical count reads as unknown, not a subtotal.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
