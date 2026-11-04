@@ -2409,6 +2409,20 @@ describe("Weekly strategic review", () => {
 });
 
 describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall retention", () => {
+	it("gives a capture item only the parts its accepted manifest lists", async () => {
+		await inStore((storage, who) => {
+			const one = (text: string) => JSON.stringify({ asks: [{ text, pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			const range = "codex:ctx-m:0a1b2c3d:0-10", p = (id: string, text: string) => { const body = one(text); return { range_id: range, capture_status: "consolidated" as const, part_id: id, sha256: sha256(body), body }; };
+			const whole = p("0-10", "listed whole"), a = p("0-5", "unlisted half"), b = p("5-10", "unlisted other half");
+			expect(ingest(storage, who, { session: { client: "codex", id: "ctx-m" }, digests: [whole, a, b], manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] })
+				.map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			const item = next(storage, { kinds: ["unprocessed_capture"] }).items[0]!;
+			const text = JSON.stringify(item.context);
+			expect(text).toContain("listed whole");
+			expect(text).not.toContain("unlisted");
+		});
+	});
+
 	const DAY = 86_400_000, job = { platform: "test", userId: USER };
 	const only = (storage: DurableObjectStorage, who: Who, stage: Stage) => {
 		for (const s of ["dedupe", "ttl", "purge", "queue"]) {
