@@ -166,3 +166,14 @@ Source ready, not deployed. Depends on the v2 request plumbing and #10 above (le
 - Flags: a batch not completed for 26 hours, an expired incomplete lease, a non-revoked reporting device whose last digest is older than 48 hours, and an encrypted export older than 30 hours. A v1 device with no status row is not stale.
 - `GET /api/health` reads the same state. Each active profile gets one slot; a profile that cannot be read stays a null slot, so the lexical count reads as unknown, not a subtotal.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 activity and project insights (#15), 2026-11-04
+
+Source ready, not deployed. Depends on #12 above for session and project semantics. Reads only; nothing is written.
+
+- `GET /api/profiles/:p/activity-summary?from=&to=` returns active days, session and observation counts, the busiest day, work kinds, busy sessions and the latest observations with session links. Days are the UTC day each digest part was uploaded.
+- When the read budget (5,000 digest parts) runs out, the oldest partly read day is dropped and the reply's `from` moves to the first day counted in full, so a later `from` than asked means the summary was cut short.
+- `GET /api/profiles/:p/projects` lists projects; `GET /api/profiles/:p/projects/:key/profile` returns session count and last activity, linked-concept frequency, scoped rules and preferences, and grouped corrections and decisions from the past 30 days. Its `budget` is marked exhausted at 200 sessions, 5,000 links or 1,000 correction parts.
+- File lists (`top_files`, `files`) come only from the profile's Corpus when it is on; `me` has none. A failed Corpus read fails the request instead of showing no files, and with the Corpus off the lists are empty.
+- Data stays in the explicitly selected, authorized profile and project; no profile is inferred from content.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
