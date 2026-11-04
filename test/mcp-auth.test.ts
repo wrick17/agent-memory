@@ -1311,3 +1311,21 @@ describe("v2 request plumbing (#4)", () => {
 		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`, { headers: { authorization: `Bearer ${fresh.token}` } }))).status).toBe(403);
 	});
 });
+
+describe("v2 health vector count (#11)", () => {
+	it("does not count an uploaded session or a bare entity as a vector", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin, session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const vectors = async () => ((await (await exports.default.fetch(new Request(`${origin}/api/health`, { headers: { authorization: `Bearer ${session}` } }))).json()) as { search: { vectors: number } }).search.vectors;
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		const before = await vectors();
+		// Both are written with embed_hash equal to card_hash so the embed stage skips them; neither has a vector.
+		const { ingest } = await import("../src/profile/capture"), { sha256 } = await import("../src/domain/ids");
+		const b = JSON.stringify({ asks: [{ text: "a", pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			ingest(st.storage, ref, { session: { client: "codex", id: `vec-${tag}` }, manifests: [], digests: [{ range_id: `codex:vec-${tag}:0a1b2c3d:0-10`, capture_status: "heuristic", part_id: "-", sha256: sha256(b), body: b }] });
+		});
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "component", name: `Bare ${tag}` }] });
+		expect(await vectors()).toBe(before);
+	});
+});
