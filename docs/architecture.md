@@ -1379,7 +1379,7 @@ The CI gate `test/eval-synthetic.test.ts` seeds 24 invented records and runs 22 
 | Channels | recall_all_at_k | any_hit_at_k | MRR |
 |---|---|---|---|
 | lexical | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
-| vector | 15/22 (0.6818) | 16/22 (0.7273) | 0.7273 |
+| vector | 19/22 (0.8636) | 21/22 (0.9545) | 0.8561 |
 | hybrid | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
 
 These numbers come from invented records and the bag-of-words fake embeddings in `test/fakes.js`. They are not a live provider, semantic-quality or golden-query result. A live run and real golden baselines are still open.
