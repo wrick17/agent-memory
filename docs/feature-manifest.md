@@ -113,5 +113,13 @@ The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTIO
 - `/api/*` stays owner-only. `POST /v1/recall` takes the owner or a read-scoped device; job tokens get 403.
 - `FeedItem.id` is the activity id, and `target` is the activity's first target node id when it names one.
 - `HealthReport.search.lexical_documents` is null when any profile's count could not be read, never a guessed 0.
+
+### v2 request plumbing and device whoami (part of #4), 2026-11-04
+
+Source ready, not deployed. `src/v2-api.ts` holds the v2 routes: device-token routes run before the owner check in `src/api.ts`, owner routes only after it, so `/api/*` stays owner-only. This change adds no v2 data route; each lands with the service that implements it.
+
+- `GET /v1/whoami` with an enabled, unrevoked `am_` device token returns only that device's `kind: "device"`, `device_id`, `scopes` and `profiles`. Revoked, disabled or unknown tokens get 401, and a request without a token gets 401. The owner's `{ claims }` reply is unchanged.
+- The Worker passes its `ExecutionContext` to `/mcp` and the API, so later v2 changes can finish work after the reply (`ToolContext.waitUntil`). Nothing uses it yet.
+- Evidence: the `v2 request plumbing` case in `test/mcp-auth.test.ts`.
 - `ProjectProfile.budget`, when present, is the graph reads' `Budget`; `exhausted` means the graph-derived lists are partial.
 - Evidence: `npm run typecheck` and `npm run lint`.

@@ -16,6 +16,7 @@ import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
 import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
+import { deviceV2, ownerV2 } from "./v2-api";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
@@ -658,8 +659,12 @@ async function refreshPart(env: Env, ctx: AccountContext, text: string, raw: Rec
 	return r.ok ? json({ profile: ref.profile, routed_by: ref.routedBy, ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
 }
 
-export async function api(request: Request, env: Env): Promise<Response> {
+export async function api(request: Request, env: Env, exec?: ExecutionContext): Promise<Response> {
 	const url = new URL(request.url);
+	const waitUntil = exec ? (p: Promise<unknown>) => exec.waitUntil(p) : undefined;
+	// v2 device-token routes (src/v2-api.ts), before the owner check below; a device token's own /v1/whoami facts answer there.
+	const device = await deviceV2(request, env, url, waitUntil);
+	if (device) return device;
 	if (url.pathname === "/v1/refresh/status" && request.method === "GET") return refreshStatus(request, env);
 	const control = /^\/v1\/refresh\/(claim|plan|finish)$/.exec(url.pathname);
 	if (control && request.method === "POST") return refreshControl(request, env, control[1] as "claim" | "plan" | "finish");
@@ -693,6 +698,9 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	const account = accountStub(env, auth.principal.userId);
 	const ctx = await account.context(auth.principal);
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	// v2 owner routes (src/v2-api.ts): reached only after the owner check above, so /api/* stays owner-only.
+	const v2 = await ownerV2(request, env, url, ctx.value, account, auth.claims, waitUntil);
+	if (v2) return v2;
 	const run = async (cmd: AccountCommand) => {
 		const r = await account.admin(cmd);
 		return r.ok ? json(r.value, cmd.op === "createDevice" ? 201 : 200) : json({ error: r.error }, r.error.code === "not_found" ? 404 : 400);

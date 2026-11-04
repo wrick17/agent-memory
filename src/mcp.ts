@@ -22,7 +22,8 @@ import { driveTransfer, transferPorts } from "./transfer";
  * MCP calls write as agent and move from wherever the record is. `moveFrom` is the source profile and generation a dashboard move
  * showed: the durable transfer intent binds them, so the account refuses the move if the record left that source meanwhile.
  */
-export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner">; moveFrom?: { profile: string; generation: string } }
+/** waitUntil: the request's ExecutionContext.waitUntil, for work after the reply such as recall hit counts (absent in internal calls). */
+export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner">; moveFrom?: { profile: string; generation: string }; waitUntil?: (p: Promise<unknown>) => void }
 
 const RRF_K = 60;
 

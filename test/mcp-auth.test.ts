@@ -1289,3 +1289,25 @@ it("routing rules and the restore drill are owner only: stored rules, validated 
 	expect((await listExports(env, "profile-personal")).length).toBeGreaterThanOrEqual(3);
 	expect(await http("/api/rules", "PUT", { rules: restore })).toMatchObject({ status: 200 });
 });
+
+describe("v2 request plumbing (#4)", () => {
+	it("gives an enabled device its own whoami facts, keeps the owner reply, and refuses revoked, forged and missing tokens", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const whoami = (token?: string) => exports.default.fetch(new Request(`${origin}/v1/whoami`, { headers: token ? { authorization: `Bearer ${token}` } : {} }))
+			.then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) as Record<string, unknown> | null }));
+		const { id, token } = await deviceToken(`whoami-device-${Date.now()}`, ["read"], ["personal", "me"], "personal");
+		expect(await whoami(token)).toEqual({ status: 200, body: { kind: "device", device_id: id, scopes: ["read"], profiles: ["personal", "me"] } });
+		const owner = await whoami(await jwt({}));
+		expect(owner.status).toBe(200);
+		expect(Object.keys(owner.body!)).toEqual(["claims"]);
+		expect((await whoami(token.replace(/.$/, (c) => (c === "0" ? "1" : "0")))).status).toBe(401);
+		expect((await whoami()).status).toBe(401);
+		const { accountStub } = await import("../src/mcp");
+		await accountStub(env, env.OWNER_USER_ID).admin({ op: "revokeDevice", id });
+		expect((await whoami(token)).status).toBe(401);
+		// /api/* stays owner-only for the same device token.
+		const fresh = await deviceToken(`whoami-api-${Date.now()}`, ["read"], ["personal"], "personal");
+		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`, { headers: { authorization: `Bearer ${fresh.token}` } }))).status).toBe(403);
+	});
+});
