@@ -19,6 +19,7 @@ import { archivedNodeIds, archivePage } from "./archive";
 import { archiveCursor, archiveOperation, archiveStatus, deferArchive, nextArchiveAlarm, nextArchiveOperation, runArchive, stagedArchiveActivity, stagedUndo, type ArchiveCommand } from "./archive-operations";
 export type { ArchiveCommand } from "./archive-operations";
 import { PROFILE_MIGRATIONS } from "./schema";
+import { restorable } from "../compat";
 import { runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
@@ -159,7 +160,7 @@ export class ProfileStore extends DurableObject<Env> {
 			const m = await readManifest(this.env, `profile-${who.profile}`, r.exportId, who.userId);
 			if (!m.ok) return m;
 			const manifest = m.value;
-			if (manifest.profile !== who.profile || manifest.schema_version !== PROFILE_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+			if (manifest.profile !== who.profile || !restorable("profile", manifest.schema_version, PROFILE_MIGRATIONS.length)) return fail("validation", "this export's profile does not match or its schema version is not restorable");
 			if (!meta("restore_id")) {
 				if (exportTables(sql, { control: PROFILE_CONTROL }).some((t) => t !== "profile_meta" && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a restore needs a fresh generation");
 				sql.exec("INSERT INTO profile_meta (key, value) VALUES ('restore_id', ?), ('restore_next', '0')", r.id);

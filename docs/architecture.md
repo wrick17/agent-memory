@@ -657,6 +657,7 @@ Every base table has a `seq` column and an index on `(seq, primary key)`. Each w
 -- operations and source fields, requests.completed_at and source, import_records, import_parts. v4 (phase 3): archive, transfers,
 -- transfer_parts (planned as v3 before the import vertical took that number), activity.redacted. v5 (import refresh, 2026-10-29):
 -- import_refreshes, and each import record's published revision and content hash as the next refresh's anchor.
+-- v9 (v2 storage, issue #5): recall_daily, recall_totals, eval_candidates, and maintenance rebuilt to add the stale_memory kind.
 -- Control state not exported (rebuilt after a restore): cursors, transfer_parts. profile_meta goes into the export manifest.
 CREATE TABLE profile_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; -- user_id, profile, generation, schema_version, write_seq
 
@@ -780,6 +781,14 @@ CREATE TABLE maintenance (
 	created_at TEXT NOT NULL, done_at TEXT, outcome TEXT, seq INTEGER NOT NULL
 );
 CREATE INDEX maintenance_open ON maintenance (state, kind, created_at);
+-- v9 rebuilds maintenance with the same columns, rows, ids, indexes and tombstone triggers; its kind CHECK adds 'stale_memory'.
+
+-- v9 (v2 storage): recall hits per node and UTC day, daily totals, and eval cases the owner corrected. nodes rows do not change.
+CREATE TABLE recall_daily (node_id TEXT NOT NULL, day TEXT NOT NULL, hits INTEGER NOT NULL, seq INTEGER NOT NULL,
+	PRIMARY KEY (node_id, day)) WITHOUT ROWID;
+CREATE TABLE recall_totals (day TEXT PRIMARY KEY, recalls INTEGER NOT NULL, tokens INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE eval_candidates (id TEXT PRIMARY KEY, query TEXT NOT NULL, expected_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed')), created_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
 
 CREATE TABLE markers (repo TEXT PRIMARY KEY, head TEXT, uploaded_at TEXT, analyzed_at TEXT, analysis_head TEXT, seq INTEGER NOT NULL) WITHOUT ROWID;
 
@@ -838,6 +847,12 @@ CREATE TABLE review_list (id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, suggest
 	created_at TEXT NOT NULL, resolved_profile TEXT, resolved_at TEXT, seq INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE sensitive_terms (term TEXT PRIMARY KEY, source TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE counters (day TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (day, name)) WITHOUT ROWID;
+-- v7 (v2 storage, issue #5): snapshot state. Exported, kept in a restore's checkpoint, replaced by a restore; a v6 export leaves them empty.
+CREATE TABLE eval_runs (id TEXT PRIMARY KEY, profile TEXT NOT NULL, at TEXT NOT NULL, channels TEXT NOT NULL, k INTEGER NOT NULL,
+	cases INTEGER NOT NULL, recall_all_at_k REAL NOT NULL, any_hit_at_k REAL NOT NULL, mrr REAL NOT NULL, device_id TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE client_status (device_id TEXT PRIMARY KEY, reported_at TEXT NOT NULL, body TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE health (check_id TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('ok','warn','fail')),
+	detail TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (check_id, subject)) WITHOUT ROWID;
 ```
 
 ### Journals are entry chunks
@@ -1754,6 +1769,10 @@ Trace of the case that broke v3: a transfer publishes in `personal` (the target)
 4. The recovery reconciliation runs. The owner confirms in the dashboard, and `AccountStore` marks `h` active in the ledger, then switches `work` to generation `h` in one write and opens.
 5. Generation `g` is retired in the ledger, deletes its own `g<g>:` vector ids, then the object is cleared with `deleteAll()`.
 6. Restoring `AccountStore` itself loads into a fresh object name recorded in a Worker variable, which the owner sets and deploys. It is the one restore that needs a deploy. The reconciliation then runs from the profiles and the tombstones.
+
+**Schema compatibility (issue #5).** A profile or account restore, and the drill's export choice, accept an export whose schema version is an integer from the store's floor in `src/compat.ts` to this code's own version. The floors are the last v1 schemas, profile 8 and account 6, so v2 code restores both pre-v2 and v2 exports. A v1 row goes in by named columns; the v2 tables start empty, and the rebuilt `maintenance` accepts every v1 kind. A version below the floor or above this code's version is refused. Corpus restore still needs an exact match, since v2 leaves the corpus schema unchanged.
+
+**Rolling back v2.** Export every profile and the account before the deploy. If v2 code misbehaves but the data is intact, deploy the previous Worker version. Its `migrate()` runs nothing, because the stored version is above its list. It ignores the new tables, and the rebuilt `maintenance` keeps the v1 columns. This is a code rollback only: v1 code refuses an export taken after the migration. If the data is damaged, restore the pre-deploy export into a fresh generation. That restore loses only `recall_daily`, `recall_totals`, `eval_candidates`, `eval_runs`, `client_status` and `health`.
 
 A monthly restore drill, started from the dashboard, restores the newest exports of `AccountStore`, `me` and one rotating profile into scratch objects, runs the reconciliation against the scratch set only, compares counts and hashes, and deletes the scratch objects and their own generation-qualified vectors. Each scratch generation gets a fresh id reserved in the R2 ledger, so its ids differ from every live, restored or earlier generation, even after an `AccountStore` restore, and neither its embedding nor its cleanup can touch a live vector (section 11).
 
