@@ -271,17 +271,20 @@ describe("sessions (S1)", () => {
 	it("recalls only an accepted manifest's consolidated parts, now and as of a time", async () => {
 		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
 		const one = (word: string) => JSON.stringify({ asks: [{ text: word, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
-		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+		const session = await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
 			const range = `codex:rc-${tag}:0a1b2c3d:0-10`;
 			const whole = part("0-10", one(`kept${tag}`), "consolidated", range), a = part("0-5", one(`dropped${tag}`), "consolidated", range), b = part("5-10", one(`dropped${tag}`), "consolidated", range);
 			expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `rc-${tag}` }, digests: [whole, a, b],
 				manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] }).map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			return st.storage.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", `session:codex:rc-${tag}`).one().id;
 		});
 		const at = new Date(Date.now() + 1000).toISOString();
 		for (const extra of [{}, { as_of: at }]) {
 			const hits = async (word: string) => (await call<CaptureRecall>(c, "recall_memories", { keyword: word, profile: "test", include_captures: true, ...extra })).results.map((r) => r.memory_id);
-			expect(await hits(`kept${tag}`), JSON.stringify(extra)).toHaveLength(1);
-			expect(await hits(`dropped${tag}`), JSON.stringify(extra)).toEqual([]);
+			// The session is recalled by its listed part only. Other records the shared test profile holds may still match a word
+			// through the vector channel (the test fakes hash words into 63 buckets), so the check is on the session itself.
+			expect(await hits(`kept${tag}`), JSON.stringify(extra)).toContain(session);
+			expect(await hits(`dropped${tag}`), JSON.stringify(extra)).not.toContain(session);
 		}
 	});
 
