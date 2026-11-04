@@ -145,7 +145,7 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
 // The registered Memories tab takes the built-in Memories entry's place.
-const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Actions #actions"]], ["System", ["Audit #/activity"]],
+const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]], ["System", ["Audit #/activity"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -258,7 +258,7 @@ describe("dashboard shell", () => {
 		expect(navOf(b)).toEqual(GROUPED_NAV);
 		const current = () => find(b.els.nav!, "a").filter((a) => a.attrs["aria-current"] === "page").map((a) => a.textContent);
 		expect(current()).toEqual(["Memories"]);
-		expect(text(b.els.nav!)).not.toMatch(/Overview|Sessions|Replay|Health|Live|features/i);
+		expect(text(b.els.nav!)).not.toMatch(/Overview|Health|Live|features/i);
 		b.go("#memories/r1?profile=personal");
 		await settle();
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: personal"); // the Memories tab: the list with r1's detail panel
