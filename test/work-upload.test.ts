@@ -1773,6 +1773,17 @@ describe("daily refresh server", () => {
 	});
 
 
+	/**
+	 * The account's daily row meter is shared by every profile this file creates: at this point a measured run had 70 of them
+	 * holding 105,195 counted rows not yet reported, and each reports on its own alarm. Past ROW_PAUSE the alarm skips
+	 * housekeeping, terminal cleanup included, by design, so a backstop alarm here would depend on other tests' timing. This
+	 * ACCOUNT namespace answers only meter as open and forwards everything else, so the manual alarm checks the cleanup itself.
+	 */
+	const meterOpen = (ns: DurableObjectNamespace): DurableObjectNamespace => new Proxy(ns, { get: (t, k) => {
+		if (k !== "get") { const v = Reflect.get(t, k); return typeof v === "function" ? v.bind(t) : v; } // native namespace methods need their receiver
+		return (id: DurableObjectId) => new Proxy(t.get(id), { get: (stub, m) => (m === "meter" ? async () => ({ embed: true, background: true }) : Reflect.get(stub, m)) });
+	} });
+
 	it("BACKSTOP resumes terminal cleanup in bounded alarm pages without releasing the account day", { timeout: 120_000 }, async () => {
 		const p = await isolated(), pending = await isolated();
 		const active = await client(pending.token, pending.name, prFrames(pending, [[prWire(999, at(1))]]));
@@ -1799,7 +1810,7 @@ describe("daily refresh server", () => {
 		const pages = await runInDurableObject(stub, async (instance, state) => {
 			const storage = state.storage, sql = storage.sql, originalEnv = Reflect.get(instance, "env");
 			for (const stage of ["dedupe", "ttl", "purge", "queue", "dangling"]) sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?) ON CONFLICT(stage) DO UPDATE SET due_at = excluded.due_at", stage, Date.now() + 86_400_000);
-			Reflect.set(instance, "env", { ...originalEnv, EMBEDDINGS: "off" });
+			Reflect.set(instance, "env", { ...originalEnv, EMBEDDINGS: "off", ACCOUNT: meterOpen(originalEnv.ACCOUNT) });
 			const exec = sql.exec, sync = storage.transactionSync;
 			type Query = { q: string; params: SqlStorageValue[]; c: SqlStorageCursor<Record<string, SqlStorageValue>> };
 			let current: Query[] | null = null, selection: Query["c"] | null = null;
@@ -1863,7 +1874,11 @@ describe("daily refresh server", () => {
 		expect(await p.inProfile((st) => st.getAlarm())).not.toBeNull();
 		await p.inProfile((st) => st.sql.exec("DROP TRIGGER backstop_empty"));
 		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
-		await runInDurableObject(stub, async (instance) => { await instance.alarm(); });
+		await runInDurableObject(stub, async (instance) => {
+			const originalEnv = Reflect.get(instance, "env");
+			Reflect.set(instance, "env", { ...originalEnv, ACCOUNT: meterOpen(originalEnv.ACCOUNT) });
+			try { await instance.alarm(); } finally { Reflect.set(instance, "env", originalEnv); }
+		});
 		expect(await mirror(p, c.b.claim_id)).toMatchObject({ state: "done", cleaned: 1, erased: 1 });
 		expect((await c.status()).data.claim.state).toBe("pending");
 		const proof = receipt(await c.finish(), "finish", c.body.finish());
