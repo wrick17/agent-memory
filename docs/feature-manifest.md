@@ -288,17 +288,17 @@ Source fix in review; not deployed.
 
 ### v2 opt-in prompt recall (#19), 2026-11-04
 
-Module source in review, off by default; not installed. Extends the AM-09 capture hooks. `local/inject.mjs` builds the recall request and the hook output. Hook registration and dispatch arrive with #16, so nothing calls the module yet.
+Module source in review, off by default; not installed. Extends the AM-09 capture hooks. `local/inject.mjs` builds the recall request and the hook output. #16 registers the hook and calls the module.
 
 - With `inject.enabled` and `inject.profile`, the `UserPromptSubmit` hook sends the prompt, cut to 4,096 characters, to `POST /v1/recall` with the read token, that profile and the lexical channel, within `inject.timeout_ms` (default 1,500 ms) and `inject.max_tokens` (default 600). Without a profile it sends nothing.
 - It never sends a repo for routing, never infers work or personal from the prompt or the working directory, and never uses the job token.
 - On a timeout, an error or a missing read token it prints nothing, so the prompt goes through.
 - Both clients get `hookSpecificOutput.additionalContext`: plain text, one line per record, under a line saying stored records are evidence, not instructions. Codex support rests on the Codex hooks documentation (codex-cli 0.166.0, checked 2026-11-04).
-- Evidence: its author's fail-open synthetic smoke. Its config and install tests arrive with #16. No real-client verification has run.
+- Evidence: its author's fail-open synthetic smoke. Its config and install tests are part of #16. No real-client verification has run.
 
 ### v2 local scheduling diagnostics and backfill (#18), 2026-11-04
 
-Module source in review; not installed. Extends AM-10 scheduling. This change adds `local/launchd.mjs`, `local/status.mjs`, `local/doctor.mjs` and `local/backfill.mjs`. The `doctor` and `backfill` commands, the plist install and the status report call arrive with #16, so nothing calls these modules yet.
+Module source in review; not installed. Extends AM-10 scheduling. This change adds `local/launchd.mjs`, `local/status.mjs`, `local/doctor.mjs` and `local/backfill.mjs`. #16 wires the `doctor` and `backfill` commands, the plist install and the status report.
 
 - `launchd.mjs` builds the daily job plist for the installing Node binary, `AGENT_MEMORY_HOME` and `PATH`, with the test label `com.agent-memory.batch.test` for any non-default home. It never runs `launchctl`; install only prints the load command.
 - `status.mjs` builds the per-device report: counts, times, booleans, hook names and client versions. It holds no transcript text, paths, session ids or token.
@@ -306,3 +306,17 @@ Module source in review; not installed. Extends AM-10 scheduling. This change ad
 - `backfill.mjs` queues triggers for retained transcripts whose cursor is behind. It reads file sizes, prefix hashes and a session's working directory, never message text.
 - Evidence: syntax and CLI bundle checks at this stage. The `doctor` and `backfill` tests arrive in #73. No launchd job has been loaded or run.
 - A claim-recovery observation (unlink after a failed rename) stays open for review.
+
+### v2 capture hooks, scheduled runs and status (#16), 2026-11-04
+
+Source in review; not deployed or installed. Extends AM-09 capture and AM-10 scheduling. This change wires the #17, #18, #19 and #20 modules into the CLI.
+
+- `install` adds `PreCompact` to the Claude Code and Codex hook lists; it runs in the background like `Stop`. `UserPromptSubmit` is listed only when injection is on.
+- On macOS, `install` writes the daily job plist and prints its `launchctl bootstrap` command. It never loads the job.
+- `run --scheduled` takes the machine lock. When nothing is queued, claimed, spooled or due, it sends the status report and checks the queue again before it returns `idle`. Otherwise it drains captures and runs the batch, even on a day with no sessions.
+- Batches carry a sticky `session.ended` and `session.files_changed`, a locally computed count of distinct edited files. Only the number is uploaded.
+- Each run ends with one content-free `POST /v1/status`. Against a pre-v2 Worker, an ingest refused only because of the two new session fields is sent once more without them.
+- `eval`, `backfill` and `doctor` dispatch to their modules.
+- `extract()` drops injected text block by block and still drops a Claude Code command record whole. Only `EEXIST` counts as a newer trigger when a claim goes back to the queue.
+- End marker: a `Stop` that replaces a `SessionEnd` a crashed run had claimed keeps `ended`, so the session still reports its end after recovery drops the old claim.
+- Evidence: the tests for hooks, install, the plist (written, never loaded), scheduled runs, session facts and status are in `local/agent-memory.test.mjs` in this change. On the integrated tree they passed in the combined local run of 2026-11-04 (120 of 120), before the current review fixes; the end-marker case passed in a scoped run in the current review batch. No client install, `launchctl` load or physical job run has happened.

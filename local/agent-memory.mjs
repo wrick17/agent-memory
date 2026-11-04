@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Agent Memory local CLI (section 10): `hook <client>`, `run`, `install`. Node 24, no dependencies.
+// Agent Memory local CLI (section 10): `hook <client>`, `run [--scheduled]`, `install`, `eval`, `replay`, `backfill`, `doctor` and
+// `corpus-upload`. Node 24, no dependencies.
 // Reads transcripts completely on this machine and uploads only bounded, redacted digests.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -7,12 +8,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { launchdLabel, loadCommand, plist, plistPath } from "./launchd.mjs";
 
 export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024, sweep: 64 };
 const DEBOUNCE_MS = 45_000, DEBOUNCE_MAX_MS = 600_000, PENDING_SOURCE_DAYS = 7, EPOCH_BYTES = 4096;
 const CLIENTS = new Set(["claude-code", "codex"]);
 // The consolidation rules' revision. A range stuck under an older revision is retried once by the sweep, then stamped.
 const DIGEST_REV = 2;
+/** Client versions in the /v1/status report must match the server's allowlist. */
+const VERSION = /^[0-9A-Za-z.+-]{1,32}$/;
+/** The largest files_changed the ingest schema accepts. */
+const FILES_MAX = 100_000;
 
 export const home = () => process.env.AGENT_MEMORY_HOME || path.join(os.homedir(), ".agent-memory");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
@@ -59,7 +65,9 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	if (!CLIENTS.has(client)) return;
 	let h;
 	try { h = JSON.parse(input); } catch { return; }
-	const session = typeof h.session_id === "string" ? h.session_id : null;
+	// A prompt hook is the opt-in injection path (inject.mjs, dispatched by the CLI). It never queues a capture run.
+	if (h?.hook_event_name === "UserPromptSubmit") return;
+	const session = typeof h?.session_id === "string" ? h.session_id : null;
 	if (!session || !/^[A-Za-z0-9._:-]{1,128}$/.test(session)) return;
 	const name = `${client}-${safeName(session)}.json`;
 	const file = path.join(home(), "queue", name);
@@ -69,9 +77,12 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	if (h.hook_event_name === "SessionStart") writePrivate(file.replace(/\.json$/, ".start"), "");
 	// last_assistant_message is never stored: it cannot stand in for a range. client_home keeps the session's origin, so whichever
 	// process later holds the run lock looks for this transcript only in the store of the client that fired the hook.
+	// ended is sticky: a later trigger that replaces a queued or claimed SessionEnd keeps it, so the session still reports that it
+	// ended even when a crashed run's claim of the SessionEnd is dropped in favor of this trigger.
 	writePrivate(file, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event: h.hook_event_name ?? null, client_home: clientHome(client),
 		transcript_path: h.transcript_path ?? prior?.transcript_path ?? claimed?.transcript_path ?? null, cwd: h.cwd ?? prior?.cwd ?? claimed?.cwd ?? null,
-		turn_id: h.turn_id ?? null, at: Date.now(), first_at: prior?.first_at ?? Date.now() }));
+		turn_id: h.turn_id ?? null, at: Date.now(), first_at: prior?.first_at ?? Date.now(),
+		...(h.hook_event_name === "SessionEnd" || prior?.ended === true || claimed?.ended === true ? { ended: true } : {}) }));
 	if (spawnRun && !lockHeld()) {
 		spawn(process.execPath, [fileURLToPath(import.meta.url), "run"], { detached: true, stdio: "ignore", env: process.env }).unref();
 	}
@@ -199,6 +210,19 @@ export function readLines(file, from) {
 const INJECTED = /^\s*(<environment_context>|<user_instructions>|<INSTRUCTIONS>|# AGENTS\.md instructions|<command-name>|<local-command-stdout>|Caveat: The messages below)/;
 export const stripReminders = (s) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
 
+// A Claude Code command record (a slash command or its local output) opens with one of these; none of its blocks is the owner's.
+const COMMAND = /^\s*(<command-name>|<local-command-stdout>)/;
+
+/**
+ * The message text from its text blocks, each checked on its own: a block that is only a system reminder or starts as injected
+ * context (environment, instructions, AGENTS.md, command output) is dropped, and the owner's own blocks beside it are kept. A
+ * record that opens as a command is dropped whole, as when its text is one string.
+ */
+const ownText = (blocks) => {
+	const texts = blocks.map((b) => stripReminders(String(b ?? ""))).filter(Boolean);
+	return COMMAND.test(texts[0] ?? "") ? "" : texts.filter((b) => !INJECTED.test(b)).join("\n");
+};
+
 /** Owner and assistant text only. Tool calls and output, thinking, and injected system or hook text are skipped. */
 export function extract(client, lines) {
 	const out = [];
@@ -207,26 +231,65 @@ export function extract(client, lines) {
 		if (client === "codex") {
 			if (obj.type !== "event_msg") continue;
 			const p = obj.payload, item = p?.type === "item_completed" ? p.item : null;
-			if (p?.type === "user_message") { role = "owner"; text = String(p.message ?? ""); }
-			else if (p?.type === "agent_message") { role = "assistant"; text = String(p.message ?? ""); }
+			if (p?.type === "user_message") { role = "owner"; text = ownText([p.message]); }
+			else if (p?.type === "agent_message") { role = "assistant"; text = ownText([p.message]); }
 			// Codex 0.166+: completed turn items. A UserMessage is what the owner submitted; AGENTS.md, environment and developer
 			// context arrive only as response_item records, which are never read. Text blocks only.
 			else if (item?.type === "UserMessage" || item?.type === "AgentMessage") {
 				role = item.type === "UserMessage" ? "owner" : "assistant";
-				text = (Array.isArray(item.content) ? item.content : []).filter((c) => /^text$/i.test(c?.type ?? "")).map((c) => String(c.text ?? "")).join("\n");
+				text = ownText((Array.isArray(item.content) ? item.content : []).filter((c) => /^text$/i.test(c?.type ?? "")).map((c) => c.text));
 			}
 		} else {
 			if ((obj.type !== "user" && obj.type !== "assistant") || obj.isMeta || obj.isSidechain) continue;
 			const c = obj.message?.content;
-			const parts = typeof c === "string" ? [c] : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => String(b.text ?? "")) : [];
 			role = obj.type === "user" ? "owner" : "assistant";
-			text = parts.join("\n");
+			text = ownText(typeof c === "string" ? [c] : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => b.text) : []);
 		}
-		text = stripReminders(text);
-		if (!role || !text || INJECTED.test(text)) continue;
+		if (!role || !text) continue;
 		out.push({ role, text: redact(text), pos, next });
 	}
 	return out;
+}
+
+const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+// An apply_patch header names one file. Inside a JSON or JS string literal the line ends at an escaped newline or the quote.
+const PATCH_HEADER = /\*\*\* (?:(?:Add|Update|Delete) File|Move to): ([^\n\r"'`\\]+)/g;
+
+/**
+ * The file paths these lines edited, for the local distinct count only: never stored or uploaded. Claude Code: the file_path
+ * (NotebookEdit: notebook_path) of Edit, Write, MultiEdit and NotebookEdit calls. Codex: apply_patch headers in apply_patch
+ * calls (direct, or inside an exec or shell call), and the paths of completed FileChange items and patch_apply_end events.
+ */
+export function editedPaths(client, lines) {
+	const out = [];
+	const keys = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o) : []);
+	for (const { obj } of lines) {
+		const p = obj?.payload;
+		if (client === "codex") {
+			if (obj?.type === "response_item" && (p?.type === "custom_tool_call" || p?.type === "function_call")) {
+				const text = typeof p.input === "string" ? p.input : typeof p.arguments === "string" ? p.arguments : "";
+				if (p.name === "apply_patch" || ((p.name === "exec" || p.name === "shell") && text.includes("apply_patch"))) for (const m of text.matchAll(PATCH_HEADER)) out.push(m[1].trim());
+			} else if (obj?.type === "event_msg" && p?.type === "item_completed" && p.item?.type === "FileChange" && p.item.status === "completed") out.push(...keys(p.item.changes));
+			else if (obj?.type === "event_msg" && p?.type === "patch_apply_end" && p.success !== false) out.push(...keys(p.changes));
+		} else if (obj?.type === "assistant" && Array.isArray(obj.message?.content)) {
+			for (const b of obj.message.content) {
+				if (b?.type !== "tool_use" || !EDIT_TOOLS.has(b.name)) continue;
+				const f = b.input?.file_path ?? b.input?.notebook_path;
+				if (typeof f === "string") out.push(f);
+			}
+		}
+	}
+	return out.filter((f) => f && f.length <= 4096);
+}
+
+/** The client version these lines record (Claude Code: each entry's version; Codex: session_meta's cli_version), or null. */
+export function versionOf(client, lines) {
+	let v = null;
+	for (const { obj } of lines) {
+		const x = client === "codex" ? (obj?.type === "session_meta" ? obj.payload?.cli_version : undefined) : obj?.version;
+		if (typeof x === "string" && VERSION.test(x)) v = x;
+	}
+	return v;
 }
 
 // ---------- digests ----------
@@ -471,14 +534,29 @@ function keep(partsDir, partId, body) {
 
 // ---------- server ----------
 
+// The pre-v2 Worker's whole 400 message (zod 4 strict object, src/api.ts at 07fb1f4) when the only problem is the v2 session fields.
+const V1_SESSION_REFUSAL = /^session: Unrecognized keys?: "(?:ended|files_changed)"(?:, "(?:ended|files_changed)")?$/;
+
 /** The hosted API, or a spool when it cannot be reached. The spool holds digests and manifests only. */
 export function httpServer(config) {
 	const token = () => fs.readFileSync(config.token_file, "utf8").trim();
 	const post = async (p, body, options = {}) => {
 		const res = await fetch(new URL(p, config.server), { method: "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" }, body: JSON.stringify(body), ...options });
-		if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+		if (!res.ok) {
+			const error = res.status === 400 ? await res.json().then((r) => r?.error ?? null, () => null) : null;
+			throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, ...(error ? { error } : {}) });
+		}
 		return res.json();
 	};
+	/**
+	 * A server older than v2 (a rolled-back Worker) refuses the optional session.ended and session.files_changed with exactly this
+	 * strict-schema message and writes nothing. Only then is the batch sent once more with the v1 session object, every digest and
+	 * manifest unchanged; any other refusal is thrown as before. Later batches carry both fields again for a v2 server.
+	 */
+	const ingest = (batch) => post("/v1/ingest", batch).catch((e) => {
+		if (e?.status !== 400 || e.error?.code !== "validation" || !V1_SESSION_REFUSAL.test(e.error.message ?? "")) throw e;
+		return post("/v1/ingest", { ...batch, session: { client: batch.session.client, id: batch.session.id } });
+	});
 	return {
 		/** Closed daily transport: retained UTF-8 bytes, the configured origin and existing job credential only. */
 		refresh: async (operation, input) => {
@@ -505,7 +583,7 @@ export function httpServer(config) {
 			}
 			return res.json();
 		},
-		ingest: (batch) => post("/v1/ingest", batch).then((r) => r.results),
+		ingest: (batch) => ingest(batch).then((r) => r.results),
 		work: (batch) => post("/v1/ingest", batch, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		state: (ids, repo) => post("/v1/capture", { range_ids: ids, ...(repo ? { repo } : {}) }).then((r) => r.ranges),
 		// v2, job token. The server routes land with their modules: status with status.mjs, evalRun with eval.mjs.
@@ -607,6 +685,77 @@ async function replaySpool(server) {
 
 export const statePath = (c, s) => path.join(home(), "state", c, `${safeName(s)}.json`);
 
+// Content-free capture counters for the /v1/status report: client versions, the last stored digest's time and refusals since
+// the last report that was sent. Written only by the lock holder.
+const statsFile = () => path.join(home(), "capture.json");
+function noteCapture(client, { refused, digestAt, version }) {
+	if (!refused && !digestAt && !version) return;
+	const s = readJson(statsFile(), {});
+	if (version) s.clients = { ...(s.clients ?? {}), [client]: version };
+	if (digestAt) s.last_digest_at = new Date(digestAt).toISOString();
+	if (refused) s.refused_since_last = (Number.isInteger(s.refused_since_last) ? s.refused_since_last : 0) + refused;
+	writePrivate(statsFile(), JSON.stringify(s));
+}
+
+/**
+ * Capture state from this machine's session files, for status.mjs (counts, times and versions only) and doctor.mjs (with
+ * ids: true, also `local`, the session and range ids behind each count, which never leave this machine).
+ * @returns {{ clients: Record<string, string>, last_digest_at: string | null, refused_since_last: number, pending_ranges: number,
+ *   stuck_ranges: number, oldest_pending_at: string | null, missing_sources: number,
+ *   local?: { pending: object[], stuck: object[], missing: object[] } }}
+ */
+export function captureSummary({ ids = false } = {}) {
+	const s = readJson(statsFile(), {});
+	const out = { clients: {}, last_digest_at: null, refused_since_last: 0, pending_ranges: 0, stuck_ranges: 0, oldest_pending_at: null, missing_sources: 0 };
+	for (const [c, v] of Object.entries(s?.clients ?? {})) if (CLIENTS.has(c) && typeof v === "string" && VERSION.test(v)) out.clients[c] = v;
+	if (typeof s?.last_digest_at === "string" && !Number.isNaN(Date.parse(s.last_digest_at))) out.last_digest_at = new Date(s.last_digest_at).toISOString();
+	if (Number.isInteger(s?.refused_since_last) && s.refused_since_last > 0) out.refused_since_last = s.refused_since_last;
+	const local = { pending: [], stuck: [], missing: [] };
+	let oldest = Infinity;
+	for (const client of CLIENTS) {
+		const dir = path.join(home(), "state", client);
+		for (const f of fs.existsSync(dir) ? fs.readdirSync(dir).filter((x) => x.endsWith(".json")) : []) {
+			const st = readJson(path.join(dir, f), null);
+			if (!st || typeof st !== "object") continue;
+			const session = typeof st.source?.session === "string" ? st.source.session : f.slice(0, -5);
+			if (st.pending_source_since != null) { out.missing_sources++; local.missing.push({ client, session }); }
+			for (const [range, r] of Object.entries(st.ranges ?? {})) {
+				if (r?.status === "pending") {
+					out.pending_ranges++;
+					local.pending.push({ client, session, range, reason: r.reason ?? null });
+					// A range from before v2 has no time: its pending text was written when the range was made.
+					let at = Number.isFinite(r.at) ? r.at : null;
+					if (at === null) try { at = fs.statSync(path.join(home(), "pending", `${safeName(range)}.txt`)).mtimeMs; } catch { /* no time known */ }
+					if (at !== null && at < oldest) oldest = at;
+				} else if (r?.status === "stuck") {
+					out.stuck_ranges++;
+					local.stuck.push({ client, session, range, reason: r.reason ?? null });
+				}
+			}
+		}
+	}
+	if (oldest < Infinity) out.oldest_pending_at = new Date(oldest).toISOString();
+	return ids ? { ...out, local } : out;
+}
+
+/**
+ * Queues a capture trigger for a seen session without replacing one already queued or claimed (the SessionStart sweep and
+ * backfill.mjs). The trigger is linked, never renamed, into place, so a trigger a hook writes meanwhile is kept.
+ * Returns whether this call queued it.
+ */
+export function queueTrigger({ client, session, transcript_path, cwd = null, client_home = null, event }, { now = Date.now(), debounceMs = 0 } = {}) {
+	if (!CLIENTS.has(client) || typeof session !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(session) || typeof transcript_path !== "string") return false;
+	const qdir = path.join(home(), "queue"), name = `${client}-${safeName(session)}.json`;
+	if (fs.existsSync(path.join(qdir, name)) || fs.existsSync(path.join(claimDir(), name))) return false;
+	const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
+	writePrivate(tmp, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event, transcript_path, cwd: cwd ?? null, client_home: client_home ?? null,
+		turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
+	let queuedNow = true;
+	try { fs.linkSync(tmp, path.join(qdir, name)); } catch { queuedNow = false; }
+	fs.rmSync(tmp, { force: true });
+	return queuedNow;
+}
+
 /** The repo identity the server routes by: the origin remote from local git, and the session's working directory. */
 export function repoOf(cwd) {
 	if (!cwd || !fs.existsSync(cwd)) return null;
@@ -626,6 +775,11 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	const pendingDir = path.join(home(), "pending");
 	const repo = repoOf(t.cwd);
 	const where = repo ? { repo } : {};
+	// Sticky once a SessionEnd trigger is handled. files are hashes of the distinct edited paths, kept here only for the count.
+	if (t.ended === true || t.event === "SessionEnd") st.ended = true;
+	// v2 session fields are sent only when set, so a session with neither sends a v1 body.
+	const sessionOf = () => ({ client: t.client, id: t.session, ...(st.ended ? { ended: true } : {}), ...(st.files?.length ? { files_changed: Math.min(st.files.length, FILES_MAX) } : {}) });
+	const tally = { refused: 0, digestAt: null, version: null };
 	const src = findTranscript(t);
 	if (!src) {
 		st.pending_source_since ??= now;
@@ -639,20 +793,37 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		const { end, lines } = readLines(src, st.digested_to);
 		if (end > st.digested_to) {
 			const messages = extract(t.client, lines);
+			tally.version = versionOf(t.client, lines);
+			// shortcut: the hash set is rewritten with the state file; fine for hundreds of files, split it out if sessions reach tens of thousands.
+			const files = new Set(st.files ?? []);
+			const base = typeof t.cwd === "string" && path.isAbsolute(t.cwd) ? t.cwd : "/";
+			for (const f of editedPaths(t.client, lines)) { if (files.size >= FILES_MAX) break; files.add(sha(path.resolve(base, f)).slice(0, 16)); }
+			if (files.size) st.files = [...files];
 			const id = `${t.client}:${t.session}:${epoch}:${st.digested_to}-${end}`;
 			writePrivate(path.join(pendingDir, `${safeName(id)}.txt`), JSON.stringify(messages));
-			st.ranges[id] = { start: st.digested_to, end, epoch, status: "pending" };
+			st.ranges[id] = { start: st.digested_to, end, epoch, status: "pending", at: now };
 			const body = JSON.stringify(heuristicDigest(messages));
-			const batch = { session: { client: t.client, id: t.session }, ...where, digests: [{ range_id: id, capture_status: "heuristic", part_id: "-", sha256: sha(body), body }], manifests: [] };
+			const batch = { session: sessionOf(), ...where, digests: [{ range_id: id, capture_status: "heuristic", part_id: "-", sha256: sha(body), body }], manifests: [] };
 			// The heuristic digest is best effort and never counts as captured: a refusal is recorded, a network failure spools.
 			try {
 				const r = await server.ingest(batch);
-				if (!r.every((x) => x.status === "stored" || x.status === "replayed")) st.ranges[id].heuristic = r.find((x) => x.status === "refused")?.reason ?? "refused";
+				if (!r.every((x) => x.status === "stored" || x.status === "replayed")) { st.ranges[id].heuristic = r.find((x) => x.status === "refused")?.reason ?? "refused"; tally.refused++; }
+				else tally.digestAt = now;
 				st.digested_to = end;
+				if (st.ended) st.ended_sent = true;
 			} catch (e) {
-				if (refusedBy(e)) Object.assign(st.ranges[id], { status: "refused", reason: `http_${e.status}` });
-				if (refusedBy(e) || spool(batch)) st.digested_to = end;
+				if (refusedBy(e)) { Object.assign(st.ranges[id], { status: "refused", reason: `http_${e.status}` }); tally.refused++; }
+				if (refusedBy(e) || spool(batch)) { st.digested_to = end; if (st.ended) st.ended_sent = true; }
 			}
+		}
+		save();
+	}
+	// A SessionEnd with nothing new to digest (its Stop already sent the tail) still reports the end, in a batch with no items.
+	if (st.ended && !st.ended_sent && st.digested_to > 0) {
+		const batch = { session: sessionOf(), ...where, digests: [], manifests: [] };
+		try { await server.ingest(batch); st.ended_sent = true; } catch (e) {
+			if (refusedBy(e)) tally.refused++;
+			if (refusedBy(e) || spool(batch)) st.ended_sent = true;
 		}
 		save();
 	}
@@ -668,7 +839,7 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	};
 	const outcomes = {};
 	// Refused ranges keep no local text; they settle like acknowledged ones and are never sent again.
-	const refuse = (id, r, e) => { r.status = "refused"; r.reason = `http_${e.status}`; cleanup(id); outcomes[id] = "refused"; };
+	const refuse = (id, r, e) => { r.status = "refused"; r.reason = `http_${e.status}`; cleanup(id); outcomes[id] = "refused"; tally.refused++; };
 	for (const [id, r] of Object.entries(st.ranges)) {
 		// Acknowledged earlier; a crash may have left its local copies behind.
 		if (r.status === "consolidated") { cleanup(id); continue; }
@@ -688,16 +859,17 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		try { result = await consolidate({ id, start: r.start, end: r.end }, messages, { runner, server, dir: pendingDir, repo }); } catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 		if (result.status !== "ready") { Object.assign(r, { status: result.status === "stuck" ? "stuck" : "pending", reason: result.reason ?? result.status, digest_rev: DIGEST_REV }); outcomes[id] = r.status; continue; }
 		try {
-			const session = { client: t.client, id: t.session };
+			const session = sessionOf();
 			const fresh = result.parts.filter((p) => !p.remote);
 			if (fresh.length) {
 				const up = await server.ingest({ session, ...where, digests: fresh.map((p) => ({ range_id: id, capture_status: "consolidated", part_id: p.part_id, sha256: p.sha256, body: p.body })), manifests: [] });
-				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { Object.assign(r, { status: "stuck", reason: up.find((x) => x.status === "refused")?.reason, digest_rev: DIGEST_REV }); outcomes[id] = "stuck"; continue; }
+				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { Object.assign(r, { status: "stuck", reason: up.find((x) => x.status === "refused")?.reason, digest_rev: DIGEST_REV }); outcomes[id] = "stuck"; tally.refused++; continue; }
 			}
 			const m = await server.ingest({ session, ...where, digests: [], manifests: [{ range_id: id, parts: result.parts.map(({ part_id, sha256 }) => ({ part_id, sha256 })) }] });
 			if (m[0]?.status !== "stored" && m[0]?.status !== "replayed") { r.reason = m[0]?.reason; outcomes[id] = "pending"; continue; }
 		} catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }
 		// The server holds a manifest that tiles the range. Save the acknowledgement first, then remove this range's local copies.
+		tally.digestAt = now;
 		r.status = "consolidated";
 		delete r.reason;
 		advance();
@@ -707,6 +879,7 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	}
 	advance();
 	save();
+	noteCapture(t.client, tally);
 	const missing = !src && (now - st.pending_source_since > PENDING_SOURCE_DAYS * 86_400_000 ? "source_missing_expired" : "source_missing");
 	return { status: missing || "done", digested_to: st.digested_to, consolidated_to: st.consolidated_to, outcomes };
 }
@@ -747,7 +920,8 @@ const starts = (qdir) => (fs.existsSync(qdir) ? fs.readdirSync(qdir).filter((f) 
 
 /** Returns a claimed trigger to the queue, unless a newer one for the session is already there: that one supersedes it. */
 function unclaim(claimed, queuedFile) {
-	try { fs.linkSync(claimed, queuedFile); } catch { /* a newer trigger is queued */ }
+	// Any other failure (ENOSPC, EDQUOT, ...) keeps the claim, so the next run's recovery returns it.
+	try { fs.linkSync(claimed, queuedFile); } catch (e) { if (e.code !== "EEXIST") throw e; /* a newer trigger is queued */ }
 	fs.rmSync(claimed, { force: true });
 }
 
@@ -772,12 +946,7 @@ function sweep(now, debounceMs) {
 		// Same size and same checked prefix is current; a changed prefix is queued so processSession starts the new epoch.
 		const retry = Object.values(st.ranges ?? {}).some((r) => r?.status === "stuck" && r.digest_rev !== DIGEST_REV);
 		if (!retry && size === st.digested_to && Number.isInteger(st.prefix_len) && prefixHash(s.transcript_path, st.prefix_len) === st.prefix_hash) continue;
-		// Linked, never renamed, into place: a trigger a hook wrote meanwhile is kept.
-		const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
-		writePrivate(tmp, JSON.stringify({ client, session: s.session, gen: randomBytes(6).toString("hex"), event: "sweep", transcript_path: s.transcript_path,
-			cwd: s.cwd, client_home: s.client_home ?? null, turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
-		try { fs.linkSync(tmp, path.join(qdir, name)); } catch { /* a newer trigger is queued */ }
-		fs.rmSync(tmp, { force: true });
+		queueTrigger({ ...s, event: "sweep" }, { now, debounceMs });
 	}
 	if (turn.length) writePrivate(cursor, JSON.stringify({ after: turn[Math.min(LIMITS.sweep, turn.length) - 1] }));
 }
@@ -787,7 +956,7 @@ function sweep(now, debounceMs) {
  * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
  * trigger written meanwhile lands in a new queue file and is handled after it.
  */
-async function drain({ server, runner, clock, sleep, debounceMs }, results) {
+async function drain({ server, runner, clock, sleep, debounceMs, trigger }, results) {
 	const config = loadConfig();
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
@@ -833,8 +1002,9 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
-			results.batch = await batch({ runner, config, clock });
+			results.batch = await batch({ runner, config, clock, trigger });
 		}
+		results.status = await sendStatus(config, server, clock());
 	} finally {
 		runner?.cleanup?.();
 	}
@@ -860,18 +1030,74 @@ async function corpusAfterSessions(config, cwds, runner) {
 	return out;
 }
 
-/** The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. */
-export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS } = {}) {
+/**
+ * The end-of-run capture report (status.mjs builds it from captureSummary and the local spool, hooks and launchd job). Sent with
+ * the job token while this process holds the lock; a sent report starts the refusal count again. Never throws.
+ */
+async function sendStatus(config, server, now) {
+	try {
+		const { reportStatus } = await import("./status.mjs");
+		const r = await reportStatus({ config, server: server ?? httpServer(config), now });
+		if (r?.status === "sent") {
+			const s = readJson(statsFile(), {});
+			if (s.refused_since_last) writePrivate(statsFile(), JSON.stringify({ ...s, refused_since_last: 0 }));
+		}
+		return r?.status === "sent" ? "sent" : "failed";
+	} catch { return "failed"; }
+}
+
+/**
+ * The hook events install registers, for both clients: UserPromptSubmit only when injection is on. status.mjs reports this list
+ * and doctor.mjs checks the client settings against it.
+ */
+export const hookEvents = (config = loadConfig()) => ["Stop", "SessionEnd", "SessionStart", "PreCompact", ...(config.inject?.enabled === true ? ["UserPromptSubmit"] : [])];
+
+/**
+ * Whether a configured profile may get a batch lease now. The server allows one lease per profile every 20 hours (BATCH_GAP_MS in
+ * src/profile/maintenance.ts); batch/last.json shows when this machine last took one, or the gate time the server last returned.
+ * Anything else, including a skipped or failed batch, counts as due.
+ */
+export function batchDue(config = loadConfig(), now = Date.now()) {
+	const last = readJson(path.join(home(), "batch", "last.json"), null);
+	const at = Date.parse(last?.at ?? "");
+	return (config.batch_profiles ?? []).some((p) => {
+		const r = last?.profiles?.[p];
+		if (r?.status === "idle") return !(Date.parse(r.next_allowed_at ?? "") > now);
+		const leased = ["completed", "lease_short", "lease_expired", "discarded"].includes(r?.status);
+		return !(leased && now - at < 20 * 3_600_000);
+	});
+}
+
+/**
+ * The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. trigger is "hook"
+ * (a client hook started it) or "scheduled" (`run --scheduled` from launchd). A scheduled run with no queued trigger, no claim a
+ * crashed run left behind, no spooled batch and no batch due sends its status report and returns "idle" without starting the
+ * confined runtime.
+ */
+export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
 	const results = {};
-	let last = null;
+	let last = null, idle = null;
 	while (takeLock()) {
-		try { last = await drain({ server, runner, clock, sleep, debounceMs }, results); } finally { dropLock(); }
-		// A trigger written after the last scan saw the lock and started no run of its own: take the lock back for it.
+		try {
+			if (trigger === "scheduled" && !last) {
+				const config = loadConfig(), qdir = path.join(home(), "queue"), spoolDir = path.join(home(), "spool");
+				const spooled = fs.existsSync(spoolDir) && fs.readdirSync(spoolDir).some((f) => f.endsWith(".json"));
+				// Under the lock every entry in claimed/ is a dead run's; drain returns it to the queue first.
+				const retained = fs.existsSync(claimDir()) && fs.readdirSync(claimDir()).length > 0;
+				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock())) {
+					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
+				}
+			}
+			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger }, results);
+		} finally { dropLock(); }
+		// A trigger written after the last scan (or during the idle report) saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");
-		if (!starts(qdir).length && !queued(qdir).some((f) => { const t = readJson(path.join(qdir, f), null); return t && last.handled.get(f) !== genOf(t); })) break;
+		if (!starts(qdir).length && !queued(qdir).some((f) => { const t = readJson(path.join(qdir, f), null); return t && last?.handled.get(f) !== genOf(t); })) break;
+		idle = null;
 	}
+	if (idle) return idle;
 	if (!last) return { status: "locked" };
-	return { status: "ran", results, runtime: last.runtime, reason: last.reason };
+	return { status: "ran", trigger, results, runtime: last.runtime, reason: last.reason };
 }
 
 // ---------- confined runtime (section 12) ----------
@@ -1228,7 +1454,8 @@ export function parseEvents(stdout) {
 // ---------- install ----------
 
 /**
- * Writes this CLI, a private config and the probe directory under the Agent Memory home. Never edits client settings.
+ * Writes this CLI, a private config, the probe and log directories under the Agent Memory home and, on macOS, the daily batch
+ * plist (launchd.mjs; a home other than the default gets the test label). Never edits client settings and never loads the job.
  * bin/agent-memory.mjs is the one CLI copy; the hook command bin/agent-memory is a relative symlink to it, so the entry and
  * batch.mjs's `./agent-memory.mjs` import load one module instance and one lock owner. Each file is replaced atomically.
  * `corpus-upload` runs the copied corpus CLI and its imports, laid out as in the source tree.
@@ -1238,8 +1465,14 @@ const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs",
 const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
 // replay's import closure: replay.mjs imports transcript-full.mjs, which imports ./agent-memory.mjs; the player is read as bytes.
 const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
+// Local operations: the daily job (launchd.mjs, imported here), the status report sent after each run, doctor and backfill.
+const LO_LOCAL = ["launchd.mjs", "status.mjs", "doctor.mjs", "backfill.mjs"];
+// The eval command and its scorer.
+const EVAL_LOCAL = ["eval.mjs", "eval-score.mjs"];
+// Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit. They import only ./agent-memory.mjs and each other.
+export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", ...EVAL_LOCAL];
 
-export function install({ server = "https://memory.wrick17.com" } = {}) {
+export function install({ server = "https://memory.wrick17.com", platform = process.platform } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
 	// Home and bin are checked before anything is created inside them: a symlink or a foreign directory is refused.
 	for (const [dir, recursive] of [[home(), true], [path.dirname(bin), false], [path.join(home(), "src"), false], [path.join(home(), "src", "domain"), false]]) {
@@ -1249,7 +1482,7 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 		fs.chmodSync(dir, 0o700);
 	}
 	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
-	for (const f of [...CORPUS_LOCAL, ...REPLAY_LOCAL]) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+	for (const f of [...CORPUS_LOCAL, ...REPLAY_LOCAL, ...V2_LOCAL]) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
 	for (const f of CORPUS_DOMAIN) writePrivate(path.join(home(), "src", "domain", f), fs.readFileSync(new URL(`../src/domain/${f}`, import.meta.url)));
 	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -1258,28 +1491,75 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const cfg = path.join(home(), "config.json");
 	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna", batch_profiles: [], batch_luna_model: "gpt-6-luna", batch_terra_model: "gpt-6.1-terra" }, null, 2));
 	fs.mkdirSync(path.join(home(), "probe"), { recursive: true, mode: 0o700 });
-	return { bin, config: cfg, claude: { hooks: Object.fromEntries(["Stop", "SessionEnd", "SessionStart"].map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...(e === "Stop" ? { async: true } : {}) }] }]])) },
-		codex: ["Stop", "SessionEnd", "SessionStart"].map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${e === "Stop" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : ""}`).join("\n\n") };
+	fs.mkdirSync(path.join(home(), "logs"), { recursive: true, mode: 0o700 });
+	const config = loadConfig(), events = hookEvents(config);
+	// The daily batch job, on macOS: the plist is written, never loaded; the owner runs the printed bootstrap command.
+	let launchd = null;
+	if (platform === "darwin") {
+		const label = launchdLabel(home()), file = plistPath(label);
+		// launchd runs the job with this Node, this home and the installer's PATH, since it inherits neither the shell nor its env.
+		writePrivate(file, plist({ label, bin, hour: config.batch_hour, log: path.join(home(), "logs", "batch.log"), agentHome: home(),
+			nodeExecutable: process.execPath, runnerPath: process.env.PATH }), 0o644);
+		launchd = { label, plist: file, load: loadCommand(file) };
+	}
+	// Stop and PreCompact only queue a run, so they never hold up the client. UserPromptSubmit waits for its output, bounded by
+	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout.
+	const promptTimeout = Math.ceil(config.inject.timeout_ms / 1000) + 1;
+	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : {});
+	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}` : "");
+	return { bin, config: cfg, launchd, hooks: events,
+		claude: { hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
+		codex: events.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
 }
 
 // ---------- CLI ----------
+
+export const USAGE = "usage: agent-memory hook <claude-code|codex> | run [--scheduled] | install | eval --cases FILE --profile P [--channels lexical|vector|hybrid] [--k N] [--out FILE] [--write-baseline FILE] | eval export-candidates --profile P --out FILE | replay [--list] [--session ID] [--port N]"
+	+ " | backfill [--client claude-code|codex] [--since 30d] | doctor | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory <command> --help` for its options\n";
+
+/** v2 commands: each module's main(argv, prog) resolves to the exit code. replay keeps its own branch below. */
+const COMMANDS = { eval: "./eval.mjs", backfill: "./backfill.mjs", doctor: "./doctor.mjs" };
+
+/**
+ * UserPromptSubmit: the only hook that may wait on the network. Off unless inject.enabled; prints at most the client's
+ * context output, and on any failure, a missing read token or the timeout prints nothing and exits 0.
+ */
+function promptHook(client, input) {
+	const config = loadConfig();
+	if (!config.inject.enabled) process.exit(0);
+	setTimeout(() => process.exit(0), config.inject.timeout_ms + 250);
+	import("./inject.mjs").then((m) => m.inject(client, input, { config })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
 	const [cmd, arg] = process.argv.slice(2);
 	if (cmd === "hook") {
 		let input = "";
-		process.stdin.on("data", (d) => { input += d; }).on("end", () => { try { hook(arg, input); } catch { /* never block the client */ } process.exit(0); });
+		process.stdin.on("data", (d) => { input += d; }).on("end", () => {
+			let event = null;
+			try { event = JSON.parse(input)?.hook_event_name ?? null; } catch { /* hook() ignores bad input */ }
+			if (event === "UserPromptSubmit" && CLIENTS.has(arg)) { try { promptHook(arg, input); } catch { process.exit(0); } return; }
+			try { hook(arg, input); } catch { /* never block the client */ }
+			process.exit(0);
+		});
 	} else if (cmd === "run") {
-		run().then((r) => { writePrivate(path.join(home(), "last-run.json"), JSON.stringify({ at: new Date().toISOString(), status: r.status, runtime: r.runtime ?? null })); }, () => process.exit(1));
+		const trigger = process.argv.slice(3).includes("--scheduled") ? "scheduled" : "hook";
+		run({ trigger }).then((r) => { writePrivate(path.join(home(), "last-run.json"), JSON.stringify({ at: new Date().toISOString(), status: r.status, runtime: r.runtime ?? null, ...(trigger === "scheduled" ? { trigger } : {}) })); }, () => process.exit(1));
 	} else if (cmd === "install") {
 		const r = install();
-		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\nClaude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
+		const job = r.launchd ? `Daily batch job written to ${r.launchd.plist} (not loaded). To load it, run:\n${r.launchd.load}\n` : "";
+		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\n${job}Claude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
 	} else if (cmd === "corpus-upload") {
 		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else if (cmd === "replay") {
 		import("./replay.mjs").then((m) => m.main(process.argv.slice(3))).then((code) => process.exit(code), () => { process.stderr.write("agent-memory replay: failed\n"); process.exit(1); });
+	} else if (Object.hasOwn(COMMANDS, cmd)) {
+		import(COMMANDS[cmd]).then((m) => m.main(process.argv.slice(3), `agent-memory ${cmd}`)).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else {
-		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | replay [--list] [--session ID] [--port N] | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
+		process.stderr.write(USAGE);
 		process.exit(2);
 	}
 }
