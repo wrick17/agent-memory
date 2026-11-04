@@ -126,9 +126,10 @@ const submitDate = (b: ReturnType<typeof browser>, value: string) => {
 	find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
 };
 
-// Every route the dashboard served before the split, and the heading it opened with under the default fixtures (unchanged by the split).
+// Every route the dashboard served before the split, and the heading it opened with under the default fixtures. Only the site root
+// changed: it opens the registered Overview tab.
 const ROUTES: [string, string][] = [
-	["", "Knowledge graph: work"], ["#/", "Knowledge graph: work"], ["#/profiles", "Profiles"], ["#/profiles/work", "Profile: work"],
+	["", "Overview"], ["#/", "Overview"], ["#/profiles", "Profiles"], ["#/profiles/work", "Profile: work"],
 	["#/profiles/nobody", "No profile named nobody"], ["#/work", "Work: work"], ["#/work/personal", "Work: personal"],
 	["#/about", "About you: personal"], ["#/about/work", "About you: work"], ["#/memories", "Memories: work"],
 	["#/memories/personal", "Memories: personal"], ["#/memory/work/r1", "Memory"], ["#/graph/work", "Knowledge graph: work"],
@@ -138,15 +139,15 @@ const ROUTES: [string, string][] = [
 	["#/backups", "Backups and recovery"], ["#/routing", "Routing"], ["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"],
 	["#/graph/nobody", "No active profile named nobody"]];
 // The shell's nav: each group's label and its links. Only pages that exist today; Admin holds the rest, as the static nav did.
-const navOf = (b: ReturnType<typeof browser>) => b.els.nav!.children.map((g) => [g.tag === "details" ? find(g, "summary")[0]!.textContent : find(g, "span")[0]!.textContent,
+const navOf = (b: ReturnType<typeof browser>) => b.els.nav!.children.map((g) => [g.tag === "details" ? find(g, "summary")[0]!.textContent : g.attrs["aria-label"] ?? null,
 	find(g, "a").map((a) => `${a.textContent} ${a.attrs.href}`)]);
 const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/activity", "Timeline #/timeline", "Journals #/journals", "Paths #/path", "Work #/work",
 	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
-// The registered Memories tab takes the built-in Memories entry's place.
-const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
-	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Audit #audit"]],
+// The registered Memories and Audit tabs take the built-in entries' places; Overview stands alone, before the groups.
+const GROUPED_NAV = [[null, ["Overview #overview"]], ["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
+	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Health #health", "Audit #audit"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -259,7 +260,7 @@ describe("dashboard shell", () => {
 		expect(navOf(b)).toEqual(GROUPED_NAV);
 		const current = () => find(b.els.nav!, "a").filter((a) => a.attrs["aria-current"] === "page").map((a) => a.textContent);
 		expect(current()).toEqual(["Memories"]);
-		expect(text(b.els.nav!)).not.toMatch(/Overview|Health|Live|features/i);
+		expect(text(b.els.nav!)).not.toMatch(/Live|features/i);
 		b.go("#memories/r1?profile=personal");
 		await settle();
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: personal"); // the Memories tab: the list with r1's detail panel
@@ -274,11 +275,7 @@ describe("dashboard shell", () => {
 		b.go("#/backups");
 		expect(current()).toEqual(["Backups and recovery"]);
 		expect(b.els.nav!.children.at(-1)!.attrs.class).toBe("navgroup current");
-		b.go("");
-		expect(current()).toEqual(["Graph"]);
-		// Once an Overview tab registers, the site root opens it; Graph's link and #/graph/NAME still open the graph.
-		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
-		am.tab({ id: "overview", group: null, label: "Overview", key: "o", render: (root: El) => am.el("h2", root, "Overview") });
+		// The registered Overview tab opens at the site root; Graph's link and #/graph/NAME still open the graph.
 		for (const [hash, heading, mark] of [["", "Overview", "Overview"], ["#/", "Overview", "Overview"], ["#/graph", "Knowledge graph: work", "Graph"],
 			["#/graph/personal", "Knowledge graph: personal", "Graph"]]) {
 			b.go(hash!);
@@ -302,7 +299,7 @@ describe("dashboard shell", () => {
 		expect(b.key("?", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(false);
 		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, m Memories, l Lessons, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, u Audit.");
+		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, o Overview, m Memories, l Lessons, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, h Health, u Audit.");
 		expect(b.key("Escape", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(true);
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
@@ -320,7 +317,7 @@ describe("dashboard shell", () => {
 		const plain = browser({ signedIn: true });
 		await dashboardMain(plain.win);
 		expect(plain.html.attrs["data-theme"]).toBeUndefined();
-		const b = browser({ signedIn: true, storage: new Map([["am.theme", "dark"]]) });
+		const b = browser({ signedIn: true, hash: "#/graph", storage: new Map([["am.theme", "dark"]]) });
 		await dashboardMain(b.win);
 		expect(b.html.attrs["data-theme"]).toBe("dark");
 		const toggle = find(b.els.tools!, "button").find((x) => x.attrs["aria-label"]?.startsWith("Use the"))!;
@@ -1385,7 +1382,7 @@ describe("dashboard knowledge graph", () => {
 	};
 
 	it("opens active work's whole graph at the root, pages metadata to the server's totals, draws every record and only real links", async () => {
-		const b = browser({ signedIn: true, api: graphApi() });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
 		const started = performance.now();
 		await dashboardMain(b.win);
 		await loaded(b);
@@ -1419,7 +1416,7 @@ describe("dashboard knowledge graph", () => {
 
 	it("reads a selected record's detail only on selection, shows its real links, and drops a slower earlier selection", async () => {
 		const slow = gate();
-		const b = browser({ signedIn: true, api: graphApi(async (path) => {
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi(async (path) => {
 			if (path === "/api/profiles/work/nodes/r1") { await slow.wait; return Response.json({ node: { name: "Record 1", description: "late detail" }, history: { items: [] } }); }
 			if (path === "/api/profiles/work/nodes/u1") return Response.json({ node: { name: "Owner", description: "The owner" }, history: { items: [{ revision: 1, op: "saved", at: "2026-10-01T00:00:00Z", actor: "agent" }] } });
 		}) });
@@ -1446,7 +1443,7 @@ describe("dashboard knowledge graph", () => {
 	});
 
 	it("says plainly when the server has no whole-graph read, without a fallback read", async () => {
-		const b = browser({ signedIn: true, api: (path) => path.includes("/graph?") ? Response.json({ error: "not_found" }, { status: 404 }) : undefined });
+		const b = browser({ signedIn: true, hash: "#/graph", api: (path) => path.includes("/graph?") ? Response.json({ error: "not_found" }, { status: 404 }) : undefined });
 		await dashboardMain(b.win);
 		await settle();
 		expect(status(b).textContent).toContain("This server does not offer the whole-graph read yet");
@@ -1456,7 +1453,7 @@ describe("dashboard knowledge graph", () => {
 
 	it("offers a fresh walk when the profile changed during loading, and replaces the cached graph", async () => {
 		let changed = true;
-		const b = browser({ signedIn: true, api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", edges, path, changed) : undefined) });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", edges, path, changed) : undefined) });
 		await dashboardMain(b.win);
 		await loaded(b);
 		expect(status(b).textContent).toContain("The profile changed while loading; reload for a fresh graph.");
@@ -1468,7 +1465,7 @@ describe("dashboard knowledge graph", () => {
 	});
 
 	it("resizes the backing canvas on a height-only change and keeps headings and the selected label inside a narrow canvas without overlap", async () => {
-		const b = browser({ signedIn: true, api: graphApi() });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
 		await dashboardMain(b.win);
 		await loaded(b);
 		await settle();
@@ -1494,7 +1491,7 @@ describe("dashboard knowledge graph", () => {
 	});
 
 	it("draws every record into one cached dot layer as a path per colour, so a pan stamps one bitmap and a zoom redraws the layer once", async () => {
-		const b = browser({ signedIn: true, api: graphApi() });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
 		const made: (El & { ctx: Ctx })[] = [], create = b.win.document.createElement;
 		b.win.document.createElement = (tag: string) => { const e = create(tag) as El & { ctx: Ctx }; if (tag === "canvas") made.push(e); return e; };
 		await dashboardMain(b.win);
@@ -1524,7 +1521,7 @@ describe("dashboard knowledge graph", () => {
 		const rgb = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
 		for (const [surface, dark] of [[[26, 28, 29], true], [[251, 252, 253], false]] as const) {
 			let reads = 0;
-			const b = browser({ signedIn: true, api: graphApi() });
+			const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
 			// A forced dark page: the canvas's computed background, whatever the colour-scheme media query says.
 			Object.assign(b.win, { getComputedStyle: (e: El) => { reads++; return { backgroundColor: e.tag === "canvas" ? `rgb(${surface.join(", ")})` : "rgba(0, 0, 0, 0)" }; } });
 			await dashboardMain(b.win);
@@ -1549,7 +1546,7 @@ describe("dashboard knowledge graph", () => {
 	});
 
 	it("draws an unsaved what-if apart from the saved graph, compares only loaded facts, resets, keeps it to its profile and sends nothing", async () => {
-		const b = browser({ signedIn: true, api: graphApi((path) => path === "/api/profiles/work/nodes/r13" ? Response.json({ node: { name: "Record 13" }, history: { items: [] } }) : undefined) });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi((path) => path === "/api/profiles/work/nodes/r13" ? Response.json({ node: { name: "Record 13" }, history: { items: [] } }) : undefined) });
 		await dashboardMain(b.win);
 		await loaded(b);
 		const saved = status(b).textContent;
@@ -1588,7 +1585,7 @@ describe("dashboard knowledge graph", () => {
 	});
 
 	it("tries unsaved link and record changes between loaded records, counts their impact, restores and resets, keeps them to the profile, never drafts or sends them", async () => {
-		const b = browser({ signedIn: true, api: graphApi() });
+		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
 		await dashboardMain(b.win);
 		await loaded(b);
 		const saved = status(b).textContent, flat = () => text(b.view()).replace(/\s+/g, " ");
@@ -2159,5 +2156,25 @@ describe("dashboard Audit tab and Admin pages", () => {
 			if (!find(b.view(), "p").some((x) => x.attrs.class === "intro") || /No page|Could not/.test(t)) bad.push(`${h}: ${t.slice(0, 160)}`);
 		}
 		expect(bad).toEqual([]);
+	});
+});
+
+describe("dashboard tabs on the shared profile choice", () => {
+	it("keeps Overview narrow for an active profile the snapshot did not read, and asks the one-profile tabs for a profile without reading", async () => {
+		const b = browser({ signedIn: true, hash: "#overview?profile=personal", api: (path) => path === "/api/viewer/snapshot" ? Response.json({ ...SNAPSHOT, profiles: ["work"] }) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Overview");
+		expect(text(b.view())).toContain("The snapshot did not read personal, so its sessions and feed are not shown.");
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		expect([pick.hidden, pick.value]).toEqual([false, "personal"]); // the choice stays; nothing falls back to All or to work
+		for (const [hash, label] of [["#profile", "Profile"], ["#replay", "Replay"]]) {
+			const before = b.seen.fetched.length;
+			b.go(hash!);
+			await settle();
+			expect(find(b.view(), "h2")[0]!.textContent).toBe(`${label}: choose a profile`);
+			expect(find(b.view(), "a").map((a) => a.attrs.href)).toEqual([`${hash}?profile=personal`, `${hash}?profile=work`]); // no All for a one-profile tab
+			expect(b.seen.fetched.length).toBe(before);
+		}
 	});
 });
