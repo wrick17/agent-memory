@@ -2449,8 +2449,22 @@ describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall 
 			// Only items still leased come back once one is completed.
 			complete(storage, who, { lease_id: first.lease_id!, results: [{ item_id: first.items[0]!.item_id, ops: [{ op: "dismiss" }] }] }, job);
 			expect(next(storage, { request_id: "run-1", lease_seconds: 60 }).items.map((i) => i.item_id)).toEqual([first.items[1]!.item_id]);
-			sql.exec("UPDATE profile_meta SET value = json_set(value, '$.lease_until', '2000-01-01T00:00:00.000Z') WHERE key = 'lease_request'");
+			sql.exec("UPDATE profile_meta SET value = json_set(value, '$.lease_until', ?) WHERE key LIKE 'lease\\_request%' ESCAPE '\\'", new Date(Date.now() - 60_000).toISOString());
 			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
+			// A later run's lease keeps run-1's binding: a delayed run-1 retry, past both gates, still finds it expired, and with other
+			// arguments is still refused; it never becomes a new run.
+			const past = () => sql.exec("UPDATE cursors SET last_run_at = ? WHERE stage = 'maintenance_batch'", new Date(Date.now() - 21 * 3_600_000).toISOString());
+			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
+			past();
+			const second = next(storage, { request_id: "run-2", lease_seconds: 60 });
+			expect(second.lease_id).toEqual(expect.any(String));
+			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
+			past();
+			const attempts = () => sql.exec("SELECT attempts FROM maintenance ORDER BY id").toArray().map((r) => r.attempts);
+			const before = attempts();
+			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
+			expect(() => next(storage, { request_id: "run-1", lease_seconds: 30 })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "idempotency_mismatch" }) }));
+			expect(attempts()).toEqual(before);
 		});
 	});
 
