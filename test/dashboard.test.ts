@@ -97,6 +97,20 @@ const submitDate = (b: ReturnType<typeof browser>, value: string) => {
 	find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
 };
 
+// Every route the dashboard served before the split, and the heading it opened with under the default fixtures (unchanged by the split).
+const ROUTES: [string, string][] = [
+	["", "Knowledge graph: work"], ["#/", "Knowledge graph: work"], ["#/profiles", "Profiles"], ["#/profiles/work", "Profile: work"],
+	["#/profiles/nobody", "No profile named nobody"], ["#/work", "Work: work"], ["#/work/personal", "Work: personal"],
+	["#/about", "About you: personal"], ["#/about/work", "About you: work"], ["#/memories", "Memories: work"],
+	["#/memories/personal", "Memories: personal"], ["#/memory/work/r1", "Memory"], ["#/graph/work", "Knowledge graph: work"],
+	["#/graph/work/r1", "Knowledge graph: work"], ["#/map/work", "Map: work"], ["#/draft", "Write: work"], ["#/draft/work", "Write: work"],
+	["#/activity/work", "Activity: work"], ["#/timeline/work", "Timeline: work"], ["#/journals/work", "Journals: work"],
+	["#/path/work", "Path finder: work"], ["#/review/work", "Review: work"], ["#/move/work/r1", "Move a record"], ["#/copy/work/r1", "Save a copy"],
+	["#/backups", "Backups and recovery"], ["#/routing", "Routing"], ["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"],
+	["#/graph/nobody", "No active profile named nobody"]];
+const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/activity", "Timeline #/timeline", "Journals #/journals", "Paths #/path", "Work #/work",
+	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
+
 describe("dashboard", () => {
 	it("mounts sign-in and fetches nothing until the owner signs in", async () => {
 		const b = browser();
@@ -167,6 +181,20 @@ describe("dashboard", () => {
 		const malformed = browser({ signedIn: true, hash: "#/profiles/%E0%A4%A" });
 		await dashboardMain(malformed.win);
 		expect(find(malformed.view(), "h2")[0]!.textContent).toBe("No profile named %E0%A4%A");
+	});
+
+	it("serves every existing page from the split parts through the served /app.js, at its old route, under the unchanged nav", async () => {
+		// The pages now live in separate serialized parts; one that used anything but `am` and browser globals fails here.
+		const nav = /<nav[^>]*aria-label="Dashboard">(.*?)<\/nav>/.exec(DASHBOARD_HTML(env))![1]!;
+		expect([...nav.matchAll(/<a href="([^"]+)">([^<]+)<\/a>/g)].map((m) => `${m[2]} ${m[1]}`)).toEqual(NAV);
+		const response = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/app.js`));
+		const b = browser({ signedIn: true, hash: "#/profiles" });
+		new Function("window", await response.text())(b.win);
+		await settle();
+		const seen: [string, string][] = [];
+		for (const [hash] of ROUTES) { b.go(hash); await settle(); seen.push([hash, find(b.view(), "h2")[0]?.textContent ?? ""]); }
+		expect(seen).toEqual(ROUTES);
+		expect(b.els.nav).toBeUndefined(); // no tab registers yet, so the shell adds nothing to the static nav
 	});
 
 	it("reports an API refusal instead of showing an empty dashboard", async () => {
