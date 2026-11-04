@@ -618,6 +618,11 @@ export class AccountStore extends DurableObject<Env> {
 	private wiping(): boolean {
 		return this.sql.exec("SELECT 1 FROM wipes WHERE json_extract(report, '$.state') <> 'done' LIMIT 1").toArray().length > 0;
 	}
+	/** When the last full successful export ran. Before last_full_export existed, last_export counts only if it was such a run. */
+	private lastFullExportAt(): string | null {
+		const r = JSON.parse(this.meta("last_full_export") ?? this.meta("last_export") ?? "null") as { at?: string; results?: Record<string, unknown> } | null;
+		return r?.results && "account" in r.results ? r.at ?? null : null;
+	}
 	private exportAccount(userId: string, preserve?: true) {
 		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: [], ...(preserve ? { preserve } : {}) }));
 	}
@@ -1005,7 +1010,12 @@ export class AccountStore extends DurableObject<Env> {
 					mark(`corpus-${p.name}`, p.generation, c, { due });
 				}
 				const failed = Object.values(results).some((v) => typeof v === "object" && v !== null && "error" in v);
-				this.write(() => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", JSON.stringify({ at: now(), trigger, results, stores })));
+				const record = JSON.stringify({ at: now(), trigger, results, stores });
+				this.write(() => {
+					this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", record);
+					// Backup health counts only a run that exported the account and every profile without a failure.
+					if (!failed && !cmd.profile) this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", "last_full_export", record);
+				});
 				return failed ? fail("unavailable", "an export failed", { results }) : ok(results);
 			}
 			case "listExports":
@@ -2140,14 +2150,11 @@ export class AccountStore extends DurableObject<Env> {
 					return f?.ok ? { profile: r.name, facts: f.value as LeaseFacts } : null;
 				}));
 				const devices = this.sql.exec<{ id: string; revoked: number }>("SELECT id, (revoked_at IS NOT NULL OR enabled = 0) AS revoked FROM devices").toArray().map((d) => ({ id: d.id, revoked: d.revoked === 1 }));
-				const last = JSON.parse(this.meta("last_export") ?? "null") as { at?: string } | null;
-				const input = { now: new Date().toISOString(), profiles: profiles.filter((p) => p !== null), devices, last_export_at: last?.at ?? null };
+				const input = { now: new Date().toISOString(), profiles: profiles.filter((p) => p !== null), devices, last_export_at: this.lastFullExportAt() };
 				return ok(this.write(() => healthSweep(this.sql, input)));
 			}
-			case "accountHealth": {
-				const last = JSON.parse(this.meta("last_export") ?? "null") as { at?: string } | null;
-				return ok({ checks: readHealth(this.sql), devices: listClientStatus(this.sql), last_export_at: last?.at ?? null, exports: await listExports(this.env, "account") } satisfies AccountHealth);
-			}
+			case "accountHealth":
+				return ok({ checks: readHealth(this.sql), devices: listClientStatus(this.sql), last_export_at: this.lastFullExportAt(), exports: await listExports(this.env, "account") } satisfies AccountHealth);
 			case "reportStatus":
 				this.write(() => storeClientStatus(this.sql, cmd.deviceId, new Date().toISOString(), cmd.body));
 				return ok(null);
