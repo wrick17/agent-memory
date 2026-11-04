@@ -136,6 +136,31 @@ Source ready, not deployed. Depends on the v2 request plumbing above. Recall sta
 - Wipe and restore: a profile wipe purges recall rows and candidates naming a purged node. Before a restored or point-in-time generation opens, the recovery copies every account `wiped:` identity into it as a local fence and removes the matching side rows (`fence` phase). Reads hide fenced candidates in between.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
 
+### v2 recall eval runner and synthetic gate (#20), 2026-11-04
+
+Source ready, not deployed. Depends on #9's `/v1/recall` and `/v1/eval/*` routes and on the CLI's `eval` dispatch, read client and install copies (#6, #16).
+
+- `agent-memory eval --cases FILE --profile P [--channels lexical|vector|hybrid] [--k 5]` reads a schema_version 1 case file. It accepts golden cases and exported candidates. `--profile` is required and is never inferred.
+- Each case goes to `POST /v1/recall` with the read token and `count_hits: false`. Recall and candidate export never fall back to the job token.
+- `local/eval-score.mjs` computes recall_all_at_k, any_hit_at_k and first-relevant MRR, with misses scored as 0. It has no imports, so the CLI and the Workers gate share the same parser, request body, scorer and baseline rule.
+- The full report, with misses, stays on the device at mode 600. `POST /v1/eval/runs` gets only scores and counts, with the job token.
+- Without `--out`, the report goes to `~/.agent-memory/eval/<UTC run time>-<channels>.json`, such as `2026-11-05T093000.000Z-hybrid.json`. The write never replaces an existing report; a run that finds its name taken adds `-2`, `-3` and so on. `--out FILE` replaces that file.
+- `eval export-candidates --profile P --out FILE` appends accepted candidates in one atomic write. It refuses the golden-query file as output.
+- `--write-baseline FILE` writes only when no baseline exists, or when the channels and k match, no metric is lower and one is higher.
+- Golden filter gap, still open: `/v1/recall` takes no `type`, `kinds` or `scope`. Golden cases that set one run unfiltered. The report lists them under `unsupported_filters` and the CLI prints a warning. Golden scores can differ from the earlier filtered top-5 check until a filter contract exists.
+- CI gate: `test/eval-synthetic.test.ts` runs in `npm test`. It seeds the 24 invented records of `test/fixtures/eval/synthetic-cases.json` and runs its 22 cases (2 in golden form with a `type` filter) on all three channels through `POST /v1/recall` with a read-only device token. It fails when lexical recall_all_at_k drops below `synthetic-baseline-lexical.json`.
+- The same run checks that `recall_daily` and `recall_totals` stay empty through all three eval passes. A later counted recall then adds exactly its own rows.
+- Synthetic baselines at k 5, 22 cases, recorded by `npm run eval:baseline` (only rises):
+
+| Channels | recall_all_at_k | any_hit_at_k | MRR |
+|---|---|---|---|
+| lexical | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
+| vector | 15/22 (0.6818) | 16/22 (0.7273) | 0.7273 |
+| hybrid | 21/22 (0.9545) | 21/22 (0.9545) | 0.9545 |
+
+- These numbers come from invented records and the bag-of-words fake embeddings in `test/fakes.js`. They are not a live provider, semantic-quality or golden-query result. Each baseline file carries that label in `source`.
+- Evidence: `npm run typecheck`, eslint on the touched files, `npm run eval:baseline` (wrote all three, then a second run left them byte-identical), the gate passing, the gate failing with the lexical baseline raised to 1, and one CLI run against stubbed routes. The combined test phase still owns the CLI tests and the full suite. A live run and real golden baselines are still open.
+
 ### v2 sessions and provenance (#12), 2026-11-04
 
 Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Sessions are read from stored digests only.
