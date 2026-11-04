@@ -7,12 +7,13 @@ import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
 import { corpusFiles, corpusFilesSql, embeddingsOn, type SearchCounts } from "./profile/store";
 import { corpusOn, corpusStub } from "./corpus-tools";
+import { eventStream, parseCursor, STREAM_MAX_MS } from "./viewer/events";
 import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
 import { healthReport } from "./health";
 import { mayUse } from "./routing";
 import { parseEvalRun } from "./eval";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
-import type { ActivitySummary, LeaseFacts, Page, ProjectProfile, SessionRow } from "./viewer/types";
+import type { ActivitySummary, FeedItem, LeaseFacts, Page, ProjectProfile, SessionRow, ViewerCursor } from "./viewer/types";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
@@ -108,7 +109,7 @@ export async function deviceV2(request: Request, env: Env, url: URL, waitUntil: 
 
 /** Owner routes; api.ts calls this only after its owner check. Null for any other path. */
 export async function ownerV2(request: Request, env: Env, url: URL, ctx: AccountContext, account: Pick<AccountStore, "admin">,
-	_claims: Record<string, unknown> | undefined, _waitUntil: Waiter | undefined): Promise<Response | null> {
+	claims: Record<string, unknown> | undefined, _waitUntil: Waiter | undefined): Promise<Response | null> {
 	const path = url.pathname, method = request.method, params = Object.fromEntries(url.searchParams);
 	const p = /^\/api\/profiles\/([^/]+)\/(.+)$/.exec(path);
 	const ref = p && profileName.safeParse(p[1]).success ? ctx.profiles.find((x) => x.profile === p[1]) : undefined;
@@ -131,6 +132,32 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		}));
 		return json(healthReport(a.value as AccountHealth, per.flatMap((x) => (x.lease ? [{ profile: x.profile, facts: x.lease }] : [])),
 			per.map((x) => (x.counts ? { usage: x.counts } : null)), embeddingsOn(env)));
+	}
+	// #14 live events: owner only (this function runs after the owner check). The stream ends at the token's exp or after five
+	// minutes; a failed profile read ends it, and the next cursor names only the owner's active profiles.
+	if (path === "/api/viewer/events" && method === "GET") {
+		const raw = url.searchParams.get("cursor");
+		const cursor = raw === null ? {} : parseCursor(raw);
+		if (!cursor) return invalid("cursor is not valid");
+		const exp = typeof claims?.exp === "number" ? claims.exp * 1000 : Date.now() + STREAM_MAX_MS;
+		return eventStream({
+			changes: async (cur) => {
+				const items: FeedItem[] = [], next: ViewerCursor = {};
+				for (const r of ctx.profiles) {
+					const out = await profileStub(env, r).readV2(r, { kind: "changes", after: cur[r.profile] ?? 0, limit: 50 });
+					if (!out.ok) throw new Error(`changes ${r.profile}: ${out.error.code}`);
+					const v = out.value as { items: FeedItem[]; seq: number };
+					items.push(...v.items);
+					next[r.profile] = v.seq;
+				}
+				return { items, cursor: next };
+			},
+			health: async () => {
+				const h = await account.admin({ op: "accountHealth" });
+				if (!h.ok) throw new Error(`health: ${h.error.code}`);
+				return (h.value as AccountHealth).checks;
+			},
+		}, cursor, exp, request.signal);
 	}
 	// #9 eval runs, candidates and recall strength.
 	if (path === "/api/eval/runs" && method === "GET") {

@@ -189,3 +189,13 @@ Source ready, not deployed. Depends on #12 above for session and project semanti
 - Activity, a project's last activity and session order use the same current parts and last-upload time as Sessions (#12).
 - Evidence for these rules: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 live viewer events (#14), 2026-11-04
+
+Source ready, not deployed. Depends on the v2 request plumbing and #11 above for account health.
+
+- `GET /api/viewer/events?cursor=` is a `text/event-stream` for the owner only; every device token gets 403 from the existing owner check.
+- Every three seconds it reads each active profile's activity after the cursor and the account health checks, and sends change and health events in the typed contracts, health first.
+- The cursor holds each profile's activity sequence, so a reconnect resumes without losing intervening activity; an invalid cursor is refused. A failed profile read ends the stream instead of skipping that profile.
+- The stream ends at the authenticating token's `exp` or after five minutes, whichever is earlier, and a cancelled request stops polling.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved stream tests run in the combined phase.
