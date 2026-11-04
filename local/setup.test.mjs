@@ -255,6 +255,7 @@ describe("self-host setup", () => {
 		assert.deepEqual(c.r2_buckets, [{ binding: "BACKUPS", bucket_name: "am-selfhost-ledger" }]);
 		assert.deepEqual(c.ai, { binding: "AI" });
 		assert.deepEqual(c.vectorize, [{ binding: "VECTORS", index_name: "am-selfhost-cards" }]);
+		assert.deepEqual(c.version_metadata, { binding: "CF_VERSION_METADATA" }, "the viewer snapshot reads the deployed version");
 		assert.deepEqual(c.vars, { RESOURCE_URL: "https://memory.selfhost-synthetic.dev/mcp", CLERK_ISSUER: "https://clerk.selfhost-synthetic.dev",
 			CLERK_FRONTEND_API: "https://clerk.selfhost-synthetic.dev", CLERK_PUBLISHABLE_KEY: SETTINGS.clerk_publishable_key, REQUIRED_SCOPE: "memory",
 			DASHBOARD_ORIGIN: "https://memory.selfhost-synthetic.dev", EMBEDDINGS: "on", ROUTING_DEFAULTS: SETTINGS.routing.join(","), IMPORT_PROFILES: "" });
