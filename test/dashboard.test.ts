@@ -145,7 +145,7 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
 // The registered Memories tab takes the built-in Memories entry's place.
-const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories"]], ["System", ["Audit #/activity"]],
+const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Actions #actions"]], ["System", ["Audit #/activity"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -258,7 +258,7 @@ describe("dashboard shell", () => {
 		expect(navOf(b)).toEqual(GROUPED_NAV);
 		const current = () => find(b.els.nav!, "a").filter((a) => a.attrs["aria-current"] === "page").map((a) => a.textContent);
 		expect(current()).toEqual(["Memories"]);
-		expect(text(b.els.nav!)).not.toMatch(/Overview|Lessons|Crystals|Sessions|Actions|Replay|Health|Live|features/i);
+		expect(text(b.els.nav!)).not.toMatch(/Overview|Sessions|Replay|Health|Live|features/i);
 		b.go("#memories/r1?profile=personal");
 		await settle();
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: personal"); // the Memories tab: the list with r1's detail panel
@@ -383,9 +383,9 @@ describe("dashboard live chrome", () => {
 		expect(text(b.els.features!)).toContain("Affects: Memories.");
 		// A tab registered with a count shows the snapshot's number, labelled as covering every profile; built-in pages show none.
 		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
-		am.tab({ id: "lessons", group: "memory", label: "Lessons", key: "l", count: (s: typeof SNAPSHOT) => s.counts.lessons, render: (root: El) => am.el("h2", root, "Lessons") });
+		am.tab({ id: "probe", group: "memory", label: "Probe", key: "q", count: (s: typeof SNAPSHOT) => s.counts.lessons, render: (root: El) => am.el("h2", root, "Probe") });
 		am.render(false);
-		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories 12 across all profiles", "Lessons 7 across all profiles", "Audit"]));
+		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories 12 across all profiles", "Probe 7 across all profiles", "Audit"]));
 		b.listeners.pagehide!(); // the client lets go of its connection before the test closes the stream
 		stream.close();
 	});
