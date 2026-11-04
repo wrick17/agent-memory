@@ -24,6 +24,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] v2 viewer snapshot with real counts, usage, health and version (#13): source in review, not deployed.
 - [ ] v2 Lessons and Actions server reads (#27): source in review, not deployed; the tabs are separate.
 - [ ] v2 CLI config defaults, read token and job client helpers (#6): source in review, not installed.
+- [ ] Opt-in prompt recall for Claude Code and Codex (#19), off by default: source in review, not installed.
 - [ ] Add the source-only batch transport for issue #17, with retries, stable request IDs and lease handling, before runtime lease acceptance (#10) and trigger forwarding (#16).
 - [ ] Local full-transcript replay, `agent-memory replay` (#22): source in review. `agent-memory install` copies it beside the CLI, but it is not installed on any machine.
 
