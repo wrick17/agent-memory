@@ -25,6 +25,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] v2 Lessons and Actions server reads (#27): source in review, not deployed; the tabs are separate.
 - [ ] v2 CLI config defaults, read token and job client helpers (#6): source in review, not installed.
 - [ ] Opt-in prompt recall for Claude Code and Codex (#19), off by default: source in review, not installed.
+- [ ] Daily launchd job, device status report, doctor and backfill (#18): source in review, not installed.
 - [ ] Add the source-only batch transport for issue #17, with retries, stable request IDs and lease handling, before runtime lease acceptance (#10) and trigger forwarding (#16).
 
 Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
