@@ -16,6 +16,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] Release the keep-all manual export, then use it before the v2 fixture upgrade and the canonical migration.
 - [ ] Add the v2 viewer and local workflows. Source for device `GET /v1/whoami` is in review (part of #4) and is not deployed. The other routes are unfinished.
 - [ ] v2 recall channels, recall hit counts and eval records (#9): source in review, not deployed.
+- [ ] v2 digest-backed session list, detail and provenance (#12): source in review, not deployed.
 
 Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
 

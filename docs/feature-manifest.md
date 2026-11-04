@@ -135,3 +135,16 @@ Source ready, not deployed. Depends on the v2 request plumbing above. Recall sta
 - Eval candidates: the owner lists, accepts and dismisses at `/api/profiles/:p/eval-candidates`; a read-scoped device exports accepted ones at `GET /v1/eval/candidates?profile=`. Storage validates and redacts each candidate and refuses one naming a wiped id. The `suggest_eval_case` producer and the 400-day recall purge land with #10.
 - Wipe and restore: a profile wipe purges recall rows and candidates naming a purged node. Before a restored or point-in-time generation opens, the recovery copies every account `wiped:` identity into it as a local fence and removes the matching side rows (`fence` phase). Reads hide fenced candidates in between.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 sessions and provenance (#12), 2026-11-04
+
+Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Sessions are read from stored digests only.
+
+- Ingest: `session.ended` (sticky) and `session.files_changed` (largest count kept) are optional, so v1 runner bodies are unchanged. The session's device comes from the authenticated token on `/v1/ingest` and MCP ingest, never from a body field; older sessions show an unknown device.
+- Reads: `GET /api/profiles/:p/sessions` (cursor, project, client, status, limit) and `GET /api/profiles/:p/sessions/:id` for one profile; `GET /api/sessions` merges every active profile by last upload. A profile that cannot be read fails the merged list instead of being left out.
+- Detail orders events by range start, then position. Once a range's manifest is accepted, only the consolidated parts it lists (by part id and hash) are read. It links produced records through evidence and inferred-preference provenance.
+- The last upload is recorded at ingest each time a part or manifest is stored; owner pin, unpin and unflag do not change it. Active means a last upload in the past 30 minutes and no session end. List order, filters and cursors use the same last upload.
+- Counts come from stored evidence only. Upload span and first upload are labelled as such; no working directory, original start time or hosted tool count is invented.
+- Capture recall (`include_captures`) reads the same current parts as Sessions: once a range's manifest is accepted, only the parts it lists, as of the requested time when one is given.
+- Evidence for the manifest-selected parts, the last-upload time and capture recall: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.

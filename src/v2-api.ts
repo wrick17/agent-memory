@@ -7,6 +7,8 @@ import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
 import { mayUse } from "./routing";
 import { parseEvalRun } from "./eval";
+import { mergeSessions, parseSessionsCursor } from "./sessions";
+import type { Page, SessionRow } from "./viewer/types";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
@@ -117,6 +119,32 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		const q = z.object({ status: z.enum(["pending", "accepted", "dismissed", "all"]).optional(), cursor: z.string().min(1).max(2048).optional(),
 			limit: z.coerce.number().int().min(1).max(100).optional() }).strict().safeParse(params);
 		return q.success ? reply(await profileStub(env, ref).readV2(ref, { kind: "eval_candidates", q: q.data })) : invalid("status, cursor, limit 1 to 100");
+	}
+	// #12 sessions: one profile's list and detail, and the list merged across every active profile by last upload.
+	const sessionQuery = z.object({ cursor: z.string().min(1).max(4096).optional(), project: z.string().min(1).max(256).optional(), client: z.enum(["claude-code", "codex"]).optional(),
+		status: z.enum(["active", "completed"]).optional(), limit: z.coerce.number().int().min(1).max(100).optional() }).strict();
+	const sess = /^sessions(?:\/([^/]+))?$/.exec(sub);
+	if (p && sess && method === "GET") {
+		if (!ref) return notActive();
+		if (sess[1]) return reply(await profileStub(env, ref).readV2(ref, { kind: "session", id: decodeURIComponent(sess[1]) }));
+		const q = sessionQuery.safeParse(params);
+		return q.success ? reply(await profileStub(env, ref).readV2(ref, { kind: "sessions", q: q.data })) : invalid("cursor, project, client, status (active or completed), limit 1 to 100");
+	}
+	if (path === "/api/sessions" && method === "GET") {
+		const q = sessionQuery.safeParse(params);
+		if (!q.success) return invalid("cursor, project, client, status (active or completed), limit 1 to 100");
+		const { cursor, ...rest } = q.data;
+		const cursors = cursor ? parseSessionsCursor(cursor) : {};
+		if (!cursors) return invalid("cursor is not valid");
+		const pages: { profile: string; page: Page<SessionRow> }[] = [];
+		for (const r of ctx.profiles) {
+			const own = cursors[r.profile];
+			const out = await profileStub(env, r).readV2(r, { kind: "sessions", q: { ...rest, ...(own ? { cursor: own } : {}) } });
+			// One profile that cannot be read fails the merged list; it is never silently left out.
+			if (!out.ok) return reply(out);
+			pages.push({ profile: r.profile, page: out.value as Page<SessionRow> });
+		}
+		return json(mergeSessions(pages, rest.limit ?? 50));
 	}
 	if (p && sub === "recall-strength" && method === "GET") {
 		if (!ref) return notActive();

@@ -5,6 +5,11 @@ import { describe, expect, it } from "vitest";
 import type { RecallHit } from "../src/domain/types";
 import { sha256 } from "../src/domain/ids";
 import { call, contextFor, deviceToken, outcome } from "./helpers";
+import { ingest, type IngestBatch } from "../src/profile/capture";
+import { runWrite } from "../src/profile/write";
+import { listSessions, sessionDetail } from "../src/profile/sessions";
+import { mergeSessions, parseSessionsCursor } from "../src/sessions";
+import type { SessionRow } from "../src/viewer/types";
 
 type CaptureRecall = { results: RecallHit[]; next_cursor: string | null; estimated_tokens: number; lexical_only: boolean };
 
@@ -259,5 +264,162 @@ describe("capture_memory and review_candidates", () => {
 		expect(await outcome(c, "review_candidates", { action: "dismiss", candidate_id: other.capture_id })).toMatchObject({ ok: false, error: { details: { reason: "missing_reason" } } });
 		expect(await call(c, "review_candidates", { action: "dismiss", candidate_id: other.capture_id, reason: "not useful" })).toMatchObject({ action: "dismissed" });
 		expect(await outcome(c, "capture_memory", { content: "x", profile: "me" })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+	});
+});
+
+describe("sessions (S1)", () => {
+	it("recalls only an accepted manifest's consolidated parts, now and as of a time", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		const one = (word: string) => JSON.stringify({ asks: [{ text: word, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		const session = await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const range = `codex:rc-${tag}:0a1b2c3d:0-10`;
+			const whole = part("0-10", one(`kept${tag}`), "consolidated", range), a = part("0-5", one(`dropped${tag}`), "consolidated", range), b = part("5-10", one(`dropped${tag}`), "consolidated", range);
+			expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `rc-${tag}` }, digests: [whole, a, b],
+				manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] }).map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			return st.storage.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", `session:codex:rc-${tag}`).one().id;
+		});
+		const at = new Date(Date.now() + 1000).toISOString();
+		for (const extra of [{}, { as_of: at }]) {
+			const hits = async (word: string) => (await call<CaptureRecall>(c, "recall_memories", { keyword: word, profile: "test", include_captures: true, ...extra })).results.map((r) => r.memory_id);
+			// The session is recalled by its listed part only. Other records the shared test profile holds may still match a word
+			// through the vector channel (the test fakes hash words into 63 buckets), so the check is on the session itself.
+			expect(await hits(`kept${tag}`), JSON.stringify(extra)).toContain(session);
+			expect(await hits(`dropped${tag}`), JSON.stringify(extra)).not.toContain(session);
+		}
+	});
+
+	const S1 = "codex:s1-main:0a1b2c3d", body = (asks: [string, number][], decisions: [string, number][], commits: string[] = [], entities: string[] = []) => JSON.stringify({
+		asks: asks.map(([text, pos]) => ({ text, pos })), decisions: decisions.map(([text, pos]) => ({ text, pos })), corrections: [], outcomes: { commits }, entities, dropped: { asks: 0, decisions: 0, corrections: 0 } });
+	const p1 = body([["First ask", 10]], [["Pick the queue", 900]]), p2 = body([], [["Retry twice", 3000]], ["Pushed 0a1b2c3d4e"], ["https://github.com/acme/sessions"]);
+
+	it("stores trusted metadata, reads current digest parts in order, and pages, filters and merges", async () => {
+		const c = await contextFor();
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:acme/sessions", name: "Sessions project" }] });
+		// A v1 body through the real endpoint: no ended and no files count; the device comes from the job token.
+		const { id: device, token } = await deviceToken("s1-job", ["ingest"], ["test"], "test");
+		expect((await post(token, "/v1/ingest", { session: { client: "claude-code", id: "s1-v1" }, digests: [part("-", body([["Old runner", 1]], []), "heuristic", "claude-code:s1-v1:0a1b2c3d:0-10")] })).status).toBe(200);
+		const ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const ids = await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const sql = st.storage.sql, run = (b: IngestBatch) => ingest(st.storage, {} as never, b).map((r) => r.status);
+			// Earlier tests in this file share the profile; assertions look only at this test's sessions.
+			const mine = (rows: SessionRow[]) => rows.map((r) => r.session).filter((x) => x.startsWith("s1-"));
+			const main = { client: "codex" as const, id: "s1-main" };
+			// A direct ingest with no token device, as a session stored before v2: its device stays unknown.
+			expect(run({ session: { client: "claude-code", id: "s1-legacy" }, digests: [part("-", body([["Legacy ask", 1]], []), "heuristic", "claude-code:s1-legacy:0a1b2c3d:0-10")], manifests: [] })).toEqual(["stored"]);
+			// The later range arrives first; its heuristic digest is current until a manifest supersedes it.
+			expect(run({ session: { ...main, files_changed: 3 }, device_id: "dev_a", digests: [part("-", body([["Later ask", 6000]], []), "heuristic", `${S1}:5000-9000`)], manifests: [] })).toEqual(["stored"]);
+			const a = part("0-2500", p1, "consolidated", `${S1}:0-5000`), b = part("2500-5000", p2, "consolidated", `${S1}:0-5000`);
+			expect(run({ session: { ...main, files_changed: 2 }, device_id: "dev_b", digests: [part("-", body([["Superseded ask", 5]], []), "heuristic", `${S1}:0-5000`), a, b],
+				manifests: [{ range_id: `${S1}:0-5000`, parts: [{ part_id: "0-2500", sha256: a.sha256 }, { part_id: "2500-5000", sha256: b.sha256 }] }] })).toEqual(["stored", "stored", "stored", "stored"]);
+			const project = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'github:acme/sessions'").one().id;
+			const row = () => listSessions(sql, { client: "codex" }).rows[0]!;
+			const before = row();
+			expect(before).toMatchObject({ client: "codex", session: "s1-main", device: "dev_b", project, status: "active", first_ask: "First ask",
+				counts: { asks: 2, decisions: 2, corrections: 0, outcomes: 1, parts: 2, files_changed: 3 } });
+			// A replay with ended and a lower count: ended sticks, the count and device stay, and the upload time does not move.
+			expect(run({ session: { ...main, ended: true, files_changed: 1 }, device_id: "dev_c", digests: [a], manifests: [] })).toEqual(["replayed"]);
+			expect(row()).toMatchObject({ status: "completed", device: "dev_b", last_upload_at: before.last_upload_at, first_upload_at: before.first_upload_at, counts: { files_changed: 3 } });
+			// A digest-free SessionEnd batch ends a session it does not upload to.
+			const other = { client: "codex" as const, id: "s1-other" };
+			run({ session: other, digests: [part("-", body([["Other ask", 2]], []), "heuristic", "codex:s1-other:0a1b2c3d:0-10")], manifests: [] });
+			expect(run({ session: { ...other, ended: true }, digests: [], manifests: [] })).toEqual([]);
+			expect(mine(listSessions(sql, { status: "completed" }).rows).sort()).toEqual(["s1-main", "s1-other"]);
+			expect(mine(listSessions(sql, { status: "active" }).rows).sort()).toEqual(["s1-legacy", "s1-v1"]);
+			const named = (session: string) => listSessions(sql, { client: "claude-code", limit: 100 }).rows.find((r) => r.session === session)!;
+			const old = named("s1-legacy");
+			expect(old).toMatchObject({ device: null, status: "active", counts: { files_changed: null, parts: 0 } });
+			expect(named("s1-v1")).toMatchObject({ device, status: "active", counts: { files_changed: null, parts: 0 } });
+			// Events: range start, then part span, then position; outcomes after their part's items; order only, no time.
+			const d = sessionDetail(sql, before.id)!;
+			expect(d.events.map((e) => [e.i, e.kind, e.label, e.offset_ms, e.detail])).toEqual([
+				[0, "ask", "First ask", null, { part: "0-2500", pos: "10" }], [1, "decision", "Pick the queue", null, { part: "0-2500", pos: "900" }],
+				[2, "decision", "Retry twice", null, { part: "2500-5000", pos: "3000" }], [3, "outcome", "Pushed 0a1b2c3d4e", null, { part: "2500-5000", outcome: "commit" }],
+				[4, "ask", "Later ask", null, { part: "-", pos: "6000" }]]);
+			expect(sessionDetail(sql, old.id)!.events).toHaveLength(1);
+			expect(sessionDetail(sql, project)).toBeNull();
+			// Filters and pages.
+			expect(listSessions(sql, { project }).rows.map((r) => r.session)).toEqual(["s1-main"]);
+			expect(listSessions(sql, { project: "github:acme/sessions" }).rows.map((r) => r.session)).toEqual(["s1-main"]);
+			const seen: string[] = [];
+			for (let cursor: string | undefined, n = 0; n < 50; n++) {
+				const page = listSessions(sql, { limit: 1, ...(cursor ? { cursor } : {}) });
+				seen.push(...page.rows.map((r) => r.session));
+				if (!page.next_cursor) break;
+				cursor = page.next_cursor;
+			}
+			const all = listSessions(sql, {}).rows.map((r) => r.session);
+			expect(seen).toEqual(all);
+			expect(mine(listSessions(sql, {}).rows)).toHaveLength(4);
+			expect(() => listSessions(sql, { cursor: "not-a-cursor" })).toThrow("cursor is not valid");
+			// Two profiles over the same rows: every (profile, id) appears once, newest first, until both cursors end.
+			const merged: { profile: string; at: string }[] = [];
+			let cursors: Record<string, string> = {};
+			for (let n = 0; n < 50; n++) {
+				const page = mergeSessions(["test", "work"].map((profile) => ({ profile, page: listSessions(sql, { limit: 2, ...(cursors[profile] ? { cursor: cursors[profile] } : {}) }) })), 2);
+				merged.push(...page.rows.map((r) => ({ profile: `${r.profile}:${r.session}`, at: r.last_upload_at })));
+				if (!page.next_cursor) break;
+				cursors = parseSessionsCursor(page.next_cursor)!;
+			}
+			expect(new Set(merged.map((m) => m.profile)).size).toBe(2 * all.length);
+			expect(merged).toHaveLength(2 * all.length);
+			expect(merged.map((m) => m.at)).toEqual([...merged.map((m) => m.at)].sort().reverse());
+			return { main: before.id };
+		});
+		expect(parseSessionsCursor("e30")).toBeNull();
+		expect(parseSessionsCursor(btoa(JSON.stringify({ test: "garbage" })))).toBeNull();
+		// Records citing the session by key or by its node are produced from it; the session's own mention rows are not.
+		await call(c, "save_memory", { profile: "test", name: "Queue retry rule", type: "feedback", description: "Retry the queue twice", content: "Retry twice.", evidence: [{ kind: "session", ref: "session:codex:s1-main" }] });
+		await call(c, "save_memory", { profile: "test", name: "Queue pick", type: "reference", description: "Queue chosen in a session", content: "The queue.", evidence: [{ kind: "node", ref: ids.main }] });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const produced = sessionDetail(st.storage.sql, ids.main)!.produced;
+			expect(produced.map((p) => [p.title, p.via]).sort()).toEqual([["Queue pick", "evidence"], ["Queue retry rule", "evidence"]]);
+		});
+	});
+
+	it("reads only the manifest's parts, and keeps the last upload apart from owner actions", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const one = (ask: string) => JSON.stringify({ asks: [{ text: ask, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] }, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const sql = st.storage.sql, run = (b: IngestBatch) => ingest(st.storage, {} as never, b).map((r) => r.status);
+			// Overlapping consolidated parts are all stored; the accepted manifest selects 0-10 alone.
+			const tiling = { client: "codex" as const, id: "s1-tiling" }, range = "codex:s1-tiling:0a1b2c3d:0-10";
+			const whole = part("0-10", one("Whole range"), "consolidated", range), a = part("0-5", one("First half"), "consolidated", range), b = part("5-10", one("Second half"), "consolidated", range);
+			expect(run({ session: tiling, digests: [whole, a, b], manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] })).toEqual(["stored", "stored", "stored", "stored"]);
+			const t = listSessions(sql, { client: "codex", limit: 100 }).rows.find((r) => r.session === "s1-tiling")!;
+			expect(sessionDetail(sql, t.id)!.events.map((e) => e.label)).toEqual(["Whole range"]);
+			expect(t.counts).toMatchObject({ asks: 1, parts: 1 });
+			// An owner action is not an upload: pinning a session last uploaded two hours ago keeps it completed, in place, with that time.
+			const pinned = { client: "codex" as const, id: "s1-pinned" };
+			expect(run({ session: pinned, digests: [part("-", one("Pinned ask"), "heuristic", "codex:s1-pinned:0a1b2c3d:0-10")], manifests: [] })).toEqual(["stored"]);
+			const earlier = new Date(Date.now() - 2 * 3_600_000).toISOString();
+			const id = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'session:codex:s1-pinned'").one().id;
+			// As if that upload happened two hours ago: the node, its stored part and any recorded upload time say so.
+			sql.exec("UPDATE nodes SET updated_at = ?, attrs = CASE WHEN json_extract(attrs, '$.last_upload_at') IS NULL THEN attrs ELSE json_set(attrs, '$.last_upload_at', ?) END WHERE id = ?", earlier, earlier, id);
+			sql.exec("UPDATE texts SET created_at = ? WHERE node_id = ? AND part = 'capture'", earlier, id);
+			const order = () => listSessions(sql, { limit: 100 }).rows.map((r) => r.id);
+			const before = { row: listSessions(sql, { limit: 100 }).rows.find((r) => r.id === id)!, order: order() };
+			expect(before.row).toMatchObject({ status: "completed", last_upload_at: earlier });
+			for (const action of ["pin", "unpin"] as const) runWrite(st.storage, { userId: ref.userId, profile: "test", generation: ref.generation }, { op: "owner", args: { memory_id: id, action } },
+				{ actor: "owner", platform: "test", routedBy: "test", userId: ref.userId, payloadHash: `owner-${action}` });
+			expect(sql.exec<{ updated_at: string }>("SELECT updated_at FROM nodes WHERE id = ?", id).one().updated_at > earlier).toBe(true);
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === id)).toMatchObject({ status: "completed", last_upload_at: earlier });
+			expect(order()).toEqual(before.order);
+			expect(listSessions(sql, { status: "active", limit: 100 }).rows.map((r) => r.id)).not.toContain(id);
+			// A real upload still moves it: a new part makes it active and newest.
+			expect(run({ session: pinned, digests: [part("-", one("Pinned later"), "heuristic", "codex:s1-pinned:0a1b2c3d:10-20")], manifests: [] })).toEqual(["stored"]);
+			expect(listSessions(sql, { limit: 100 }).rows[0]).toMatchObject({ id, status: "active" });
+		});
+	});
+
+	it("keeps rows of a profile that the merged page did not show", () => {
+		const row = (id: string, at: string): SessionRow => ({ id, client: "codex", session: id, device: null, project: null, first_upload_at: at, last_upload_at: at, status: "completed", first_ask: null,
+			counts: { asks: 0, decisions: 0, corrections: 0, outcomes: 0, parts: 0, files_changed: null } });
+		const page = mergeSessions([{ profile: "work", page: { rows: [row("a", "2026-11-03T00:00:00.000Z")], next_cursor: null } },
+			{ profile: "personal", page: { rows: [row("b", "2026-11-01T00:00:00.000Z")], next_cursor: null } }], 1);
+		expect(page.rows.map((r) => r.profile)).toEqual(["work"]);
+		const cursors = parseSessionsCursor(page.next_cursor!)!;
+		expect(cursors.work).toBe("end");
+		expect(cursors.personal).not.toBe("end");
+		expect(mergeSessions([{ profile: "work", page: { rows: [], next_cursor: null } }], 5).next_cursor).toBeNull();
 	});
 });

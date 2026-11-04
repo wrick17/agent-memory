@@ -15,7 +15,8 @@ import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPr
 import { ownerModel } from "./owner-model";
 import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
 import { noteRecall, recallStrength } from "./recall-stats";
-import type { EvalCandidateQuery, EvalCandidateStatus, RecallOptions } from "../viewer/types";
+import type { EvalCandidateQuery, EvalCandidateStatus, RecallOptions, SessionQuery } from "../viewer/types";
+import { listSessions, sessionDetail } from "./sessions";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -52,7 +53,8 @@ export type MarkerResult = ReturnType<typeof putMarker>;
 /** v2 reads for the owner routes and the Worker (src/v2-api.ts); each kind calls one module function. */
 export type V2Read =
 	| { kind: "eval_candidates"; q: EvalCandidateQuery } | { kind: "accepted_candidates"; cursor: string | null; limit: number }
-	| { kind: "recall_strength"; ids: string[]; day: string };
+	| { kind: "recall_strength"; ids: string[]; day: string }
+	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string };
 
 import { foldDue, foldStep } from "./compact";
 import { danglingPage, enqueueDangling } from "./dangling";
@@ -758,6 +760,8 @@ export class ProfileStore extends DurableObject<Env> {
 				case "eval_candidates": return ok(listCandidates(sql, q.q));
 				case "accepted_candidates": return ok(acceptedCandidates(sql, q.cursor, q.limit));
 				case "recall_strength": return ok(recallStrength(sql, q.ids, q.day));
+				case "sessions": return ok(listSessions(sql, q.q));
+				case "session": { const d = sessionDetail(sql, q.id); return d ? ok(d) : fail("not_found", "no such session"); }
 			}
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
