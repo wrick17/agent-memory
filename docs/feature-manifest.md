@@ -144,6 +144,7 @@ Source ready, not deployed. Depends on #9's `/v1/recall` and `/v1/eval/*` routes
 - Each case goes to `POST /v1/recall` with the read token and `count_hits: false`. Recall and candidate export never fall back to the job token.
 - `local/eval-score.mjs` computes recall_all_at_k, any_hit_at_k and first-relevant MRR, with misses scored as 0. It has no imports, so the CLI and the Workers gate share the same parser, request body, scorer and baseline rule.
 - The full report, with misses, stays on the device at mode 600. `POST /v1/eval/runs` gets only scores and counts, with the job token.
+- Without `--out`, the report goes to `~/.agent-memory/eval/<UTC run time>-<channels>.json`, such as `2026-11-05T093000.000Z-hybrid.json`. The write never replaces an existing report; a run that finds its name taken adds `-2`, `-3` and so on. `--out FILE` replaces that file.
 - `eval export-candidates --profile P --out FILE` appends accepted candidates in one atomic write. It refuses the golden-query file as output.
 - `--write-baseline FILE` writes only when no baseline exists, or when the channels and k match, no metric is lower and one is higher.
 - Golden filter gap, still open: `/v1/recall` takes no `type`, `kinds` or `scope`. Golden cases that set one run unfiltered. The report lists them under `unsupported_filters` and the CLI prints a warning. Golden scores can differ from the earlier filtered top-5 check until a filter contract exists.
