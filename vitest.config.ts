@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
@@ -5,6 +6,8 @@ import { defineConfig } from "vitest/config";
 // so the test environment wraps small fakes from test/fakes.js; live behavior is checked in G5.
 export default defineConfig({
 	plugins: [
+		// #29: the same Text import wrangler.jsonc's rule gives the Worker: local/*-player.js as its exact bytes.
+		{ name: "player-text", enforce: "pre", load: (id: string) => (/\/local\/[^/]+-player\.js$/.test(id) ? `export default ${JSON.stringify(readFileSync(id, "utf8"))};` : null) },
 		cloudflareTest({
 			wrangler: { configPath: "./wrangler.jsonc", environment: "test" },
 			remoteBindings: false,

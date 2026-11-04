@@ -25,8 +25,8 @@ export function writePrivate(file, data, mode = 0o600) {
 	fs.writeFileSync(tmp, data, { mode });
 	fs.renameSync(tmp, file);
 }
-const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
-const safeName = (s) => s.replace(/[^A-Za-z0-9._-]/g, "_");
+export const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
+export const safeName = (s) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 
 // Same patterns as the server's src/domain/redact.ts (port of BothQ memory_privacy.py).
 const REDACTED = "[REDACTED]";
@@ -197,7 +197,7 @@ export function readLines(file, from) {
 }
 
 const INJECTED = /^\s*(<environment_context>|<user_instructions>|<INSTRUCTIONS>|# AGENTS\.md instructions|<command-name>|<local-command-stdout>|Caveat: The messages below)/;
-const stripReminders = (s) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+export const stripReminders = (s) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
 
 /** Owner and assistant text only. Tool calls and output, thinking, and injected system or hook text are skipped. */
 export function extract(client, lines) {
@@ -508,6 +508,72 @@ export function httpServer(config) {
 		ingest: (batch) => post("/v1/ingest", batch).then((r) => r.results),
 		work: (batch) => post("/v1/ingest", batch, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		state: (ids, repo) => post("/v1/capture", { range_ids: ids, ...(repo ? { repo } : {}) }).then((r) => r.ranges),
+		// v2, job token. The server routes land with their modules: status with status.mjs, evalRun with eval.mjs.
+		/** POST /v1/status: this device's content-free capture report. */
+		status: (body) => post("/v1/status", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		/** POST /v1/eval/runs: one eval run's scores and counts, never prompt or record text. */
+		evalRun: (body) => post("/v1/eval/runs", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		/** GET /v1/whoami with the job token: this device's own identity and scopes. */
+		whoami: async () => {
+			const res = await fetch(new URL("/v1/whoami", config.server), { headers: { authorization: `Bearer ${token()}` }, redirect: "error", signal: AbortSignal.timeout(10_000) });
+			if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+			return res.json();
+		},
+	};
+}
+
+/**
+ * The read-scoped device token named by config.read_token_file, or null. It is a separate file from the job token_file: a path
+ * that resolves to token_file is refused, and the job token is never read in its place. The file must be a regular file (not a
+ * symlink) owned by this user with no group or other access.
+ */
+export function readToken(config = loadConfig()) {
+	const file = expandHome(config.read_token_file), job = expandHome(config.token_file);
+	if (!file || (job && path.resolve(file) === path.resolve(job))) return null;
+	try {
+		const st = fs.lstatSync(file);
+		if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) return null;
+		const t = fs.readFileSync(file, "utf8").trim();
+		return t && !/\s/.test(t) ? t : null;
+	} catch { return null; }
+}
+
+/**
+ * The read client for injection and eval, with the read token only: POST /v1/recall and GET /v1/eval/candidates. A missing or
+ * refused read token throws read_token_missing; there is no fallback to the job token. Every request names the profile its caller
+ * chose (inject.profile, eval --profile). The service validates that target and the token's read scope; the client never picks or
+ * infers a profile. Arguments are checked before any request; an HTTP error throws with its status (400, 401, 403 or 503).
+ */
+export function readServer(config = loadConfig()) {
+	const refuse = (code) => { throw Object.assign(new Error(code), { code }); };
+	const send = async (url, { body, timeoutMs = 30_000 } = {}) => {
+		const token = readToken(config);
+		if (!token) refuse("read_token_missing");
+		const get = body === undefined;
+		const res = await fetch(url, { method: get ? "GET" : "POST", headers: { authorization: `Bearer ${token}`, ...(get ? {} : { "content-type": "application/json" }) },
+			...(get ? {} : { body: JSON.stringify(body) }), redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+		if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+		return res.json();
+	};
+	return {
+		recall: async (body, { timeoutMs = 30_000 } = {}) => {
+			if (!PROFILE_RE.test(body?.profile ?? "")) refuse("profile_required");
+			return send(new URL("/v1/recall", config.server), { body, timeoutMs });
+		},
+		/**
+		 * One page of the profile's accepted candidates, oldest first: { rows, next_cursor }. next_cursor is null on the last page.
+		 * cursor is the opaque next_cursor of the previous page (1 to 2048 characters); limit is an integer 1 to 100 (server default 100).
+		 */
+		acceptedCandidates: async ({ profile, cursor, limit } = {}) => {
+			if (typeof profile !== "string" || !PROFILE_RE.test(profile)) refuse("profile_required");
+			if (cursor !== undefined && !(typeof cursor === "string" && cursor.length >= 1 && cursor.length <= 2048)) refuse("cursor_invalid");
+			if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 100)) refuse("limit_invalid");
+			const url = new URL("/v1/eval/candidates", config.server);
+			url.searchParams.set("profile", profile);
+			if (cursor !== undefined) url.searchParams.set("cursor", cursor);
+			if (limit !== undefined) url.searchParams.set("limit", String(limit));
+			return send(url);
+		},
 	};
 }
 
@@ -539,7 +605,7 @@ async function replaySpool(server) {
 
 // ---------- run ----------
 
-const statePath = (c, s) => path.join(home(), "state", c, `${safeName(s)}.json`);
+export const statePath = (c, s) => path.join(home(), "state", c, `${safeName(s)}.json`);
 
 /** The repo identity the server routes by: the origin remote from local git, and the session's working directory. */
 export function repoOf(cwd) {
@@ -645,8 +711,33 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	return { status: missing || "done", digested_to: st.digested_to, consolidated_to: st.consolidated_to, outcomes };
 }
 
+/** `~` or `~/…` to the user's home; other strings unchanged; anything else to null. */
+export const expandHome = (p) => (typeof p !== "string" || !p ? null : p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p);
+
+// The server's PROFILE_NAME (src/domain/types.ts).
+const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
+
+/**
+ * v2 keys, used when config.json leaves them out, so a v1 config keeps working unchanged. Injection is off by default and turns
+ * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them.
+ */
+export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 } });
+const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
+
+/** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
+export function withDefaults(raw) {
+	const c = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}, d = configDefaults();
+	const i = c.inject && typeof c.inject === "object" && !Array.isArray(c.inject) ? c.inject : {};
+	const profile = typeof i.profile === "string" && PROFILE_RE.test(i.profile) ? i.profile : null;
+	return { ...c,
+		batch_hour: Number.isInteger(c.batch_hour) && c.batch_hour >= 0 && c.batch_hour <= 23 ? c.batch_hour : d.batch_hour,
+		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
+		inject: { enabled: i.enabled === true && profile !== null, profile,
+			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) } };
+}
+
 export function loadConfig() {
-	return readJson(path.join(home(), "config.json"), {});
+	return withDefaults(readJson(path.join(home(), "config.json"), {}));
 }
 
 const claimDir = () => path.join(home(), "claimed");
@@ -1145,6 +1236,8 @@ export function parseEvents(stdout) {
 // corpus-upload's import closure in the source layout: its modules beside this CLI, and their domain imports at ../src/domain.
 const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
 const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
+// replay's import closure: replay.mjs imports transcript-full.mjs, which imports ./agent-memory.mjs; the player is read as bytes.
+const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 
 export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1156,7 +1249,7 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 		fs.chmodSync(dir, 0o700);
 	}
 	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
-	for (const f of CORPUS_LOCAL) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+	for (const f of [...CORPUS_LOCAL, ...REPLAY_LOCAL]) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
 	for (const f of CORPUS_DOMAIN) writePrivate(path.join(home(), "src", "domain", f), fs.readFileSync(new URL(`../src/domain/${f}`, import.meta.url)));
 	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -1183,8 +1276,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\nClaude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
 	} else if (cmd === "corpus-upload") {
 		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
+	} else if (cmd === "replay") {
+		import("./replay.mjs").then((m) => m.main(process.argv.slice(3))).then((code) => process.exit(code), () => { process.stderr.write("agent-memory replay: failed\n"); process.exit(1); });
 	} else {
-		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
+		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | replay [--list] [--session ID] [--port N] | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
 		process.exit(2);
 	}
 }

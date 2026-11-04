@@ -252,8 +252,8 @@ export interface V2Routes {
 	"POST /api/profiles/:p/maintenance/queue": { auth: "owner"; body: Extract<OwnerQueue, { kind: "unlinked" }>; reply: { queued: number } };
 	"POST /api/profiles/:p/sessions/:id/consolidate": { auth: "owner"; reply: { queued: number } };
 	/**
-	 * Existing route, owner-only on master. The owner reply is unchanged; an authenticated, enabled device token gets only its
-	 * own facts. Never anonymous.
+	 * Existing route. The owner reply is unchanged; an authenticated, enabled device token gets only its own facts
+	 * (src/v2-api.ts). Never anonymous.
 	 */
 	"GET /v1/whoami": { auth: "owner_or_device"; reply: { claims: unknown } | { kind: "device"; device_id: string; scopes: string[]; profiles: string[] } };
 }

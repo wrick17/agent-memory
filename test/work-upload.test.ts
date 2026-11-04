@@ -20,7 +20,7 @@ import { foldStep } from "../src/profile/compact";
 import { Tx, readContent, runWrite } from "../src/profile/write";
 import { commitArgs, prArgs, ticketArgs, uploadTerms } from "../src/profile/work-upload";
 import { ackPart, FINISH_READS, installMirror, markRegistered, partHash, planHash, receiptSeq, sealPlan, terminal, type Binding, type Parts } from "../src/profile/daily-proof";
-import { call, contextFor, deviceToken, outcome, OWNER } from "./helpers";
+import { call, contextFor, deviceToken, outcome, OWNER, tempDir } from "./helpers";
 // @ts-expect-error -- the untyped Node client, run here as the real local caller of the job ingest route.
 import { uploadPRs } from "../local/pr-upload.mjs";
 // @ts-expect-error -- the untyped Node client, run here as the real local caller of the job ingest route.
@@ -570,7 +570,7 @@ describe("PR uploads", () => {
 			if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 			return r.data;
 		};
-		const stateFile = `/tmp/am-pr-${p.name}/prs.json`;
+		const stateFile = `${tempDir("am-pr-")}/prs.json`;
 		const out = await uploadPRs({ repo: p.ns, profile: p.name, since: ago(24 * 60), stateFile, gh: { account: "wrick17", run }, ownerLogin: "owner-login", send });
 		expect(out).toEqual({ status: "acknowledged", prs: 1, incomplete: [] });
   expect(calls).toHaveLength(1);
@@ -727,7 +727,8 @@ describe("Jira ticket uploads", () => {
 			if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 			return r.data;
 		};
-		const run = () => uploadTickets({ keys: [`${P}-1`, `${P}-2`, `${P}-3`], stateFile: `/tmp/am-jira-${P}/tickets.json`, connector, ownerAccountId: owner, send });
+		const stateFile = `${tempDir("am-jira-")}/tickets.json`;
+		const run = () => uploadTickets({ keys: [`${P}-1`, `${P}-2`, `${P}-3`], stateFile, connector, ownerAccountId: owner, send });
 		expect(await run()).toEqual({ status: "acknowledged", tickets: 2, incomplete: [], missing: [`${P}-3`], invalid: [] });
 		expect(calls).toEqual([{ keys: [`${P}-1`, `${P}-2`, `${P}-3`], fields: FIELDS }]);
 		expect(JSON.stringify(sent)).not.toMatch(/example\.com|hunter2|Private Person|secret description|secret comment|avatar/);
@@ -801,7 +802,8 @@ describe("Jira ticket uploads", () => {
 			.toEqual([{ rel: "assigned", valid_to: iso(t3) }, { rel: "blocked_by", valid_to: iso(t3) }, { rel: "blocked_by", valid_to: iso(t3) }]));
 		const third = await node();
 		expect((await item(snap(t1))).status).toBe("replayed");
-		expect(await item(snap(gh(60)))).toEqual({ key, status: "stale", updated_at: iso(gh(60)) });
+		const older = gh(60); // read once: gh() follows the clock, and the upload's await can cross a second
+		expect(await item(snap(older))).toEqual({ key, status: "stale", updated_at: iso(older) });
 		expect(await item(snap(t3, { assignee: undefined, blocked_by: [], blocks: [], title: "Changed title" }))).toMatchObject({ status: "refused", reason: "idempotency_mismatch" });
 		expect((await node()).attrs).toBe(third.attrs);
 		await w.inWork((st) => {
@@ -1145,7 +1147,8 @@ describe("Jira reciprocal link source order", () => {
 			return JSON.stringify({ issues: [{ key: f.A, fields: { summary: "Endpoint", issuetype: { name: "Task" }, updated: T0,
 				status: { name: "To Do", statusCategory: { key: "new" } }, priority: null, duedate: null, assignee: null, reporter: null, issuelinks: [] } }] });
 		} };
-		const run = () => uploadTickets({ keys: [f.A], stateFile: "/tmp/am-jira-" + stem + "/pending.json", connector, ownerAccountId: "owner-id", now: () => T5,
+		const jiraDir = tempDir("am-jira-");
+		const run = () => uploadTickets({ keys: [f.A], stateFile: `${jiraDir}/pending.json`, connector, ownerAccountId: "owner-id", now: () => T5,
 			send: async (body: unknown) => {
 				sent.push(JSON.stringify(body));
 				const r = await post(f.w.token, body);
@@ -2256,16 +2259,25 @@ describe("default refresh scope", () => {
 		const p = await fresh();
 		await readScope(p.token, p.name); // initialize the profile and account before measured reads
 		const profile = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:${p.name}:${p.who.generation}`));
+		type Spy = { calls: { q: string; c: SqlStorageCursor<Record<string, SqlStorageValue>>; meter: boolean }[]; exec: SqlStorage["exec"]; inMeter: boolean; restore?: () => void };
 		const start = (stub: typeof profile | ReturnType<typeof account>) => runInDurableObject(stub, (instance, st) => {
 			const sql = st.storage.sql, exec = sql.exec;
-			const calls: { q: string; c: SqlStorageCursor<Record<string, SqlStorageValue>> }[] = [];
-			(instance as any).scopeSQL = { calls, exec };
-			sql.exec = ((q: string, ...args: SqlStorageValue[]) => { const c = exec.call(sql, q, ...args); calls.push({ q, c }); return c; }) as SqlStorage["exec"];
+			const spy: Spy = { calls: [], exec, inMeter: false };
+			// Every profile of this shared account reports its row and embedding meters to AccountStore.meter() from its own alarm, at
+			// any time. meter() runs synchronously, so a flag around it tags exactly its SQL; the request's own SQL stays untagged.
+			const proto = Object.getPrototypeOf(instance) as { meter?: (...a: unknown[]) => unknown };
+			const meter = proto.meter;
+			if (meter) {
+				proto.meter = function (this: unknown, ...a: unknown[]) { spy.inMeter = true; try { return meter.apply(this, a); } finally { spy.inMeter = false; } };
+				spy.restore = () => { proto.meter = meter; };
+			}
+			(instance as any).scopeSQL = spy;
+			sql.exec = ((q: string, ...args: SqlStorageValue[]) => { const c = exec.call(sql, q, ...args); spy.calls.push({ q, c, meter: spy.inMeter }); return c; }) as SqlStorage["exec"];
 		});
 		const stop = (stub: typeof profile | ReturnType<typeof account>) => runInDurableObject(stub, (instance, st) => {
-			const spy = (instance as any).scopeSQL as { calls: { q: string; c: SqlStorageCursor<Record<string, SqlStorageValue>> }[]; exec: SqlStorage["exec"] };
-			st.storage.sql.exec = spy.exec; delete (instance as any).scopeSQL;
-			return spy.calls.map(({ q, c }) => ({ q, reads: c.rowsRead, writes: c.rowsWritten }));
+			const spy = (instance as any).scopeSQL as Spy;
+			st.storage.sql.exec = spy.exec; spy.restore?.(); delete (instance as any).scopeSQL;
+			return spy.calls.map(({ q, c, meter }) => ({ q, reads: c.rowsRead, writes: c.rowsWritten, ...(meter ? { meter } : {}) }));
 		});
 		const unchanged = () => runInDurableObject(account(), (_i, st) => ["routing_rules", "sensitive_terms", "refresh_days", "request_index", "node_index"].map((t) => st.storage.sql.exec(`SELECT * FROM ${t}`).toArray()));
 		const before = await unchanged();
@@ -2273,9 +2285,12 @@ describe("default refresh scope", () => {
 			if (stale) await runInDurableObject(account(), (_i, st) => st.storage.sql.exec("UPDATE devices SET last_used_at = '2000-01-01T00:00:00Z' WHERE id = ?", p.token.split("_")[2]!));
 			await start(account()); await start(profile);
 			const got = await readScope(p.token, p.name);
-			const a = await stop(account()), b = await stop(profile);
+			const all = await stop(account()), b = await stop(profile);
+			// Out-of-band meter reports may write only their daily counter and the write sequence it takes; the rest is the request's.
+			expect(all.filter((x) => x.meter && x.writes).every((x) => /^INSERT INTO (counters|account_meta)/.test(x.q))).toBe(true);
+			const a = all.filter((x) => !x.meter);
 			// Logged before the assertions so a refused write can be attributed: SQL text and row counts only, never bindings.
-			console.log("SCOPE_SQL", JSON.stringify({ stale, account: a, profile: b }));
+			console.log("SCOPE_SQL", JSON.stringify({ stale, account: all, profile: b }));
 			expect(got.status).toBe(200);
 			expect(b.reduce((n, x) => n + x.writes, 0)).toBe(0);
 			expect(a.filter((x) => x.writes).every((x) => /^(UPDATE devices SET last_used_at|INSERT INTO account_meta)/.test(x.q))).toBe(true);

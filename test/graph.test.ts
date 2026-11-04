@@ -9,6 +9,8 @@ import { identifiers, resolveMentions, resolveMentionsAlone, structuralEdges, ty
 import { EDGE_ROWS, EXPAND_ROWS, expandLinks, explore, trace, timeline, LEVEL_NODES } from "../src/profile/graph";
 import { SETTLE_MS, similarStep } from "../src/profile/similar";
 import { sha256 } from "../src/domain/ids";
+import { ingest } from "../src/profile/capture";
+import { activitySummary, corpusFiles, corpusFilesSql, listProjects, projectProfile } from "../src/profile/insights";
 import { nextSeq } from "../src/storage";
 import { RELATIONS } from "../src/domain/types";
 
@@ -693,4 +695,41 @@ it("historical map bounds future-edge discovery reads", async () => {
  expect(out.result.budget.edges_read).toBeGreaterThanOrEqual(out.scanned);
  expect(out.result.budget.exhausted).toBe(true);
  expect(out.result.truncated).toBe(true);
+});
+
+// v2 IN1 (#15): activity and project insights read only the selected profile's stored digests and never write.
+describe("v2 IN1: activity and project insights", () => {
+	it("summarizes a seeded session for its project and day, writes nothing, and builds only validated Corpus file queries", async () => {
+		const c = await contextFor();
+		const tag = crypto.randomUUID().slice(0, 8), key = `github:acme/in1-${tag}`;
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key, name: `IN1 project ${tag}` }] });
+		const body = JSON.stringify({ asks: [{ text: `IN1 ask ${tag}`, pos: 10 }], decisions: [{ text: "Keep reads scoped", pos: 40 }], corrections: [],
+			outcomes: { commits: ["Pushed 0a1b2c3d4e"] }, entities: [`https://github.com/acme/in1-${tag}`], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		const range = `codex:in1-${tag}:0a1b2c3d:0-100`;
+		const ref = c.account.profiles.find((p) => p.profile === "test")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const sql = st.storage.sql;
+			expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `in1-${tag}` }, manifests: [],
+				digests: [{ range_id: range, capture_status: "heuristic", part_id: "-", sha256: sha256(body), body }] }).map((r) => r.status)).toEqual(["stored"]);
+			const session = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE kind = 'session' AND key LIKE ?", `%in1-${tag}%`).one().id;
+			const footprint = () => ({ seq: sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value,
+				rows: ["nodes", "texts", "edges", "evidence", "activity"].map((t) => sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n) });
+			const before = footprint(), day = new Date().toISOString().slice(0, 10);
+			const summary = activitySummary(sql, { from: day, to: day });
+			expect(summary).toMatchObject({ from: day, to: day, top_files: [] });
+			expect(summary.sessions).toBeGreaterThanOrEqual(1);
+			expect(summary.latest).toEqual(expect.arrayContaining([expect.objectContaining({ session, kind: "ask", text: `IN1 ask ${tag}` })]));
+			expect(listProjects(sql).find((p) => p.key === key)).toMatchObject({ sessions: 1 });
+			expect(projectProfile(sql, key, new Date().toISOString())).toMatchObject({ key, sessions: 1, files: [] });
+			expect(projectProfile(sql, `github:acme/none-${tag}`, new Date().toISOString())).toBeNull();
+			expect(footprint()).toEqual(before);
+		});
+		// File lists come only from the Corpus, through one SELECT whose literals are validated or escaped.
+		expect(corpusFilesSql({ project: "jira:WU-1", now: new Date().toISOString() })).toBeNull();
+		expect(corpusFilesSql({ project: "github:acme/it's", now: new Date().toISOString() })).toBeNull();
+		expect(corpusFilesSql({ project: key, now: "2026-11-04T00:00:00Z" })).toMatch(/^SELECT .* lower\(c\.repo\) = 'acme\/in1-[0-9a-f]+' AND /s);
+		expect(() => corpusFilesSql({ from: "2026-11-04'; DROP TABLE commits; --", to: "2026-11-04" })).toThrow();
+		expect(corpusFiles({ columns: ["path", "count"], rows: [["src/a.ts", 3], [7, "x"], "bad"] })).toEqual([{ path: "src/a.ts", count: 3 }]);
+		expect(corpusFiles({ error: "no corpus" })).toEqual([]);
+	});
 });

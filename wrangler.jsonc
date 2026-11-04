@@ -6,6 +6,8 @@
 	"workers_dev": false,
 	"preview_urls": false,
 	"main": "src/worker.ts",
+	// #29: the dashboard embeds the shared replay player's exact bytes as text; globs are relative to main's directory.
+	"rules": [{ "type": "Text", "globs": ["../local/*-player.js"], "fallthrough": true }],
 	"compatibility_date": "2026-10-20",
 	// global_fetch_strictly_public: the Clerk Frontend API (clerk.memory.wrick17.com) is a DNS-only CNAME in this Worker's own
 	// zone, served by Clerk's Worker. Cloudflare documents that without the flag same-zone fetches go to the zone's origin and
@@ -13,6 +15,8 @@
 	// observed here. The live 503 was egress.ts using redirect: "error", which Workers rejects.
 	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"observability": { "enabled": true },
+	// #13: the dashboard shows the deployed version id and time.
+	"version_metadata": { "binding": "CF_VERSION_METADATA" },
 	// Owner-released nightly encrypted exports at 03:17 UTC; runtime schedule confirmation is separate.
 	"triggers": { "crons": ["17 3 * * *"] },
 	"durable_objects": {
@@ -49,6 +53,7 @@
 	"env": {
 		// Test-only environment: AI and Vectorize are replaced by local fakes in vitest.config.ts.
 		"test": {
+			"version_metadata": { "binding": "CF_VERSION_METADATA" },
 			"routes": [],
 			"durable_objects": {
 				"bindings": [
@@ -81,6 +86,7 @@
 		// Vectorize index and R2 generation ledger are its own. The full rehearsal keeps BothQ's original ids and request ids
 		// without taking them in production's AccountStore indexes, vectors or ledger. Provisioned and deployed by Terra.
 		"rehearsal": {
+			"version_metadata": { "binding": "CF_VERSION_METADATA" },
 			"name": "agent-memory-rehearsal",
 			"migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountStore", "ProfileStore"] }],
 			"routes": [{ "pattern": "memory-rehearsal.wrick17.com", "custom_domain": true }],

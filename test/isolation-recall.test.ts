@@ -6,7 +6,12 @@ import type { AccountStore, Principal } from "../src/account/store";
 import { requestHash, sha256 } from "../src/domain/ids";
 import { redactPayload } from "../src/domain/redact";
 import type { Caller, RoutingRule } from "../src/domain/types";
-import { accountStub, type ToolContext } from "../src/mcp";
+import { accountStub, callTool, type ToolContext } from "../src/mcp";
+import { parseEvalRun } from "../src/eval";
+import { acceptedCandidates, decideCandidate, insertCandidate, listCandidates } from "../src/profile/eval-candidates";
+import { recallStrength } from "../src/profile/recall-stats";
+import { nextSeq } from "../src/storage";
+import type { RecallOptions } from "../src/viewer/types";
 import { readSet, routeWrite } from "../src/routing";
 import { call, contextFor, deviceToken, devicePrincipal, OWNER, outcome, registered } from "./helpers";
 
@@ -403,5 +408,118 @@ describe("generation identities", () => {
 		expect(await (await env.BACKUPS.get(`generations/${taken}.json`))!.json()).toMatchObject({ state: "active" });
 		await expect(runInDurableObject(stub, (instance: AccountStore) => instance.reserveGeneration("u".repeat(60), "test", "scratch"))).rejects.toThrow("64 bytes");
 		void accountStub;
+	});
+});
+
+// v2 R1 (#9): channel selection on the shared recall path, hit counts after packing, and bounded eval records.
+describe("v2 R1: recall channels, hit counts and eval records", () => {
+	type Hits = { results: { profile: string; memory_id: string; matched_by: string[] }[]; lexical_only: boolean; diagnostics: Record<string, unknown> };
+	const today = () => new Date().toISOString().slice(0, 10);
+	const recallOf = async (c: ToolContext, args: Record<string, unknown>, opts?: RecallOptions) => {
+		const r = await callTool(c, "recall_memories", args, opts);
+		if (!r.ok) throw new Error(r.error.code);
+		return r.value as Hits;
+	};
+	const state = (c: ToolContext, ids: string[]) => runInDurableObject(profileStub(c, "test"), (_i, s) => {
+		const sql = s.storage.sql;
+		return {
+			totals: sql.exec<{ recalls: number; tokens: number }>("SELECT recalls, tokens FROM recall_totals WHERE day = ?", today()).toArray()[0] ?? { recalls: 0, tokens: 0 },
+			hits: Object.fromEntries(sql.exec<{ node_id: string; hits: number }>("SELECT node_id, hits FROM recall_daily WHERE day = ? AND node_id IN (SELECT value FROM json_each(?))",
+				today(), JSON.stringify(ids)).toArray().map((r) => [r.node_id, r.hits])),
+			nodes: sql.exec("SELECT * FROM nodes WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id", JSON.stringify(ids)).toArray(),
+		};
+	});
+
+	it("counts only the ids each recall returned, once per recall, and nothing for count_hits false or an inventory", async () => {
+		const owner = await contextFor({ kind: "owner", userId: OWNER }, { EMBEDDINGS: "off" } as Partial<Env>);
+		const pending: Promise<unknown>[] = [];
+		const c: ToolContext = { ...owner, waitUntil: (p) => void pending.push(p) };
+		const settle = () => Promise.all(pending.splice(0));
+		const word = `kestrel${crypto.randomUUID().slice(0, 8)}`;
+		const ids: string[] = [];
+		for (const n of [1, 2, 3]) ids.push((await call(c, "save_memory", { name: `R1 count ${word} ${n}`, type: "project", description: word, content: `${word} body ${n}`, profile: "test" })).memory_id as string);
+		// The store's own embedding alarm updates these rows after a save; let it finish so only recall could change them.
+		await runDurableObjectAlarm(profileStub(c, "test"));
+		for (const id of ids) for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		const before = await state(c, ids);
+		const first = await recallOf(c, { keyword: word, profile: "test", limit: 2 });
+		const shown = first.results.filter((h) => h.profile === "test").map((h) => h.memory_id);
+		expect(shown).toHaveLength(2);
+		await settle();
+		const once = await state(c, ids);
+		expect(once.hits).toEqual(Object.fromEntries(shown.map((id) => [id, 1])));
+		expect(once.totals.recalls).toBe(before.totals.recalls + 1);
+		expect(once.totals.tokens).toBeGreaterThan(before.totals.tokens);
+		await recallOf(c, { keyword: word, profile: "test", limit: 2 });
+		await settle();
+		const twice = await state(c, ids);
+		expect(twice.hits).toEqual(Object.fromEntries(shown.map((id) => [id, 2])));
+		expect(twice.totals.recalls).toBe(before.totals.recalls + 2);
+		// count_hits false and an empty-keyword inventory return results and change no count.
+		expect((await recallOf(c, { keyword: word, profile: "test", limit: 2 }, { count_hits: false })).results.length).toBeGreaterThan(0);
+		expect((await recallOf(c, { profile: "test", limit: 5 })).results.length).toBeGreaterThan(0);
+		expect(pending).toHaveLength(0);
+		expect(await state(c, ids)).toEqual(twice);
+		// Recall is a read for records: every node row is unchanged.
+		expect(twice.nodes).toEqual(before.nodes);
+	});
+
+	it("runs only the selected channels, and lexical-only ranks match the default when vectors are off", async () => {
+		const c = await contextFor();
+		const word = `osprey${crypto.randomUUID().slice(0, 8)}`;
+		const saved = await call(c, "save_memory", { name: `R1 channel ${word}`, type: "reference", description: "channel probe", content: `${word} nesting platform`, profile: "test" });
+		await runDurableObjectAlarm(profileStub(c, "test"));
+		for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: saved.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		const LEXICAL = ["exact", "literal", "fulltext"];
+		const both = await recallOf(c, { keyword: word, profile: "test" });
+		expect(both.results.find((h) => h.memory_id === saved.memory_id)?.matched_by).toEqual(expect.arrayContaining(["fulltext", "vector"]));
+		const lexical = await recallOf(c, { keyword: word, profile: "test" }, { channels: ["lexical"] });
+		expect(lexical.lexical_only).toBe(true);
+		expect(lexical.results.every((h) => !h.matched_by.includes("vector"))).toBe(true);
+		expect((lexical.diagnostics.test as Record<string, string>).embedding).toBe("off:channels");
+		const vector = await recallOf(c, { keyword: word, profile: "test" }, { channels: ["vector"] });
+		expect(vector.results.find((h) => h.memory_id === saved.memory_id)?.matched_by).toContain("vector");
+		expect(vector.results.every((h) => !h.matched_by.some((m) => LEXICAL.includes(m)))).toBe(true);
+		const off = await contextFor({ kind: "owner", userId: OWNER }, { EMBEDDINGS: "off" } as Partial<Env>);
+		const ranks = async (opts?: RecallOptions) => (await recallOf(off, { keyword: word, profile: "test" }, opts)).results.map((h) => `${h.profile}:${h.memory_id}`);
+		expect(await ranks({ channels: ["lexical"] })).toEqual(await ranks());
+	});
+
+	it("keeps eval scores, candidates and strength inside their bounds", async () => {
+		const ok = { profile: "test", at: "2026-11-04T10:00:00Z", channels: "hybrid", k: 5, cases: 3, recall_all_at_k: 0.5, any_hit_at_k: 1, mrr: 0.25 };
+		expect(parseEvalRun(ok)).toEqual({ ok: true, value: ok });
+		for (const bad of [{ ...ok, mrr: 1.5 }, { ...ok, k: 0 }, { ...ok, at: "yesterday" }, { ...ok, channels: "sql" }, { ...ok, query: "private case text" }]) {
+			expect(parseEvalRun(bad), JSON.stringify(bad)).toMatchObject({ ok: false, error: { code: "validation" } });
+		}
+		const c = await contextFor();
+		const tag = crypto.randomUUID().slice(0, 8);
+		await runInDurableObject(profileStub(c, "test"), (_i, s) => {
+			const sql = s.storage.sql, now = new Date().toISOString(), seq = () => nextSeq(sql, "profile_meta");
+			const op = (o: Partial<{ query: string; expected: string[]; evidence: { kind: string; ref: string; note?: string }[] }> = {}) =>
+				({ query: "where is the retry rule", expected: [`n-${tag}`], evidence: [{ kind: "node", ref: `n-${tag}` }], ...o }) as never;
+			const code = (f: () => unknown) => { try { f(); return "none"; } catch (e) { return (e as { failure?: { code: string } }).failure?.code; } };
+			expect(code(() => insertCandidate(sql, seq(), now, `c1-${tag}`, op({ query: "q".repeat(281) })))).toBe("validation");
+			expect(code(() => insertCandidate(sql, seq(), now, `c1-${tag}`, op({ expected: Array.from({ length: 21 }, (_, i) => `n${i}`) })))).toBe("validation");
+			expect(code(() => insertCandidate(sql, seq(), now, `c1-${tag}`, op({ evidence: [{ kind: "node", ref: "x", extra: 1 } as never] })))).toBe("validation");
+			sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, 'test-fence')", `wiped:w-${tag}`);
+			expect(code(() => insertCandidate(sql, seq(), now, `c1-${tag}`, op({ evidence: [{ kind: "node", ref: `w-${tag}` }] })))).toBe("profile_wiped");
+			const first = insertCandidate(sql, seq(), now, `c1-${tag}`, op());
+			expect(insertCandidate(sql, seq(), now, `c1-${tag}`, op({ query: "a different query" }))).toEqual(first);
+			insertCandidate(sql, seq(), now, `c2-${tag}`, op());
+			const mine = (rows: { id: string }[]) => rows.map((r) => r.id).filter((id) => id.endsWith(tag));
+			expect(decideCandidate(sql, seq(), `c1-${tag}`, "accepted")).toMatchObject({ status: "accepted" });
+			expect(decideCandidate(sql, seq(), `c2-${tag}`, "dismissed")).toMatchObject({ status: "dismissed" });
+			expect(mine(acceptedCandidates(sql, null, 100).rows)).toEqual([`c1-${tag}`]);
+			expect(mine(listCandidates(sql, {}).rows)).toEqual([]);
+			// A later wipe fence on an expected id hides the candidate from every read and refuses a decision.
+			sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, 'test-fence')", `wiped:n-${tag}`);
+			expect(mine(listCandidates(sql, { status: "all" }).rows)).toEqual([]);
+			expect(code(() => decideCandidate(sql, seq(), `c2-${tag}`, "accepted"))).toBe("profile_wiped");
+			// Strength: hits within the 90 UTC days ending today, capped at 10.
+			const day = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+			sql.exec("INSERT INTO recall_daily (node_id, day, hits, seq) VALUES (?, ?, 7, 1), (?, ?, 5, 1), (?, ?, 100, 1)", `s-${tag}`, day(0), `s-${tag}`, day(89), `s-${tag}`, day(90));
+			expect(recallStrength(sql, [`s-${tag}`, `none-${tag}`], day(0))).toEqual({
+				[`s-${tag}`]: { hits_90d: 12, strength: 10, last_recalled: day(0) }, [`none-${tag}`]: { hits_90d: 0, strength: 0, last_recalled: null } });
+		});
 	});
 });
