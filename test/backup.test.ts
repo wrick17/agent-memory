@@ -96,6 +96,36 @@ describe("export and restore", () => {
 		expect(await profileStub(env, old).read(old, { kind: "get", id: rule.memory_id } as never)).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
 	});
 
+	it("a profile export whose serial R2 puts would outlast the 30 s pause still completes inside it, with at most six puts in flight", async () => {
+		await call(await contextFor(), "save_memory", { name: "Latency probe", type: "reference", description: "l", content: "latency body", profile: "personal" });
+		const g = await personal(), stub = env.PROFILE.get(env.PROFILE.idFromName(`${OWNER}:personal:${g}`)), filler = "x".repeat(6_000);
+		// About 37 chunks of 512 KiB: at 800 ms per put, one put at a time takes about 30 s, which resets the object.
+		await runInDurableObject(stub, (_i, s) => {
+			for (let i = 0; i < 2_800; i++) s.storage.sql.exec("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, 1, 'saved', ?, 'agent', '2026-11-04T00:00:00Z', 1)",
+				`lat-${String(i).padStart(6, "0")}`, JSON.stringify({ body: filler }));
+		});
+		let inFlight = 0, peak = 0;
+		const r = await runInDurableObject(stub, (instance) => {
+			const real = env.BACKUPS;
+			(instance as unknown as { env: Env }).env = { ...env, BACKUPS: { list: (o: R2ListOptions) => real.list(o), head: (k: string) => real.head(k), get: (k: string) => real.get(k), delete: (k: string[]) => real.delete(k),
+				put: async (k: string, v: Uint8Array) => {
+					peak = Math.max(peak, ++inFlight);
+					try { await new Promise((done) => setTimeout(done, 800)); return await real.put(k, v); } finally { inFlight--; }
+				} } } as unknown as Env;
+			return (instance as unknown as ProfileStore).exportNow({ userId: OWNER, profile: "personal", generation: g });
+		});
+		expect(r).toMatchObject({ ok: true, value: { rows: expect.any(Number) } });
+		if (!r.ok) return;
+		expect(r.value.chunks).toBeGreaterThan(36);
+		expect(peak).toBeGreaterThan(1);
+		expect(peak).toBeLessThanOrEqual(6);
+		const m = await readManifest(env, "profile-personal", r.value.id, OWNER);
+		if (!m.ok) throw new Error(m.error.message);
+		// The manifest lists every chunk in order, each readable and matching its hash.
+		expect(m.value.chunks.map((c) => c.key)).toEqual(m.value.chunks.map((_c, i) => `exports/profile-personal/${r.value.id}/${String(i).padStart(5, "0")}.enc`));
+		expect((await Promise.all(m.value.chunks.map((_c, i) => readChunk(env, m.value, i)))).reduce((n, c) => n + c.rows.length, 0)).toBe(r.value.rows);
+	}, 90_000);
+
 	it("leaves Miniflare's object-name table out of the export and the fresh-generation check, and still refuses populated application tables", async () => {
 		const c = await contextFor();
 		const rule = await call(c, "save_memory", { name: "Platform rule", type: "feedback", description: "a rule", content: "platform-marker body", profile: "personal", request_id: "bk-platform" });
