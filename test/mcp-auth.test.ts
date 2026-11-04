@@ -1498,6 +1498,26 @@ describe("v2 health vector count (#11)", () => {
 		const origin = new URL(env.RESOURCE_URL).origin, session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
 		const vectors = async () => ((await (await exports.default.fetch(new Request(`${origin}/api/health`, { headers: { authorization: `Bearer ${session}` } }))).json()) as { search: { vectors: number } }).search.vectors;
 		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		// The total covers every profile of the account, and earlier cases leave memories waiting to embed. An alarm firing inside
+		// the comparison (this case's own writes arm the test profile's) would embed them and move the total. Every due alarm runs
+		// to completion first, until the stores are quiet, so only the two writes below are compared; the comparison stays exact.
+		// An alarm the runtime has already started holds no stored alarm, so each profile is first evicted, which waits for its
+		// in-flight work to drain, before its stored alarm is read.
+		const stubs = c.account.profiles.map((r) => env.PROFILE.get(env.PROFILE.idFromName(`${r.userId}:${r.profile}:${r.generation}`)));
+		const quiet = async () => {
+			for (let pass = 0; pass < 10; pass++) {
+				let ran = false;
+				for (const stub of stubs) for (let i = 0; i < 20; i++) {
+					if (i === 0) await evictDurableObject(stub).catch(() => undefined); // rejects only when the object is not running
+					const at = await runInDurableObject(stub, (_i, st) => st.storage.getAlarm());
+					if (at === null || at > Date.now() + 30_000) break;
+					ran = (await runDurableObjectAlarm(stub)) || ran;
+				}
+				if (!ran) return;
+			}
+			throw new Error("the stores did not quiesce");
+		};
+		await quiet();
 		const before = await vectors();
 		// Both are written with embed_hash equal to card_hash so the embed stage skips them; neither has a vector.
 		const { ingest } = await import("../src/profile/capture"), { sha256 } = await import("../src/domain/ids");
@@ -1506,6 +1526,7 @@ describe("v2 health vector count (#11)", () => {
 			ingest(st.storage, ref, { session: { client: "codex", id: `vec-${tag}` }, manifests: [], digests: [{ range_id: `codex:vec-${tag}:0a1b2c3d:0-10`, capture_status: "heuristic", part_id: "-", sha256: sha256(b), body: b }] });
 		});
 		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "component", name: `Bare ${tag}` }] });
+		await quiet();
 		expect(await vectors()).toBe(before);
 	});
 });
