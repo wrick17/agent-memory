@@ -1,5 +1,26 @@
 # Import verification and rehearsal preparation
 
+## Missing capture sources, 2026-11-04
+
+**Historical record.** The [2026-11-02 record](#account-recovery-and-learning-preview-2026-11-02) reports 32 capture queue entries with status `source_missing`. They were already in pre-activation inventories and stayed preserved. Its metadata check found no missing pending-payload references, inverted cursors, recorded range gaps or evidence of v1-caused pending-content loss. The inventories could not establish when the sources disappeared.
+
+**Missing receipts.** The source-missing classification and the run receipts cited there are no longer at their recorded `/private/tmp` paths. The entry-by-entry list behind the 32 cannot be compared today.
+
+**Read-only check on this Mac, 07:52 to 07:59 UTC on 2026-11-04.** A metadata scan of the local capture queue and session state read no transcript or pending text, and changed nothing.
+
+- 32 queued triggers were first queued before 07:30:12 UTC on 2026-11-02, when commit `6fc6d63` recorded the 32 entries. The next trigger was first queued at 08:27:01 UTC.
+- They were first queued between 09:56:48 UTC on 2026-11-01 and 04:42:46 UTC on 2026-11-02: 30 Codex and 2 Claude Code, 30 `SessionEnd` and 2 `SessionStart`.
+- The installed client's source lookup finds no source for any of them.
+- Each has a state file with no ranges, both cursors at zero and no recorded source. Each state file marks the source missing 45 to 64 seconds after the first trigger, which is the first pass after the debounce.
+- No pending text exists for them.
+- A selection manifest of the 32 trigger and state files, with their SHA-256 hashes, has SHA-256 `5d1c0d1ee848ff2f2aab544b33e3a13a067c0b9ad0d1f228869232cebcb50a0f`.
+
+The count and time window match the historical record. Without the classification receipt, this check does not prove they are the same 32 entries. It shows that the client never found or digested these sources. It does not show whether a source ever existed at a path the client could read, and it recovers nothing.
+
+**Queue pruning.** The current client removes a queued trigger on its first pass after the source has been missing for more than 7 days ([source lookup](architecture.md#complete-local-reading-digest-only-upload)). It keeps the session state file, and its start-of-session sweep does not queue these sessions again because their state records no source. These 32 triggers reach that limit between 09:57 UTC on 2026-11-08 and 04:43 UTC on 2026-11-09, so the queue does not keep them indefinitely. That pruning is a gap against the goal of keeping all 32 entries preserved.
+
+**Preserved copies.** At 08:04:37 UTC on 2026-11-04, protected copies of all 32 trigger files and all 32 state files were made in `~/.local/share/agent-memory-preservation/missing-sources-2026-11-04`, outside the client's home and outside temporary folders. The 64 source files matched the manifest hashes before and after copying, and all 64 copies matched them. The directories are owner-only and the files owner-read/write. The private receipt has SHA-256 `1a5d4c566d1cd6c6818957948ce436b52eb4b56e3f2dd4c8e91ce29fcb0e1145`. These copies keep the 32 entries preserved after the queue prunes their triggers. Making the copies did not modify or delete any queued trigger or state file.
+
 ## Profile selection local verification, 2026-11-04
 
 The reviewed profile-selection source passed typecheck and lint. The Worker rerun passed 569 tests across 17 files; the separate local stage passed 222 tests. The earlier combined run failed one recall assertion and reported two graph RPC teardown errors. After isolation of new test fixtures, the Worker rerun exited successfully, but its runtime log still reported an unresolved Vitest worker teardown RPC error and an undisposed RPC result warning. This is local evidence only; fixture and canonical release checks remain pending.
