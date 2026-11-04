@@ -869,11 +869,14 @@ export class ProfileStore extends DurableObject<Env> {
 				const prefix = `g${who.generation}:`;
 				const ids = res.matches.map((m) => m.id).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length));
 				const sql = this.ctx.storage.sql;
-				const present = new Set(ids.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(ids)).toArray().map((r) => r.id) : []);
+				const rows = ids.length ? sql.exec<{ id: string; current: number }>("SELECT id, embed_hash IS card_hash AS current FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(ids)).toArray() : [];
+				const present = new Set(rows.map((r) => r.id));
+				// A vector embedded from an earlier card answers for text the record no longer holds; it counts again once re-embedded.
+				const current = new Set(rows.filter((r) => r.current).map((r) => r.id));
 				const gone = ids.filter((id) => !present.has(id));
 				// Lazy cleanup, only of this generation's own ids.
 				if (gone.length) this.ctx.waitUntil(this.env.VECTORS!.deleteByIds(gone.map((id) => vectorId(who, id))).then(() => undefined, () => undefined));
-				channels.vector = ids.filter((id) => present.has(id)).map((id) => ({ id }));
+				channels.vector = ids.filter((id) => current.has(id)).map((id) => ({ id }));
 				diagnostics.vector = ids.length ? `hits:${ids.length}` : "no_results";
 			}
 		}
