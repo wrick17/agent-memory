@@ -226,11 +226,12 @@ function purgeRecall(storage: DurableObjectStorage, now: number): { deleted: num
 /** Nightly node scan, bounded to 200 nodes. Fingerprints make repeats harmless and changed cards eligible again. */
 function queueStep(storage: DurableObjectStorage, who: Who, after: number, now: number): StepResult {
 	const sql = storage.sql;
-	// stale_memory (decay without deletion): an active record, not a journal or preference, untouched for 90 days and with no
-	// recall hit in the 90 UTC days ending today. Never stated, pinned or in me, so a protected record is never queued.
+	// stale_memory (decay without deletion): an active memory, not a journal or preference, untouched for 90 days and with no
+	// recall hit in the 90 UTC days ending today. Never stated, pinned or in me, so a protected record is never queued. Graph
+	// nodes without a memory type (sessions, entities) are excluded: the retire-only save cannot find them.
 	const staleBefore = new Date(now - STALE_DAYS * DAY).toISOString(), hitsFrom = new Date(now - (STALE_DAYS - 1) * DAY).toISOString().slice(0, 10);
 	const rows = sql.exec<{ r: number; id: string; kind: string; attrs: string; memory_type: string | null; chars: number; updated_at: string; created_at: string; stale: number }>(
-		`SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at, (status = 'active' AND kind NOT IN ('journal', 'preference') AND origin <> 'stated'
+		`SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at, (status = 'active' AND memory_type IS NOT NULL AND kind NOT IN ('journal', 'preference') AND origin <> 'stated'
 			AND pinned = 0 AND ?1 <> 'me' AND updated_at < ?2 AND NOT EXISTS (SELECT 1 FROM recall_daily d WHERE d.node_id = nodes.id AND d.day >= ?3)) AS stale
 		FROM nodes WHERE rowid > ?4 AND status IN ('active','candidate') ORDER BY rowid LIMIT ?5`, who.profile, staleBefore, hitsFrom, after, STEP.queue).toArray();
 	let items = 0;
