@@ -204,7 +204,10 @@ Source ready, not deployed. Depends on the v2 request plumbing and #11 above for
 Source ready, not deployed. Depends on #9, #11, #12 and #14 above.
 
 - `GET /api/viewer/snapshot` (owner only) returns the time, version and deploy time, profiles, the event cursor, counts, usage, health, recent sessions, the feed, layers and feature flags. Each profile's part is one synchronous read, so its sequence, feed and counts come from one state of the store.
-- Usage comes from the UTC day's `recall_totals` and activity, the store's actual SQL size, and nodes whose current card is embedded. The version and deploy time come from the new `CF_VERSION_METADATA` binding (`version_metadata` in `wrangler.jsonc`, including the test and rehearsal environments).
+- Usage comes from the UTC day's `recall_totals` and activity, the store's actual SQL size, and nodes whose current card is embedded. The version and deploy time come from the new `CF_VERSION_METADATA` binding. It is `version_metadata` in `wrangler.jsonc`, including the test and rehearsal environments, in the config `npm run setup` writes, and in `wrangler.example.jsonc`.
 - Availability is reported honestly: no uptime, MCP call or failure metrics, semantic latency, confidence percentages or tool counts are made up. A feature with no confirming device report reads as inactive.
 - A failed profile read fails the request instead of returning a smaller total.
+- Usage `vectors` uses the same rule as health.
+- Observations, the parts layer, crystals, and running and completed session counts use the same current parts and last-upload time as Sessions (#12).
+- Evidence for the setup binding, the vector rule and the current parts: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved snapshot tests run in the combined phase.
