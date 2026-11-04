@@ -11,8 +11,11 @@ export const CHUNK_ROWS = 500;
 export const CHUNK_BYTES = 512 * 1024;
 export const KEEP = 2;
 
-/** `rowid`: also export each rowid table's own rowid, for stores whose rows are keyed by it (the corpus families). */
-export interface StoreSpec { store: string; userId: string; metaTable: string; control: readonly string[]; first?: readonly string[]; profile?: string; generation?: string; rowid?: boolean }
+/**
+ * `rowid`: also export each rowid table's own rowid, for stores whose rows are keyed by it (the corpus families). `preserve`: the owner's
+ * manual export that keeps every existing export (no retention for this one export only; the next default export prunes as usual).
+ */
+export interface StoreSpec { store: string; userId: string; metaTable: string; control: readonly string[]; first?: readonly string[]; profile?: string; generation?: string; rowid?: boolean; preserve?: boolean }
 export interface ChunkRef { key: string; table: string; rows: number; sha256: string }
 export interface Manifest {
 	/** 2: a journaled resumable export (exportStep), restored in order with replace and delta deletes. */
@@ -124,7 +127,7 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
 			schema_version: schema, seq, at, counts, chunks };
 		const mk = `${prefix}manifest.enc`;
 		await env.BACKUPS.put(mk, await seal(key, mk, JSON.stringify(manifest)));
-		await retain(env, spec.store);
+		if (!spec.preserve) await retain(env, spec.store);
 		return ok({ id, seq, chunks: chunks.length, rows: Object.values(counts).reduce((a, b) => a + b, 0) });
 	} catch (e) {
 		if (e instanceof Fail) return { ok: false, error: e.failure };
@@ -138,8 +141,9 @@ export async function exportStore(storage: DurableObjectStorage, env: Env, spec:
  * durable progress lives in the store's meta table under `export_*` keys, which are never exported or journaled. A write fence
  * (exportFenced) is only the fallback when catch-up falls behind, and it lapses by the clock after 30 s.
  */
+/** `preserve`: set at begin from StoreSpec.preserve and read back from the durable job, so a resumed step never prunes; absent on older jobs. */
 export interface ExportJob { id: string; at: string; schema: number; phase: "baseline" | "delta" | "publishing"; table: number; after: unknown[] | null; jc: number; over: number;
-	fence_until: number | null; n: number; counts: Record<string, number> }
+	fence_until: number | null; n: number; counts: Record<string, number>; preserve?: true }
 const JOURNAL = "export_journal";
 const STEP_MS = 10_000, STEP_CHUNKS = 200, DRAIN = 1_000, CUT_ROWS = 8_000, CUT_BYTES = 2 * 1024 * 1024, FENCE_MS = 30_000, FENCE_AFTER = 50;
 const pad = (n: number, w: number) => String(n).padStart(w, "0");
@@ -182,7 +186,7 @@ export function endCapture(sql: SqlStorage): void {
  */
 export function beginExport(storage: DurableObjectStorage, spec: StoreSpec): ExportJob {
 	const sql = storage.sql, at = new Date().toISOString();
-	const job: ExportJob = { id: `${at.replace(/[-:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`, at, phase: "baseline", table: 0, after: null, jc: 0, over: 0, fence_until: null, n: 0, counts: {},
+	const job: ExportJob = { id: `${at.replace(/[-:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`, at, phase: "baseline", table: 0, after: null, jc: 0, over: 0, fence_until: null, n: 0, counts: {}, ...(spec.preserve ? { preserve: true as const } : {}),
 		schema: Number(sql.exec<{ value: string }>(`SELECT value FROM ${spec.metaTable} WHERE key = 'schema_version'`).one().value) };
 	storage.transactionSync(() => {
 		endCapture(sql);
@@ -343,7 +347,7 @@ async function step(storage: DurableObjectStorage, env: Env, spec: StoreSpec, ha
 			await env.BACKUPS.put(mk, await seal(key, mk, JSON.stringify(manifest)));
 			// A store closed or cleared meanwhile keeps no export.
 			if (halted() || !mine()) return await abandon(halted() ?? "the export was cancelled");
-			await retain(env, spec.store);
+			if (!job.preserve) await retain(env, spec.store);
 			finish({ state: "done", chunks: chunks.length, rows: rowsOf(job.counts) });
 			return ok({ id, done: true, chunks: chunks.length, rows: rowsOf(job.counts) });
 		};

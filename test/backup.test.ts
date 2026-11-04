@@ -544,9 +544,100 @@ describe("corpus resumable export", () => {
 		expect(await admin({ op: "wipeProfile", profile: name, typed: name })).toMatchObject({ ok: true });
 		expect(await value<string[]>(admin({ op: "listExports", profile: name, corpus: true }))).toEqual([]);
 	});
+
+	it("a manual preserve_existing export keeps every existing profile and account export unchanged; the next default or any scheduled export prunes to two", async () => {
+		await call(await contextFor(), "save_memory", { name: "Preserve probe", type: "reference", description: "p", content: "preserve body", profile: "personal" });
+		const stores = ["profile-personal", "account"] as const;
+		const lists = async () => Promise.all(stores.map((s) => listExports(env, s)));
+		const objects = async (store: string, ids: string[]) => Promise.all(ids.map(async (id) => (await env.BACKUPS.list({ prefix: `exports/${store}/${id}/` })).objects.map((o) => `${o.key}:${o.etag}`)));
+		await value(admin({ op: "export" }));
+		await value(admin({ op: "export" }));
+		const two = await lists();
+		for (const ids of two) expect(ids).toHaveLength(2);
+		const before = await Promise.all(stores.map((s, i) => objects(s, two[i]!)));
+
+		await value(admin({ op: "export", preserve_existing: true }));
+		const three = await lists();
+		for (const [i, ids] of three.entries()) {
+			expect(ids).toHaveLength(3);
+			expect(ids.slice(0, 2)).toEqual(two[i]);
+			expect(await objects(stores[i]!, two[i]!)).toEqual(before[i]);
+		}
+		// Not pinned: the next default export applies retention again, keeping the two newest.
+		await value(admin({ op: "export" }));
+		for (const [i, ids] of (await lists()).entries()) { expect(ids).toHaveLength(2); expect(ids[0]).toBe(three[i]!.at(-1)); }
+		// A scheduled run never takes the manual flag.
+		await value(admin({ op: "export", preserve_existing: true }));
+		for (const ids of await lists()) expect(ids).toHaveLength(3);
+		await value(admin({ op: "export", preserve_existing: true, trigger: { scheduled_time: Date.now(), cron: "17 3 * * *" } }));
+		for (const ids of await lists()) expect(ids).toHaveLength(2);
+	});
 });
 
 describe("corpus export and restore", () => {
+	it("a preserve_existing corpus export keeps every export from its saved job across steps and a failed publish; a running default job refuses it; a job without the flag prunes", async () => {
+		await contextFor();
+		const { beginExport, exportJob, exportStep } = await import("../src/backup");
+		const { SNAPSHOTS, stageName } = await import("../src/corpus/snapshots");
+		const name = `pv${crypto.randomUUID().slice(0, 6)}`, g = crypto.randomUUID().slice(0, 8), META = "corpus_store_meta", store = `corpus-${name}`;
+		await accountSql((sql) => {
+			const now = new Date().toISOString();
+			sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${OWNER}:${name}:${g}`, g, now);
+			sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", g, name, now);
+		});
+		const corpus = env.CORPUS_STORE!.get(env.CORPUS_STORE!.idFromName(`${OWNER}:${name}:${g}`));
+		const on = <T,>(f: (s: DurableObjectState) => T) => runInDurableObject(corpus, (_i, s) => f(s));
+		await on((s) => {
+			for (const [k, v] of [["user_id", OWNER], ["profile", name], ["generation", g]]) s.storage.sql.exec(`INSERT INTO ${META} (key, value) VALUES (?, ?)`, k, v);
+			for (let i = 1; i <= 1200; i++) s.storage.sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name) VALUES (?, 'org/alpha', ?, ?, ?)", i, i, i, `dev-${i}`);
+		});
+		// The store's own spec, as its alarm passes it: never a preserve flag, so every step below reads the flag from the saved job.
+		const spec = { store, userId: OWNER, metaTable: META, control: Object.keys(SNAPSHOTS).map(stageName), profile: name, generation: g, rowid: true };
+		const drive = async (e: Env = env) => {
+			for (let i = 0; i < 20; i++) { const r = await on((s) => exportStep(s.storage, e, spec, () => null)); if (!r.ok || r.value.done) return r; }
+			throw new Error("the export did not finish");
+		};
+		const objects = async (ids: string[]) => Promise.all(ids.map(async (id) => (await env.BACKUPS.list({ prefix: `exports/${store}/${id}/` })).objects.map((o) => `${o.key}:${o.etag}`)));
+		const ask = (extra: { preserve_existing?: boolean } = {}) => admin({ op: "export", profile: name, corpus: true, ...extra });
+
+		// A preserve request while a default job runs is refused as busy, and that job keeps running unchanged.
+		const plain = await on((s) => beginExport(s.storage, spec).id);
+		expect(await ask({ preserve_existing: true })).toMatchObject({ ok: false, error: { details: { results: { [store]: { error: { code: "busy", details: { reason: "export_running" } } } } } } });
+		expect(await on((s) => exportJob(s.storage.sql, META))).toEqual(expect.objectContaining({ id: plain }));
+		expect(await on((s) => exportJob(s.storage.sql, META)?.preserve)).toBeUndefined();
+		expect(await drive()).toMatchObject({ ok: true, value: { id: plain, done: true } });
+		const second = await settled(name, g, (await value<Record<string, { id: string }>>(ask()))[store]!.id);
+		expect(await listExports(env, store)).toEqual([plain, second]);
+		const before = await objects([plain, second]);
+
+		// Through the owner's request: its publication leaves both earlier exports. exportNow arms an immediate alarm that Miniflare may
+		// run before any read here, so this checks the finished outcome, not the in-flight job; the store's alarm steps with its own spec,
+		// which never carries the flag, so keeping all three shows it came from the saved job. The saved field is checked directly below.
+		const asked = (await value<Record<string, { id: string }>>(ask({ preserve_existing: true })))[store]!.id;
+		await settled(name, g, asked);
+		expect(await listExports(env, store)).toEqual([plain, second, asked]);
+		expect(await objects([plain, second])).toEqual(before);
+
+		// Across several steps and a failed manifest put: the publishing job keeps its flag, and its retry still deletes nothing.
+		let puts = 0, manifestFailed = false;
+		const flaky = { ...env, BACKUPS: { head: (k: string) => env.BACKUPS.head(k), list: (o: R2ListOptions) => env.BACKUPS.list(o), delete: (k: string[]) => env.BACKUPS.delete(k),
+			put: (k: string, v: Uint8Array) => (k.endsWith("manifest.enc") ? !manifestFailed && (manifestFailed = true) : ++puts === 2) ? Promise.reject(new Error("r2 down")) : env.BACKUPS.put(k, v) } } as unknown as Env;
+		const kept = await on((s) => beginExport(s.storage, { ...spec, preserve: true }).id);
+		expect(await drive(flaky)).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await on((s) => exportJob(s.storage.sql, META))).toMatchObject({ id: kept, phase: "baseline", n: 1, preserve: true });
+		expect(await drive(flaky)).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await on((s) => exportJob(s.storage.sql, META))).toMatchObject({ id: kept, phase: "publishing", preserve: true });
+		expect(await drive()).toMatchObject({ ok: true, value: { id: kept, done: true } });
+		expect(await listExports(env, store)).toEqual([plain, second, asked, kept]);
+		expect(await objects([plain, second])).toEqual(before);
+
+		// A job saved before this flag existed (no preserve key) still applies retention: the two newest remain.
+		const old = await on((s) => beginExport(s.storage, spec).id);
+		expect(await on((s) => s.storage.sql.exec<{ value: string }>(`SELECT value FROM ${META} WHERE key = 'export_job'`).one().value)).not.toContain("preserve");
+		expect(await drive()).toMatchObject({ ok: true, value: { id: old, done: true } });
+		expect(await listExports(env, store)).toEqual([kept, old]);
+	});
+
 	it("exports a corpus encrypted with its own rowids, keeps two, restores into an empty generation with search, and refuses wiped or non-empty targets", async () => {
 		await contextFor();
 		const name = `cr${crypto.randomUUID().slice(0, 6)}`, g1 = crypto.randomUUID().slice(0, 8), g2 = crypto.randomUUID().slice(0, 8);

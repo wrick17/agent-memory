@@ -8,6 +8,7 @@ import { resetKeyCache } from "../src/auth";
 import { egressFetch } from "../src/egress";
 import { settingsMain } from "../src/settings";
 import wranglerConfig from "../wrangler.jsonc?raw";
+import { listExports } from "../src/backup";
 import { nextSeq } from "../src/storage";
 import { call, contextFor, deviceToken, outcome, registered } from "./helpers";
 
@@ -1250,7 +1251,8 @@ it("routing rules and the restore drill are owner only: stored rules, validated 
 	const seq = () => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, st) => st.storage.sql.exec("SELECT value FROM account_meta WHERE key = 'write_seq'").one().value);
 	for (const [path, method, body] of [["/api/rules", "GET"], ["/api/rules", "PUT", { rules: [] }], ["/api/rules/test", "POST", { remote: "github.com/a/b" }],
 		["/api/backups/drill", "GET"], ["/api/backups/drill", "POST", { profile: "personal", request_id: "device-drill-1" }],
-		["/api/backups/drill/step", "POST", { id: crypto.randomUUID() }], ["/api/backups/drill/cleanup", "POST", { id: crypto.randomUUID() }]] as const) {
+		["/api/backups/drill/step", "POST", { id: crypto.randomUUID() }], ["/api/backups/drill/cleanup", "POST", { id: crypto.randomUUID() }],
+		["/api/backups/export", "POST", { profile: "personal", preserve_existing: true }]] as const) {
 		expect([path, method, (await http(path, method, body, device)).status]).toEqual([path, method, 403]);
 	}
 	const original = await http("/api/rules");
@@ -1277,5 +1279,13 @@ it("routing rules and the restore drill are owner only: stored rules, validated 
 	expect((await http("/api/backups/drill", "POST", { profile: "personal", request_id: "owner-drill-1", extra: 1 })).status).toBe(400);
 	expect((await http("/api/backups/drill/step", "POST", { id: "not-a-uuid" })).status).toBe(400);
 	expect(await http("/api/backups/drill")).toMatchObject({ status: 200, body: { drill: null } });
+	// The manual export's preserve_existing: a boolean or absent; anything else is refused before any export.
+	const exportsNow = async () => (await env.BACKUPS.list({ prefix: "exports/profile-personal/" })).objects.length;
+	const stored = await exportsNow();
+	for (const bad of ["true", 1, null, {}]) expect((await http("/api/backups/export", "POST", { profile: "personal", preserve_existing: bad })).status).toBe(400);
+	expect(await exportsNow()).toBe(stored);
+	// True reaches the profile export: three in a row keep every complete one, where retention would leave two.
+	for (let i = 0; i < 3; i++) expect((await http("/api/backups/export", "POST", { profile: "personal", preserve_existing: true })).status).toBe(200);
+	expect((await listExports(env, "profile-personal")).length).toBeGreaterThanOrEqual(3);
 	expect(await http("/api/rules", "PUT", { rules: restore })).toMatchObject({ status: 200 });
 });

@@ -121,14 +121,14 @@ export class ProfileStore extends DurableObject<Env> {
 		return !!me && me.userId === who.userId && me.profile === who.profile && me.generation === who.generation;
 	}
 
-	/** Internal RPC from AccountStore: this generation's encrypted export (section 18), under the bounded write pause. */
-	async exportNow(who: Who): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
+	/** Internal RPC from AccountStore: this generation's encrypted export (section 18), under the bounded write pause. `preserve_existing`: skip retention for this export only. */
+	async exportNow(who: Who, opts: { preserve_existing?: boolean } = {}): Promise<Outcome<{ id: string; seq: number; chunks: number; rows: number }>> {
 		if (!this.same(who)) return fail("not_found", "this generation holds nothing to export");
 		const sql = this.ctx.storage.sql;
 		if (sql.exec("SELECT 1 FROM profile_meta WHERE key = 'closed'").toArray().length) return fail("profile_wiped", "this profile generation is closed");
 		if (sql.exec("SELECT 1 FROM profile_meta WHERE key = 'restore_id'").toArray().length && !sql.exec("SELECT 1 FROM profile_meta WHERE key = 'restore_done'").toArray().length) return fail("busy", "this generation is being restored");
 		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env,
-			{ store: `profile-${who.profile}`, userId: who.userId, metaTable: "profile_meta", control: PROFILE_CONTROL, first: ["nodes"], profile: who.profile, generation: who.generation }));
+			{ store: `profile-${who.profile}`, userId: who.userId, metaTable: "profile_meta", control: PROFILE_CONTROL, first: ["nodes"], profile: who.profile, generation: who.generation, ...(opts.preserve_existing === true ? { preserve: true } : {}) }));
 	}
 
 	/**
