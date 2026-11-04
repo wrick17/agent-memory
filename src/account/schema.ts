@@ -58,4 +58,12 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 		created_at TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID`,
 	"CREATE INDEX review_items_seq ON review_items (seq, id)",
 	...tombstoneTriggers("account_meta", "review_items", pk("id")),
+], [
+	// v7 (v2 storage, issue #5): eval scores, each device's last status report and the health checks' latest state. Ordinary
+	// snapshot state: exported, kept in an account restore's checkpoint, cleared and replaced by a restore (none from a v6 export).
+	`CREATE TABLE eval_runs (id TEXT PRIMARY KEY, profile TEXT NOT NULL, at TEXT NOT NULL, channels TEXT NOT NULL, k INTEGER NOT NULL,
+		cases INTEGER NOT NULL, recall_all_at_k REAL NOT NULL, any_hit_at_k REAL NOT NULL, mrr REAL NOT NULL, device_id TEXT NOT NULL) WITHOUT ROWID`,
+	"CREATE TABLE client_status (device_id TEXT PRIMARY KEY, reported_at TEXT NOT NULL, body TEXT NOT NULL CHECK (json_valid(body))) WITHOUT ROWID",
+	`CREATE TABLE health (check_id TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('ok','warn','fail')),
+		detail TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (check_id, subject)) WITHOUT ROWID`,
 ]];
