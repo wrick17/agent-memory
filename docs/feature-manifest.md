@@ -145,3 +145,14 @@ Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Ses
 - Detail orders events by range start, then position, and links produced records through evidence and inferred-preference provenance. Active means an upload in the last 30 minutes and no session end.
 - Counts come from stored evidence only. Upload span and first upload are labelled as such; no working directory, original start time or hosted tool count is invented.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 replay-safe maintenance and stale records (#10), 2026-11-04
+
+Source ready, not deployed. Depends on #9 above for the recall counts and eval candidates.
+
+- `maintenance_next` takes an optional `request_id`. The first call binds it to the lease; an identical retry returns the same lease and only items still leased, a changed retry is refused, and an expired binding returns `lease_id: null` with `reason: "lease_expired"`. Without `request_id` the v1 behavior is unchanged, and `maintenance_complete` per-op replay stays exactly once.
+- Housekeeping queues `stale_memory` only for active records older than 90 days with no recall hit in 90 days. Journals, preferences, stated, pinned and `me` records are excluded. A stale item allows only a retire-only save, `flag` and `dismiss`; every change still goes through `mayChange`, and nothing is deleted automatically.
+- `suggest_eval_case` is allowed only on `unprocessed_capture` and `preference_signal` items. Its query, expected ids and evidence are checked against the item's subjects and stored through the #9 candidate store, which refuses wiped ids.
+- Housekeeping purges `recall_daily` and `recall_totals` rows older than 400 days in bounded pages.
+- The owner can queue link maintenance for 1 to 40 memories (`POST /api/profiles/:p/maintenance/queue`) and consolidation for one session (`POST /api/profiles/:p/sessions/:id/consolidate`) through the existing fingerprinted queue, so a repeat queues nothing.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase; the original module tests were not preserved and are listed as needed coverage.
