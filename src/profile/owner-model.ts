@@ -3,8 +3,14 @@
 // writes, binds, stamps a sequence number or resolves another profile; pin, unpin, forget and unflag stay the owner actions.
 import { Fail } from "../domain/types";
 
-/** The read-query shape; the integrator adds the same member to ReadQuery in domain/types.ts. */
-export interface OwnerModelQuery { kind: "owner_model"; after: string | null; limit: number }
+/**
+ * The read-query shape; the integrator adds the same member to ReadQuery in domain/types.ts. `kinds` (v2 Lessons): which
+ * memory kinds to list, preference (type user) and rule (type feedback); omitted, preferences only, as About you reads them.
+ */
+export interface OwnerModelQuery { kind: "owner_model"; after: string | null; limit: number; kinds?: ("preference" | "rule")[] }
+export const OWNER_MODEL_KINDS = ["preference", "rule"] as const;
+/** At most this many linked project names per item. */
+export const OWNER_PROJECTS_MAX = 3;
 
 /** At most this many preferences per page; a larger limit is capped. */
 export const OWNER_MODEL_MAX = 200;
@@ -14,6 +20,10 @@ export const OWNER_EVIDENCE_MAX = 10;
 export interface OwnerModelItem {
 	id: string; name: string; description: string; origin: string; pinned: boolean; flagged: string | null; revision: number;
 	updated_at: string; source_profile: string | null;
+	/** v2: the stored kind, and the record's scope ("default" when none was given). */
+	kind: "preference" | "rule"; scope: string;
+	/** v2: names of projects it currently links to in this profile, at most OWNER_PROJECTS_MAX, by name. */
+	projects: string[];
 	/** Current edges from this preference, as the section 5 view counts them. */
 	links: number;
 	evidence: { kind: string; ref: string; note: string | null }[];
@@ -42,13 +52,17 @@ export function ownerModel(sql: SqlStorage, q: OwnerModelQuery): OwnerModelPage 
 	if (q.after !== null && typeof q.after !== "string") throw Fail.of("validation", "after must be a cursor string or null");
 	const limit = Math.min(q.limit, OWNER_MODEL_MAX);
 	const key = q.after === null ? null : position(q.after);
+	const kinds = q.kinds ?? ["preference"];
+	if (!Array.isArray(kinds) || !kinds.length || kinds.some((k) => !(OWNER_MODEL_KINDS as readonly string[]).includes(k))) throw Fail.of("validation", "kinds lists preference and/or rule");
 	// id descending only breaks ties; it keeps the whole key in one direction, so one row-value comparison resumes the page.
 	const rows = sql.exec<{ id: string; name: string; description: string; origin: string; flagged: string | null; revision: number;
-		updated_at: string; source_profile: string | null; links: number; s: number; p: number }>(
-		`SELECT n.id, n.name, n.description, n.origin, n.flagged, n.revision, n.updated_at, n.source_profile,
-			(SELECT count(*) FROM edges e WHERE e.src = n.id AND e.ended_at IS NULL) AS links, (n.origin = 'stated') AS s, (n.pinned <> 0) AS p
-		FROM nodes n WHERE n.kind = 'preference' AND n.status = 'active' ${key ? "AND ((n.origin = 'stated'), (n.pinned <> 0), n.updated_at, n.id) < (?, ?, ?, ?)" : ""}
-		ORDER BY s DESC, p DESC, n.updated_at DESC, n.id DESC LIMIT ?`, ...(key ?? []), limit + 1).toArray();
+		updated_at: string; source_profile: string | null; links: number; s: number; p: number; kind: "preference" | "rule"; scope: string; projects: string }>(
+		`SELECT n.id, n.name, n.description, n.origin, n.flagged, n.revision, n.updated_at, n.source_profile, n.kind, n.scope,
+			(SELECT count(*) FROM edges e WHERE e.src = n.id AND e.ended_at IS NULL) AS links, (n.origin = 'stated') AS s, (n.pinned <> 0) AS p,
+			(SELECT json_group_array(name) FROM (SELECT p.name FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = n.id AND e.ended_at IS NULL
+				AND e.dst_profile = '' AND p.kind = 'project' AND p.status = 'active' GROUP BY p.name ORDER BY p.name LIMIT ${OWNER_PROJECTS_MAX})) AS projects
+		FROM nodes n WHERE n.kind IN (SELECT value FROM json_each(?)) AND n.status = 'active' ${key ? "AND ((n.origin = 'stated'), (n.pinned <> 0), n.updated_at, n.id) < (?, ?, ?, ?)" : ""}
+		ORDER BY s DESC, p DESC, n.updated_at DESC, n.id DESC LIMIT ?`, JSON.stringify(kinds), ...(key ?? []), limit + 1).toArray();
 	const page = rows.slice(0, limit);
 	// One statement for the page's evidence: the ids travel as one JSON parameter, and each owner reads at most cap + 1 rows.
 	const evidence = new Map(sql.exec<{ owner: string; items: string }>(
@@ -59,7 +73,7 @@ export function ownerModel(sql: SqlStorage, q: OwnerModelQuery): OwnerModelPage 
 	const items = page.map((r): OwnerModelItem => {
 		const ev = evidence.get(`n:${r.id}`) ?? [];
 		return { id: r.id, name: r.name, description: r.description, origin: r.origin, pinned: r.p === 1, flagged: r.flagged, revision: r.revision,
-			updated_at: r.updated_at, source_profile: r.source_profile, links: r.links,
+			updated_at: r.updated_at, source_profile: r.source_profile, kind: r.kind, scope: r.scope, projects: JSON.parse(r.projects) as string[], links: r.links,
 			evidence: ev.slice(0, OWNER_EVIDENCE_MAX).map(([kind, ref, note]) => ({ kind, ref, note })),
 			evidence_truncated: ev.length > OWNER_EVIDENCE_MAX, evidence_missing: r.origin === "inferred" && ev.length === 0 };
 	});
