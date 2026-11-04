@@ -860,7 +860,7 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 		const { channels, count_hits, ...args } = b;
 		const opts = recallOptions.safeParse({ ...(channels !== undefined ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) });
 		if (!opts.success) return json({ error: { code: "validation", message: "channels is lexical and/or vector; count_hits is true or false" } }, 400);
-		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner", ...(waitUntil ? { waitUntil } : {}) }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
+		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner", ...(waitUntil ? { waitUntil } : {}), ...(tool[2] === "recall" ? { withoutMe: true as const } : {}) }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
 			{ ...args, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) }, opts.data);
 		if (r.ok) return json(r.value);
 		const code = r.error.code;
