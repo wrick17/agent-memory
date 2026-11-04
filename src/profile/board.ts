@@ -37,13 +37,23 @@ const W = { priority: 40, due: 25, owner_action: 15, blocking: 10, recent_activi
  *   change after as_of is replaced by the node's recorded_at, so nothing as_of could not have seen is credited.
  * `known` lists the account's profile names, as in graph reads, so links written while an item lived elsewhere are found.
  */
-export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[] }
+export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[]; state?: BoardStateFilter }
+/**
+ * v2 owner read (Actions tab): which uploaded state to list. Omitted, "open": the scored board work_board and reviews read.
+ * "closed" and "all" list those items with the same fields and terms; "all" includes items with no state.
+ */
+export type BoardStateFilter = "open" | "closed" | "all";
 export type BoardRef = { id: string; kind: string; name: string } | { id: string; readable: false };
 export type Term = keyof typeof W;
 export interface BoardItem {
 	id: string; kind: string; key: string | null; name: string; scope: string; priority: string | null; due: string | null;
 	score: number; reasons: { term: Term; points: number; text: string }[]; stale: boolean; last_activity_at: string;
 	blocked_by: BoardRef[]; blocks: BoardRef[]; unrecognized: string[];
+	/**
+	 * v2: the uploaded state ("open", "closed", or null when missing) and a Jira ticket's own status text. GitHub merged PRs
+	 * arrive as "closed": uploads do not carry the merged distinction, so it is never reported here.
+	 */
+	state: string | null; status: string | null;
 }
 
 type Attrs = Partial<Record<(typeof BOARD_ATTRS)[number], unknown>>;
@@ -76,17 +86,21 @@ export function board(sql: SqlStorage, q: BoardQuery) {
 	if (Number.isNaN(ms)) throw Fail.of("validation", "as_of must be an ISO date");
 	const asOf = iso(ms), recentFrom = iso(ms - RECENT_DAYS * DAY), staleBefore = iso(ms - STALE_DAYS * DAY);
 	const kinds = JSON.stringify(BOARD_KINDS), b: Budget & { candidates: number } = { ...newBudget(EDGE_ROWS), candidates: 0 };
+	const want = q.state ?? "open";
+	if (!["open", "closed", "all"].includes(want)) throw Fail.of("validation", "state is open, closed or all");
+	// The state filter: a literal per allowed value, never caller text; `state` in the count, the attrs path in the item read.
+	const pick = (col: string) => (want === "all" ? "1" : `${col} = '${want}'`);
 
 	// shortcut: state lives in attrs, so both reads scan every active item of the four kinds; add an index on it if that grows.
-	const counts = sql.exec<{ open: number; without_state: number }>(`SELECT count(*) FILTER (WHERE state = 'open') AS open,
+	const counts = sql.exec<{ matching: number; without_state: number }>(`SELECT count(*) FILTER (WHERE ${pick("state")}) AS matching,
 		count(*) FILTER (WHERE state IS NULL OR state NOT IN (SELECT value FROM json_each(?))) AS without_state
 		FROM (SELECT json_extract(attrs, '$.state') AS state FROM nodes WHERE kind IN (SELECT value FROM json_each(?)) AND status = 'active' AND recorded_at <= ?)`,
 	JSON.stringify(BOARD_STATES), kinds, asOf).one();
 	// At most 200 candidates, the most recently uploaded first; the rest are counted in skipped.
 	const cands = sql.exec<Row>(`SELECT ${NODE_COLS} FROM nodes WHERE kind IN (SELECT value FROM json_each(?)) AND status = 'active' AND recorded_at <= ?
-		AND json_extract(attrs, '$.state') = 'open' ORDER BY updated_at DESC, id LIMIT ?`, kinds, asOf, LEVEL_NODES).toArray();
+		AND ${pick("json_extract(attrs, '$.state')")} ORDER BY updated_at DESC, id LIMIT ?`, kinds, asOf, LEVEL_NODES).toArray();
 	b.candidates = cands.length;
-	if (counts.open > cands.length) { b.exhausted = true; b.stopped = "candidates"; b.skipped = counts.open - cands.length; }
+	if (counts.matching > cands.length) { b.exhausted = true; b.stopped = "candidates"; b.skipped = counts.matching - cands.length; }
 
 	// One level of links through the graph's own read: indexed, valid at as_of, similarity links left out, charged to the budget.
 	let edges: Edge[] = [];
@@ -148,6 +162,7 @@ export function board(sql: SqlStorage, q: BoardQuery) {
 			id: c.id, kind: c.kind, key: c.key, name: c.name, scope: c.scope, priority: typeof a.priority === "string" ? a.priority : null, due: typeof a.due === "string" ? a.due : null,
 			score: round(reasons.reduce((s, r) => s + r.points, 0)), reasons, stale: last < staleBefore, last_activity_at: last,
 			blocked_by: [...l.blockedBy].sort().map(ref), blocks: [...l.blocks].sort().map(ref), unrecognized,
+			state: typeof a.state === "string" ? a.state : null, status: typeof (a as { status?: unknown }).status === "string" ? (a as { status: string }).status : null,
 		};
 	}).sort((x, y) => y.score - x.score || x.id.localeCompare(y.id));
 

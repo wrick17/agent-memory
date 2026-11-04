@@ -212,3 +212,12 @@ Source ready, not deployed. Depends on #9, #11, #12 and #14 above.
 - Observations, the parts layer, crystals, and running and completed session counts use the same current parts and last-upload time as Sessions (#12).
 - Evidence for the setup binding, the vector rule and the current parts: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved snapshot tests run in the combined phase.
+
+### v2 Lessons and Actions read seams (#27), 2026-11-04
+
+Server source ready, not deployed; the Lessons, Crystals and Actions tabs land separately.
+
+- `GET /api/profiles/:p/owner-model` takes `kinds=preference,rule`. Omitted, it lists preferences only, as About you reads them; any other kind is refused. Each item now carries its stored kind, scope (`default` when none was given) and up to three linked project names.
+- `GET /api/profiles/:p/board` takes `state=open|closed|all`. Omitted or `open`, it is the scored board `work_board` reads; `closed` and `all` list those items with the same fields and terms. Each item carries its uploaded state and a Jira ticket's own status text. Merged GitHub PRs arrive as `closed`, so a merge is never reported.
+- Reads only; no issue state is written and no feed or polling is added.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.

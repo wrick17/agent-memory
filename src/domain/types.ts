@@ -193,7 +193,7 @@ export type ReadQuery =
 	| { kind: "candidates"; status: "pending" | "promoted" | "dismissed" | "all"; limit: number; asOf?: string }
 	| { kind: "import_audit"; after: string | null; limit: number; record?: string; rows?: "revisions" | "requests" | "texts" }
 	| { kind: "batch_status" }
-	| { kind: "owner_model"; after: string | null; limit: number }
+	| { kind: "owner_model"; after: string | null; limit: number; kinds?: ("preference" | "rule")[] }
 	| ExploreQuery | TraceQuery | TimelineQuery | BoardQuery
 	// The owner's page reads (section 15); src/profile/pages.ts takes the same shapes.
 	| { kind: "entity"; node: { id: string } | { key: string }; asOf?: string; before?: number; content?: { cursor?: string }; known: string[] }
@@ -218,7 +218,7 @@ export type TraceQuery = { kind: "trace"; known: string[]; maxEdges: number; asO
 	| { mode: "detail"; nodes: string[]; edges: number[] });
 export interface TimelineQuery { kind: "timeline"; from: string; to: string; node?: GraphRef; kinds?: NodeKind[]; limit: number; known: string[] }
 /** work_board (section 13); src/profile/board.ts takes the same shape. The Worker supplies asOf. */
-export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[] }
+export interface BoardQuery { kind: "board"; asOf: string; limit: number; known: string[]; state?: "open" | "closed" | "all" }
 
 /** With as_of, the record's stored state then: a field its history does not hold is null, never the current value. */
 export interface RecallHit {

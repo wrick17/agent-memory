@@ -22,6 +22,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] v2 activity summaries and project profiles (#15): source in review, not deployed.
 - [ ] v2 owner-only live viewer events with cursor resume (#14): source in review, not deployed.
 - [ ] v2 viewer snapshot with real counts, usage, health and version (#13): source in review, not deployed.
+- [ ] v2 Lessons and Actions server reads (#27): source in review, not deployed; the tabs are separate.
 
 Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
 

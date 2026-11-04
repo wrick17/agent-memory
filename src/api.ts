@@ -358,7 +358,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 }
 
 const boardQuery = z.object({ as_of: z.string().max(40).refine((s) => !Number.isNaN(Date.parse(s)), "must be an ISO date").optional(),
-	limit: z.coerce.number().int().min(1).max(200).optional() }).strict();
+	limit: z.coerce.number().int().min(1).max(200).optional(), state: z.enum(["open", "closed", "all"]).optional() }).strict();
 // Owner page reads (section 15). Entity: before pages revision history, content=all with cursor pages the whole content. Journals:
 // after pages the list; id with entries_after pages one journal's entries, at most 25 a page. The rest bound their own windows.
 const asOfParam = boardQuery.shape.as_of;
@@ -823,8 +823,10 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 	if (model && request.method === "GET") {
 		const ref = PROFILE_NAME.test(model[1]!) ? ctx.value.profiles.find((p) => p.profile === model[1]) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${model[1]}' is not active` } }, 404);
-		const limit = url.searchParams.get("limit");
-		const r = await profileStub(env, ref).read(ref, { kind: "owner_model", after: url.searchParams.get("after"), limit: limit === null ? 50 : Number(limit) });
+		const limit = url.searchParams.get("limit"), kinds = url.searchParams.get("kinds");
+		// Lessons (#27): kinds=preference,rule; omitted, preferences only, as About you reads them. The store refuses any other kind.
+		const r = await profileStub(env, ref).read(ref, { kind: "owner_model", after: url.searchParams.get("after"), limit: limit === null ? 50 : Number(limit),
+			...(kinds !== null ? { kinds: kinds.split(",") as ("preference" | "rule")[] } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
 	}
 	// One profile's work board, for the dashboard's work page (sections 13 and 15). It never follows a link into another profile.
@@ -833,8 +835,9 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 		const ref = PROFILE_NAME.test(brd[1]!) ? ctx.value.profiles.find((p) => p.profile === brd[1]) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${brd[1]}' is not active` } }, 404);
 		const q = boardQuery.safeParse(Object.fromEntries(url.searchParams));
-		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200" } }, 400);
-		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known });
+		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200; state open, closed or all" } }, 400);
+		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known,
+			...(q.data.state ? { state: q.data.state } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
 	}
 	// The dashboard's memory list, search and draft save (section 15): the MCP tools' own dispatch (routing, redaction, request
