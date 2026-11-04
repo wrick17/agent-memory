@@ -1311,3 +1311,48 @@ describe("v2 request plumbing (#4)", () => {
 		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`, { headers: { authorization: `Bearer ${fresh.token}` } }))).status).toBe(403);
 	});
 });
+
+describe("v2 health vector count (#11)", () => {
+	it("does not count an uploaded session or a bare entity as a vector", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin, session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const vectors = async () => ((await (await exports.default.fetch(new Request(`${origin}/api/health`, { headers: { authorization: `Bearer ${session}` } }))).json()) as { search: { vectors: number } }).search.vectors;
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		const before = await vectors();
+		// Both are written with embed_hash equal to card_hash so the embed stage skips them; neither has a vector.
+		const { ingest } = await import("../src/profile/capture"), { sha256 } = await import("../src/domain/ids");
+		const b = JSON.stringify({ asks: [{ text: "a", pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			ingest(st.storage, ref, { session: { client: "codex", id: `vec-${tag}` }, manifests: [], digests: [{ range_id: `codex:vec-${tag}:0a1b2c3d:0-10`, capture_status: "heuristic", part_id: "-", sha256: sha256(b), body: b }] });
+		});
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "component", name: `Bare ${tag}` }] });
+		expect(await vectors()).toBe(before);
+	});
+});
+
+describe("v2 activity summary with no fully covered day (#15)", () => {
+	it("returns the truncated summary and no file list when the read budget drops every requested day", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin, session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		await contextFor();
+		const name = `as${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`, generation = crypto.randomUUID().slice(0, 8), day = new Date().toISOString().slice(0, 10);
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)), (_i, st) => {
+			const now = new Date().toISOString();
+			st.storage.sql.exec("INSERT INTO profiles (name, object_name, generation, status, created_at, seq) VALUES (?, ?, ?, 'active', ?, 1)", name, `${env.OWNER_USER_ID}:${name}:${generation}`, generation, now);
+			st.storage.sql.exec("INSERT INTO generations (id, profile, purpose, state, reserved_at, seq) VALUES (?, ?, 'live', 'active', ?, 1)", generation, name, now);
+		});
+		// One more current digest part on the requested day than the 5,000-part read budget.
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${env.OWNER_USER_ID}:${name}:${generation}`)), (_i, st) => {
+			const sql = st.storage.sql, at = `${day}T00:00:01.000Z`, b = JSON.stringify({ asks: [{ text: "a", pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			sql.exec(`INSERT INTO nodes (id, kind, key, name, norm_name, status, origin, content_hash, card_hash, embed_hash, recorded_at, created_at, updated_at, seq)
+				VALUES ('big', 'session', 'session:codex:big', 'big', 'big', 'active', 'upload', 'h', 'h', 'h', ?, ?, ?, 1)`, at, at, at);
+			for (let i = 0; i <= 5000; i++) sql.exec(`INSERT INTO texts (node_id, part, revision, body, actor, created_at, live, lane, seq, range_id, capture_part, capture_status)
+				VALUES ('big', 'capture', 0, ?, 'hook', ?, 1, 'capture', 1, ?, '-', 'heuristic')`, b, at, `codex:big:0a1b2c3d:${i}-${i + 1}`);
+		});
+		const res = await exports.default.fetch(new Request(`${origin}/api/profiles/${name}/activity-summary?from=${day}&to=${day}`, { headers: { authorization: `Bearer ${session}` } }));
+		const body = await res.json() as { from: string; to: string; top_files: unknown[] };
+		expect(res.status).toBe(200);
+		expect(body.from > body.to).toBe(true);
+		expect(body.top_files).toEqual([]);
+	});
+});

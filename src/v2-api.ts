@@ -227,7 +227,8 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		const r = await profileStub(env, ref).readV2(ref, { kind: "activity_summary", q: q.data });
 		if (!r.ok) return reply(r);
 		// The summary's own from: the first day it counted in full, which is later than asked when its read budget ran out.
-		const s = r.value as ActivitySummary, f = await files(ref, corpusFilesSql({ from: s.from, to: s.to }));
+		// When the budget dropped every requested day, from is after to: no day was counted in full, so no file list is read.
+		const s = r.value as ActivitySummary, f = s.from > s.to ? { ok: true as const, value: [] } : await files(ref, corpusFilesSql({ from: s.from, to: s.to }));
 		return f.ok ? json({ ...s, top_files: f.value }) : reply(f);
 	}
 	if (p && method === "GET" && sub === "projects") {

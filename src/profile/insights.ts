@@ -8,7 +8,9 @@ import { normalizeScope } from "../domain/ids";
 import { Fail } from "../domain/types";
 import type { ActivitySummary, ActivitySummaryQuery, ProjectProfile, ProjectSummary } from "../viewer/types";
 import { parseRange } from "./capture";
+import { identifiers } from "./extract";
 import { EDGE_ROWS, EXPAND_ROWS, LEVEL_NODES, newBudget } from "./graph";
+import { CURRENT_PART, UPLOAD } from "./sessions";
 
 /** Top-list sizes the dashboard shows. */
 const BUSIEST = 10, LATEST = 20, CONCEPTS = 10, CONVENTIONS = 50, ERRORS = 10, ERROR_TEXTS = 5, HIGHLIGHTS = 20, FILES = 10;
@@ -21,11 +23,9 @@ const CONCEPT_KINDS = ["component", "feature", "bug", "ticket", "other"];
 // identifier link to an active project. Kept identical so the picker's counts match the Sessions tab's project filter.
 const PROJECT = `(SELECT e.dst FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = n.id AND e.dst_profile = '' AND e.ended_at IS NULL
 	AND p.kind = 'project' AND p.status = 'active' ORDER BY e.rel = 'part_of' DESC, e.weight DESC, e.id LIMIT 1)`;
-// The digest parts that describe a session now (S1's currentParts): a range's live heuristic digest until its manifest
-// supersedes it, else its live consolidated parts. Bodies passed checkBody on ingest; json_valid guards the JSON functions.
-const CURRENT = `t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.chunk = 0 AND t.range_id IS NOT NULL
-	AND t.capture_part IS NOT 'manifest' AND (t.capture_status = 'heuristic' OR NOT EXISTS (SELECT 1 FROM texts h
-		WHERE h.range_id = t.range_id AND h.capture_status = 'heuristic' AND h.capture_part = '-' AND h.live = 1)) AND json_valid(t.body)`;
+// The digest parts that describe a session now (S1's CURRENT_PART, so an accepted manifest's listed parts only). Bodies passed
+// checkBody on ingest; json_valid guards the JSON functions.
+const CURRENT = `${CURRENT_PART} AND json_valid(t.body)`;
 const len = (path: string) => `coalesce(json_array_length(t.body, '${path}'), 0)`;
 const json = (v: unknown) => JSON.stringify(v);
 
@@ -134,8 +134,8 @@ export function activitySummary(sql: SqlStorage, q: ActivitySummaryQuery): Activ
 export function listProjects(sql: SqlStorage): ProjectSummary[] {
 	// shortcut: the picker lists at most LEVEL_NODES projects; page it if a profile ever holds more.
 	return sql.exec<{ id: string; key: string | null; name: string; sessions: number | null; last: string | null }>(`SELECT p.id, p.key, p.name,
-		s.sessions, s.last FROM nodes p LEFT JOIN (SELECT project, count(*) AS sessions, max(updated_at) AS last FROM (SELECT ${PROJECT} AS project,
-		n.updated_at FROM nodes n WHERE n.kind = 'session' AND n.status = 'active') WHERE project IS NOT NULL GROUP BY project) s ON s.project = p.id
+		s.sessions, s.last FROM nodes p LEFT JOIN (SELECT project, count(*) AS sessions, max(upload) AS last FROM (SELECT ${PROJECT} AS project,
+		${UPLOAD} AS upload FROM nodes n WHERE n.kind = 'session' AND n.status = 'active') WHERE project IS NOT NULL GROUP BY project) s ON s.project = p.id
 		WHERE p.kind = 'project' AND p.status = 'active' ORDER BY s.last IS NULL, s.last DESC, p.name, p.id LIMIT ?`, LEVEL_NODES).toArray()
 		.map((r) => ({ key: r.key ?? r.id, name: r.name, sessions: r.sessions ?? 0, last_activity: r.last }));
 }
@@ -163,10 +163,10 @@ export function projectProfile(sql: SqlStorage, key: string, now: string): Proje
 	const budget = newBudget(EDGE_ROWS);
 	const stop = (where: string, skipped: number) => { budget.exhausted = true; budget.stopped ??= where; budget.skipped += skipped; };
 
-	const totals = sql.exec<{ sessions: number; last: string | null }>(`SELECT count(*) AS sessions, max(n.updated_at) AS last FROM nodes n
+	const totals = sql.exec<{ sessions: number; last: string | null }>(`SELECT count(*) AS sessions, max(${UPLOAD}) AS last FROM nodes n
 		WHERE n.kind = 'session' AND n.status = 'active' AND ${PROJECT} = ?`, p.id).one();
 	const sessions = sql.exec<{ id: string; key: string }>(`SELECT n.id, n.key FROM nodes n WHERE n.kind = 'session' AND n.status = 'active'
-		AND ${PROJECT} = ? ORDER BY n.updated_at DESC, n.id DESC LIMIT ?`, p.id, LEVEL_NODES).toArray();
+		AND ${PROJECT} = ? ORDER BY ${UPLOAD} DESC, n.id DESC LIMIT ?`, p.id, LEVEL_NODES).toArray();
 	if (totals.sessions > sessions.length) stop("project sessions", totals.sessions - sessions.length);
 	const sessionIds = sessions.map((s) => s.id);
 	// Evidence cites a session by its node id (kind node) or by its key or client:id (kind session), as S1 reads it.
@@ -220,13 +220,15 @@ export function projectProfile(sql: SqlStorage, key: string, now: string): Proje
 		try { return [{ node: r.node, corrections: JSON.parse(r.corrections) as { text: string }[], entities: JSON.parse(r.entities) as string[] }]; }
 		catch { return []; }
 	});
-	const keys = [...new Set(named.flatMap((r) => r.entities.flatMap((e) => [e, e.toLowerCase()])))];
+	// An entity as uploaded (PROJ-123, acme/web#42, a GitHub URL) and the node keys ingest's identifiers() resolve it to.
+	const refsOf = (e: string) => [e, e.toLowerCase(), ...identifiers(e).keys];
+	const keys = [...new Set(named.flatMap((r) => r.entities.flatMap(refsOf)))];
 	const byKey = new Map(keys.length ? sql.exec<{ id: string; key: string; name: string }>(`SELECT id, key, name FROM nodes WHERE key IN (SELECT value FROM json_each(?))
 		AND status = 'active' AND kind NOT IN ('person','session','project')`, json(keys)).toArray().map((n) => [n.key, n]) : []);
 	const groups = new Map<string, { entity_id: string; entity: string; count: number; corrections: { id: string; text: string }[]; seen: Set<string> }>();
 	for (const r of named) {
 		const hit = new Map<string, { id: string; name: string }>();
-		for (const e of r.entities) { const n = byKey.get(e) ?? byKey.get(e.toLowerCase()); if (n) hit.set(n.id, n); }
+		for (const e of r.entities) for (const k of refsOf(e)) { const n = byKey.get(k); if (n) hit.set(n.id, n); }
 		for (const n of hit.values()) {
 			const g = groups.get(n.id) ?? { entity_id: n.id, entity: n.name, count: 0, corrections: [], seen: new Set<string>() };
 			groups.set(n.id, g);
