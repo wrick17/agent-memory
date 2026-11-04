@@ -150,7 +150,8 @@ describe("corpus main flow", () => {
 		const { source } = await syntheticSource();
 		await uploadCorpus({ source, client: p.client, profile: p.name, tables: TABLES, asOf: AS_OF, fileSha256: FILE, state: {} });
 		await call(await contextFor(), "record_knowledge", { profile: p.name, nodes: [{ kind: "project", key: "github:acme/web", name: "acme/web" },
-			{ kind: "commit", key: `git:acme/web@${sha(1)}`, name: "Fix the token refresh loop" }, { kind: "project", key: "github:o'x/y", name: "quoted" }, { kind: "person", name: "Alice" }] });
+			{ kind: "commit", key: `git:acme/web@${sha(1)}`, name: "Fix the token refresh loop" }, { kind: "project", key: "github:o'x/y", name: "quoted" }, { kind: "person", name: "Alice" },
+			{ kind: "project", key: "github:Acme/Web", name: "Acme/Web" }, { kind: "commit", key: `git:Acme/Web@${sha(1)}`, name: "Same commit, other case" }] });
 		const explore = async (key: string, e?: Env) => {
 			const r = (await p.rpc("tools/call", { name: "explore", arguments: { profile: p.name, node: { key } } }, p.reader, e)).result as { content: { text: string }[]; isError?: boolean };
 			expect(r.isError).not.toBe(true);
@@ -160,6 +161,9 @@ describe("corpus main flow", () => {
 		expect(repo.corpus).toMatchObject({ profile: p.name, kind: "repo", key: "acme/web", counts: { repos: 1, commits: 2, refs: 1, commit_paths: 3, contributors: 2 } });
 		expect(Object.keys(repo.corpus.as_of)).toEqual(["commit_paths", "commits", "contributors", "refs", "repos"]);
 		expect((await explore(`git:acme/web@${sha(1)}`)).corpus).toMatchObject({ kind: "commit", key: `acme/web@${sha(1)}`, counts: { commits: 1, commit_paths: 2 } });
+		// GitHub names are case-insensitive: a project key written in another case counts the same Corpus rows.
+		expect((await explore("github:Acme/Web")).corpus).toMatchObject({ kind: "repo", counts: { repos: 1, commits: 2, refs: 1, commit_paths: 3, contributors: 2 } });
+		expect((await explore(`git:Acme/Web@${sha(1)}`)).corpus).toMatchObject({ kind: "commit", counts: { commits: 1, commit_paths: 2 } });
 		// A quote in a stored key stays a literal; it neither escapes nor errors.
 		expect((await explore("github:o'x/y")).corpus).toMatchObject({ key: "o'x/y", counts: { repos: 0, commits: 0, refs: 0, commit_paths: 0, contributors: 0 } });
 		const off = await explore("github:acme/web", env);

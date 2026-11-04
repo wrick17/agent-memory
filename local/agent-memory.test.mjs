@@ -1281,6 +1281,38 @@ describe("v2 config defaults and the separate read token", () => {
 			["POST", "https://memory.example/v1/eval/runs", "Bearer job-secret", "error"],
 			["GET", "https://memory.example/v1/whoami", "Bearer job-secret", "error"]]);
 	});
+
+	it("keeps every default eval report when runs share a time and channels; an explicit --out is replaced", async () => {
+		const { main } = await import("./eval.mjs");
+		const job = path.join(am.home(), "job-token"), read = path.join(am.home(), "read-token"), cases = path.join(am.home(), "cases.json");
+		am.writePrivate(job, "job-secret\n");
+		am.writePrivate(read, "read-secret\n");
+		writeConfig({ server: "https://memory.example", token_file: job });
+		fs.writeFileSync(cases, JSON.stringify({ schema_version: 1, cases: [{ id: "c1", query: "one", expected: ["m1"] }, { id: "c2", query: "two", expected: ["m2"] }] }));
+		const dir = path.join(am.home(), "eval"), old = path.join(dir, "2026-11-05-hybrid.json");
+		am.writePrivate(old, "earlier default report\n");
+		const realFetch = globalThis.fetch, realNow = Date.now;
+		// work finds m1 and personal finds m2, so each report has a different miss.
+		globalThis.fetch = async (url, init) => Response.json(new URL(url).pathname === "/v1/recall" ? { results: [{ memory_id: JSON.parse(init.body).profile === "work" ? "m1" : "m2" }] } : { ok: true });
+		Date.now = () => Date.parse("2026-11-05T09:30:00.000Z");
+		const quiet = process.stdout.write;
+		process.stdout.write = () => true;
+		const run = (...args) => main(["--cases", cases, "--channels", "hybrid", ...args]);
+		try {
+			assert.equal(await run("--profile", "work"), 0);
+			assert.equal(await run("--profile", "personal"), 0);
+			const out = path.join(am.home(), "chosen.json");
+			am.writePrivate(out, "replace me\n");
+			assert.equal(await run("--profile", "work", "--out", out), 0);
+			assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")).misses.map((m) => m.case), ["c2"]);
+		} finally { globalThis.fetch = realFetch; Date.now = realNow; process.stdout.write = quiet; }
+		assert.deepEqual(fs.readdirSync(dir).sort(), ["2026-11-05-hybrid.json", "2026-11-05T093000.000Z-hybrid-2.json", "2026-11-05T093000.000Z-hybrid.json"]);
+		assert.equal(fs.readFileSync(old, "utf8"), "earlier default report\n");
+		const report = (f) => JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+		assert.deepEqual(report("2026-11-05T093000.000Z-hybrid.json").misses.map((m) => m.case), ["c2"]);
+		assert.deepEqual(report("2026-11-05T093000.000Z-hybrid-2.json").misses.map((m) => m.case), ["c1"]);
+		for (const f of fs.readdirSync(dir)) assert.equal(fs.statSync(path.join(dir, f)).mode & 0o777, 0o600);
+	});
 });
 
 describe("capture hooks, scheduled runs and status (#16)", () => {
