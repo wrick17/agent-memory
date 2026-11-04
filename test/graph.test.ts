@@ -10,6 +10,7 @@ import { EDGE_ROWS, EXPAND_ROWS, expandLinks, explore, trace, timeline, LEVEL_NO
 import { SETTLE_MS, similarStep } from "../src/profile/similar";
 import { sha256 } from "../src/domain/ids";
 import { ingest } from "../src/profile/capture";
+import { runWrite } from "../src/profile/write";
 import { activitySummary, corpusFiles, corpusFilesSql, listProjects, projectProfile } from "../src/profile/insights";
 import { nextSeq } from "../src/storage";
 import { RELATIONS } from "../src/domain/types";
@@ -699,6 +700,53 @@ it("historical map bounds future-edge discovery reads", async () => {
 
 // v2 IN1 (#15): activity and project insights read only the selected profile's stored digests and never write.
 describe("v2 IN1: activity and project insights", () => {
+	it("groups corrections by entities written as uploads write them: a Jira key and an org/repo#n reference", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const tag = crypto.randomUUID().slice(0, 6).replace(/\d/g, "x").toUpperCase(), key = `github:acme/in1e-${tag.toLowerCase()}`;
+		const jira = `W${tag}-77`, pr = `acme/web-${tag.toLowerCase()}#42`;
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key, name: `IN1E ${tag}` }, { kind: "ticket", key: `jira:${jira}`, name: jira },
+			{ kind: "pr", key: `github:${pr}`, name: pr }] });
+		const fix = (text: string, entity: string) => JSON.stringify({ asks: [], decisions: [], corrections: [{ text, pos: 1 }], outcomes: { commits: [] },
+			entities: [`https://github.com/acme/in1e-${tag.toLowerCase()}`, entity], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			let k = 0;
+			for (const [text, entity] of [["Use the v2 token", jira], ["Refresh before retry", jira], ["Rebase first", pr], ["Squash on merge", pr]] as const) {
+				const b = fix(text, entity), range = `codex:in1e-${tag}-${k}:0a1b2c3d:0-10`;
+				expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `in1e-${tag}-${k++}` }, manifests: [],
+					digests: [{ range_id: range, capture_status: "heuristic", part_id: "-", sha256: sha256(b), body: b }] }).map((r) => r.status)).toEqual(["stored"]);
+			}
+			const errors = projectProfile(st.storage.sql, key, new Date().toISOString())!.recurring_errors;
+			expect(errors.map((e) => [e.entity, e.count]).sort()).toEqual([[jira, 2], [pr, 2]].sort());
+		});
+	});
+
+	it("counts only an accepted manifest's parts, and keeps a project's last activity at its last upload after an owner pin", async () => {
+		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const tag = crypto.randomUUID().slice(0, 8), key = `github:acme/in1m-${tag}`;
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key, name: `IN1 manifest ${tag}` }] });
+		const one = (ask: string) => JSON.stringify({ asks: [{ text: ask, pos: 1 }], decisions: [], corrections: [], outcomes: { commits: [] },
+			entities: [`https://github.com/acme/in1m-${tag}`], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`)), (_i, st) => {
+			const sql = st.storage.sql, range = `codex:in1m-${tag}:0a1b2c3d:0-10`;
+			const part = (id: string, b: string) => ({ range_id: range, capture_status: "consolidated" as const, part_id: id, sha256: sha256(b), body: b });
+			const whole = part("0-10", one(`Whole ${tag}`)), a = part("0-5", one(`Half one ${tag}`)), b = part("5-10", one(`Half two ${tag}`));
+			expect(ingest(st.storage, {} as never, { session: { client: "codex", id: `in1m-${tag}` }, digests: [whole, a, b],
+				manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] }).map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			const id = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", `session:codex:in1m-${tag}`).one().id, day = new Date().toISOString().slice(0, 10);
+			const summary = activitySummary(sql, { from: day, to: day });
+			expect(summary.busiest_sessions.find((s) => s.id === id)).toMatchObject({ observations: 1 });
+			expect(summary.latest.filter((l) => l.session === id).map((l) => l.text)).toEqual([`Whole ${tag}`]);
+			// Its last upload two hours ago; an owner pin afterwards is not an upload.
+			const earlier = new Date(Date.now() - 2 * 3_600_000).toISOString();
+			sql.exec("UPDATE nodes SET updated_at = ?, attrs = CASE WHEN json_extract(attrs, '$.last_upload_at') IS NULL THEN attrs ELSE json_set(attrs, '$.last_upload_at', ?) END WHERE id = ?", earlier, earlier, id);
+			sql.exec("UPDATE texts SET created_at = ? WHERE node_id = ? AND part = 'capture'", earlier, id);
+			runWrite(st.storage, { userId: ref.userId, profile: "test", generation: ref.generation }, { op: "owner", args: { memory_id: id, action: "pin" } },
+				{ actor: "owner", platform: "test", routedBy: "test", userId: ref.userId, payloadHash: `pin-${tag}` });
+			expect(listProjects(sql).find((p) => p.key === key)).toMatchObject({ sessions: 1, last_activity: earlier });
+			expect(projectProfile(sql, key, new Date().toISOString())).toMatchObject({ sessions: 1, last_activity: earlier });
+		});
+	});
+
 	it("summarizes a seeded session for its project and day, writes nothing, and builds only validated Corpus file queries", async () => {
 		const c = await contextFor();
 		const tag = crypto.randomUUID().slice(0, 8), key = `github:acme/in1-${tag}`;
