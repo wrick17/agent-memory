@@ -41,12 +41,12 @@ const save = (tx: BudgetTx, key: string, value: unknown) => tx.run("INSERT INTO 
 const conflict = (reason: string, id?: string, profile?:string) => Fail.of("revision_conflict", "archive state changed; inspect current status", { reason, ...(id && profile ? { status_url: `/api/profiles/${profile}/archive/operations/${id}` } : {}) });
 const chain = (hash: string, a: Archived) => sha256(`${hash}\n${a.id}:${a.source}:${sha256(a.payload)}`);
 const cursor = (o: ArchiveOperation) => Buffer.from(JSON.stringify([1, o.id, o.profile, o.generation, o.version])).toString("base64url");
-const guardVersion = (sql: SqlStorage, o: ArchiveOperation) => sha256(JSON.stringify([o.me, sql.exec("SELECT term,seq FROM guard_terms ORDER BY term").toArray()]));
+// Since issue #3 the guard reads no term table, so its version changes only with the operation's own me selection.
+const guardVersion = (_sql: SqlStorage, o: ArchiveOperation) => sha256(JSON.stringify([o.me?.explicit === true]));
 function guard(sql: SqlStorage, o: ArchiveOperation, material: unknown): void {
 	if (o.profile !== "me") return;
 	if (!o.me?.explicit) throw Fail.of("validation", "me must be explicitly selected");
-	const terms = sql.exec<{ term: string }>("SELECT term FROM guard_terms").toArray().map(r => r.term);
-	const g = meGuard({ ...o.me, sensitiveTerms: [...o.me.sensitiveTerms, ...terms], texts: bundleTexts(material) });
+	const g = meGuard(bundleTexts(material));
 	if (!g.ok) throw new Fail(g.error);
 }
 function status(o: ArchiveOperation, action = "progressed"): Record<string, unknown> {

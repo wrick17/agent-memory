@@ -4,7 +4,7 @@ import { drainCountArchives, redactCountArchives } from "./archive-operations";
 // account can fence them first, purges them in bounded steps with their activity redacted first, reports hand-written matches
 // without touching them, and clears a wiped generation. The Worker keeps the content-free plan in R2 before any purge.
 import { archiveOperation, cancelArchivePage, nodeOperationAfter } from "./archive-operations";
-import { meGuard } from "../domain/guard";
+import { meGuard, namedTerm } from "../domain/guard";
 import { sha256 } from "../domain/ids";
 import { Fail, ok, type Outcome } from "../domain/types";
 import { nextSeq } from "../storage";
@@ -48,14 +48,14 @@ export function originPage(sql: SqlStorage, who: Who, profile: string, after: st
 
 /**
  * The one exception (section 9, step 5): a preference in me that landed with a company_free attestation survives, and only
- * while it still passes the me guard against the wiped profile's terms.
+ * while it still passes the me guard. Since issue #3 no work-term list decides it: the provenance and attestation do.
  */
-export function survives(sql: SqlStorage, who: Who, id: string, terms: string[]): boolean {
+export function survives(sql: SqlStorage, who: Who, id: string): boolean {
 	if (who.profile !== "me") return false;
 	const n = sql.exec<Row>("SELECT * FROM nodes WHERE id = ? AND kind = 'preference' AND status IN ('active','retired','superseded','moving') AND json_extract(attrs, '$.company_free') = 1", id).toArray()[0];
 	if (!n) return false;
 	const rows = [n, ...sql.exec<Row>("SELECT * FROM texts WHERE node_id = ?", id).toArray(), ...sql.exec<Row>("SELECT * FROM revisions WHERE node_id = ?", id).toArray()];
-	return meGuard({ context: null, companyFree: true, sensitiveTerms: terms, texts: bundleTexts(rows) }).ok;
+	return meGuard(bundleTexts(rows)).ok;
 }
 
 type Image = { wipe: string; terms: string; seq: number; key: string; entry: string; after: number; last?: true; clean?: true };
@@ -100,7 +100,7 @@ function image(sql: SqlStorage, w: OriginWipe, id: string, scan?: Scan): "clean"
 		const rows = sql.exec<{ id: number; source: string; payload: string }>("SELECT id, source, payload FROM archive WHERE activity_id = ? AND id > ? ORDER BY id LIMIT ?", removal, v.after, take).toArray();
 		scan.left -= Math.max(1, rows.length);
 		const material = rows.filter((a) => a.source === "nodes" || a.source === "texts" || a.source === "revisions").map((a) => JSON.parse(a.payload) as Row);
-		if (!meGuard({ context: null, companyFree: true, sensitiveTerms: w.terms, texts: bundleTexts(material) }).ok) { verdict = "sensitive"; break; }
+		if (!meGuard(bundleTexts(material)).ok) { verdict = "sensitive"; break; }
 		if (rows.length) v.after = rows.at(-1)!.id;
 		if (rows.length < take) { if (v.last) { verdict = "clean"; break; } v.key = v.entry; v.after = 0; }
 	}
@@ -125,7 +125,7 @@ function held(sql: SqlStorage, who: Who, w: OriginWipe, scan?: Scan): { here: st
 	const here: string[] = [], preserved: string[] = [], pending: string[] = [];
 	for (const id of w.ids) {
 		if (!present.has(id)) continue;
-		const verdict = who.profile === w.profile || wiped.has(id) || !survives(sql, who, id, w.terms) ? "sensitive" : image(sql, w, id, scan);
+		const verdict = who.profile === w.profile || wiped.has(id) || !survives(sql, who, id) ? "sensitive" : image(sql, w, id, scan);
 		(verdict === "clean" ? preserved : verdict === "pending" && scan ? pending : here).push(id);
 	}
 	return { here, preserved, pending };
@@ -201,11 +201,8 @@ function requestPage(sql: SqlStorage, who: Who, w: OriginWipe, after: string): P
 /** Surviving records whose text names a term of the wiped profile: listed for the owner, never changed (section 9, step 6). */
 export function handwrittenPage(sql: SqlStorage, origin: string, terms: string[], after: string): Page {
 	const rows = sql.exec<Row>(`SELECT * FROM nodes WHERE id > ? AND status <> 'moved' AND (source_profile IS NULL OR source_profile <> ?) ORDER BY id LIMIT 40`, after, origin).toArray();
-	// meGuard's word-boundary match; a contact field alone is not a work reference.
-	const ids = rows.filter((n) => {
-		const g = meGuard({ context: null, companyFree: true, sensitiveTerms: terms, texts: bundleTexts([n, ...sql.exec<Row>("SELECT body FROM texts WHERE node_id = ?", n.id!).toArray()]) });
-		return !g.ok && g.error.details?.term !== "personal_field";
-	}).map((n) => String(n.id));
+	// A read-only report for the owner: nothing here moves, hides or deletes a record.
+	const ids = rows.filter((n) => namedTerm(bundleTexts([n, ...sql.exec<Row>("SELECT body FROM texts WHERE node_id = ?", n.id!).toArray()]), terms) !== null).map((n) => String(n.id));
 	return { ids, after: rows.length === 40 ? String(rows.at(-1)!.id) : null };
 }
 

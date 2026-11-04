@@ -445,7 +445,7 @@ function people(sql: SqlStorage) {
 }
 
 describe("corpus work guard terms", () => {
-	it("registers a work chunk's repos and people in the account and me guard before storing it; me writes naming them are refused, and protected me is untouched", async () => {
+	it("registers a work chunk's repos and people in the account only; me writes naming them are stored as chosen, and protected me is untouched", async () => {
 		const w = await workAccount();
 		// Before the chunk, a company-free me preference may still name the person; the owner pins it.
 		const pref = await w.saveMe({ name: "release pairing", content: "Ask Alice Example before a release." });
@@ -453,7 +453,7 @@ describe("corpus work guard terms", () => {
 		const id = String(pref.value.memory_id);
 		const me = w.ref("me");
 		const pinned = await (await import("../src/mcp")).profileStub(env, me).write(me, { op: "owner", args: { action: "pin", memory_id: id } },
-			{ actor: "owner", platform: "test", routedBy: "explicit", userId: w.userId, payloadHash: sha256(`pin:${id}`), meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: [] } });
+			{ actor: "owner", platform: "test", routedBy: "explicit", userId: w.userId, payloadHash: sha256(`pin:${id}`), meGuard: { explicit: true } });
 		expect(pinned.ok).toBe(true);
 		const before = await w.onProfile("me", (sql) => sql.exec("SELECT revision, pinned, flagged, updated_at FROM nodes WHERE id = ?", id).one());
 
@@ -463,28 +463,28 @@ describe("corpus work guard terms", () => {
 		// The repo and both people, never the redacted email-shaped committer name or any contact field.
 		expect(await w.terms()).toEqual(expect.arrayContaining(["acme/web", "Alice Example", "Bo Builder"]));
 		expect((await w.terms()).join(" ")).not.toMatch(/@|REDACTED/);
-		expect(await w.guard()).toEqual(expect.arrayContaining([{ term: "Alice Example", source: "work" }, { term: "Bo Builder", source: "work" }, { term: "acme/web", source: "work" }]));
+		// Issue #3: registration writes nothing into me, and the pinned record is not changed or flagged.
+		expect(await w.guard()).toEqual([]);
 		expect(JSON.stringify(state)).not.toMatch(/Alice|Bo Builder/);
-		// The me guard refuses a new write or an update naming them; the pinned record itself was not changed or flagged.
-		expect(await w.saveMe({ name: "review buddy", content: "Pair with bo builder on reviews." })).toMatchObject({ error: true, value: { error: { code: "me_sensitive_term", details: { term: "Bo Builder" } } } });
-		expect(await w.saveMe({ memory_id: id, content: "Ask Alice Example and the team before a release." })).toMatchObject({ error: true, value: { error: { code: "me_sensitive_term" } } });
 		expect(await w.onProfile("me", (sql) => sql.exec("SELECT revision, pinned, flagged, updated_at FROM nodes WHERE id = ?", id).one())).toEqual(before);
+		// An explicit me write naming them is the agent's choice and is stored.
+		expect(await w.saveMe({ name: "review buddy", content: "Pair with bo builder on reviews." })).toMatchObject({ error: false, value: { profile: "me" } });
 		expect(before).toMatchObject({ pinned: 1, flagged: null });
 		expect((await w.saveMe({ name: "editor", content: "Prefer tabs in editors." })).error).toBe(false);
 	});
 
-	it("stores nothing until every term page is confirmed: a guard outage, recovery or closed generation stops the chunk, and the resend replays exactly", async () => {
+	it("stores nothing until every term page is confirmed: recovery or a closed generation stops the chunk, an inactive me does not, and the resend replays exactly", async () => {
 		const w = await workAccount();
 		const { source } = await syntheticSource(people);
 		const state: Json = {};
 		const run = () => uploadCorpus({ source, client: w.client, profile: "work", tables: ["contributors"], asOf: AS_OF, fileSha256: FILE, state });
 		const loaded = () => w.client.status("work").then((s) => s.tables);
-		// The me guard is unavailable: the account kept its terms, me did not, and the chunk was not stored or acknowledged.
+		// Issue #3: registration no longer depends on me, so an inactive me neither refuses it nor gains rows.
 		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'me'"));
-		expect(await run()).toMatchObject({ status: "stopped", table: "contributors", reason: "unavailable" });
-		expect(await loaded()).toEqual([]);
-		expect(state.tables.contributors).toBeUndefined();
+		expect(await w.account.admin({ op: "addSensitiveTerms", terms: ["Outage Person"], profile: "work", generation: w.ref("work").generation })).toMatchObject({ ok: true, value: { terms: 1 } });
+		expect(await w.terms()).toContain("Outage Person");
 		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'active' WHERE name = 'me'"));
+		expect(await w.guard()).toEqual([]);
 		// The account is recovering: the generation-bound registration refuses before any term or row.
 		await w.onAccount((sql) => sql.exec("INSERT INTO account_meta (key, value) VALUES ('recovery_state', 'reconciling')"));
 		const held = await w.terms();
@@ -496,7 +496,7 @@ describe("corpus work guard terms", () => {
 		const flaky = { status: w.client.status, send: async (c: unknown) => { const r = await w.client.send(c); if (lost) { lost = false; throw new Error("connection reset"); } return r; } };
 		expect(await uploadCorpus({ source, client: flaky, profile: "work", tables: ["contributors"], asOf: AS_OF, fileSha256: FILE, state })).toMatchObject({ status: "stopped", reason: "connection reset" });
 		expect(await run()).toMatchObject({ status: "done" });
-		expect((await w.guard()).map((g) => g.term)).toEqual(expect.arrayContaining(["Alice Example", "Bo Builder"]));
+		expect(await w.guard()).toEqual([]);
 		expect(await loaded()).toMatchObject([{ table: "contributors", rows: 2, complete: true }]);
 		const st = await w.client.status("work");
 		const again = await w.http("/v1/corpus/import", await chunkFor(st, "contributors", [[1, "acme/web", 1, 1, "Alice Example"], [2, "acme/web", 2, 1, "Bo Builder"]], { final: true }));
@@ -515,14 +515,14 @@ describe("corpus work guard terms", () => {
 		expect(await w.corpus().importChunk(work, chunkOf(await chunkFor(st, "commits", [row(commit(7, "plain", { author_name: "Late Person" }))])))).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
 	});
 
-	it("registers a large chunk's people in bounded pages, one account and one me transaction each", async () => {
+	it("registers a large chunk's people in bounded pages, one account transaction each, and none in me", async () => {
 		const w = await workAccount();
 		const st = await w.client.status("work");
 		const rows = Array.from({ length: 450 }, (_, i) => [i + 1, "acme/web", i + 1, 1, `Dev ${String(i + 1).padStart(3, "0")} Example`]);
 		expect((await w.http("/v1/corpus/import", await chunkFor(st, "contributors", rows, { final: true }))).data.receipt).toMatchObject({ status: "stored", rows: 450 });
 		const pages = (sql: SqlStorage, table: string) => sql.exec<{ n: number; s: number }>(`SELECT count(*) AS n, count(DISTINCT seq) AS s FROM ${table} WHERE term LIKE 'Dev % Example' OR term = 'acme/web'`).one();
 		expect(await w.onAccount((sql) => pages(sql, "sensitive_terms"))).toEqual({ n: 451, s: 3 });
-		expect(await w.onProfile("me", (sql) => pages(sql, "guard_terms"))).toEqual({ n: 451, s: 3 });
+		expect(await w.onProfile("me", (sql) => pages(sql, "guard_terms"))).toEqual({ n: 0, s: 0 });
 	});
 });
 
@@ -803,14 +803,13 @@ describe("corpus refresh", () => {
 		const bodies: Json[] = [];
 		const client = { status: w.client.status, refresh: async (b: Json) => { if (b.command === "part") bodies.push(b); return route(b); } };
 		const { source: next } = await syntheticSource((sql) => { people(sql); sql.exec("INSERT INTO contributors (rowid, repo, rank, commits, name, email) VALUES (3, 'acme/web', 3, 1, 'Dee Developer', NULL)"); });
-		// The me guard is down: the part's new person cannot be confirmed, so nothing is stored and the cursor stays.
+		// Issue #3: registration no longer depends on me, so an inactive me neither stops the part nor gains rows.
 		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'me'"));
 		const state: Json = {};
-		expect(await refreshCorpus({ source: next, client, profile: "work", repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "stopped", reason: "unavailable" });
-		expect((await w.client.status("work")).refresh.next_op).toBe(0);
-		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'active' WHERE name = 'me'"));
 		expect(await refreshCorpus({ source: next, client, profile: "work", repo: "acme/web", observedAt: CUT, sourceId: FILE2, state })).toMatchObject({ status: "published" });
-		expect(await w.guard()).toEqual(expect.arrayContaining([{ term: "Dee Developer", source: "work" }]));
+		await w.onAccount((sql) => sql.exec("UPDATE profiles SET status = 'active' WHERE name = 'me'"));
+		expect(await w.terms()).toContain("Dee Developer");
+		expect(await w.guard()).toEqual([]);
 		const stored = bodies.at(-1)!;
 		expect((await route(stored)).receipt).toMatchObject({ status: "stored" });
 		// Recovery stops even an exact replay before the store; another generation and a closed corpus refuse it too.

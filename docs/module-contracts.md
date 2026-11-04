@@ -20,6 +20,27 @@ This includes reviewed L1/L2 public-save evidence and links, authorization/gener
 
 Use the sealed [CORE719 preservation inspection amendment](/var/folders/mm/dwsn1_0j0cb2scdpkdw6_4rm0000gp/T/am-core719-inspect-sol-dd2i33l6/handoff.md), pins SHA-256 `67d6d9cca5fbfc2427686e8531e862d067e2a5aa2f183ac404b612113de858a6`. The older optional-L3 2036 pack does not apply unchanged. Read-only target evidence, quiescence/pending alarms and cross-object state remain unknown until their checks run; the amendment predicts no hosted counts. Original content, history, request results and relationships retain the strict preservation precondition. Derived queue, meter and similarity-index effects are identified separately and do not waive that condition. Source/local clearance is complete for this bounded core; target eligibility, preservation rehearsal, live auth/recall/client checks, deployment, memory-copy trial and cutover remain separately gated. No feature is fully verified by this receipt. BothQ remains live, the rehearsal copy is unchanged, and dashboard work remains deferred.
 
+## Issue #3: agent-selected profile, 2026-11-04
+
+Status: implemented in worktree `t3/authorized-profile-routing` from `e2c8672`; tests and deployment pending. Product decision: [issue #3](https://github.com/wrick17/agent-memory/issues/3).
+
+| Entry point | Profile rule |
+|---|---|
+| `save_memory`, `append_memory`, `record_knowledge`, `capture_memory`, `review_candidates` | Explicit `profile` wins when known, active and allowed for the token (`validation`, `profile_wiped`, `forbidden` otherwise). With `memory_id`, the record's own profile. A bound `request_id` keeps its bound profile. Repo, device and term context never change or refuse the choice. Captures still never go to `me`. |
+| Omitted `profile` (v1 callers) | Unchanged: first enabled remote rule, then path rule, then the device default (never `me`), else `route_required`. These are owner-configured mappings, not content checks. Retire only after installed callers send `profile`. |
+| Moves (`save_memory` with a different `profile`), dashboard moves, `promote_to_me`, transfer resume | The account checks both profiles for the caller, the bound generations and the record's owner. `company_free` is optional input for ordinary writes and moves, stored in the intent and on a landed `me` preference; the dashboard may still send it, and the legacy `promote_to_me` job op still requires its literal `true`. The intent's `context` field is written as `null`. |
+| Reads (`recall_memories`, `get_memory`, graph tools, `work_board`, future `POST /v1/recall` and injection) | Explicit `profile` is the primary. `me` is added only as read compatibility when the token may read `me`; it never replaces the primary. Omitted profile uses the write order, and with no match reads `me` only. |
+| `me` guard (`meGuard(texts)`) | Explicit `me` (or a `me` record's id), no person nodes, no emails or phone numbers. No term list, no context, no `company_free` requirement. Applies to writes, undo, restore, archive operations, transfer validation, landing and publish, and recovery restore. |
+| Kept controls | Authentication and scopes, active generations, request and ID binding, idempotency hashes (legacy hash unchanged), revision checks, replay and recovery, `mayChange` for background ops, personal-field stripping. |
+
+Removed side effects: `AccountStore.guardMe` (rule, owner-term and work-term registration no longer write to `me`, so a work write no longer fails while `me` is inactive), `ProfileStore.addGuardTerms`, `AccountContext.sensitiveTerms`, the `terms` arguments of transfer and recovery steps, and `routing.contextProfile`. `sensitive_terms` keeps collecting terms for the wipe's read-only hand-written list. The `guard_terms` table and its rows stay in the schema untouched.
+
+Wipe: provenance purge is unchanged. A `company_free` `me` preference with work provenance survives unless it holds personal fields; no term match removes it. The hand-written list only reports.
+
+Error codes: `me_requires_company_free` is retired. `me_sensitive_term` remains for `term: "person"` and `term: "personal_field"`.
+
+Tests for the combined phase: the two original examples (owner name, GitHub release URL) save to explicit `me` with existing sensitive terms; an explicit profile with a repo or device default pointing elsewhere; unknown, inactive, forbidden and captured-to-`me` targets; `idempotency_mismatch` and `revision_conflict`; omitted-profile v1 shapes (rule, path, device default, `route_required`, no-match read of `me`); a move to `me` without `company_free`; append to a `me` record by `memory_id`; wipe survival without term matching and the read-only hand-written list.
+
 ## Rules for every module
 
 - **Shared files have one owner, the integrator** (current fallback and handoff in [project instructions](../AGENTS.md)):

@@ -57,7 +57,7 @@ export const PROFILES = ["me", "work", "personal", "test"] as const;
 export const PROFILE_NAME = /^[a-z][a-z0-9-]{0,11}$/;
 
 export type ErrorCode = "not_found" | "ambiguous" | "revision_conflict" | "idempotency_mismatch" | "already_exists" | "validation"
-	| "protected" | "forbidden" | "route_required" | "me_requires_company_free" | "me_sensitive_term" | "size_budget"
+	| "protected" | "forbidden" | "route_required" | "me_sensitive_term" | "size_budget"
 	| "moving" | "busy" | "unauthorized" | "unavailable" | "transfer_collision" | "profile_wiped" | "undo_redacted" | "lease_expired";
 
 export interface Failure { code: ErrorCode; message: string; details?: Record<string, unknown> }
@@ -179,8 +179,8 @@ export interface WriteContext {
 	userId: string;
 	/** A daily refresh item: its write and any replay happen only while this claim is open at this part (daily-proof.ts). */
 	refresh?: { claim_id: string; part: number; device_id: string };
-	/** Inputs for the `me` guard; required on every write to `me`. Checked after a committed replay, before any change. */
-	meGuard?: { explicit: boolean; context: string | null; companyFree: boolean; sensitiveTerms: string[] };
+	/** Required on every write to `me`: whether the caller named `me` itself. Checked after a committed replay, before any change. */
+	meGuard?: { explicit: boolean };
 }
 
 export interface Identity { memory_id?: string; name?: string; scope?: string; type?: MemoryType }

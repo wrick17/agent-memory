@@ -20,7 +20,7 @@ import { get } from "../src/profile/read";
 import { runImport, type ImportNode } from "../src/profile/import";
 import { purgeOrigin } from "../src/profile/wipe";
 import { wipeAccount, wipeProfile, type WipePorts } from "../src/wipe";
-import { driveTransfer, type TransferInput, type TransferPorts } from "../src/transfer";
+import { driveTransfer, resumeTransfer, type TransferInput, type TransferPorts } from "../src/transfer";
 
 export const unwrap = <T>(r: Outcome<T>): T => { if (!r.ok) throw new Error(`${r.error.code}: ${r.error.message}`); return r.value; };
 export async function rig() {
@@ -42,7 +42,7 @@ export async function rig() {
 	const save = async (name: string, profileName = "work", content = "initial", request = crypto.randomUUID(), kind: "journal" | "preference" = "journal") => {
 		const r = ref(profileName);
 		const result = await profile(r, (s) => runWrite(s, r, { op: "save", args: { name, type: kind === "preference" ? "user" : "project", kind, description: "fixture", content, request_id: request } },
-			{ actor: "owner", platform: "test", routedBy: "explicit", payloadHash: sha256(name), userId: caller.userId, ...(profileName === "me" ? { meGuard: { explicit: true, context: null, companyFree: true, sensitiveTerms: [] } } : {}) }));
+			{ actor: "owner", platform: "test", routedBy: "explicit", payloadHash: sha256(name), userId: caller.userId, ...(profileName === "me" ? { meGuard: { explicit: true } } : {}) }));
 		const id = String(result.result.memory_id);
 		await onAccount((s) => { s.sql.exec("INSERT INTO node_index (node_id,profile,seq) VALUES (?,?,1)", id, profileName); s.sql.exec("INSERT INTO request_index (request_id,profile,op,payload_hash,at,seq) VALUES (?,?,'save_memory',?,?,1)", request, profileName, sha256(name), new Date().toISOString()); });
 		return { id, request, result };
@@ -50,7 +50,7 @@ export async function rig() {
 	return { refs, ref, caller, ports, profile, onAccount, save };
 }
 
-const inputFor = (id: string, to = "personal"): TransferInput => ({ id: crypto.randomUUID(), nodeId: id, from: "work", to, companyFree: true, context: "work" });
+const inputFor = (id: string, to = "personal"): TransferInput => ({ id: crypto.randomUUID(), nodeId: id, from: "work", to, companyFree: true });
 
 // Crash faults are transport failures, so the driver leaves persisted progress for a later invocation.
 describe("bounded profile transfer", () => {
@@ -102,17 +102,17 @@ describe("bounded profile transfer", () => {
 
 	it("aborts on exact-bundle me guard failure and target collision without publishing", async () => {
 		for (const collision of [false, true]) {
-			const r = await rig(), saved = await r.save("blocked", "work", "Acme-Private right before fence"), input = inputFor(saved.id, collision ? "personal" : "me");
+			const r = await rig(), saved = await r.save("blocked", "work", "Acme-Private, mail owner@example.com right before fence"), input = inputFor(saved.id, collision ? "personal" : "me");
 			if (collision) await r.save("blocked", "personal");
-			const out = await driveTransfer(r.ports, input, r.caller, ["Acme-Private"]);
+			const out = await driveTransfer(r.ports, input, r.caller);
 			expect(out).toMatchObject({ ok: false, error: { code: collision ? "transfer_collision" : "me_sensitive_term" } });
 			await r.profile(r.ref("work"), (s) => expect(s.sql.exec("SELECT status FROM nodes WHERE id=?", saved.id).one().status).toBe("active"));
 			await r.profile(r.ref(input.to), (s) => expect(s.sql.exec("SELECT count(*) n FROM nodes WHERE id=?", saved.id).one().n).toBe(0));
 		}
 	});
 
-	it("fences incoming and moving writes, validates part replay and observes new local me guard terms", async () => {
-		const r = await rig(), saved = await r.save("local guard"), input = inputFor(saved.id, "me");
+	it("fences incoming and moving writes, validates part replay and runs the target's own me guard on landing", async () => {
+		const r = await rig(), saved = await r.save("local guard", "work", "call +1 415 555 0100"), input = inputFor(saved.id, "me");
 		unwrap(await r.ports.account({ op: "begin", id: input.id, nodeId: saved.id, from: "work", to: "me", caller: r.caller }));
 		unwrap(await r.ports.profile(r.ref("work"), { op: "fence", id: input.id, nodeId: saved.id, peer: "me" }));
 		await r.profile(r.ref("work"), (s) => {
@@ -122,9 +122,8 @@ describe("bounded profile transfer", () => {
 		});
 		const p = unwrap(await r.ports.profile(r.ref("work"), { op: "pack", id: input.id }));
 		const bytes = unwrap(await r.ports.profile(r.ref("work"), { op: "part", id: input.id, n: 1 }));
-		await r.profile(r.ref("me"), (s) => s.sql.exec("INSERT INTO guard_terms (term,source,added_at,seq) VALUES ('fixture','work',?,1)", new Date().toISOString()));
-		const land: TransferStep = { op: "land", id: input.id, from: "work", nodeId: saved.id, n: 1, of: p.parts!, payload: bytes.payload!, sha256: bytes.sha256!, bundle: p.sha256!, revision: 1, terms: [] };
-		expect(await r.ports.profile(r.ref("me"), land)).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+		const land: TransferStep = { op: "land", id: input.id, from: "work", nodeId: saved.id, n: 1, of: p.parts!, payload: bytes.payload!, sha256: bytes.sha256!, bundle: p.sha256!, revision: 1 };
+		expect(await r.ports.profile(r.ref("me"), land)).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		expect(await r.ports.profile(r.ref("personal"), { ...land, sha256: "0".repeat(64) })).toMatchObject({ ok: false, error: { details: { reason: "part_hash" } } });
 	});
 });
@@ -171,21 +170,34 @@ describe("transfer bounds, links, vectors and late guards", () => {
 		await r.profile(r.ref("work"), (s) => expect(s.sql.exec("SELECT dst, reason FROM edges WHERE src = ?", b.id).one()).toEqual({ dst: m.id, reason: "anchor points back at mover" }));
 	});
 
-	it("aborts after the commit decision when me registers a term before publication, and needs the attestation from a work context", async () => {
-		const r = await rig(), saved = await r.save("late term", "work", "mentions Quillfeather once");
+	it("aborts after the commit decision when the landed copy fails the me guard at publication, and needs no attestation", async () => {
+		const r = await rig(), saved = await r.save("late field", "work", "mentions Quillfeather once");
 		const input = inputFor(saved.id, "me");
 		const late: TransferPorts = { account: async (cmd) => {
-			// A registration that commits in me after landing and before publish (section 5, rule 3).
-			if (cmd.op === "decide" && cmd.outcome === "commit") await r.profile(r.ref("me"), (s) => s.sql.exec("INSERT INTO guard_terms (term, source, added_at, seq) VALUES ('Quillfeather', 'work', ?, 1)", new Date().toISOString()));
+			// The publish transaction rereads the landed rows, so a contact field that appears after landing still refuses it.
+			if (cmd.op === "decide" && cmd.outcome === "commit") await r.profile(r.ref("me"), (s) => s.sql.exec("UPDATE nodes SET description = 'mail late@example.com' WHERE id = ?", saved.id));
 			return r.ports.account(cmd);
 		}, profile: r.ports.profile };
 		expect(await driveTransfer(late, input, r.caller)).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
 		await r.profile(r.ref("work"), (s) => expect(s.sql.exec("SELECT status FROM nodes WHERE id = ?", saved.id).one().status).toBe("active"));
 		await r.profile(r.ref("me"), (s) => expect(s.sql.exec("SELECT count(*) AS n FROM nodes WHERE id = ?", saved.id).one().n).toBe(0));
 		await r.onAccount((s) => expect(s.sql.exec("SELECT state FROM transfers WHERE id = ?", input.id).one().state).toBe("aborted"));
-		const other = await r.save("unattested");
-		expect(await driveTransfer(r.ports, { ...inputFor(other.id, "me"), companyFree: false }, r.caller)).toMatchObject({ ok: false, error: { code: "me_requires_company_free" } });
-		await r.onAccount((s) => expect(s.sql.exec("SELECT count(*) AS n FROM transfers WHERE node_id = ?", other.id).one().n).toBe(0));
+		// Issue #3: a move into me needs no company_free attestation and no term check.
+		await r.profile(r.ref("me"), (s) => s.sql.exec("INSERT INTO guard_terms (term, source, added_at, seq) VALUES ('Quillfeather', 'work', ?, 1)", new Date().toISOString()));
+		const other = await r.save("unattested", "work", "mentions Quillfeather too");
+		expect(await driveTransfer(r.ports, { ...inputFor(other.id, "me"), companyFree: false }, r.caller)).toMatchObject({ ok: true, value: { state: "committed" } });
+		await r.profile(r.ref("me"), (s) => expect(s.sql.exec("SELECT status, json_extract(attrs, '$.company_free') AS free FROM nodes WHERE id = ?", other.id).one()).toEqual({ status: "active", free: null }));
+	});
+});
+
+describe("pre-upgrade transfer intents (issue #3)", () => {
+	it("resumes an intent stored with a work context and no attestation, past a stale matching guard term, to commit", async () => {
+		const r = await rig(), saved = await r.save("pre-upgrade", "work", "mentions Wrenfield once");
+		const id = crypto.randomUUID();
+		unwrap(await r.ports.account({ op: "begin", id, nodeId: saved.id, from: "work", to: "me", caller: r.caller, policy: { companyFree: false, context: "work" } }));
+		await r.profile(r.ref("me"), (s) => s.sql.exec("INSERT INTO guard_terms (term, source, added_at, seq) VALUES ('Wrenfield', 'work', ?, 1)", new Date().toISOString()));
+		expect(await resumeTransfer(r.ports, id)).toMatchObject({ ok: true, value: { state: "committed" } });
+		await r.profile(r.ref("me"), (s) => expect(s.sql.exec("SELECT status, source_profile FROM nodes WHERE id = ?", saved.id).one()).toEqual({ status: "active", source_profile: "work" }));
 	});
 });
 
@@ -193,10 +205,9 @@ describe("transfer bounds, links, vectors and late guards", () => {
 describe("transfer review regressions through MCP", () => {
 	it("keeps a refused transfer refused on retry instead of reporting it started", async () => {
 		const c = await contextFor(), request_id = crypto.randomUUID();
-		const m = await call<{ memory_id: string }>(c, "save_memory", { name: "refused move", type: "user", description: "fixture", content: "mentions Vexmoor", profile: "personal" });
-		await accountStub(env, c.caller.userId).admin({ op: "addSensitiveTerm", term: "Vexmoor" });
+		const m = await call<{ memory_id: string }>(c, "save_memory", { name: "refused move", type: "user", description: "fixture", content: "mail vexmoor@example.com", profile: "personal" });
 		const fresh = await contextFor(), args = { memory_id: m.memory_id, profile: "me", company_free: true, request_id };
-		expect(await outcome(fresh, "save_memory", args)).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+		expect(await outcome(fresh, "save_memory", args)).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		expect(await outcome(fresh, "save_memory", args)).toMatchObject({ ok: false, error: { details: { reason: "transfer_aborted" } } });
 		expect(await call(fresh, "get_memory", { memory_id: m.memory_id })).toMatchObject({ profile: "personal", status: "active" });
 	});
@@ -223,7 +234,7 @@ describe("transfer review regressions through MCP", () => {
 		const from = c.account.profiles.find((p) => p.profile === "personal")!;
 		unwrap(await ports.profile(from, { op: "fence", id: tid, nodeId: id, peer: "test" }));
 		for (const name of ["Component", "Changed"]) expect(await outcome(c, "record_knowledge", { nodes: [{ ...node, name, evidence: [{ kind: "url", ref: "https://example.test/proof" }] }], profile: "personal" })).toMatchObject({ ok: false, error: { code: "moving" } });
-		unwrap(await driveTransfer(ports, { id: tid, nodeId: id, from: "personal", to: "test", context: null, companyFree: false }));
+		unwrap(await driveTransfer(ports, { id: tid, nodeId: id, from: "personal", to: "test", companyFree: false }));
 	});
 
 	it("returns a 401-request history through public RPCs and keeps archived edge evidence through two moves", async () => {
@@ -258,14 +269,14 @@ describe("transfer review regressions through MCP", () => {
 
 describe("final review regressions", () => {
 const ctx = (r: Awaited<ReturnType<typeof rig>>, h = "h") => ({ actor: "owner" as const, platform: "test", routedBy: "explicit", payloadHash: h, userId: r.caller.userId });
-const move = (r: Awaited<ReturnType<typeof rig>>, nodeId: string, from = "work", to = "personal") => driveTransfer(r.ports, { id: crypto.randomUUID(), nodeId, from, to, companyFree: true, context: "work" }, r.caller);
+const move = (r: Awaited<ReturnType<typeof rig>>, nodeId: string, from = "work", to = "personal") => driveTransfer(r.ports, { id: crypto.randomUUID(), nodeId, from, to, companyFree: true }, r.caller);
 const wipes = (r: Awaited<ReturnType<typeof rig>>): WipePorts => ({account: cmd => r.onAccount(s => wipeAccount(s,cmd)), profile: (ref,step) => r.profile(ref,s=>purgeOrigin(s,env,ref,step))});
 async function landFixture(r: Awaited<ReturnType<typeof rig>>, id: string) {
  const tid = crypto.randomUUID(), from = r.ref("work"), to = r.ref("personal");
  unwrap(await r.ports.profile(from,{op:"fence",id:tid,nodeId:id,peer:"personal"}));
  const packed=unwrap(await r.ports.profile(from,{op:"pack",id:tid}));
  const p=unwrap(await r.ports.profile(from,{op:"part",id:tid,n:1}));
- unwrap(await r.ports.profile(to,{op:"land",id:tid,from:"work",nodeId:id,n:1,of:packed.parts!,payload:p.payload!,sha256:p.sha256!,bundle:packed.sha256!,revision:packed.revision!,terms:[]}));
+ unwrap(await r.ports.profile(to,{op:"land",id:tid,from:"work",nodeId:id,n:1,of:packed.parts!,payload:p.payload!,sha256:p.sha256!,bundle:packed.sha256!,revision:packed.revision!}));
  return tid;
 }
 describe("C3 independent concrete repros",()=>{
@@ -401,7 +412,7 @@ describe("C3 accepted intent alarm recovery", () => {
 		const m = await call<{ memory_id: string }>(c, "save_memory", { name: crypto.randomUUID(), type: "user", description: "mentions Moonthistle", profile: "work" });
 		const device = job ? unwrap(await accountStub(env, c.caller.userId).admin({ op: "createDevice", name: `job-${crypto.randomUUID()}`, scopes: ["maintenance"], profiles: ["work", "me"] })) as { id: string } : null;
 		const caller: Caller = device ? { userId: c.caller.userId, kind: "device", deviceId: device.id, scopes: ["maintenance"], profiles: ["work", "me"] } : c.caller;
-		const input: TransferInput = { id: crypto.randomUUID(), nodeId: m.memory_id, from: "work", to, companyFree: true, context: "work", protect: job };
+		const input: TransferInput = { id: crypto.randomUUID(), nodeId: m.memory_id, from: "work", to, companyFree: true, protect: job };
 		const ports = transferPorts(env, c.caller.userId);
 		await expect(driveTransfer({ ...ports, account: async (cmd) => {
 			const out = await ports.account(cmd);
@@ -439,7 +450,8 @@ describe("C3 accepted intent alarm recovery", () => {
 
 	it("aborts a new me guard refusal, retries interrupted cleanup, and leaves the source writable", async () => {
 		const r = await interrupted();
-		unwrap(await accountStub(env, r.c.caller.userId).admin({ op: "addSensitiveTerm", term: "Moonthistle" }));
+		// A contact field reaches the fenced source before packing, so the me guard refuses the exact bundle.
+		await runInDurableObject(r.stub, (_i, s) => s.storage.sql.exec("UPDATE nodes SET description = 'mail moonthistle@example.com' WHERE id = ?", r.input.nodeId));
 		let original: unknown;
 		await runInDurableObject(r.account, (instance) => {
 			original = Reflect.get(instance, "env");
@@ -590,7 +602,7 @@ describe("observed count transfer",()=>{
 				await r.profile(who,s=>s.transactionSync(()=>s.sql.exec("DELETE FROM activity WHERE id=?",Number(uploaded.out.result.activity_id))));
 				expect(await r.profile(who,s=>s.sql.exec("SELECT payload,sha256 FROM transfer_parts WHERE transfer_id=? ORDER BY n",input.id).toArray())).toEqual(before);
 				await r.profile(r.ref('personal'),s=>s.sql.exec("DELETE FROM nodes WHERE id=?",uploaded.person));
-				unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+				unwrap(await driveTransfer(r.ports,input,undefined,true));
 				await r.profile(r.ref('personal'),s=>expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]));
 				await r.profile(who,s=>expect(s.sql.exec("SELECT status FROM nodes WHERE id=?",uploaded.person).one().status).toBe('active'));
 			}else{
@@ -655,7 +667,7 @@ describe('counter correction transfer',()=>{
    const fault:TransferPorts={...r.ports,profile:async(ref,step)=>{const out=await r.ports.profile(ref,step);if(step.op==='land')throw new Error('pause archived correction landing');return out;}};
    await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('pause archived correction landing');
    await r.profile(r.ref('personal'),s=>s.sql.exec('DELETE FROM nodes WHERE id=?',fixture.person));
-   unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+   unwrap(await driveTransfer(r.ports,input,undefined,true));
    await r.profile(r.ref('personal'),s=>{expect(s.sql.exec('SELECT id FROM archive').toArray()).toEqual([]);expect(s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()).toEqual([]);});
    continue;
   }
@@ -727,10 +739,10 @@ describe('null-epoch ordinary history lifecycle',()=>{
     await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('pause ordinary history');
     await r.profile(target,s=>s.sql.exec('DELETE FROM nodes WHERE id=?',f.person));
     expect(await driveTransfer(r.ports,input)).toMatchObject({ok:false,error:{code:'revision_conflict'}});
-    unwrap(await driveTransfer(r.ports,input,undefined,[],true));
+    unwrap(await driveTransfer(r.ports,input,undefined,true));
     const clean=()=>r.profile(target,s=>({edges:s.sql.exec('SELECT id FROM edges WHERE src=?',f.person).toArray(),evidence:s.sql.exec('SELECT * FROM evidence').toArray(),archive:s.sql.exec('SELECT id FROM archive').toArray(),parts:s.sql.exec('SELECT n FROM transfer_parts').toArray(),counts:s.sql.exec("SELECT key FROM profile_meta WHERE key GLOB 'work-count:*' OR key GLOB 'work-count-transfer:*'").toArray()}));
     expect(await clean()).toEqual({edges:[],evidence:[],archive:[],parts:[],counts:[]});
-    const stable=await clean();unwrap(await driveTransfer(r.ports,input,undefined,[],true));expect(await clean()).toEqual(stable);
+    const stable=await clean();unwrap(await driveTransfer(r.ports,input,undefined,true));expect(await clean()).toEqual(stable);
     await r.profile(who,s=>expect(s.sql.exec('SELECT status FROM nodes WHERE id=?',f.person).one().status).toBe('active'));
    }else{
     unwrap(await driveTransfer(r.ports,input,r.caller));

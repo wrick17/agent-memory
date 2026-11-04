@@ -387,7 +387,7 @@ describe("recovery settlement by the fixed transfer rules", () => {
 		const caller = c.caller;
 		const move = async (nodeId: string) => {
 			const tid = crypto.randomUUID();
-			const r = await driveTransfer(transferPorts(env, OWNER), { id: tid, nodeId, from: "test", to: "personal", companyFree: true, context: "test" }, caller);
+			const r = await driveTransfer(transferPorts(env, OWNER), { id: tid, nodeId, from: "test", to: "personal", companyFree: true }, caller);
 			if (!r.ok) throw new Error(JSON.stringify(r.error));
 			return tid;
 		};
@@ -743,7 +743,7 @@ describe("recovery choices and deferred steps", () => {
 	const move = async (nodeId: string, from: string, to: string, crashAt?: string) => {
 		const base = transferPorts(env, OWNER), id = crypto.randomUUID();
 		const ports = { ...base, account: (cmd: Parameters<typeof base.account>[0]) => cmd.op === crashAt ? Promise.resolve(fail("unavailable", "crash")) : base.account(cmd) };
-		const r = await driveTransfer(ports, { id, nodeId, from, to, companyFree: true, context: from }, (await contextFor()).caller);
+		const r = await driveTransfer(ports, { id, nodeId, from, to, companyFree: true }, (await contextFor()).caller);
 		expect(r.ok).toBe(!crashAt);
 		return id;
 	};
@@ -798,14 +798,16 @@ describe("recovery choices and deferred steps", () => {
 		expect(await status()).toBeNull();
 	});
 
-	it("a moved me copy is refused under a term added since, before any change; an unfinished choice resumes from its durable body", async () => {
+	it("a moved me copy is refused when its retained image holds a contact field, before any change; an unfinished choice resumes from its durable body", async () => {
 		const c0 = await contextFor();
 		const n = await call<{ memory_id: string }>(c0, "save_memory", { name: "Kestrel rule", type: "feedback", description: "a me rule", content: "kestrelmarker body", profile: "me", company_free: true });
 		const t = await move(n.memory_id, "me", "personal");
 		await tamper("personal", n.memory_id);
 		const captured = await exportOf("personal");
 		await tamper("personal", n.memory_id, null);
+		// Issue #3: a registered term alone never refuses the restore; a contact field in the retained image does.
 		await value(admin({ op: "addSensitiveTerm", term: "kestrelmarker" }));
+		await onProfile("me", (sql) => sql.exec("UPDATE archive SET payload = replace(payload, 'kestrelmarker', 'kestrel@example.com') WHERE payload LIKE '%kestrelmarker%'"));
 		const begun = await value<Recovery>(admin({ op: "beginRestore", profile: "personal", export: captured }));
 		expect(await stepUntilChecked()).toMatchObject({ state: "unresolved" });
 		const c = (await conflicts(begun.id)).find((x) => x.node === n.memory_id)!;
@@ -855,11 +857,12 @@ describe("recovery choices and deferred steps", () => {
 			expect.objectContaining({ status: "moved" }), expect.objectContaining({ status: "active" }), expect.objectContaining({ status: "active" })]);
 	});
 
-	it("a planned undo into me is refused when a retained revision holds a term added since, before either copy changes", async () => {
+	it("a planned undo into me is refused when a retained revision holds a contact field, before either copy changes", async () => {
 		const c = await contextFor();
 		const u = await undoCase("me", async (id) => { await call(c, "save_memory", { memory_id: id, content: "clean body", profile: "me", company_free: true }); },
 			{ type: "feedback", content: "corvidmark old body", company_free: true });
 		await value(admin({ op: "addSensitiveTerm", term: "corvidmark" }));
+		await onProfile("me", (sql) => sql.exec("UPDATE revisions SET snapshot = replace(snapshot, 'corvidmark', 'corvid@example.com') WHERE node_id = ?", u.id));
 		await value(admin({ op: "beginRestore", profile: "personal", export: u.before }));
 		expect(await stepUntilChecked()).toMatchObject({ state: "unresolved", unresolved: expect.arrayContaining([expect.objectContaining({ kind: "transfer_settle_failed", id: u.id })]) });
 		expect(await value(admin({ op: "abortRestore" }))).toMatchObject({ state: "aborted" });

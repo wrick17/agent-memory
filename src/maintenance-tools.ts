@@ -73,7 +73,7 @@ async function promote(c: ToolContext, from: ProfileRef, toMe: boolean, value: {
 		if (!toMe) { Object.assign(o, { status: "rejected", code: "forbidden" }); continue; }
 		try {
 			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), { id: o.transfer_id!, nodeId: o.memory_id!, from: from.profile, to: "me", companyFree: o.company_free === true,
-				context: from.profile, expect: { from: from.generation, to: o.me! }, protect: true }, c.caller, c.account.sensitiveTerms);
+				expect: { from: from.generation, to: o.me! }, protect: true }, c.caller);
 			Object.assign(o, !moved.ok ? (moved.error.code === "moving" ? { status: "moving" } : { status: "rejected", code: moved.error.code })
 				: moved.value.state === "committed" ? { status: "applied" } : { status: "rejected", code: "transfer_aborted" });
 		} catch {

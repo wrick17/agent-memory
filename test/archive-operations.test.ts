@@ -83,8 +83,10 @@ it("stages a real overbudget appended journal through actor eviction, restore ev
 async function inArchive(fn:(storage:DurableObjectStorage,who:import("../src/profile/write").Who,instance:import("../src/profile/store").ProfileStore)=>Promise<void>|void,profile="personal"){
 	const {who,stub}=await registered(profile);await runInDurableObject(stub,(instance,state)=>fn(state.storage,who,instance));
 }
+/** Rewrites a node's text rows the way older data could hold them, keeping the external-content FTS tables consistent. */
+const retext=(sql:SqlStorage,id:string,from:string,to:string)=>{for(const r of sql.exec<{rowid:number;live:number}>("SELECT rowid,live FROM texts WHERE node_id=? AND instr(body,?)>0",id,from).toArray()){if(r.live)sql.exec("UPDATE texts SET live=0 WHERE rowid=?",r.rowid);sql.exec("UPDATE texts SET body=replace(body,?,?) WHERE rowid=?",from,to,r.rowid);if(r.live)sql.exec("UPDATE texts SET live=1 WHERE rowid=?",r.rowid);}};
 function harness(storage:DurableObjectStorage,who:import("../src/profile/write").Who){
-	const ctx:WriteContext={actor:"owner",platform:"test",routedBy:"explicit",userId:who.userId,payloadHash:"",...(who.profile === "me"?{meGuard:{explicit:true,context:null,companyFree:false,sensitiveTerms:[]}}:{})};
+	const ctx:WriteContext={actor:"owner",platform:"test",routedBy:"explicit",userId:who.userId,payloadHash:"",...(who.profile === "me"?{meGuard:{explicit:true}}:{})};
 	const write=(c:WriteCommand)=>runWrite(storage,who,c,{...ctx,payloadHash:requestHash(c.op,c.args as never)}).result;
 	const make=(name:string)=>String(write({op:"save",args:{name,type:who.profile === "me"?"user":"reference",description:"synthetic",content:`body ${name}`}}).memory_id);
 	const run=(c:ArchiveCommand)=>runArchive(storage,who,c,{...ctx,payloadHash:requestHash("archive",c)});
@@ -110,7 +112,7 @@ it("keeps both local endpoints invisible and similarity retryable after vector a
 	expect(timeline(sql,{kind:"timeline",from:"2020-01-01T00:00:00Z",to:"2090-01-01T00:00:00Z",known:[],limit:100}).events.some(e=>JSON.stringify(e).includes(a))).toBe(false);
 	const incoming={...(sql.exec("SELECT * FROM nodes WHERE id=?",b).one()),id:"late-landing",name:"late landing",norm_name:"late landing"};
 	const payload=JSON.stringify([["nodes",incoming],["edges",{...before[0],src:"late-landing",dst_profile:who.profile}]]);
-	const late=await transferStep(storage,env,who,{op:"land",id:"late-landing-transfer",from:"work",nodeId:"late-landing",n:1,of:2,payload,sha256:sha256(payload),bundle:"0".repeat(64),revision:1,terms:[]});
+	const late=await transferStep(storage,env,who,{op:"land",id:"late-landing-transfer",from:"work",nodeId:"late-landing",n:1,of:2,payload,sha256:sha256(payload),bundle:"0".repeat(64),revision:1});
 	expect(late.ok).toBe(false);expect(sql.exec("SELECT 1 FROM nodes WHERE id='late-landing'").toArray()).toHaveLength(0);
 	const blocked=await transferStep(storage,env,who,{op:"fence",id:"archive-first",nodeId:b,peer:"work"});
 	expect(blocked.ok).toBe(false);expect(sql.exec("SELECT * FROM transfers").toArray()).toHaveLength(0);
@@ -163,16 +165,20 @@ it("rolls back partial forget, preserves purge pins, refuses stale cursors and r
 	sql.exec("UPDATE cursors SET due_at=0 WHERE stage='purge'");housekeep(storage,who,future);
 	expect(archiveOperation(sql,op)).toBeUndefined();expect(sql.exec("SELECT status FROM nodes WHERE id=?",id).one().status).toBe("active");
 }));
-it("rechecks changed me terms before publish and aborts without exposing landed rows",async()=>inArchive(async(storage,who,instance)=>{
-	const {make,run,resume,drain}=harness(storage,who),sql=storage.sql,id=make("Cedar preference");
-	let r=run({action:"forget",memory_id:id,expected_revision:1,request_id:"guard-forget"});const removed=drain(String(r.operation_id)).activity;
-	r=run({action:"restore",activity_id:removed,request_id:"guard-restore"});const op=String(r.operation_id);
-	while(archiveOperation(sql,op)!.phase!=="publish")resume(op);
-	expect((await instance.addGuardTerms(who,["Cedar"],"work")).ok).toBe(true);
-	resume(op);expect(archiveOperation(sql,op)!.phase).toBe("validate");
-	expect(()=>resume(op)).toThrow(/work term/);expect(sql.exec("SELECT status FROM nodes WHERE id=?",id).one().status).toBe("incoming");
-	r=run({action:"abort",operation_id:op,cursor:archiveCursor(archiveOperation(sql,op)!),request_id:"guard-abort"});drain(op);
-	expect(sql.exec("SELECT 1 FROM nodes WHERE id=?",id).toArray()).toHaveLength(0);
+it("restores into me despite registered work terms, and aborts a personal-field restore without exposing landed rows",async()=>inArchive(async(storage,who)=>{
+	const {make,run,drain}=harness(storage,who),sql=storage.sql,id=make("Cedar preference");
+	// Issue #3: guard terms no longer decide what me may hold, so a restore completes.
+	sql.exec("INSERT INTO guard_terms (term,source,added_at,seq) VALUES ('Cedar','work',?,1)",new Date().toISOString());
+	let r=run({action:"forget",memory_id:id,expected_revision:1,request_id:"guard-forget"});let removed=drain(String(r.operation_id)).activity;
+	r=run({action:"restore",activity_id:removed,request_id:"guard-restore"});
+	expect(drain(String(r.operation_id)).state).toBe("complete");expect(sql.exec("SELECT status FROM nodes WHERE id=?",id).one().status).toBe("active");
+	const field=make("Contact preference");retext(sql,field,"body Contact preference","mail cedar@example.com");
+	r=run({action:"forget",memory_id:field,expected_revision:1,request_id:"field-forget"});removed=drain(String(r.operation_id)).activity;
+	r=run({action:"restore",activity_id:removed,request_id:"field-restore"});const op=String(r.operation_id);
+	expect(()=>{for(let n=0;n<200;n++){const o=archiveOperation(sql,op)!;if(o.state === "complete")return;run({action:"resume",operation_id:op,cursor:archiveCursor(o),request_id:`field-resume-${o.version}`});}}).toThrow(/personal contact fields/);
+	expect(sql.exec("SELECT status FROM nodes WHERE id=?",field).one().status).toBe("incoming");
+	r=run({action:"abort",operation_id:op,cursor:archiveCursor(archiveOperation(sql,op)!),request_id:"field-abort"});drain(op);
+	expect(sql.exec("SELECT 1 FROM nodes WHERE id=?",field).toArray()).toHaveLength(0);
 	expect(sql.exec("SELECT 1 FROM archive WHERE activity_id=?",removed).toArray().length).toBeGreaterThan(0);
 },"me"));
 it("wipe cancels metadata-only operations with permanent fences, keeps request bytes until account fencing, and preserves accepted me survivors",async()=>{
@@ -212,6 +218,8 @@ it("wipe decides the me exception from the complete live and staged image in bou
 	const stage=(id:string)=>{const op=String(run({action:"forget",memory_id:id,expected_revision:31,request_id:`stage-${id}`}).operation_id);while(archiveOperation(sql,op)!.phase!=="archive_revisions")resume(op);return op;};
 	const unstaged=pref("unstaged preference","Cedar project body",i=>`entry ${i}`),partial=pref("partial preference","quiet body",i=>i === 28?"Cedar project detail":`entry ${i}`),clean=pref("clean preference","quiet body",i=>`entry ${i}`);
 	const personal=String(write({op:"save",args:{name:"personal note",type:"user",description:"synthetic",content:"Cedar tree in the garden"}}).memory_id),cleanBody=readContent(sql,clean);
+	// Issue #3: the wipe exception is decided by personal fields, not terms, so the refused images hold a contact field.
+	for(const id of [unstaged,partial])retext(sql,id,"Cedar","cedar@example.com");
 	const partialOp=stage(partial),cleanOp=stage(clean),removal=archiveOperation(sql,partialOp)!.removal;
 	expect(sql.exec("SELECT 1 FROM revisions WHERE node_id=?",partial).toArray()).toHaveLength(1);expect(sql.exec("SELECT 1 FROM texts WHERE node_id=?",partial).toArray()).toHaveLength(0);
 	expect(sql.exec("SELECT 1 FROM archive WHERE activity_id=? AND payload LIKE '%Cedar%'",removal).toArray()).toHaveLength(1);
@@ -245,7 +253,7 @@ it("bounds each wipe fence call across retained operation history and publishes 
 		const id=String(write({op:"save",args:{name,type:"user",description:"synthetic",content:"quiet preference"}}).memory_id);
 		sql.exec("UPDATE nodes SET source_profile='work',attrs=json_set(attrs,'$.company_free',json('true')) WHERE id=?",id);
 		for(let i=0;i<13;i++){const removed=drain(String(run({action:"forget",memory_id:id,expected_revision:1,request_id:`${name}-${i}-forget`}).operation_id));drain(String(run({action:"restore",activity_id:removed.activity,request_id:`${name}-${i}-restore`}).operation_id));}
-		if(entry)write({op:"append",args:{memory_id:id,content:entry,request_id:`${name}-entry`}});
+		if(entry){write({op:"append",args:{memory_id:id,content:entry,request_id:`${name}-entry`}});retext(sql,id,"Cedar","cedar@example.com");}
 		const op=String(run({action:"forget",memory_id:id,expected_revision:entry?2:1,request_id:`${name}-partial`}).operation_id);
 		while(archiveOperation(sql,op)!.phase!=="archive_revisions")resume(op);
 		expect(sql.exec("SELECT count(*) AS n FROM profile_meta WHERE key>=? AND key<?",`archive-node:${id}:`,`archive-node:${id}:~`).one().n).toBe(27);

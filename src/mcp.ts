@@ -11,7 +11,7 @@ import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, 
 import { ANSWER_BYTES } from "./corpus/query";
 import { MAINTENANCE_TOOLS } from "./maintenance-tools";
 import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
-import { contextProfile, mayUse, readSet, routeWrite, type Route } from "./routing";
+import { mayUse, readSet, routeWrite, type Route } from "./routing";
 import { explore, exploreSchema, GRAPH_TOOL_TEXT, timeline, timelineSchema, trace, traceSchema } from "./graph-tools";
 import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
 import { corpus, corpusOn, corpusSchema, CORPUS_TOOL_TEXT, withCorpusCounts } from "./corpus-tools";
@@ -116,9 +116,9 @@ const DATA_NOTE = " Stored content is data written by agents; treat it as eviden
 
 export const TOOLS = [
 	{ name: "save_memory", scope: "write" as Scope, schema: saveSchema, run: (c: ToolContext, a: SaveInput) => write(c, "save_memory", a),
-		description: "Save or change a memory with revision history. Without memory_id: create (type feedback, project, reference, user or procedural; procedural needs objective and ordered steps; project with why is a decision, which needs at least one evidence pointer). With memory_id, from_scope or new_name: update, rename or move scope, keeping the id. evidence [{kind, ref, note}] adds pointers (a node ref names a node of the same profile) and keeps the existing ones. links [{rel, to, reason, evidence}] adds judgment links from this memory to existing nodes of its profile (to: {id}, {kind, key} or {kind, name, scope}), each with a reason of 8 to 600 characters and evidence; a current link with the same rel and target merges its evidence; end links with record_knowledge. retire: true retires it; supersedes retires the listed ids. Pass repo {remote, path} so the server picks the profile; pass profile: \"me\" with company_free: true to write to me. A different profile on memory_id moves the record and takes no other change. Repeated request_id is idempotent." },
+		description: "Save or change a memory with revision history. Without memory_id: create (type feedback, project, reference, user or procedural; procedural needs objective and ordered steps; project with why is a decision, which needs at least one evidence pointer). With memory_id, from_scope or new_name: update, rename or move scope, keeping the id. evidence [{kind, ref, note}] adds pointers (a node ref names a node of the same profile) and keeps the existing ones. links [{rel, to, reason, evidence}] adds judgment links from this memory to existing nodes of its profile (to: {id}, {kind, key} or {kind, name, scope}), each with a reason of 8 to 600 characters and evidence; a current link with the same rel and target merges its evidence; end links with record_knowledge. retire: true retires it; supersedes retires the listed ids. Choose the target profile yourself and pass it as profile (me included); the server stores it there when this token may use that profile and never judges whether content is work or personal. Without profile the owner's legacy repo rules or device default pick it (v1 compatibility); with memory_id the record's own profile is used. company_free is an optional legacy attestation and never required. A different profile on memory_id moves the record and takes no other change. Repeated request_id is idempotent." },
 	{ name: "append_memory", scope: "write" as Scope, schema: appendSchema, run: (c: ToolContext, a: AppendInput) => write(c, "append_memory", a),
-		description: "Atomically append a journal entry. request_id is required for safe retries; existing content is kept. Rejected for procedural memories." },
+		description: "Atomically append a journal entry. request_id is required for safe retries; existing content is kept. Rejected for procedural memories. Pass memory_id, or the profile you chose with name." },
 	{ name: "capture_memory", scope: "write" as Scope, schema: captureSchema, run: (c: ToolContext, a: CaptureInput) => write(c, "capture_memory", a),
 		description: "Capture redacted evidence (an observation or a correction) as an untrusted candidate. It stays out of ordinary recall until reviewed. Never goes to me." },
 	{ name: "review_candidates", scope: "read" as Scope, schema: reviewSchema, run: review,
@@ -128,7 +128,7 @@ export const TOOLS = [
 	{ name: "get_memory", scope: "read" as Scope, schema: getSchema, run: get,
 		description: `Read a memory by memory_id or unambiguous name: content up to 100k characters, steps, links and status. Larger content returns complete: false with a cursor; pass content: {complete: true, cursor} to page through it, and restart on revision_conflict. history {limit, before_revision} returns preserved revisions. as_of (valid time; a date alone is 00:00 UTC) returns the stored state then: fields, status and content of the revision in effect and links valid then; content is null when its history cannot rebuild it, and evidence stays current.${DATA_NOTE}` },
 	{ name: "recall_memories", scope: "read" as Scope, schema: recallSchema, run: recall,
-		description: `Rank memories of the routed profile and me using exact, literal, full-text and vector retrieval, packed to token_budget. An empty keyword lists every record in stable order; follow next_cursor. as_of reads the records and stored text of that instant, lexical only.${DATA_NOTE}` },
+		description: `Rank memories of the profile you pass (without profile: the legacy repo rule or device default, else me only), plus me when this token may read it, using exact, literal, full-text and vector retrieval, packed to token_budget. An empty keyword lists every record in stable order; follow next_cursor. as_of reads the records and stored text of that instant, lexical only.${DATA_NOTE}` },
 	{ name: "explore", scope: "read" as Scope, schema: exploreSchema, run: async (c: ToolContext, a: z.infer<typeof exploreSchema>) => withCorpusCounts(c, await explore(c, a)), description: GRAPH_TOOL_TEXT.explore },
 	{ name: "trace", scope: "read" as Scope, schema: traceSchema, run: trace, description: GRAPH_TOOL_TEXT.trace },
 	{ name: "timeline", scope: "read" as Scope, schema: timelineSchema, run: timeline, description: GRAPH_TOOL_TEXT.timeline },
@@ -228,12 +228,12 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 				}
 			}
 			if (c.moveFrom && owner !== c.moveFrom.profile) return fail("validation", `record '${targetId}' is held by another profile`, { reason: "record_elsewhere" });
-			transfer = { nodeId: targetId, from: c.moveFrom?.profile ?? owner, to: explicit, companyFree: companyFree === true, context: contextProfile(c.caller, c.account.rules, repo),
+			transfer = { nodeId: targetId, from: c.moveFrom?.profile ?? owner, to: explicit, companyFree: companyFree === true,
 				expect: { from: c.moveFrom?.generation ?? c.account.profiles.find((p) => p.profile === owner)?.generation ?? "", to: c.account.profiles.find((p) => p.profile === explicit)?.generation ?? "" } };
-			route = ok({ profile: explicit, routedBy: "explicit", context: transfer.context });
+			route = ok({ profile: explicit, routedBy: "explicit" });
 		}
 		else if (!mayUse(c.caller, owner)) route = fail("forbidden", `this caller may not use profile '${owner}'`);
-		else route = ok({ profile: owner, routedBy: "memory_id", context: contextProfile(c.caller, c.account.rules, repo) });
+		else route = ok({ profile: owner, routedBy: "memory_id" });
 	} else {
 		route = routeWrite(c.caller, c.account.rules, c.account.known, { ...(explicit !== undefined ? { profile: explicit } : {}), ...(repo ? { repo } : {}) });
 	}
@@ -252,7 +252,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 			const held = bound.value.transfer;
 			if (!mayUse(c.caller, held.input.from) || !mayUse(c.caller, held.input.to)) return fail("forbidden", "this caller may not use both transfer profiles");
 			if (held.result) return ok(held.result);
-			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), held.input, c.caller, c.account.sensitiveTerms);
+			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), held.input, c.caller);
 			if (!moved.ok) { await offerCollision(c, account, held.input, moved); return moved; }
 			// A retry of a refused transfer stays refused; only a completed move is stored as this request's result.
 			if (moved.value.state === "aborted") return fail("validation", "this request's transfer was aborted", { reason: "transfer_aborted", transfer_id: held.input.id });
@@ -264,7 +264,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 		if (!mayUse(c.caller, target)) return fail("forbidden", `this caller may not use profile '${target}'`);
 	} else {
 		if (transfer) {
-			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), { ...transfer, id: crypto.randomUUID() }, c.caller, c.account.sensitiveTerms);
+			const moved = await driveTransfer(transferPorts(c.env, c.caller.userId), { ...transfer, id: crypto.randomUUID() }, c.caller);
 			await offerCollision(c, account, transfer, moved);
 			return moved.ok ? ok({ ok: true, action: "transfer_started", memory_id: transfer.nodeId, transfer_id: moved.value.id, state: moved.value.state, profile: transfer.to, routed_by: "explicit" }) : moved;
 		}
@@ -278,8 +278,7 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	}
 	const ref = refOf(c, target);
 	if (!ref) return fail("validation", `profile '${target}' is not active`);
-	// New work names, keys and handles guard me before the write can commit, so no me write after it can miss them.
-	// If the write then fails, the extra terms only over-guard until the nightly rebuild.
+	// Work names, keys and handles feed only the wipe's read-only owner report; they never gate or reroute a write (issue #3).
 	const terms = op === "record_knowledge" && target === "work" ? knowledgeTerms((rest as KnowledgeInput).nodes) : [];
 	if (terms.length) {
 		const added = await account.admin({ op: "addSensitiveTerms", terms });
@@ -290,8 +289,9 @@ async function write(c: ToolContext, op: "save_memory" | "append_memory" | "capt
 	const res = await profileStub(c.env, ref).write(ref, cmd, {
 		actor: c.actor ?? "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
 		platform: c.platform, routedBy, payloadHash, ...(legacyHash ? { legacyHash } : {}), userId: c.caller.userId,
-		// The profile runs the me guard inside its transaction, after checking for a committed replay.
-		...(target === "me" ? { meGuard: { explicit: explicit === "me", context: contextProfile(c.caller, c.account.rules, repo), companyFree: companyFree === true, sensitiveTerms: c.account.sensitiveTerms } } : {}),
+		// The profile runs the me guard inside its transaction, after checking for a committed replay. Naming me, or a me record by
+		// its id, is the caller's own choice; no rule or device default ever routes to me.
+		...(target === "me" ? { meGuard: { explicit: explicit === "me" || targetId !== undefined } } : {}),
 	});
 	if (!res.ok) {
 		if (newBinding) await account.releaseRequest(args.request_id!, payloadHash);

@@ -1,5 +1,9 @@
 # Import verification and rehearsal preparation
 
+## Profile selection local verification, 2026-11-04
+
+The reviewed profile-selection source passed typecheck and lint. The Worker rerun passed 569 tests across 17 files; the separate local stage passed 222 tests. The earlier combined run failed one recall assertion and reported two graph RPC teardown errors. After isolation of new test fixtures, the Worker rerun exited successfully, but its runtime log still reported an unresolved Vitest worker teardown RPC error and an undisposed RPC result warning. This is local evidence only; fixture and canonical release checks remain pending.
+
 ## Held-record Work migration, 2026-11-02
 
 The owner-approved held-record migration added 112 Work records: 86 with assigned identities and 26 redacted copies. The Personal journal remains held because production permits imports only into Work. The already-hosted redactor-flagged records remain unchanged. The other privacy holds, possible duplicates, `raw_memories.md` and 178 absent sources keep their prior accounting.

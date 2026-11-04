@@ -352,7 +352,7 @@ export function wipePreview(sql: SqlStorage, who: { userId: string; profile: str
 		const marked = sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", `wiped:${id}`).toArray().length > 0;
 		// Like held: an id with no row here (a staged operation between its steps) is left to the wipe itself.
 		const present = !!live || marked || sql.exec(`SELECT 1 FROM archive WHERE coalesce(json_extract(payload, '$.node_id'), json_extract(payload, '$.src'), json_extract(payload, '$.id')) = ? LIMIT 1`, id).toArray().length > 0;
-		return { id, ...meta, verdict: !present ? "decided_at_wipe" : marked || !survives(sql, who, id, q.terms) ? "purge" : nodeOperationAfter(sql, id, "") ? "decided_at_wipe" : "survive" };
+		return { id, ...meta, verdict: !present ? "decided_at_wipe" : marked || !survives(sql, who, id) ? "purge" : nodeOperationAfter(sql, id, "") ? "decided_at_wipe" : "survive" };
 	});
 	return { items, after: page.after };
 }

@@ -306,17 +306,17 @@ export class ProfileStore extends DurableObject<Env> {
 		return ok(settleFacts(this.ctx.storage.sql, q.id, q.nodeId, q.side));
 	}
 
-	/** Internal RPC: this generation's copy of one node, for the owner's choice in an open recovery; read only. `terms`: the account's current sensitive terms. */
-	async recoveryCopy(who: Who, nodeId: string, terms: string[] = []): Promise<Outcome<RecoveryCopy | null>> {
+	/** Internal RPC: this generation's copy of one node, for the owner's choice in an open recovery; read only. */
+	async recoveryCopy(who: Who, nodeId: string): Promise<Outcome<RecoveryCopy | null>> {
 		if (!this.who()) return ok(null);
 		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
-		return ok(recoveryCopy(this.ctx.storage, who, nodeId, terms));
+		return ok(recoveryCopy(this.ctx.storage, who, nodeId));
 	}
 
 	/** Internal RPC, read only: whether undo_move of transfer `id` can restore the whole record here now, guard included. */
-	async undoPreflight(who: Who, a: { id: string; nodeId: string; terms: string[] }): Promise<Outcome<null>> {
+	async undoPreflight(who: Who, a: { id: string; nodeId: string }): Promise<Outcome<null>> {
 		if (!this.same(who)) return fail("validation", "profile object identity mismatch");
-		return undoPreflight(this.ctx.storage, who, a.id, a.nodeId, a.terms);
+		return undoPreflight(this.ctx.storage, who, a.id, a.nodeId);
 	}
 
 	/** Internal RPC, read only: one page of a node's request rows here, so its owner's request bindings can be rebuilt (section 18, step 5). */
@@ -453,22 +453,6 @@ export class ProfileStore extends DurableObject<Env> {
 	async archiveOperationStatus(who:Who,id:string):Promise<Outcome<Record<string,unknown>>> {
 		try{await this.access(who,[archiveOperation(this.ctx.storage.sql,id)?.node??""]);this.bind(who,true);return ok(archiveStatus(this.ctx.storage.sql,who,id));}
 		catch(e){if(e instanceof Fail)return {ok:false,error:e.failure};throw e;}
-	}
-
-	/** The me guard's term table, written only by AccountStore before it confirms a term registration (section 5). */
-	async addGuardTerms(who: Who, terms: string[], source: string): Promise<Outcome<number>> {
-		try {
-			await this.access(who);
-			this.bind(who);
-			if (who.profile !== "me") return { ok: false, error: { code: "validation", message: "guard terms live in the me profile" } };
-			const sql = this.ctx.storage.sql;
-			const at = new Date().toISOString();
-			this.ctx.storage.transactionSync(() => {
-				const seq = nextSeq(sql, "profile_meta");
-				for (const t of terms) sql.exec("INSERT OR IGNORE INTO guard_terms (term, source, added_at, seq) VALUES (?, ?, ?, ?)", t, source, at, seq);
-			});
-			return ok(this.metered(terms.length));
-		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
 	/** Capture digests and manifests (section 10). Never through the memory write path: digests are not memories. */
@@ -895,15 +879,12 @@ export class ProfileStore extends DurableObject<Env> {
 			// Unfinished transfers this profile is the source of, after five minutes, from the step they reached (section 9).
 			const stale = dueTransfers(this.ctx.storage.sql);
 			if (stale.length) {
-				const ctx = await (account as unknown as Pick<import("../account/store").AccountStore, "context">).context({ kind: "owner", userId: who.userId });
-				for (const id of stale) await resumeTransfer(transferPorts(this.env, who.userId), id, ctx.ok ? ctx.value.sensitiveTerms : []);
+				for (const id of stale) await resumeTransfer(transferPorts(this.env, who.userId), id);
 			}
 			// Finished maintenance items whose caller never saw or acted on the result: register, then promote or abort (section 12).
 			try {
 				const boxes = dueOutbox(this.ctx.storage.sql, Date.now());
-				const ctx = boxes.some((b) => b.box.promote.length) ? await (account as unknown as Pick<import("../account/store").AccountStore, "context">).context({ kind: "owner", userId: who.userId }) : null;
-				if (ctx && !ctx.ok) throw new Error(`account context: ${ctx.error.code}`);
-				for (const b of boxes) await this.settle(who, b.stage, b.box, ctx?.value.sensitiveTerms ?? [], gate);
+				for (const b of boxes) await this.settle(who, b.stage, b.box, gate);
 				await gate();
 				this.stage("outbox", null);
 			} catch (e) { await failed("outbox", e); }
@@ -969,14 +950,14 @@ export class ProfileStore extends DurableObject<Env> {
 	 * protected since. A target that is no longer promotable goes down C3's abort path, so a begun transfer never stays open.
 	 * A transport failure, or a transfer C3 still reports moving, keeps the row for a retry.
 	 */
-	private async settle(who: Who, stage: string, box: Outbox, terms: string[], gate: () => Promise<void>): Promise<void> {
+	private async settle(who: Who, stage: string, box: Outbox, gate: () => Promise<void>): Promise<void> {
 		let kept = false;
 		if (box.created.length) await this.register(who, box.created).catch(() => { kept = true; });
 		for (const p of box.promote) {
 			const go = promotable(this.ctx.storage.sql, p);
 			const caller = { userId: who.userId, kind: "device" as const, deviceId: p.device, scopes: ["maintenance" as const], profiles: [who.profile, "me"] };
-			const r = await driveTransfer(transferPorts(this.env, who.userId), { id: p.id, nodeId: p.node, from: who.profile, to: "me", companyFree: p.company_free === true, context: who.profile,
-				expect: { from: who.generation, to: p.me }, protect: true }, go ? caller : undefined, terms, !go).catch(() => null);
+			const r = await driveTransfer(transferPorts(this.env, who.userId), { id: p.id, nodeId: p.node, from: who.profile, to: "me", companyFree: p.company_free === true,
+				expect: { from: who.generation, to: p.me }, protect: true }, go ? caller : undefined, !go).catch(() => null);
 			if (!r || (!r.ok && r.error.code === "moving")) kept = true;
 		}
 		await gate();

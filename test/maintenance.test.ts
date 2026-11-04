@@ -130,7 +130,7 @@ async function inStore<T>(fn: (storage: DurableObjectStorage, who: Who) => T | P
 }
 
 const ctx = (who: Who): WriteContext => ({ actor: "agent", platform: "test", routedBy: "test", payloadHash: crypto.randomUUID(), userId: who.userId,
-	...(who.profile === "me" ? { meGuard: { explicit: true, context: null, companyFree: true, sensitiveTerms: [] } } : {}) });
+	...(who.profile === "me" ? { meGuard: { explicit: true } } : {}) });
 
 /** One write through the real dispatcher, which stores its undo. */
 function wired(storage: DurableObjectStorage, who: Who, cmd: WriteCommand): Record<string, unknown> & { activity_id: number } {
@@ -601,16 +601,21 @@ describe("review fixes (C4-R1 to C4-R6)", () => {
 		});
 	});
 
-	it("R2: undo rechecks restored me content against the terms registered since; an ordinary save is refused the same way", async () => {
+	it("R2: undo rechecks restored me content against the me guard; registered work terms refuse neither an undo nor a save", async () => {
 		await inStore((storage, who) => {
 			const a = wired(storage, who, save({ name: "Personal note", content: "PrivateOrionProject detail" }));
 			const change = wired(storage, who, save({ memory_id: a.memory_id, content: "safe detail" }));
 			storage.sql.exec("INSERT INTO guard_terms (term, source, added_at, seq) VALUES ('PrivateOrionProject', 'work', ?, 0)", new Date().toISOString());
-			const term = expect.objectContaining({ failure: expect.objectContaining({ code: "me_sensitive_term" }) });
-			expect(() => wired(storage, who, save({ memory_id: a.memory_id, content: "PrivateOrionProject detail" }))).toThrow(term);
+			// A contact field in what undo would put back (as older data might hold) is refused before any change.
+			const plain = storage.sql.exec<{ undo: string }>("SELECT undo FROM activity WHERE id = ?", change.activity_id as number).one().undo;
+			storage.sql.exec("UPDATE activity SET undo = ? WHERE id = ?", plain.replaceAll("PrivateOrionProject", "orion@example.com"), change.activity_id as number);
+			const field = expect.objectContaining({ failure: expect.objectContaining({ code: "me_sensitive_term", details: { term: "personal_field" } }) });
 			const snapshot = state(storage.sql);
-			expect(() => undoIt(storage, who, change.activity_id)).toThrow(term);
+			expect(() => undoIt(storage, who, change.activity_id)).toThrow(field);
 			expect(state(storage.sql)).toEqual(snapshot);
+			storage.sql.exec("UPDATE activity SET undo = ? WHERE id = ?", plain, change.activity_id as number);
+			expect(() => undoIt(storage, who, change.activity_id)).not.toThrow();
+			expect(wired(storage, who, save({ memory_id: a.memory_id, content: "PrivateOrionProject detail again" })).action).toBe("updated");
 		}, "me");
 	});
 
@@ -859,16 +864,18 @@ describe("D1 compaction", () => {
 	}));
 
 	it("guards a me summary and restored entries before any reindex, and refuses closed or moving generations", async () => inStore((storage, who) => {
-		const ctx = { actor: "owner" as const, platform: "test", routedBy: "explicit", userId: who.userId, meGuard: { explicit: true, companyFree: true, context: "work", sensitiveTerms: [] as string[] } };
+		const ctx = { actor: "owner" as const, platform: "test", routedBy: "explicit", userId: who.userId, meGuard: { explicit: true } };
 		const write = (cmd: WriteCommand) => runWrite(storage, who, cmd, { ...ctx, payloadHash: requestHash(cmd.op, cmd.args as never) });
 		const id = String(write({ op: "save", args: { name: "guard compact", type: "project", description: "test" } }).result.memory_id);
 		write({ op: "append", args: { memory_id: id, content: "pastorgterm", request_id: "guard-entry" } });
 		const saved = write({ op: "save", args: { memory_id: id, expected_revision: 2, request_id: "guard-compact", compact: { through_seq: 1, summary: "safe" } } });
 		while (foldDue(storage.sql)) foldStep(storage);
-		storage.sql.exec("INSERT INTO guard_terms(term,source,added_at,seq) VALUES ('pastorgterm','test',?,1)", new Date().toISOString());
-		expect(() => write({ op: "save", args: { memory_id: id, expected_revision: 3, request_id: "unsafe-summary", compact: { through_seq: 2, summary: "pastorgterm" } } })).toThrow(/work term/);
+		expect(() => write({ op: "save", args: { memory_id: id, expected_revision: 3, request_id: "unsafe-summary", compact: { through_seq: 2, summary: "mail pastorg@example.com" } } })).toThrow(/personal contact fields/);
+		// Restored entries meet the same guard: a contact field in the archived entries refuses the undo before any change.
+		// Folded entries are not indexed (only live = 1 is), so this rewrite leaves the FTS tables consistent.
+		storage.sql.exec("UPDATE texts SET body = replace(body, 'pastorgterm', 'pastorg@example.com') WHERE node_id = ? AND live <> 1 AND instr(body, 'pastorgterm') > 0", id);
 		const before = ["nodes","texts","activity","requests","profile_meta"].map((t) => storage.sql.exec(`SELECT * FROM ${t}`).toArray());
-		expect(() => undo(storage, who, Number(saved.result.activity_id), ctx)).toThrow(/work term/);
+		expect(() => undo(storage, who, Number(saved.result.activity_id), ctx)).toThrow(/personal contact fields/);
 		expect(["nodes","texts","activity","requests","profile_meta"].map((t) => storage.sql.exec(`SELECT * FROM ${t}`).toArray())).toEqual(before);
 		storage.sql.exec("UPDATE nodes SET status = 'moving' WHERE id = ?", id);
 		expect(() => write({ op: "save", args: { memory_id: id, expected_revision: 3, request_id: "moving-compact", compact: { through_seq: 2, summary: "safe" } } })).toThrow(/transferred/);
@@ -1067,7 +1074,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 	});
 
 	/** A synthetic account with work, me and personal at fresh generations, and job-token tool contexts for it (the Worker checks only the caller). */
-	async function jobRig(terms: string[] = []) {
+	async function jobRig() {
 		const r = await registered("work", "me", "personal");
 		const names = ["work", "me", "personal"], refs = names.map((p) => r.of(p).who), now = new Date().toISOString();
 		await r.account((a) => {
@@ -1078,7 +1085,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		});
 		const tool = (profiles: string[], envOverride: Partial<Env> = {}): ToolContext => {
 			const caller: Caller = { userId: r.userId, kind: "device", deviceId: `job-${profiles.join("-")}`, scopes: ["ingest", "maintenance"], profiles };
-			return { env: { ...env, ...envOverride } as Env, caller, account: { caller, rules: [], profiles: refs, known: names, sensitiveTerms: terms }, platform: "test" };
+			return { env: { ...env, ...envOverride } as Env, caller, account: { caller, rules: [], profiles: refs, known: names }, platform: "test" };
 		};
 		const on = <T,>(p: string, f: (sql: SqlStorage) => T) => runInDurableObject(r.of(p).stub, (_i, s) => f(s.storage.sql));
 		const digest = await runInDurableObject(r.of("work").stub, (_i, s) => String(runWrite(s.storage, r.of("work").who, save({ name: "synthetic correction digest" }), agent(r.of("work").who)).result.memory_id));
@@ -1163,8 +1170,8 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 	});
 
 	it("rejects a guarded promotion and leaves the record writable in work; a transport failure stays resumable and replays once", async () => {
-		const guarded = await jobRig(["Vexmoor"]);
-		const out = await guarded.run(guarded.tool(["work", "me"]), "Learned while pairing on the Vexmoor rollout.");
+		const guarded = await jobRig();
+		const out = await guarded.run(guarded.tool(["work", "me"]), "Learned while pairing; mail vexmoor@example.com.");
 		const id = out.ops[0]!.created![0]!;
 		expect(out.ops[1]).toMatchObject({ status: "rejected", code: "me_sensitive_term" });
 		await guarded.on("me", (sql) => expect(sql.exec("SELECT count(*) AS n FROM nodes WHERE id = ?", id).one().n).toBe(0));
@@ -1263,19 +1270,19 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		await r.on("work", (sql) => expect(sql.exec("SELECT status FROM nodes WHERE id = ?", id).one().status).toBe("moved"));
 	});
 
-	it("on resume, a new guard term, a regenerated me, a revoked job device or a closed source refuses; the record stays writable and nothing stays open", async () => {
+	it("on resume, a new contact field, a regenerated me, a revoked job device or a closed source refuses; the record stays writable and nothing stays open", async () => {
 		for (const change of ["guard", "me", "revoked", "begun_me", "begun_revoked", "closed"] as const) {
 			const r = await jobRig();
 			const begun = change === "begun_me" || change === "begun_revoked";
 			const out = await r.run(crashing(r, begun ? "fence" : "begin"), "Learned while pairing on the Vexmoor rollout.");
 			const id = out.ops[0]!.created![0]!;
 			await r.account((a) => {
-				if (change === "guard") a.exec("INSERT INTO sensitive_terms (term, source, updated_at, seq) VALUES ('Vexmoor', 'owner', ?, 1)", new Date().toISOString());
 				if (change === "me" || change === "begun_me") a.exec("UPDATE profiles SET generation = 'regenerated' WHERE name = 'me'");
 				// begun_revoked: the intent is already open at the account, so its retry must recheck the device too.
 				if (change === "revoked" || change === "begun_revoked") a.exec("UPDATE devices SET revoked_at = ?, enabled = 0 WHERE id = 'job-work-me'", new Date().toISOString());
 				if (change === "closed") a.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'work'");
 			});
+			if (change === "guard") await r.on("work", (sql) => sql.exec("UPDATE nodes SET description = 'mail vexmoor@example.com' WHERE id = ?", id));
 			await r.alarm(change !== "closed");
 			if (change === "closed") expect(await runInDurableObject(r.of("work").stub, (_i, s) => s.storage.getAlarm())).toBeNull();
 			await r.account((a) => expect(a.exec("SELECT state FROM transfers").toArray(), change).toEqual(change === "guard" || begun ? [{ state: "aborted" }] : []));
@@ -1287,6 +1294,16 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 			// A closed source runs nothing more; every other outcome is final, so the intent is gone.
 			expect((await r.outbox()).length, change).toBe(change === "closed" ? 1 : 0);
 		}
+	});
+
+	it("on resume, a sensitive term registered since does not refuse the promotion (issue #3)", async () => {
+		const r = await jobRig();
+		const out = await r.run(crashing(r, "begin"), "Learned while pairing on the Vexmoor rollout.");
+		const id = out.ops[0]!.created![0]!;
+		await r.account((a) => a.exec("INSERT INTO sensitive_terms (term, source, updated_at, seq) VALUES ('Vexmoor', 'owner', ?, 1)", new Date().toISOString()));
+		await r.alarm();
+		await r.account((a) => expect(a.exec("SELECT state FROM transfers").toArray()).toEqual([{ state: "committed" }]));
+		await r.on("me", (sql) => expect(sql.exec("SELECT status FROM nodes WHERE id = ?", id).one().status).toBe("active"));
 	});
 
 	/** Runs `body` while the profile's own account calls run `after(method, args)` once each real call has returned (an await window). */
@@ -1327,7 +1344,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 			}
 			// The owner's own move of the pinned record keeps C3's interactive behavior.
 			const owner: Caller = { userId: r.userId, kind: "owner", scopes: ["read", "write"], profiles: "*" };
-			expect(await driveTransfer(transferPorts(env, r.userId), { id: crypto.randomUUID(), nodeId: id, from: "work", to: "personal", companyFree: false, context: null }, owner))
+			expect(await driveTransfer(transferPorts(env, r.userId), { id: crypto.randomUUID(), nodeId: id, from: "work", to: "personal", companyFree: false }, owner))
 				.toMatchObject({ ok: true, value: { state: "committed" } });
 		}
 	});
@@ -1391,7 +1408,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 		const owner: Caller = { userId: r.userId, kind: "owner", scopes: ["read", "write"], profiles: "*" };
 		const c: ToolContext = { ...r.tool([]), caller: owner, env: { ...env, EMBEDDINGS: "off" } as Env };
 		c.account = { ...c.account, caller: owner };
-		const meCtx = { ...agent(me.who), meGuard: { explicit: true, context: null, companyFree: true, sensitiveTerms: [] } };
+		const meCtx = { ...agent(me.who), meGuard: { explicit: true } };
 		await runInDurableObject(work.stub, (_i, s) => {
 			runWrite(s.storage, work.who, save({ name: "Kestrel spacing guide", content: "guide" }), agent(work.who));
 			runWrite(s.storage, work.who, { op: "save", args: { name: "Kestrel spacing", type: "user", description: "inferred", origin: "inferred", evidence: [{ kind: "node", ref: r.digest }] } }, agent(work.who));
@@ -1557,7 +1574,7 @@ describe("D4 dangling links and D5 row meter", () => {
 				return { src, pinned, a, b };
 			}));
 			const caller: Caller = { userId: r.userId, kind: "device", deviceId: "job-dangling", scopes: ["ingest", "maintenance"], profiles: ["work"] };
-			const c: ToolContext = { env, caller, account: { caller, rules: [], profiles: [who], known: ["work"], sensitiveTerms: [] }, platform: "test" };
+			const c: ToolContext = { env, caller, account: { caller, rules: [], profiles: [who], known: ["work"] }, platform: "test" };
 			type Item = { item_id: number; kind: string; subjects: string[]; allowed_ops: string[]; context: { edges: { id: number }[] } };
 			const lease = await call<{ lease_id: string; items: Item[] }>(c, "maintenance_next", { profile: "work" });
 			expect(lease.items.map((i) => [i.kind, i.allowed_ops, i.context.edges.map((e) => e.id)])).toEqual([
@@ -2287,7 +2304,7 @@ describe("Weekly strategic review", () => {
 	it("an empty board gets one truthful weekly item per slot; a review in the last seven days skips the next slot; me gets none and refuses one; a closing generation writes nothing", async () => {
 		const r = await registered("work", "me"), { who, stub } = r.of("work"), meStub = r.of("me").stub;
 		const caller: Caller = { userId: r.userId, kind: "device", deviceId: "job-review", scopes: ["ingest", "maintenance"], profiles: ["work", "me"] };
-		const c: ToolContext = { env, caller, account: { caller, rules: [], profiles: [who, r.of("me").who], known: ["work", "me"], sensitiveTerms: [] }, platform: "test" };
+		const c: ToolContext = { env, caller, account: { caller, rules: [], profiles: [who, r.of("me").who], known: ["work", "me"] }, platform: "test" };
 		const weekly = (st = stub) => runInDurableObject(st, (_i, s) => s.storage.sql.exec<{ subjects: string }>("SELECT subjects FROM maintenance WHERE kind = 'weekly_review'").toArray());
 		// A first job call binds each fresh store (its alarm runs nothing before that) and finds nothing queued yet.
 		for (const p of ["work", "me"]) expect(await call<Lease>(c, "maintenance_next", { profile: p })).toMatchObject({ lease_id: null, items: [] });

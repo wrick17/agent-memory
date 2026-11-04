@@ -55,7 +55,7 @@ async function rig() {
 		return { id, request };
 	};
 	const move = async (id: string, from: string, to: string, companyFree = false) =>
-		unwrap(await driveTransfer(transfers, { id: crypto.randomUUID(), nodeId: id, from, to, companyFree, context: null }, caller));
+		unwrap(await driveTransfer(transfers, { id: crypto.randomUUID(), nodeId: id, from, to, companyFree }, caller));
 	return { caller, ref, profile, onAccount, save, move, wipes, ctx };
 }
 
@@ -89,7 +89,8 @@ describe("profile wipe", () => {
 		const r = await rig();
 		const native = await r.save("native", "test", "project", "test-only journal");
 		const moved = await r.save("moved", "test", "project", "body from test");
-		const pref = await r.save("concise answers", "test", "user", "prefers short answers");
+		// Issue #3: the attested preference survives on provenance and attestation even though it names a sensitive term.
+		const pref = await r.save("concise answers", "test", "user", "prefers short answers on Zephyrcorp calls");
 		const rule = await r.save("house rule", "test", "feedback", "always run the checks");
 		await r.move(moved.id, "test", "personal");
 		await r.move(pref.id, "test", "me", true);
@@ -244,8 +245,8 @@ describe("observed count origin wipe",()=>{
 				});
 			}else{
 				const ports:TransferPorts={account:c=>r.onAccount(s=>accountTransfer(s,c)),profile:(ref,c)=>r.profile(ref,s=>transferStep(s,env,ref,c))};
-				r.wipes.resumeCountTransfer=(id,terms)=>resumeTransfer(ports,id,terms);
-				const input={id:crypto.randomUUID(),nodeId:person,from:'personal',to:'test',companyFree:false,context:null};
+				r.wipes.resumeCountTransfer=(id)=>resumeTransfer(ports,id);
+				const input={id:crypto.randomUUID(),nodeId:person,from:'personal',to:'test',companyFree:false};
 				const fault:TransferPorts={...ports,profile:async(ref,c)=>{const out=await ports.profile(ref,c);if(c.op===stop)throw new Error('paused count transfer');return out;}};
 				await expect(driveTransfer(fault,input,r.caller)).rejects.toThrow('paused count transfer');
 			}
@@ -334,8 +335,8 @@ describe('null-epoch history origin wipe',()=>{
     const note=await r.save('personal survivor','personal','project','personal payload stays');
     await r.profile(personal,s=>s.sql.exec("INSERT INTO edges(src,rel,dst,dst_profile,basis,reason,recorded_at,actor,seq) VALUES(?,'relates_to',?,'work','judgment','personal opaque backlink',?,'owner',1)",note.id,f.project,new Date().toISOString()));
     const ports:TransferPorts={account:c=>r.onAccount(s=>accountTransfer(s,c)),profile:(ref,c)=>r.profile(ref,s=>transferStep(s,env,ref,c))};
-    r.wipes.resumeCountTransfer=(id,terms)=>resumeTransfer(ports,id,terms);
-    const input={id:crypto.randomUUID(),nodeId:person,from:'test',to:'personal',companyFree:false,context:null};
+    r.wipes.resumeCountTransfer=(id)=>resumeTransfer(ports,id);
+    const input={id:crypto.randomUUID(),nodeId:person,from:'test',to:'personal',companyFree:false};
     if(stop==='complete'){
      unwrap(await driveTransfer(ports,input,r.caller));
      if(archived)await r.profile(personal,s=>s.transactionSync(()=>{

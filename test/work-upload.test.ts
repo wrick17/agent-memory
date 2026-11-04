@@ -482,14 +482,16 @@ describe("work uploads", () => {
 		});
 	});
 
-	it("registers work terms before publication and gives an ingest token no generic MCP write grant", async () => {
+	it("registers work terms in the account only before publication and gives an ingest token no generic MCP write grant", async () => {
 		const c = await contextFor(), label = `wu-${crypto.randomUUID().slice(0, 8)}`;
 		const { token } = await deviceToken(label, ["ingest"], ["work"]);
 		const result = await post(token, { profile: "work", repo: { remote: `https://github.com/${label}/demo.git` }, commits: [{ sha: hex("work"), at: ago(1), title: "work", author: label }] });
 		expect(result.data.commits![0]!.status).toBe("stored");
 		const me = c.account.profiles.find((p) => p.profile === "me")!;
 		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${me.userId}:${me.profile}:${me.generation}`));
-		expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT term FROM guard_terms WHERE term = ?", label).toArray())).toEqual([{ term: label }]);
+		// Issue #3: the account keeps the term for the wipe report; nothing is written into me.
+		expect(await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(me.userId)), (_i, st) => st.storage.sql.exec("SELECT term FROM sensitive_terms WHERE term = ?", label).toArray())).toEqual([{ term: label }]);
+		expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT term FROM guard_terms WHERE term = ?", label).toArray())).toEqual([]);
 		const rpc = await exports.default.fetch(new Request(`${origin}/mcp`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "save_memory", arguments: { profile: "work", name: "must not save", type: "project", description: "forbidden" } } }) }));
 		expect(await rpc.text()).toContain("Method not found");
 	});
@@ -757,11 +759,12 @@ describe("Jira ticket uploads", () => {
 		const reasons = (k: string) => board.items.find((i) => i.key === k)!.reasons.map((r) => r.text);
 		expect(reasons(k1)).toEqual(expect.arrayContaining(["Priority High (+30).", "Assigned to the owner (+15).", "Has 1 open blocked_by link (-20)."]));
 		expect(reasons(k2)).toEqual(expect.arrayContaining(["Blocks 1 open item (+3.33)."]));
-		// Ticket keys, summaries and Jira handles guard me, as record_knowledge's would.
+		// Ticket keys, summaries and Jira handles register in the account, as record_knowledge's would; me gains no rows (issue #3).
 		const me = w.c.account.profiles.find((r) => r.profile === "me")!;
-		const terms = await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${me.userId}:${me.profile}:${me.generation}`)), (_i, st) =>
-			st.storage.sql.exec("SELECT term FROM guard_terms WHERE term IN (?, ?, ?)", `${P}-1`, "Session store crash", owner).toArray().map((r) => r.term));
-		expect(terms.sort()).toEqual([`${P}-1`, owner, "Session store crash"].sort());
+		const termsIn = (stub: DurableObjectStub, table: string) => runInDurableObject(stub, (_i, st) =>
+			st.storage.sql.exec(`SELECT term FROM ${table} WHERE term IN (?, ?, ?)`, `${P}-1`, "Session store crash", owner).toArray().map((r) => r.term));
+		expect((await termsIn(env.ACCOUNT.get(env.ACCOUNT.idFromName(me.userId)), "sensitive_terms")).sort()).toEqual([`${P}-1`, owner, "Session store crash"].sort());
+		expect(await termsIn(env.PROFILE.get(env.PROFILE.idFromName(`${me.userId}:${me.profile}:${me.generation}`)), "guard_terms")).toEqual([]);
 		// The acknowledged snapshots are not sent again while unchanged.
 		expect(await run()).toEqual({ status: "acknowledged", tickets: 0, incomplete: [], missing: [`${P}-3`], invalid: [] });
 		expect(sent).toHaveLength(1);
@@ -1939,7 +1942,7 @@ describe("daily refresh server", () => {
 		expect(await stubOf(work).upload(work, { repo: ns, commits: [], prs: [prArgs(ns, prWire(7, at(1)), at(10))] }, ctx)).toMatchObject({ ok: true, value: { prs: [{ status: "stored" }] } });
 		const key = variant === "archived project" ? `github:${ns}` : `github:${ns}#7`;
 		const nodeId = await inside(work, (st) => st.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", key).one().id);
-		expect(await driveTransfer(transferPorts(env, userId), { id: crypto.randomUUID(), nodeId, from: "work", to: "personal", companyFree: false, context: null }, fresh.value.caller)).toMatchObject({ ok: true });
+		expect(await driveTransfer(transferPorts(env, userId), { id: crypto.randomUUID(), nodeId, from: "work", to: "personal", companyFree: false }, fresh.value.caller)).toMatchObject({ ok: true });
 		expect(await inside(personal, (st) => st.sql.exec("SELECT source_profile FROM nodes WHERE id = ?", nodeId).one().source_profile)).toBe("work");
 		if (variant !== "live PR with an acknowledged part") {
 			const forgot = await stubOf(personal).write(personal, { op: "owner", args: { action: "forget", memory_id: nodeId, request_id: crypto.randomUUID() } }, { actor: "owner", platform: "test", routedBy: "test", payloadHash: sha256(nodeId), userId });
@@ -2271,13 +2274,14 @@ describe("default refresh scope", () => {
 			await start(account()); await start(profile);
 			const got = await readScope(p.token, p.name);
 			const a = await stop(account()), b = await stop(profile);
+			// Logged before the assertions so a refused write can be attributed: SQL text and row counts only, never bindings.
+			console.log("SCOPE_SQL", JSON.stringify({ stale, account: a, profile: b }));
 			expect(got.status).toBe(200);
 			expect(b.reduce((n, x) => n + x.writes, 0)).toBe(0);
 			expect(a.filter((x) => x.writes).every((x) => /^(UPDATE devices SET last_used_at|INSERT INTO account_meta)/.test(x.q))).toBe(true);
 			if (stale) expect(a.reduce((n, x) => n + x.writes, 0)).toBeGreaterThan(0);
 			else expect(a.reduce((n, x) => n + x.writes, 0)).toBe(0);
 			expect(a.some((x) => /refresh_days|sensitive_terms|request_index/.test(x.q))).toBe(false);
-			console.log("SCOPE_SQL", JSON.stringify({ stale, account: a, profile: b }));
 		}
 		expect(await unchanged()).toEqual(before);
 		expect(await p.inProfile((st) => ["refresh_claims", "refresh_refs", "refresh_parts"].map((t) => st.sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n))).toEqual([0, 0, 0]);

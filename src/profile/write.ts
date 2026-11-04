@@ -799,11 +799,8 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 		let guard: (material: unknown) => void = () => {};
 		if (who.profile === "me") {
 			if (!ctx.meGuard?.explicit) throw Fail.of("validation", "writes to me must name profile: \"me\" explicitly");
-			// Work terms registered before a work write committed here first, so this read inside the transaction cannot miss them.
-			const stored = sql.exec<{ term: string }>("SELECT term FROM guard_terms").toArray().map((r) => r.term);
-			const me = ctx.meGuard;
 			guard = (material) => {
-				const r = meGuard({ ...me, sensitiveTerms: [...me.sensitiveTerms, ...stored], texts: guardTexts(material) });
+				const r = meGuard(guardTexts(material));
 				if (!r.ok) throw new Fail(r.error);
 			};
 			guard(cmd.args);

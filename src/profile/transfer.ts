@@ -28,8 +28,8 @@ export type TransferStep =
 	| { op: "pack"; id: string }
 	| { op: "part"; id: string; n: number }
 	| { op: "sent"; id: string }
-	| { op: "land"; id: string; from: string; nodeId: string; n: number; of: number; payload: string; sha256: string; bundle: string; revision: number; terms: string[]; companyFree?: boolean }
-	| { op: "publish"; id: string; terms: string[] }
+	| { op: "land"; id: string; from: string; nodeId: string; n: number; of: number; payload: string; sha256: string; bundle: string; revision: number; companyFree?: boolean }
+	| { op: "publish"; id: string }
 	| { op: "settle"; id: string }
 	| { op: "commit"; id: string }
 	| { op: "abort"; id: string; side: "out"; nodeId?: string; peer?: string }
@@ -181,8 +181,8 @@ function ledger(sql: SqlStorage, id: string): (Ledger & { n: number; sha256: str
 		.map((r) => ({ ...(JSON.parse(r.payload) as Ledger), n: r.n, sha256: r.sha256 }));
 }
 
-/** The me guard over every copied field of the landed rows, with this profile's own guard terms read in this transaction. */
-function guardLanded(sql: SqlStorage, nodeId: string, activity: number | undefined, terms: string[]): void {
+/** The me guard (person rule and personal fields) over every copied field of the landed rows. */
+function guardLanded(sql: SqlStorage, nodeId: string, activity: number | undefined): void {
 	const node = nodeRow(sql, nodeId)!;
 	if (node.kind === "person") throw Fail.of("me_sensitive_term", "me holds no person nodes", { term: "person" });
 	const edges = sql.exec<Row>("SELECT * FROM edges WHERE src = ?", nodeId).toArray();
@@ -192,8 +192,7 @@ function guardLanded(sql: SqlStorage, nodeId: string, activity: number | undefin
 		...sql.exec<Row>("SELECT * FROM requests WHERE node_id = ?", nodeId).toArray(),
 		...sql.exec<Row>("SELECT * FROM evidence WHERE owner IN (SELECT value FROM json_each(?))", JSON.stringify([`n:${nodeId}`, ...edges.map((e) => `e:${String(e.id)}`)])).toArray(),
 		...(activity !== undefined ? sql.exec<Row>("SELECT payload FROM archive WHERE activity_id = ?", activity).toArray() : [])];
-	const stored = sql.exec<{ term: string }>("SELECT term FROM guard_terms").toArray().map((r) => r.term);
-	const g = meGuard({ context: null, companyFree: true, texts: bundleTexts(rows), sensitiveTerms: [...terms, ...stored] });
+	const g = meGuard(bundleTexts(rows));
 	if (!g.ok) throw new Fail(g.error);
 }
 
@@ -331,7 +330,7 @@ function land(sql: SqlStorage, who: Who, s: Extract<TransferStep, { op: "land" }
 	const node = nodeRow(sql, s.nodeId);
 	if (node?.status !== "incoming" || Number(node.revision) !== s.revision) throw refuse("bundle_incomplete", "the landed record is missing or not at the bound revision");
 	if (sha256([...parts.map((p) => p.sha256), s.sha256].join("\n")) !== s.bundle) throw refuse("bundle_hash", "the bundle hash does not match its parts");
-	if (who.profile === "me") guardLanded(sql, s.nodeId, activity, s.terms);
+	if (who.profile === "me") guardLanded(sql, s.nodeId, activity);
 	const revision = s.revision + 1;
 	// The transfer's immutable identity, which recovery matches against the source's fence (section 18).
 	tx.run("INSERT INTO revisions (node_id, revision, op, snapshot, actor, at, seq) VALUES (?, ?, 'transferred_in', ?, 'transfer', ?, ?)", s.nodeId, revision,
@@ -574,10 +573,10 @@ function apply(sql: SqlStorage, who: Who, s: TransferStep): TransferOut {
 				return {state:"refused",error:closedTransferCounts(sql,s.id)?{code:"profile_wiped",message:"an aggregate's source origin is being wiped"}:{code:"revision_conflict",message:"the incoming transfer node is missing"}};
 			}
 			if (who.profile === "me") {
-				// The guard runs inside the publishing transaction, so a term registered since landing is seen (section 5). A refusal
+				// The guard runs inside the publishing transaction, over exactly what publishes (section 5). A refusal
 				// un-lands the record, which no later publish or land can undo, and lets the account abort after its commit decision.
 				try {
-					guardLanded(sql, t.node_id, ledger(sql, s.id)[0]?.activity, s.terms);
+					guardLanded(sql, t.node_id, ledger(sql, s.id)[0]?.activity);
 				} catch (e) {
 					if (!(e instanceof Fail)) throw e;
 					const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());

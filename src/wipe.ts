@@ -117,7 +117,7 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 }
 
 export interface WipePorts {
-	resumeCountTransfer?(id:string,terms:string[]):Promise<Outcome<unknown>>;
+	resumeCountTransfer?(id:string):Promise<Outcome<unknown>>;
 	account(cmd: WipeAccountCommand): Promise<Outcome<WipeAccountResult>>;
 	profile(ref: ProfileRef, step: WipeStep): Promise<Outcome<WipeOut>>;
 	/** AccountStore's export replacement. Without it, a wipe finishes only when R2 holds no export at all. */
@@ -127,7 +127,7 @@ export interface WipePorts {
 /** Inside AccountStore: its own wipe commands directly, and the integrator's ProfileStore.purgeOrigin(who, step) by stub. */
 export const wipePorts = (env: Env, storage: DurableObjectStorage): WipePorts => ({
 	account: async (cmd) => wipeAccount(storage, cmd),
-	resumeCountTransfer:(id,terms)=>resumeTransfer(transferPorts(env,storage.sql.exec<{value:string}>("SELECT value FROM account_meta WHERE key='user_id'").one().value),id,terms),
+	resumeCountTransfer:(id)=>resumeTransfer(transferPorts(env,storage.sql.exec<{value:string}>("SELECT value FROM account_meta WHERE key='user_id'").one().value),id),
 	profile: (ref, step) => (env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
 		{ purgeOrigin(who: ProfileRef, step: WipeStep): Promise<Outcome<WipeOut>> }).purgeOrigin(ref, step),
 });
@@ -162,9 +162,9 @@ export async function wipeProfile(env: Env, ports: WipePorts, caller: Caller, pr
 				const p=await page(ref,{op:"count_transfers",profile,after});
 				for(const id of p.ids){
 					if(!ports.resumeCountTransfer)throw Fail.of("moving","finish the transfer carrying this origin's counts before wiping it");
-					const out=await ports.resumeCountTransfer(id,begun.terms!);
+					const out=await ports.resumeCountTransfer(id);
 					// A closed-origin or missing-node refusal may have completed an abort; require its terminal replay before continuing.
-					value(!out.ok && ["profile_wiped","revision_conflict"].includes(out.error.code)?await ports.resumeCountTransfer(id,begun.terms!):out);
+					value(!out.ok && ["profile_wiped","revision_conflict"].includes(out.error.code)?await ports.resumeCountTransfer(id):out);
 				}
 				after=p.after??"";
 			}while(after);

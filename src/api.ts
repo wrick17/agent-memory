@@ -758,7 +758,7 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		if(!parsed.success)return json({error:{code:"validation",message:"invalid archive operation"}},400);
 		const cmd=(archiveOp[3]?{...parsed.data,action:archiveOp[3],operation_id:archiveOp[2]}:parsed.data) as import("./profile/store").ArchiveCommand;
 		const r=await profileStub(env,ref).archiveOperation(ref,cmd,{actor:"owner",platform:"dashboard",routedBy:"explicit",userId:auth.principal.userId,payloadHash:requestHash("archive",cmd),
-			...(ref.profile === "me"?{meGuard:{explicit:true,context:null,companyFree:false,sensitiveTerms:ctx.value.sensitiveTerms}}:{})});
+			...(ref.profile === "me"?{meGuard:{explicit:true}}:{})});
 		return r.ok?json(r.value):json({error:r.error},r.error.code === "not_found"?404:r.error.code === "revision_conflict"||r.error.code === "moving"?409:r.error.code === "size_budget"?413:400);
 	}
 
@@ -773,7 +773,7 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			: { op: "undo", args: { activity_id: Number(undo![2]), request_id: `undo:${undo![2]}` } };
 		const r = await profileStub(env, ref).write(ref, cmd, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: auth.principal.userId,
 			payloadHash: requestHash(cmd.op, cmd.args as unknown as Record<string, unknown>),
-			...(name === "me" ? { meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: ctx.value.sensitiveTerms } } : {}) });
+			...(name === "me" ? { meGuard: { explicit: true } } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, r.error.code === "not_found" ? 404 : r.error.code === "revision_conflict" ? 409 : 400);
 	}
 	// Restore one removal from the archive (section 15): an ordinary owner write with its activity row, undo and replay as
@@ -786,7 +786,7 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		if (!b.success) return json({ error: { code: "validation", message: "send JSON with activity_id, the removal to restore" } }, 400);
 		const args = { activity_id: b.data.activity_id, request_id: `restore:${b.data.activity_id}` };
 		const r = await profileStub(env, ref).write(ref, { op: "restore", args }, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: auth.principal.userId,
-			payloadHash: requestHash("restore", args), ...(ref.profile === "me" ? { meGuard: { explicit: true, context: null, companyFree: false, sensitiveTerms: ctx.value.sensitiveTerms } } : {}) });
+			payloadHash: requestHash("restore", args), ...(ref.profile === "me" ? { meGuard: { explicit: true } } : {}) });
 		if (!r.ok) {
 			const code = r.error.code;
 			return json({ error: r.error }, code === "not_found" ? 404 : code === "revision_conflict" || code === "moving" ? 409 : code === "size_budget" ? 413 : 400);

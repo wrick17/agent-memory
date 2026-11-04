@@ -2,11 +2,13 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { AccountStore } from "../src/account/store";
+import type { AccountStore, Principal } from "../src/account/store";
 import { requestHash, sha256 } from "../src/domain/ids";
 import { redactPayload } from "../src/domain/redact";
-import { accountStub } from "../src/mcp";
-import { call, contextFor, deviceToken, devicePrincipal, OWNER, outcome } from "./helpers";
+import type { Caller, RoutingRule } from "../src/domain/types";
+import { accountStub, type ToolContext } from "../src/mcp";
+import { readSet, routeWrite } from "../src/routing";
+import { call, contextFor, deviceToken, devicePrincipal, OWNER, outcome, registered } from "./helpers";
 
 const workRepo = { remote: "git@github.com:Sequoia-Engineering/web.git" };
 const profileStub = (c: Awaited<ReturnType<typeof contextFor>>, name: string) => {
@@ -82,28 +84,32 @@ describe("G4 isolation", () => {
 		expect(await outcome(ingestOnly, "recall_memories", args)).toMatchObject({ ok: false, error: { code: "forbidden" } });
 	});
 
-	it("guards every write into me", async () => {
+	it("guards every write into me: explicit choice, personal fields and route compatibility", async () => {
 		const c = await contextFor();
 		const base = { name: "Prefers small diffs", type: "user", description: "a preference", content: "Keep changes small." };
-		expect(await outcome(c, "save_memory", { ...base, profile: "me", repo: workRepo, request_id: "g4-me-1" })).toMatchObject({ ok: false, error: { code: "me_requires_company_free" } });
-		expect(await outcome(c, "save_memory", { ...base, content: "Learned at Sequoia-Engineering standups.", profile: "me", company_free: true, repo: workRepo }))
-			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "Sequoia-Engineering" } } });
-		expect(await outcome(c, "save_memory", { ...base, content: "Mail me at a@b.co", profile: "me", company_free: true })).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+		// Issue #3: a work repo context neither refuses nor reroutes an explicit me, with or without company_free.
+		expect(await outcome(c, "save_memory", { ...base, content: "Mail me at a@b.co", profile: "me", repo: workRepo, request_id: "g4-me-1" }))
+			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		// The refused request id was released, so the corrected write may reuse it.
-		const ok = await call(c, "save_memory", { ...base, profile: "me", company_free: true, repo: workRepo, request_id: "g4-me-1" });
-		expect(ok.profile).toBe("me");
-		expect(await outcome(c, "append_memory", { memory_id: ok.memory_id, content: "more", request_id: "g4-me-2" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		const ok = await call(c, "save_memory", { ...base, profile: "me", repo: workRepo, request_id: "g4-me-1" });
+		expect(ok).toMatchObject({ profile: "me", routed_by: "explicit" });
+		const org = await call(c, "save_memory", { ...base, name: "Standup habit", content: "Learned at Sequoia-Engineering standups.", profile: "me", company_free: true, repo: workRepo });
+		expect(org.profile).toBe("me");
+		// The record's own id selects me; repo context does not change it.
+		expect(await call(c, "append_memory", { memory_id: ok.memory_id, content: "more", request_id: "g4-me-2", repo: workRepo })).toMatchObject({ profile: "me", routed_by: "memory_id" });
+		expect(await outcome(c, "append_memory", { memory_id: ok.memory_id, content: "call +1 415 555 0100", request_id: "g4-me-3" }))
+			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		expect(await outcome(c, "save_memory", { ...base, name: "Unrouted" })).toMatchObject({ ok: false, error: { code: "route_required" } });
 		const path = await call(c, "save_memory", { ...base, name: "Path routed", repo: { path: "/Users/test/work/api" } });
 		expect(path.profile).toBe("work");
 	});
 	it("never lets a pending request binding skip the me guard (crash after binding, or overlapping identical calls)", async () => {
 		const c = await contextFor();
-		const unsafe = { name: "Guard bypass probe", type: "user", description: "a preference", content: "Sequoia-Engineering private roadmap", profile: "me", repo: workRepo };
+		const unsafe = { name: "Guard bypass probe", type: "user", description: "a preference", content: "private roadmap: mail owner@example.com", profile: "me", repo: workRepo };
 		// Durable state when the Worker binds the request and dies before the guard runs.
 		const crashed = { ...unsafe, request_id: "f1-crash-after-bind" };
 		await accountStub(env, OWNER).bindRequest({ requestId: crashed.request_id, profile: "me", op: "save_memory", payloadHash: requestHash("save_memory", redactPayload(crashed)) });
-		expect(await outcome(c, "save_memory", crashed)).toMatchObject({ ok: false, error: { code: "me_requires_company_free" } });
+		expect(await outcome(c, "save_memory", crashed)).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		const overlapping = { ...unsafe, name: "Guard bypass probe 2", request_id: "f1-overlap" };
 		const both = await Promise.all([outcome(c, "save_memory", overlapping), outcome(c, "save_memory", overlapping)]);
 		expect(both.every((r) => !r.ok)).toBe(true);
@@ -111,14 +117,117 @@ describe("G4 isolation", () => {
 		expect(leaked.results).toHaveLength(0);
 	});
 
-	it("still replays a committed me write after the guard would refuse it", async () => {
+	it("replays a committed me write, and a later sensitive term never refuses a fresh one", async () => {
 		const c = await contextFor();
 		const args = { name: "Committed me replay", type: "user", description: "a preference", content: "Prefers rebase over merge.", profile: "me", company_free: true, request_id: "f1-committed" };
 		const first = await call(c, "save_memory", args);
 		await accountStub(env, OWNER).admin({ op: "addSensitiveTerm", term: "rebase" });
 		const later = await contextFor();
 		expect(await call(later, "save_memory", args)).toMatchObject({ action: "replayed", memory_id: first.memory_id, profile: "me" });
-		expect(await outcome(later, "save_memory", { ...args, name: "Fresh me write", request_id: "f1-fresh" })).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "rebase" } } });
+		expect(await call(later, "save_memory", { ...args, name: "Fresh me write", request_id: "f1-fresh" })).toMatchObject({ action: "created", profile: "me" });
+		expect(await outcome(later, "save_memory", { ...args, content: "Changed payload.", request_id: "f1-committed" })).toMatchObject({ ok: false, error: { code: "idempotency_mismatch" } });
+	});
+});
+
+describe("issue #3: the calling agent selects the profile", () => {
+	/** A distinct owner account, so these me records never join another test's read set (the transfer and wipe suites' fresh-context pattern). */
+	async function isolated() {
+		const userId = `issue3-${crypto.randomUUID().slice(0, 8)}`, account = accountStub(env, userId);
+		const ctx = async (principal: Principal = { kind: "owner", userId }): Promise<ToolContext> => {
+			const a = await account.context(principal);
+			if (!a.ok) throw new Error(`context failed: ${a.error.message}`);
+			return { env: { ...env, OWNER_USER_ID: userId } as Env, caller: a.value.caller, account: a.value, platform: "test" };
+		};
+		const owner = await ctx();
+		const device = async (name: string, scopes: string[], profiles: string[], defaultProfile?: string) => {
+			const r = await account.admin({ op: "createDevice", name, scopes: scopes as never, profiles, ...(defaultProfile ? { defaultProfile } : {}) });
+			if (!r.ok) throw new Error(r.error.message);
+			return ctx(devicePrincipal((r.value as { token: string }).token));
+		};
+		return { account, owner, device };
+	}
+	const known = ["me", "work", "personal", "test"];
+	const owner: Caller = { kind: "owner", userId: "u", scopes: ["read", "write"], profiles: "*" };
+	const rules: RoutingRule[] = [
+		{ id: "r1", priority: 10, match: "remote", pattern: "github.com/sequoia-engineering/*", profile: "work", enabled: true },
+		{ id: "r2", priority: 20, match: "path", pattern: "/Users/test/work", profile: "work", enabled: true },
+	];
+
+	it("saves both original examples under the explicit me target with the matching sensitive terms registered", async () => {
+		const { account, owner: c, device: deviceFor } = await isolated();
+		for (const term of ["Pratyush Poddar", "GitHub"]) expect((await account.admin({ op: "addSensitiveTerm", term })).ok).toBe(true);
+		const device = await deviceFor("issue3-work-default", ["read", "write"], ["work", "me"], "work");
+		const identity = await call(device, "save_memory", { name: "Owner identity and household", type: "user", description: "identity summary",
+			content: "The owner is Pratyush Poddar; household summary for personal planning.", profile: "me", company_free: true, repo: workRepo, request_id: "issue3-identity" });
+		const release = await call(c, "save_memory", { name: "T3 Code release history", type: "reference", description: "personal release history",
+			content: "Personal T3 Code release history: https://github.com/pingdotgg/t3code/releases/tag/v0.0.20 on GitHub.", profile: "me", company_free: true, repo: workRepo, request_id: "issue3-release" });
+		expect(identity).toMatchObject({ action: "created", profile: "me", routed_by: "explicit" });
+		expect(release).toMatchObject({ action: "created", profile: "me", routed_by: "explicit" });
+		const back = await call<{ content: string }>(c, "get_memory", { memory_id: release.memory_id });
+		expect(back.content).toContain("https://github.com/pingdotgg/t3code/releases/tag/v0.0.20");
+		// A retry of the same call replays the stored result.
+		expect(await call(device, "save_memory", { name: "Owner identity and household", type: "user", description: "identity summary",
+			content: "The owner is Pratyush Poddar; household summary for personal planning.", profile: "me", company_free: true, repo: workRepo, request_id: "issue3-identity" }))
+			.toMatchObject({ action: "replayed", memory_id: identity.memory_id });
+	});
+
+	it("keeps an explicit profile over repo, path and device context, and refuses only real authorization, activity and data failures", async () => {
+		const { owner: c, device: deviceFor } = await isolated();
+		const device = await deviceFor("issue3-precedence", ["read", "write"], ["work", "personal"], "work");
+		const base = { type: "reference", description: "precedence", content: "issue3 precedence note" };
+		expect(await call(device, "save_memory", { ...base, name: "issue3 personal over work repo", profile: "personal", repo: workRepo })).toMatchObject({ profile: "personal", routed_by: "explicit" });
+		expect(await call(device, "save_memory", { ...base, name: "issue3 personal over work path", profile: "personal", repo: { path: "/Users/test/work/api" } })).toMatchObject({ profile: "personal", routed_by: "explicit" });
+		expect(await call(device, "save_memory", { ...base, name: "issue3 device default" })).toMatchObject({ profile: "work", routed_by: expect.stringMatching(/^device:/) });
+		// Real refusals stay: a profile the token may not use, an unknown profile, a read-only token, and captures into me.
+		expect(await outcome(device, "save_memory", { ...base, name: "issue3 me forbidden", profile: "me" })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+		expect(await outcome(device, "save_memory", { ...base, name: "issue3 unknown", profile: "nosuch" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		expect(await outcome(await deviceFor("issue3-reader", ["read"], ["personal"], "personal"), "save_memory", { ...base, name: "issue3 read only", profile: "personal" })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+		expect(await outcome(c, "capture_memory", { content: "issue3 capture", profile: "me" })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+		const saved = await call(c, "save_memory", { ...base, name: "issue3 revision", profile: "me" });
+		expect(await call(c, "save_memory", { memory_id: saved.memory_id, content: "issue3 revision 2", expected_revision: saved.revision })).toMatchObject({ profile: "me", action: "updated" });
+		expect(await outcome(c, "save_memory", { memory_id: saved.memory_id, content: "issue3 stale", expected_revision: saved.revision })).toMatchObject({ ok: false, error: { code: "revision_conflict" } });
+		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "person", name: "Issue3 Colleague" }], profile: "me" })).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "person" } } });
+		expect(await call(c, "record_knowledge", { nodes: [{ kind: "project", name: "Issue3 GitHub hobby" }], profile: "me", repo: workRepo })).toMatchObject({ profile: "me" });
+	});
+
+	it("moves a record into me without company_free from a work context", async () => {
+		const { account, owner: c } = await isolated();
+		await account.admin({ op: "addSensitiveTerm", term: "Issue3Movable" });
+		const src = await call(c, "save_memory", { name: "issue3 movable", type: "user", description: "to move", content: "Issue3Movable preference.", profile: "personal" });
+		expect(await call(c, "save_memory", { memory_id: src.memory_id, profile: "me", repo: workRepo, request_id: "issue3-move" }))
+			.toMatchObject({ action: "transfer_started", profile: "me", state: "committed" });
+		expect(await call(c, "get_memory", { memory_id: src.memory_id })).toMatchObject({ memory_id: src.memory_id, profile: "me" });
+		expect(await call(c, "save_memory", { memory_id: src.memory_id, profile: "me", repo: workRepo, request_id: "issue3-move" })).toMatchObject({ action: "transfer_started", state: "committed" });
+	});
+
+	it("registers rule, owner and work terms in the account while me is inactive, writing nothing into me", async () => {
+		const r = await registered("work", "me");
+		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(r.userId));
+		await r.account((sql) => sql.exec("UPDATE profiles SET status = 'wiping' WHERE name = 'me'"));
+		expect(await account.admin({ op: "setRules", rules: [{ priority: 10, match: "remote", pattern: "github.com/issue3org/*", profile: "work", enabled: true }] })).toMatchObject({ ok: true, value: { rules: 1 } });
+		expect(await account.admin({ op: "addSensitiveTerm", term: "Issue3 Owner Term" })).toMatchObject({ ok: true });
+		expect(await account.admin({ op: "addSensitiveTerms", terms: ["Issue3 Work Person"] })).toMatchObject({ ok: true, value: { terms: 1 } });
+		expect(await r.account((sql) => sql.exec<{ term: string }>("SELECT term FROM sensitive_terms ORDER BY term").toArray().map((x) => x.term))).toEqual(["Issue3 Owner Term", "Issue3 Work Person"]);
+		expect(await runInDurableObject(r.of("me").stub, (_i, st) => st.storage.sql.exec("SELECT name FROM sqlite_master WHERE name = 'guard_terms'").toArray().length
+			? st.storage.sql.exec("SELECT count(*) AS n FROM guard_terms").one().n : 0)).toBe(0);
+	});
+
+	it("keeps v1 routing for omitted profiles and an explicit primary for reads", () => {
+		const device: Caller = { ...owner, kind: "device", deviceId: "d1", defaultProfile: "personal" };
+		expect(routeWrite(owner, rules, known, { profile: "personal", repo: { remote: "git@github.com:Sequoia-Engineering/web.git" } })).toEqual({ ok: true, value: { profile: "personal", routedBy: "explicit" } });
+		expect(routeWrite(owner, rules, known, { repo: { remote: "git@github.com:Sequoia-Engineering/web.git" } })).toMatchObject({ ok: true, value: { profile: "work", routedBy: "rule:github.com/sequoia-engineering/*" } });
+		expect(routeWrite(owner, rules, known, { repo: { path: "/Users/test/work/api" } })).toMatchObject({ ok: true, value: { profile: "work" } });
+		expect(routeWrite(device, rules, known, {})).toMatchObject({ ok: true, value: { profile: "personal", routedBy: "device:d1" } });
+		expect(routeWrite({ ...device, defaultProfile: "me" }, rules, known, {})).toMatchObject({ ok: false, error: { code: "route_required" } });
+		expect(routeWrite(owner, rules, known, {})).toMatchObject({ ok: false, error: { code: "route_required" } });
+		// Inactive or unknown explicit targets and forbidden ones are refused; an inactive routed target is profile_wiped.
+		expect(routeWrite(owner, rules, ["me", "personal"], { profile: "work" })).toMatchObject({ ok: false, error: { code: "validation" } });
+		expect(routeWrite(owner, rules, ["me", "personal"], { repo: { path: "/Users/test/work" } })).toMatchObject({ ok: false, error: { code: "profile_wiped" } });
+		expect(routeWrite({ ...owner, profiles: ["personal"] }, rules, known, { profile: "me" })).toMatchObject({ ok: false, error: { code: "forbidden" } });
+		expect(readSet(owner, rules, known, { profile: "personal", repo: { path: "/Users/test/work" } })).toEqual({ ok: true, value: { primary: "personal", withMe: true, routedBy: "explicit" } });
+		expect(readSet(owner, rules, known, { profile: "me", repo: { path: "/Users/test/work" } })).toEqual({ ok: true, value: { primary: "me", withMe: false, routedBy: "explicit" } });
+		expect(readSet({ ...owner, profiles: ["personal"] }, rules, known, { profile: "personal" })).toMatchObject({ ok: true, value: { primary: "personal", withMe: false } });
+		expect(readSet(owner, rules, known, {})).toMatchObject({ ok: true, value: { primary: "me", withMe: false, routedBy: "default:me" } });
 	});
 });
 

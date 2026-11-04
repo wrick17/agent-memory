@@ -72,23 +72,21 @@ export function refreshSelectors(rules: RoutingRule[], profile: string): Outcome
 	return unique.length && unique.length <= 64 ? ok(unique) : unsupported();
 }
 
-/** The profile the repo or device default points at, ignoring any explicit profile. Used by the `me` guard. */
-export function contextProfile(caller: Caller, rules: RoutingRule[], repo?: RepoRef): string | null {
-	return matchRule(rules, repo)?.profile ?? caller.defaultProfile ?? null;
-}
-
-export interface Route { profile: string; routedBy: string; context: string | null }
+export interface Route { profile: string; routedBy: string }
 
 /** `known` holds only active profiles; a rule or device default may still name one that is being wiped. */
 const inactive = (profile: string, by: string) => fail("profile_wiped", `profile '${profile}' (${by}) is not active`, { profile });
 
-/** Steps 2 to 5 of section 9; step 1 (a bound request_id) is applied by the Worker through AccountStore. */
+/**
+ * Steps 2 to 5 of section 9; step 1 (a bound request_id) is applied by the Worker through AccountStore. An explicit profile is
+ * the calling agent's choice (issue #3): only its existence, activity and the caller's scope are checked, never repo or device
+ * context. Rules and the device default apply only when profile is omitted, as v1 compatibility, and never pick me.
+ */
 export function routeWrite(caller: Caller, rules: RoutingRule[], known: string[], input: { profile?: string; repo?: RepoRef }): Outcome<Route> {
-	const context = contextProfile(caller, rules, input.repo);
 	if (input.profile !== undefined) {
 		if (!known.includes(input.profile)) return fail("validation", `unknown profile '${input.profile}'`, { known });
 		if (!mayUse(caller, input.profile)) return fail("forbidden", `this caller may not use profile '${input.profile}'`);
-		return ok({ profile: input.profile, routedBy: "explicit", context });
+		return ok({ profile: input.profile, routedBy: "explicit" });
 	}
 	const rule = matchRule(rules, input.repo);
 	const chosen = rule ? { profile: rule.profile, routedBy: `rule:${rule.pattern}` }
@@ -97,10 +95,13 @@ export function routeWrite(caller: Caller, rules: RoutingRule[], known: string[]
 	if (!chosen) return fail("route_required", "no routing rule or device default matched; pass profile explicitly, or repo {remote, path}");
 	if (!mayUse(caller, chosen.profile)) return fail("forbidden", `this caller may not use profile '${chosen.profile}' (${chosen.routedBy})`);
 	if (!known.includes(chosen.profile)) return inactive(chosen.profile, chosen.routedBy);
-	return ok({ ...chosen, context });
+	return ok(chosen);
 }
 
-/** Reads use the same order to pick the primary profile; with no match they read `me` only. */
+/**
+ * Reads use the same order to pick the primary profile; with no match they read `me` only. An explicit profile is always the
+ * primary. The `me` overlay is additive read compatibility for callers that may read `me`; it never replaces the primary.
+ */
 export function readSet(caller: Caller, rules: RoutingRule[], known: string[], input: { profile?: string; repo?: RepoRef }): Outcome<ReadSet & { routedBy: string }> {
 	const withMe = (primary: string) => primary !== "me" && mayUse(caller, "me") && known.includes("me");
 	if (input.profile !== undefined) {

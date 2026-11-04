@@ -22,7 +22,7 @@ export type Principal = { kind: "owner"; userId: string; device?: string } | { k
 
 export interface TransferRequest { input: TransferInput; result?: Record<string, unknown> }
 
-export interface AccountContext { caller: Caller; rules: RoutingRule[]; profiles: ProfileRef[]; known: string[]; sensitiveTerms: string[] }
+export interface AccountContext { caller: Caller; rules: RoutingRule[]; profiles: ProfileRef[]; known: string[] }
 
 export interface RefreshScope {
 	version: 1; origin: string; profile: string; generation: string; device_id: string;
@@ -317,8 +317,7 @@ export class AccountStore extends DurableObject<Env> {
 		const rules = this.routingRules();
 		const profiles = this.sql.exec<{ name: string; generation: string }>("SELECT name, generation FROM profiles WHERE status = 'active' ORDER BY name").toArray()
 			.map((r) => ({ userId, profile: r.name, generation: r.generation }));
-		const terms = this.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((r) => r.term);
-		return ok({ caller: caller.value, rules, profiles, known: profiles.map((x) => x.profile), sensitiveTerms: [...new Set([...orgTerms(rules), ...terms])] });
+		return ok({ caller: caller.value, rules, profiles, known: profiles.map((x) => x.profile) });
 	}
 
 	/** Authenticated selected projection, with no await between device validation and the policy snapshot. */
@@ -549,24 +548,6 @@ export class AccountStore extends DurableObject<Env> {
 		return ok(ids.map((id) => absent.has(id)));
 	}
 
-	/** Owner-only administration, reached only through the dashboard API. */
-	/**
-	 * Copies terms into the me profile's guard table, which the me write transaction reads. A registration is confirmed only
-	 * after this commits, so a work write dispatched after it can never be followed by a me write that misses its terms.
-	 */
-	private async guardMe(terms: string[], source: string): Promise<Outcome<unknown>> {
-		const userId = this.meta("user_id");
-		const me = this.sql.exec<{ generation: string }>("SELECT generation FROM profiles WHERE name = 'me' AND status = 'active'").toArray()[0];
-		if (!userId || !me) return fail("unavailable", "the me profile is not active");
-		const ref = { userId, profile: "me", generation: me.generation };
-		const stub = this.env.PROFILE.get(this.env.PROFILE.idFromName(`${userId}:me:${me.generation}`)) as unknown as { addGuardTerms(who: typeof ref, terms: string[], source: string): Promise<Outcome<number>> };
-		try {
-			return await stub.addGuardTerms(ref, terms, source);
-		} catch (e) {
-			return fail("unavailable", `the me guard could not be updated: ${(e as Error).message}`);
-		}
-	}
-
 	/** The account's part of a transfer between profiles (section 9). */
 	async transfer(cmd: TransferCommand): Promise<Outcome<AccountTransfer>> {
 		if (this.meta("recovery_state")) return fail("busy", "account is closed for recovery");
@@ -584,13 +565,11 @@ export class AccountStore extends DurableObject<Env> {
 		const ports = { ...transferPorts(this.env, this.meta("user_id")!), account: (cmd: TransferCommand) => this.transfer(cmd) };
 		try {
 			if (this.meta("recovery_state")) return;
-			const ctx = await this.context({ kind: "owner", userId: this.meta("user_id")! });
-			if (!ctx.ok) return;
 			const due = this.sql.exec<{ id: string }>("SELECT id FROM transfers WHERE retry_at <= ? ORDER BY retry_at, id LIMIT 10", Date.now()).toArray();
 			for (const { id } of due) {
 				// Persist the retry before transport; an interrupted cleanup retains the same accepted intent.
 				this.write((seq) => this.sql.exec("UPDATE transfers SET retry_at = ?, seq = ? WHERE id = ? AND retry_at IS NOT NULL", Date.now() + 60_000, seq, id));
-				await resumeTransfer(ports, id, ctx.value.sensitiveTerms).catch(() => null);
+				await resumeTransfer(ports, id).catch(() => null);
 			}
 		} finally {
 			const at = this.sql.exec<{ at: number | null }>("SELECT min(retry_at) at FROM transfers").one().at;
@@ -1425,7 +1404,7 @@ export class AccountStore extends DurableObject<Env> {
 			const copies = [];
 			for (const profile of c.profiles) {
 				const generation = this.settleGeneration(r, profile) ?? null, ref = { userId, profile, generation: generation ?? "" };
-				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, c.node, this.termsFor(profile)) : ok(null);
+				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, c.node) : ok(null);
 				if (!copy.ok) return copy;
 				// Keepable: published, and for a moved copy, restorable whole from its archive under the current guard.
 				copies.push({ profile, generation, copy: copy.value, keepable: !!copy.value && copy.value.status !== "incoming" && (copy.value.status !== "moved" || copy.value.restorable?.ok === true) });
@@ -1558,7 +1537,7 @@ export class AccountStore extends DurableObject<Env> {
 			const now: Record<string, { generation: string | null; copy: RecoveryCopy | null }> = {};
 			for (const profile of c.profiles) {
 				const generation = this.settleGeneration(r, profile) ?? null, ref = { userId, profile, generation: generation ?? "" };
-				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, cmd.node, this.termsFor(profile)) : ok(null);
+				const copy = generation ? await this.profileAt(ref).recoveryCopy(ref, cmd.node) : ok(null);
 				if (!copy.ok) return copy;
 				now[profile] = { generation, copy: copy.value };
 				const e = cmd.expect.find((x) => x.profile === profile);
@@ -1665,10 +1644,6 @@ export class AccountStore extends DurableObject<Env> {
 	private planned(r: Recovery | AccountRecovery, transfer: string, profile?: string): boolean {
 		return this.meta(profile === undefined ? `restore:${r.id}:xfer:${transfer}` : `restore:${r.id}:local:${profile}:${transfer}`) !== undefined;
 	}
-	/** The account's current sensitive terms, for a record restored into me (section 5); none elsewhere. */
-	private termsFor(profile: string): string[] {
-		return profile === "me" ? this.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((t) => t.term) : [];
-	}
 
 	/** Inside a write: records findings; a copy conflict also gets, or reopens, its durable record for the owner's choice. */
 	private flagFound(r: Recovery | AccountRecovery, found: Finding[]): void {
@@ -1731,14 +1706,14 @@ export class AccountStore extends DurableObject<Env> {
 		return this.execStep(r, userId, step);
 	}
 
-	/** Runs one step now: the account's write, or the profile action in bounded steps with the current terms for me. */
+	/** Runs one step now: the account's write, or the profile action in bounded steps. */
 	private async execStep(r: Recovery | AccountRecovery, userId: string, step: RecoveryStep): Promise<Outcome<boolean>> {
 		if (step.profile === null) return this.applyOwner(r, userId, step);
 		const generation = this.settleGeneration(r, step.profile);
 		if (!generation) return fail("validation", `profile '${step.profile}' is not active`, { reason: "profile_closed" });
 		const ref = { userId, profile: step.profile, generation };
 		const x = await this.profileAt(ref).settleTransfer(ref, r.id, { action: step.action, id: step.id, nodeId: step.nodeId, peer: step.peer,
-			...(step.identity ? { identity: step.identity } : {}), ...(step.flag ? { flag: step.flag } : {}), ...(step.action === "undo_move" ? { terms: this.termsFor(step.profile) } : {}) });
+			...(step.identity ? { identity: step.identity } : {}), ...(step.flag ? { flag: step.flag } : {}) });
 		return x.ok ? ok(x.value.done) : x;
 	}
 
@@ -1748,7 +1723,7 @@ export class AccountStore extends DurableObject<Env> {
 		const generation = this.settleGeneration(r, step.profile);
 		if (!generation) return fail("validation", `profile '${step.profile}' is not active`, { reason: "profile_closed" });
 		const ref = { userId, profile: step.profile, generation };
-		return this.profileAt(ref).undoPreflight(ref, { id: step.id, nodeId: step.nodeId, terms: this.termsFor(step.profile) });
+		return this.profileAt(ref).undoPreflight(ref, { id: step.id, nodeId: step.nodeId });
 	}
 
 	/**
@@ -2234,16 +2209,13 @@ export class AccountStore extends DurableObject<Env> {
 					cmd.rules.forEach((r, i) => this.sql.exec("INSERT INTO routing_rules (id, priority, match, pattern, profile, enabled, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
 						`r${i + 1}`, r.priority, r.match, r.pattern, r.profile, r.enabled ? 1 : 0, seq));
 				});
-				const org = orgTerms(cmd.rules.map((r, i) => ({ ...r, id: `r${i + 1}` })));
-				const guarded = org.length ? await this.guardMe(org, "rules") : ok(null);
-				return guarded.ok ? ok({ rules: cmd.rules.length }) : guarded;
+				return ok({ rules: cmd.rules.length });
 			}
 			case "addSensitiveTerm": {
 				const term = cmd.term.trim();
 				if (term.length < 2 || term.length > 200) return fail("validation", "a sensitive term is 2 to 200 characters");
 				this.write((seq) => this.sql.exec("INSERT OR REPLACE INTO sensitive_terms (term, source, updated_at, seq) VALUES (?, 'owner', ?, ?)", term, now(), seq));
-				const guarded = await this.guardMe([term], "owner");
-				return guarded.ok ? ok({ term }) : guarded;
+				return ok({ term });
 			}
 			case "addSensitiveTerms": {
 				// Terms from work record_knowledge writes, in one transaction; existing terms are left as they are.
@@ -2253,8 +2225,7 @@ export class AccountStore extends DurableObject<Env> {
 				// began after the caller's context was read stops the registration.
 				if (cmd.generation && (this.meta("recovery_state") || !this.sql.exec("SELECT 1 FROM profiles WHERE name = ? AND generation = ? AND status = 'active'", cmd.profile ?? null, cmd.generation).toArray().length)) return fail("busy", "upload generation is closed or recovering");
 				this.write((seq) => { for (const t of terms) this.sql.exec("INSERT OR IGNORE INTO sensitive_terms (term, source, updated_at, seq) VALUES (?, 'work', ?, ?)", t, now(), seq); });
-				const guarded = await this.guardMe(terms, "work");
-				return guarded.ok ? ok({ terms: terms.length }) : guarded;
+				return ok({ terms: terms.length });
 			}
 		}
 	}
@@ -2272,8 +2243,3 @@ export function parseRoutingDefaults(spec: string): Omit<RoutingRule, "id">[] {
 	});
 }
 
-/** Org names from the remote rules that point at `work` (for example `your-org`), as `me` guard terms. */
-function orgTerms(rules: RoutingRule[]): string[] {
-	return rules.filter((r) => r.profile === "work" && r.match === "remote")
-		.map((r) => r.pattern.split("/")[1] ?? "").filter((org) => org && !org.includes("*"));
-}

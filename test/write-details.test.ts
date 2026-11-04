@@ -13,6 +13,9 @@ import { purgeOrigin } from "../src/profile/wipe";
 import { runWrite } from "../src/profile/write";
 import { call, contextFor, devicePrincipal, deviceToken, journal, OWNER, outcome, registered } from "./helpers";
 
+/** The account's registered terms, which feed only the wipe's owner report (issue #3). */
+const accountTerms = () => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, st) => st.storage.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms").toArray().map((r) => r.term));
+
 const note = { type: "reference", description: "a note", content: "first body", profile: "personal" };
 
 describe("save and update", () => {
@@ -139,7 +142,7 @@ describe("record_knowledge", () => {
 		const first = await call<{ nodes: { id: string; action: string }[]; edges: { id: number; action: string }[] }>(c, "record_knowledge", args);
 		expect(first.nodes.map((n) => n.action)).toEqual(["created", "created"]);
 		expect(first.edges[0]!.action).toBe("created");
-		expect((await contextFor()).account.sensitiveTerms).toEqual(expect.arrayContaining(["ZEP-7 refresh loop", "ZEP-7", "Zephyr Billing"]));
+		expect(await accountTerms()).toEqual(expect.arrayContaining(["ZEP-7 refresh loop", "ZEP-7", "Zephyr Billing"]));
 		expect(await call(c, "record_knowledge", args)).toMatchObject({ action: "replayed" });
 		const again = await call<{ nodes: { id: string; action: string }[]; edges: { action: string }[] }>(c, "record_knowledge", { ...args, request_id: "rk-2" });
 		expect(again.nodes.map((n) => n.action)).toEqual(["matched", "matched"]);
@@ -154,8 +157,9 @@ describe("record_knowledge", () => {
 			expect(s.storage.sql.exec("SELECT kind, ref FROM evidence WHERE owner = ?", `e:${first.edges[0]!.id}`).toArray()).toEqual([{ kind: "ticket", ref: "jira:ZEP-7" }]);
 		});
 		const fresh = await contextFor();
-		expect(await outcome(fresh, "save_memory", { name: "Billing habit", type: "user", description: "a preference", content: "Prefers Zephyr Billing dashboards.", profile: "me", company_free: true }))
-			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "Zephyr Billing" } } });
+		// Issue #3: the registered names never refuse an explicit me write.
+		expect(await call(fresh, "save_memory", { name: "Billing habit", type: "user", description: "a preference", content: "Prefers Zephyr Billing dashboards.", profile: "me" }))
+			.toMatchObject({ action: "created", profile: "me" });
 	});
 
 	it("refuses an edge without a reason or evidence, a decision without why, and person nodes in me", async () => {
@@ -166,7 +170,7 @@ describe("record_knowledge", () => {
 		expect(await outcome(c, "record_knowledge", { nodes, edges: [{ from: { ref: 0 }, rel: "depends_on", to: { ref: 1 }, reason: "Alpha imports Beta at build time.", evidence: [] }], profile: "personal" }))
 			.toMatchObject({ ok: false, error: { code: "validation" } });
 		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "decision", name: "Use pnpm" }], profile: "personal" })).toMatchObject({ ok: false, error: { details: { reason: "missing_why" } } });
-		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "person", name: "A. Colleague" }], profile: "me", company_free: true })).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+		expect(await outcome(c, "record_knowledge", { nodes: [{ kind: "person", name: "A. Colleague" }], profile: "me", company_free: true })).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "person" } } });
 	});
 
 	// Review F3-F7 and F9 (docs/review-sol-phase2a-hosted-2026-10-28.md), each from the reviewer's failing example.
@@ -186,17 +190,16 @@ describe("record_knowledge", () => {
 		expect(stored.map((x) => JSON.parse(String(x.attrs)))).toEqual([{ github: "contact-gh", role: "reviewer" }, { tier: "gold" }]);
 	});
 
-	it("F4: registers a work person's handle as a me term before the write succeeds", async () => {
+	it("F4: registers a work person's handle in the account before the write succeeds, and never refuses a me write with it", async () => {
 		const c = await contextFor();
 		await call(c, "record_knowledge", { profile: "work", nodes: [{ kind: "person", key: "person:colleague", name: "Colleague Name", attrs: { github: "privatecolleague42" } }] });
-		const fresh = await contextFor();
-		expect(fresh.account.sensitiveTerms).toEqual(expect.arrayContaining(["Colleague Name", "privatecolleague42", "colleague"]));
-		expect(await outcome(fresh, "save_memory", { profile: "me", company_free: true, name: "handle preference", type: "user", description: "Ask privatecolleague42 for reviews" }))
-			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "privatecolleague42" } } });
+		expect(await accountTerms()).toEqual(expect.arrayContaining(["Colleague Name", "privatecolleague42", "colleague"]));
+		expect(await call(await contextFor(), "save_memory", { profile: "me", name: "handle preference", type: "user", description: "Ask privatecolleague42 for reviews" }))
+			.toMatchObject({ action: "created", profile: "me" });
 	});
 
 	// Closure review (docs/review-sol-phase2a-hosted-fixes-2026-10-29.md): F4 with a me call already in flight, and F3 hashing.
-	it("F4: a me write already in flight cannot miss a work handle registered before the work write", async () => {
+	it("F4: a me write already in flight is neither refused nor rerouted by a work handle registered meanwhile", async () => {
 		const [reader, writer] = await Promise.all([contextFor(), contextFor()]);
 		let release!: () => void, entered!: () => void;
 		const paused = new Promise<void>((r) => (release = r)), started = new Promise<void>((r) => (entered = r));
@@ -213,8 +216,8 @@ describe("record_knowledge", () => {
 			{ profile: "me", company_free: true, request_id: "race-me", name: "Concurrent handle preference", type: "user", description: "Ask racingcolleague42 for reviews" });
 		await started;
 		try { await call(writer, "record_knowledge", { profile: "work", nodes: [{ kind: "person", key: "person:race", name: "Race Colleague", attrs: { github: "racingcolleague42" } }] }); } finally { release(); }
-		expect(await inFlight).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "racingcolleague42" } } });
-		expect(await rows("me", "SELECT id FROM nodes WHERE name = 'Concurrent handle preference'")).toEqual([]);
+		expect(await inFlight).toMatchObject({ ok: true, value: { action: "created", profile: "me" } });
+		expect(await rows("me", "SELECT id FROM nodes WHERE name = 'Concurrent handle preference'")).toHaveLength(1);
 	});
 
 	it("F3: a retry whose only change is a discarded contact value replays the same request", async () => {
@@ -386,7 +389,7 @@ describe("transfer and wipe wiring with undo, graph, maintenance and purge clean
 			const part = await from.stub.transfer(from.who, { op: "part", id, n });
 			if (!part.ok) throw new Error(part.error.message);
 			expect((await to.stub.transfer(to.who, { op: "land", id, from: from.who.profile, nodeId, n, of: pack.value.parts!, payload: part.value.payload!, sha256: part.value.sha256!,
-				bundle: pack.value.sha256!, revision: pack.value.revision!, terms: [], companyFree: true })).ok).toBe(true);
+				bundle: pack.value.sha256!, revision: pack.value.revision!, companyFree: true })).ok).toBe(true);
 		}
 		return id;
 	};
@@ -450,14 +453,14 @@ describe("transfer and wipe wiring with undo, graph, maintenance and purge clean
 		const a = await saved(src, "Landing source"), b = await saved(src, "Published neighbour");
 		expect((await src.stub.write(src.who, { op: "knowledge", args: { edges: [{ from: { id: a }, to: { id: b }, rel: "relates_to", reason: "unpublished source edge payload",
 			evidence: [{ kind: "url", ref: "https://example.invalid/unpublished-source-evidence" }] }] } }, ctxOf(r.userId))).ok).toBe(true);
-		expect((await me.stub.transfer(me.who, { op: "publish", id: await land(src, me, b), terms: [] })).ok).toBe(true);
+		expect((await me.stub.transfer(me.who, { op: "publish", id: await land(src, me, b) })).ok).toBe(true);
 		const moving = await land(src, me, a);
 		await r.account((sql) => sql.exec("INSERT INTO node_index (node_id, profile, seq) VALUES (?, 'me', 1)", b));
 		const caller = { userId: r.userId, kind: "device" as const, profiles: ["me"], scopes: ["read" as const] };
 		const c = { env, caller, account: { caller, profiles: [src.who, me.who], known: ["personal", "me"], rules: [], sensitiveTerms: [] }, platform: "test" } as unknown as ToolContext;
 		const shown = async () => JSON.stringify(await callTool(c, "explore", { node: { id: b }, profile: "me" }));
 		expect(await shown()).not.toMatch(/unpublished source edge payload|unpublished-source-evidence/);
-		expect((await me.stub.transfer(me.who, { op: "publish", id: moving, terms: [] })).ok).toBe(true);
+		expect((await me.stub.transfer(me.who, { op: "publish", id: moving })).ok).toBe(true);
 		expect(await shown()).toMatch(/unpublished source edge payload[\s\S]*unpublished-source-evidence/);
 	});
 
@@ -472,7 +475,7 @@ describe("transfer and wipe wiring with undo, graph, maintenance and purge clean
 			expect(await runInDurableObject(r.of("personal").stub, (_i, s) => s.storage.sql.exec("SELECT (SELECT flagged FROM nodes WHERE id = ?) AS flagged, (SELECT state FROM maintenance) AS state", id).one()))
 				.toEqual({ flagged: null, state: "leased" });
 		});
-		expect((await dst.stub.transfer(dst.who, { op: "publish", id: move, terms: [] })).ok).toBe(true);
+		expect((await dst.stub.transfer(dst.who, { op: "publish", id: move })).ok).toBe(true);
 		expect(await runInDurableObject(r.of("work").stub, (_i, s) => s.storage.sql.exec("SELECT flagged FROM nodes WHERE id = ?", id).one().flagged)).toBeNull();
 	});
 
@@ -691,10 +694,12 @@ describe("save_memory evidence and links", () => {
 		const fresh = await contextFor();
 		const mine = await call<Saved>(fresh, "save_memory", { name: `Me note ${stamp}`, type: "user", description: "d", profile: "me", company_free: true });
 		const peer = await call<{ nodes: { id: string }[] }>(fresh, "record_knowledge", { profile: "me", company_free: true, nodes: [{ kind: "other", other_label: "tool", name: `me tool ${stamp}` }] });
-		expect(await outcome(fresh, "save_memory", { memory_id: mine.memory_id, profile: "me", company_free: true, evidence: [{ kind: "url", ref: "https://example.invalid", note: `from Quillfeather Ledger ${stamp}` }] }))
-			.toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+		// The registered work name no longer refuses evidence in me; a contact field in evidence or a link reason still does.
+		expect(await call(fresh, "save_memory", { memory_id: mine.memory_id, evidence: [{ kind: "url", ref: "https://example.invalid", note: `from Quillfeather Ledger ${stamp}` }] })).toMatchObject({ action: "updated", profile: "me" });
+		expect(await outcome(fresh, "save_memory", { memory_id: mine.memory_id, profile: "me", evidence: [{ kind: "url", ref: "https://example.invalid", note: `mail quill-${stamp}@example.com` }] }))
+			.toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		expect(await outcome(fresh, "save_memory", { memory_id: mine.memory_id, profile: "me", company_free: true,
-			links: [{ rel: "relates_to", to: { id: peer.nodes[0]!.id }, reason: `Seen with Quillfeather Ledger ${stamp}.`, evidence: ev }] })).toMatchObject({ ok: false, error: { code: "me_sensitive_term" } });
+			links: [{ rel: "relates_to", to: { id: peer.nodes[0]!.id }, reason: `Seen with quill-${stamp}@example.com there.`, evidence: ev }] })).toMatchObject({ ok: false, error: { code: "me_sensitive_term", details: { term: "personal_field" } } });
 		expect((await call<Got>(fresh, "get_memory", { memory_id: mine.memory_id })).edges).toEqual([]);
 	});
 
