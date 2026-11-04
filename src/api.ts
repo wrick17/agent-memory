@@ -16,6 +16,7 @@ import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
 import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
+import { deviceV2, ownerV2 } from "./v2-api";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
@@ -64,7 +65,9 @@ const CSP = (env: Env) => {
 
 const rangeId = z.string().max(256);
 const ingestSchema = z.object({
-	session: z.object({ client: z.enum(["claude-code", "codex"]), id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/) }).strict(),
+	// #12: ended and files_changed are optional, so a v1 runner's body is unchanged. Only the count is sent, never a path.
+	session: z.object({ client: z.enum(["claude-code", "codex"]), id: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/),
+		ended: z.boolean().optional(), files_changed: z.number().int().min(0).max(100_000).optional() }).strict(),
 	repo: z.object({ remote: z.string().max(512).optional(), path: z.string().max(1024).optional() }).strict().optional(),
 	profile: z.string().regex(PROFILE_NAME).optional(),
 	digests: z.array(z.object({ range_id: rangeId, capture_status: z.enum(["heuristic", "consolidated"]), part_id: z.string().max(64),
@@ -129,7 +132,8 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile)!;
 	if (work) return workUpload(env, ctx.value, ref, route.value.routedBy, input);
 	const res = path === "/v1/ingest"
-		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [] })
+		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [],
+			...(ctx.value.caller.deviceId ? { device_id: ctx.value.caller.deviceId } : {}) })
 		: await profileStub(env, ref).captureState(ref, input.range_ids);
 	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
 }
@@ -142,7 +146,9 @@ async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, ro
 	const repo = repoNamespace(input.repo?.remote ?? ""), tickets = (input.tickets ?? []).map((t) => ticketArgs(t, input.as_of!));
 	if (!repo && (input.commits?.length || input.prs?.length || input.marker || !tickets.length)) return json({ error: { code: "validation", message: "commits, PRs and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
 	if (tickets.length && ref.profile !== "work") return json({ error: { code: "forbidden", message: "Jira tickets go only to the work profile" } }, 403);
-	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [] }) : ok([]);
+	// #12: the session's device is the authenticated token's, never a body field.
+	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [],
+		...(account.caller.deviceId ? { device_id: account.caller.deviceId } : {}) }) : ok([]);
 	if (!results.ok) return json({ error: results.error }, 400);
 	if (input.marker && results.value.some((r) => r.status !== "stored" && r.status !== "replayed")) return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: [], marker: { status: "refused", reason: "capture_not_held" } });
 	const commits = (input.commits ?? []).map((c) => commitArgs(repo!, c)), prs = (input.prs ?? []).map((p) => prArgs(repo!, p, input.as_of!));
@@ -352,7 +358,7 @@ async function importBatch(request: Request, env: Env): Promise<Response> {
 }
 
 const boardQuery = z.object({ as_of: z.string().max(40).refine((s) => !Number.isNaN(Date.parse(s)), "must be an ISO date").optional(),
-	limit: z.coerce.number().int().min(1).max(200).optional() }).strict();
+	limit: z.coerce.number().int().min(1).max(200).optional(), state: z.enum(["open", "closed", "all"]).optional() }).strict();
 // Owner page reads (section 15). Entity: before pages revision history, content=all with cursor pages the whole content. Journals:
 // after pages the list; id with entries_after pages one journal's entries, at most 25 a page. The rest bound their own windows.
 const asOfParam = boardQuery.shape.as_of;
@@ -370,7 +376,9 @@ const timelineQuery = z.object({ from: z.string().min(1).max(40), to: z.string()
 const activityQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(100).optional(),
 	actor: z.enum(["agent", "owner", "keep", "index", "maintenance", "migration", "transfer"]).optional() }).strict();
 const archiveQuery = z.object({ before: z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(), limit: z.coerce.number().int().min(1).max(50).optional() }).strict();
-const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor"];
+const DASHBOARD_RECALL = ["keyword", "type", "scope", "limit", "cursor", "channels", "count_hits"];
+/** #9: the Memories search picks its recall channels; count_hits false leaves recall counts alone. */
+const recallOptions = z.object({ channels: z.array(z.enum(["lexical", "vector"])).min(1).max(2).optional(), count_hits: z.boolean().optional() }).strict();
 const DASHBOARD_REVIEW = ["action", "status", "limit", "candidate_id", "into", "reason", "request_id"];
 const DASHBOARD_SAVE = ["name", "memory_id", "type", "kind", "description", "content", "scope", "origin", "evidence", "links", "expected_revision", "request_id", "company_free", "new_name"];
 const restoreBody = z.object({ activity_id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict();
@@ -658,8 +666,12 @@ async function refreshPart(env: Env, ctx: AccountContext, text: string, raw: Rec
 	return r.ok ? json({ profile: ref.profile, routed_by: ref.routedBy, ...r.value }) : json({ error: r.error }, refreshCode(r.error.code));
 }
 
-export async function api(request: Request, env: Env): Promise<Response> {
+export async function api(request: Request, env: Env, exec?: ExecutionContext): Promise<Response> {
 	const url = new URL(request.url);
+	const waitUntil = exec ? (p: Promise<unknown>) => exec.waitUntil(p) : undefined;
+	// v2 device-token routes (src/v2-api.ts), before the owner check below; a device token's own /v1/whoami facts answer there.
+	const device = await deviceV2(request, env, url, waitUntil);
+	if (device) return device;
 	if (url.pathname === "/v1/refresh/status" && request.method === "GET") return refreshStatus(request, env);
 	const control = /^\/v1\/refresh\/(claim|plan|finish)$/.exec(url.pathname);
 	if (control && request.method === "POST") return refreshControl(request, env, control[1] as "claim" | "plan" | "finish");
@@ -693,6 +705,9 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	const account = accountStub(env, auth.principal.userId);
 	const ctx = await account.context(auth.principal);
 	if (!ctx.ok) return json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
+	// v2 owner routes (src/v2-api.ts): reached only after the owner check above, so /api/* stays owner-only.
+	const v2 = await ownerV2(request, env, url, ctx.value, account, auth.claims, waitUntil);
+	if (v2) return v2;
 	const run = async (cmd: AccountCommand) => {
 		const r = await account.admin(cmd);
 		return r.ok ? json(r.value, cmd.op === "createDevice" ? 201 : 200) : json({ error: r.error }, r.error.code === "not_found" ? 404 : 400);
@@ -808,8 +823,10 @@ export async function api(request: Request, env: Env): Promise<Response> {
 	if (model && request.method === "GET") {
 		const ref = PROFILE_NAME.test(model[1]!) ? ctx.value.profiles.find((p) => p.profile === model[1]) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${model[1]}' is not active` } }, 404);
-		const limit = url.searchParams.get("limit");
-		const r = await profileStub(env, ref).read(ref, { kind: "owner_model", after: url.searchParams.get("after"), limit: limit === null ? 50 : Number(limit) });
+		const limit = url.searchParams.get("limit"), kinds = url.searchParams.get("kinds");
+		// Lessons (#27): kinds=preference,rule; omitted, preferences only, as About you reads them. The store refuses any other kind.
+		const r = await profileStub(env, ref).read(ref, { kind: "owner_model", after: url.searchParams.get("after"), limit: limit === null ? 50 : Number(limit),
+			...(kinds !== null ? { kinds: kinds.split(",") as ("preference" | "rule")[] } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
 	}
 	// One profile's work board, for the dashboard's work page (sections 13 and 15). It never follows a link into another profile.
@@ -818,8 +835,9 @@ export async function api(request: Request, env: Env): Promise<Response> {
 		const ref = PROFILE_NAME.test(brd[1]!) ? ctx.value.profiles.find((p) => p.profile === brd[1]) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${brd[1]}' is not active` } }, 404);
 		const q = boardQuery.safeParse(Object.fromEntries(url.searchParams));
-		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200" } }, 400);
-		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known });
+		if (!q.success) return json({ error: { code: "validation", message: "as_of must be an ISO date; limit 1 to 200; state open, closed or all" } }, 400);
+		const r = await profileStub(env, ref).read(ref, { kind: "board", asOf: new Date(q.data.as_of ?? Date.now()).toISOString(), limit: q.data.limit ?? 50, known: ctx.value.known,
+			...(q.data.state ? { state: q.data.state } : {}) });
 		return r.ok ? json(r.value) : json({ error: r.error }, 400);
 	}
 	// The dashboard's memory list, search and draft save (section 15): the MCP tools' own dispatch (routing, redaction, request
@@ -839,8 +857,11 @@ export async function api(request: Request, env: Env): Promise<Response> {
 			if (!held.ok) return json({ error: held.error }, held.error.code === "busy" ? 503 : 400);
 			if (!(held.value as string[]).length) return json({ error: { code: "not_found", message: "no record with this id in this profile" } }, 404);
 		}
-		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner" }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
-			{ ...b, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) });
+		const { channels, count_hits, ...args } = b;
+		const opts = recallOptions.safeParse({ ...(channels !== undefined ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) });
+		if (!opts.success) return json({ error: { code: "validation", message: "channels is lexical and/or vector; count_hits is true or false" } }, 400);
+		const r = await callTool({ env, caller: ctx.value.caller, account: ctx.value, platform: "dashboard", actor: "owner", ...(waitUntil ? { waitUntil } : {}) }, { recall: "recall_memories", save: "save_memory", review: "review_candidates" }[tool[2] as "recall" | "save" | "review"],
+			{ ...args, ...(tool[2] === "save" && typeof b.memory_id === "string" ? {} : { profile: ref.profile }) }, opts.data);
 		if (r.ok) return json(r.value);
 		const code = r.error.code;
 		return json({ error: r.error }, code === "not_found" ? 404 : code === "forbidden" ? 403 : code === "revision_conflict" || code === "moving" || code === "busy" ? 409

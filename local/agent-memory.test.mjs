@@ -860,7 +860,7 @@ describe("recovery and install", () => {
 		const bin = path.join(am.home(), "bin", "agent-memory"), cfg = path.join(am.home(), "config.json");
 		am.writePrivate(bin, "old regular copy");
 		am.writePrivate(cfg, "{\"server\":\"https://kept.example\"}");
-		const r = am.install();
+		const r = am.install({ platform: "linux" });
 		assert.equal(r.bin, bin);
 		assert.equal(fs.readlinkSync(bin), "agent-memory.mjs");
 		assert.equal(fs.statSync(`${bin}.mjs`).mode & 0o777, 0o700);
@@ -886,18 +886,18 @@ describe("recovery and install", () => {
 		assert.match(usage.stderr, /^usage: agent-memory/);
 		fs.rmSync(path.dirname(bin), { recursive: true });
 		fs.symlinkSync(tmp, path.dirname(bin));
-		assert.throws(() => am.install(), /install_refused/);
+		assert.throws(() => am.install({ platform: "linux" }), /install_refused/);
 		// A symlinked home is refused before anything is created through it.
 		const outside = fs.mkdtempSync(path.join(tmp, "outside-"));
 		process.env.AGENT_MEMORY_HOME = path.join(tmp, `linked-home-${n}`);
 		fs.symlinkSync(outside, am.home());
-		assert.throws(() => am.install(), /install_refused/);
+		assert.throws(() => am.install({ platform: "linux" }), /install_refused/);
 		assert.deepEqual(fs.readdirSync(outside), []);
 	});
 
 	it("runs corpus-upload from the installed command alone, through the corpus CLI's arguments and uploader to a local fake server", async () => {
 		const { DatabaseSync } = await import("node:sqlite"), http = await import("node:http");
-		const { bin } = am.install();
+		const { bin } = am.install({ platform: "linux" });
 		const defaults = am.loadConfig();
 		assert.deepEqual(defaults.batch_profiles, []);
 		assert.equal(Object.hasOwn(defaults, "corpus_profile"), false);
@@ -1191,5 +1191,244 @@ describe("Claude Code query result: pure JSON, or exactly one object with prose 
 		assert.equal(am.resultJson('Result: {"a": "unclosed}'), null);
 		assert.equal(am.resultJson("Result: [1, 2]"), null);
 		assert.deepEqual(am.resultJson("[1]"), { value: [1] }, "pure JSON is unchanged; the schema rejects it later");
+	});
+});
+
+describe("v2 config defaults and the separate read token", () => {
+	const writeConfig = (c) => am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify(c));
+	/** Records each request; answers 200 with {ok: true}. */
+	const recordFetch = async (fn) => {
+		const seen = [], real = globalThis.fetch;
+		globalThis.fetch = async (url, init = {}) => { seen.push({ url: String(url), method: init.method ?? "GET", auth: init.headers?.authorization, redirect: init.redirect, body: init.body }); return new Response('{"ok":true}', { status: 200 }); };
+		try { await fn(); } finally { globalThis.fetch = real; }
+		return seen;
+	};
+
+	it("keeps a v1 config as written, adds the v2 defaults, and turns injection on only with enabled and an explicit profile", () => {
+		const v1 = { server: "https://memory.example", token_file: "/x/job-token", batch_profiles: ["work"], debounce_ms: 5 };
+		writeConfig(v1);
+		const c = am.loadConfig();
+		for (const [k, v] of Object.entries(v1)) assert.deepEqual(c[k], v);
+		assert.equal(c.batch_hour, 4);
+		assert.equal(c.read_token_file, path.join(am.home(), "read-token"));
+		assert.deepEqual(c.inject, { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 });
+		assert.equal(am.withDefaults({ inject: { enabled: true } }).inject.enabled, false);
+		assert.equal(am.withDefaults({ inject: { enabled: "true", profile: "work" } }).inject.enabled, false);
+		assert.deepEqual(am.withDefaults({ inject: { enabled: true, profile: "Work Stuff" } }).inject, { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 });
+		assert.deepEqual(am.withDefaults({ inject: { enabled: true, profile: "personal", max_tokens: 900, timeout_ms: 0 } }).inject, { enabled: true, profile: "personal", max_tokens: 900, timeout_ms: 1500 });
+		assert.equal(am.withDefaults({ batch_hour: 24 }).batch_hour, 4);
+		assert.equal(am.withDefaults({ batch_hour: 0 }).batch_hour, 0);
+	});
+
+	it("recalls with the read token only, never the job token, and names the caller's profile", async () => {
+		const job = path.join(am.home(), "job-token"), read = path.join(am.home(), "read-token");
+		am.writePrivate(job, "job-secret\n");
+		const config = am.withDefaults({ server: "https://memory.example", token_file: job });
+		// No read token: refused before any request, with no job-token fallback.
+		let seen = await recordFetch(() => assert.rejects(am.readServer(config).recall({ profile: "work", query: "q" }), { code: "read_token_missing" }));
+		assert.deepEqual(seen, []);
+		am.writePrivate(read, "read-secret\n");
+		seen = await recordFetch(() => assert.rejects(am.readServer(config).recall({ query: "q" }), { code: "profile_required" }));
+		assert.deepEqual(seen, []);
+		seen = await recordFetch(async () => assert.deepEqual(await am.readServer(config).recall({ profile: "work", query: "q" }), { ok: true }));
+		assert.deepEqual(seen, [{ url: "https://memory.example/v1/recall", method: "POST", auth: "Bearer read-secret", redirect: "error", body: '{"profile":"work","query":"q"}' }]);
+		// read_token_file naming the job token file is refused, even though that file is private and valid.
+		assert.equal(am.readToken({ ...config, read_token_file: job }), null);
+		assert.equal(am.readToken({ ...config, read_token_file: `${path.dirname(job)}/./job-token` }), null);
+		// A group-readable file or a symlink is refused.
+		fs.chmodSync(read, 0o640);
+		assert.equal(am.readToken(config), null);
+		fs.chmodSync(read, 0o600);
+		const link = path.join(am.home(), "read-link");
+		fs.symlinkSync(read, link);
+		assert.equal(am.readToken({ ...config, read_token_file: link }), null);
+		assert.equal(am.readToken(config), "read-secret");
+	});
+
+	it("reads accepted candidates with the read token only, an explicit profile and checked paging arguments", async () => {
+		const job = path.join(am.home(), "job-token"), read = path.join(am.home(), "read-token");
+		am.writePrivate(job, "job-secret\n");
+		const config = am.withDefaults({ server: "https://memory.example", token_file: job });
+		const list = (q) => am.readServer(config).acceptedCandidates(q);
+		let seen = await recordFetch(() => assert.rejects(list({ profile: "work" }), { code: "read_token_missing" }));
+		assert.deepEqual(seen, []);
+		am.writePrivate(read, "read-secret\n");
+		seen = await recordFetch(async () => {
+			for (const q of [{}, { profile: "" }, { profile: "Work" }, { profile: "a-profile-name" }]) await assert.rejects(list(q), { code: "profile_required" });
+			for (const cursor of ["", "x".repeat(2049), 7]) await assert.rejects(list({ profile: "work", cursor }), { code: "cursor_invalid" });
+			for (const limit of [0, 101, 1.5, "10"]) await assert.rejects(list({ profile: "work", limit }), { code: "limit_invalid" });
+		});
+		assert.deepEqual(seen, []);
+		seen = await recordFetch(async () => {
+			assert.deepEqual(await list({ profile: "work" }), { ok: true });
+			await list({ profile: "work", cursor: "c/1&x=2", limit: 100 });
+		});
+		assert.deepEqual(seen, [
+			{ url: "https://memory.example/v1/eval/candidates?profile=work", method: "GET", auth: "Bearer read-secret", redirect: "error", body: undefined },
+			{ url: "https://memory.example/v1/eval/candidates?profile=work&cursor=c%2F1%26x%3D2&limit=100", method: "GET", auth: "Bearer read-secret", redirect: "error", body: undefined }]);
+		const real = globalThis.fetch;
+		globalThis.fetch = async () => new Response('{"error":{"code":"forbidden"}}', { status: 403 });
+		try { await assert.rejects(list({ profile: "work" }), { status: 403 }); } finally { globalThis.fetch = real; }
+	});
+
+	it("sends status, eval runs and the device's own whoami with the job token", async () => {
+		const job = path.join(am.home(), "job-token");
+		am.writePrivate(job, "job-secret\n");
+		const s = am.httpServer({ server: "https://memory.example", token_file: job });
+		const seen = await recordFetch(async () => { await s.status({ device: "d" }); await s.evalRun({ profile: "work" }); await s.whoami(); });
+		assert.deepEqual(seen.map((r) => [r.method, r.url, r.auth, r.redirect]), [
+			["POST", "https://memory.example/v1/status", "Bearer job-secret", "error"],
+			["POST", "https://memory.example/v1/eval/runs", "Bearer job-secret", "error"],
+			["GET", "https://memory.example/v1/whoami", "Bearer job-secret", "error"]]);
+	});
+});
+
+describe("capture hooks, scheduled runs and status (#16)", () => {
+	const queuedTrigger = (name) => JSON.parse(fs.readFileSync(path.join(am.home(), "queue", name), "utf8"));
+
+	it("queues PreCompact like Stop, never queues UserPromptSubmit, and keeps a SessionEnd's ended through a later trigger", () => {
+		am.hook("claude-code", JSON.stringify({ hook_event_name: "PreCompact", session_id: "s-pc", transcript_path: null, cwd: "/w", trigger: "manual" }), { spawnRun: false });
+		assert.equal(queuedTrigger("claude-code-s-pc.json").event, "PreCompact");
+		am.hook("claude-code", JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s-up", prompt: "secret prompt", cwd: "/w" }), { spawnRun: false });
+		assert.ok(!fs.existsSync(path.join(am.home(), "queue", "claude-code-s-up.json")));
+		am.hook("codex", JSON.stringify({ hook_event_name: "SessionEnd", session_id: "s-end", cwd: "/w" }), { spawnRun: false });
+		am.hook("codex", JSON.stringify({ hook_event_name: "Stop", session_id: "s-end", cwd: "/w" }), { spawnRun: false });
+		assert.equal(queuedTrigger("codex-s-end.json").ended, true);
+	});
+
+	it("drops an injected text block beside the owner's own text, for Claude Code and Codex, before any digest or literal", () => {
+		const claude = { pos: 0, next: 1, obj: { type: "user", message: { content: [{ type: "text", text: "owner text with `kept.ts`" }, { type: "text", text: "<environment_context>INJECTED /secret/path</environment_context>" }] } } };
+		const codex = { pos: 0, next: 1, obj: { type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "<user_instructions>INJECTED</user_instructions>" }, { type: "text", text: "do it" }] } } } };
+		const m = [...am.extract("claude-code", [claude]), ...am.extract("codex", [codex])];
+		assert.deepEqual(m.map((x) => x.text), ["owner text with `kept.ts`", "do it"]);
+		assert.deepEqual(am.literals(m), ["kept.ts"]);
+		assert.ok(!JSON.stringify(am.heuristicDigest(m)).includes("INJECTED"));
+		// A command record stays out whole, as when its text is one string: its later blocks are command output, not the owner's.
+		for (const lead of ["<command-name>/context</command-name>", "<local-command-stdout>ok</local-command-stdout>"]) {
+			assert.deepEqual(am.extract("claude-code", [{ pos: 0, next: 1, obj: { type: "user", message: { content: [{ type: "text", text: lead }, { type: "text", text: "INJECTED /secret/path" }] } } }]), []);
+		}
+	});
+
+	it("sends ended and the distinct edited-file count on the session, never a path, and reports an end with nothing new in an empty batch", async () => {
+		const server = fakeServer();
+		const edit = (name, input) => ({ type: "tool_use", name, input });
+		const f = transcript("edits", [claudeLine("user", "change things"),
+			claudeLine("assistant", [edit("Edit", { file_path: "/w/a.ts" }), edit("Write", { file_path: "b.ts" }), edit("MultiEdit", { file_path: "/w/a.ts" }), edit("Read", { file_path: "/w/r.ts" })], { version: "2.1.316" })]);
+		await am.processSession(trigger("claude-code", "edits", f, "/w"), { server, runner: null });
+		assert.deepEqual(server.log[0].session, { client: "claude-code", id: "edits", files_changed: 2 });
+		const state = fs.readFileSync(am.statePath("claude-code", "edits"), "utf8");
+		assert.ok(!state.includes("a.ts") && !state.includes("b.ts"), "only hashes of the paths are kept");
+		await am.processSession({ ...trigger("claude-code", "edits", f, "/w"), event: "SessionEnd" }, { server, runner: null });
+		assert.deepEqual(server.log.at(-1), { session: { client: "claude-code", id: "edits", ended: true, files_changed: 2 }, digests: [], manifests: [] });
+		const sent = server.log.length;
+		await am.processSession(trigger("claude-code", "edits", f, "/w"), { server, runner: null });
+		assert.equal(server.log.length, sent, "the end is reported once");
+		assert.ok(!server.log.some((b) => JSON.stringify(b).includes("/w/a.ts")));
+		const s = am.captureSummary();
+		assert.equal(s.clients["claude-code"], "2.1.316");
+		assert.equal(s.pending_ranges, 1);
+		assert.ok(!JSON.stringify(s).includes("edits"), "the report carries no session id");
+		assert.equal(am.captureSummary({ ids: true }).local.pending[0].session, "edits");
+	});
+
+	it("resends a batch without ended and files_changed only on a pre-v2 server's exact refusal of them, leaving the batch unchanged", async () => {
+		const job = path.join(am.home(), "job-token");
+		am.writePrivate(job, "job-secret\n");
+		const s = am.httpServer({ server: "https://memory.example", token_file: job });
+		const sent = [], real = globalThis.fetch;
+		let message = "session: Unrecognized keys: \"ended\", \"files_changed\"";
+		globalThis.fetch = async (_url, init) => {
+			const body = JSON.parse(init.body);
+			sent.push(body.session);
+			return Object.keys(body.session).length > 2 ? new Response(JSON.stringify({ error: { code: "validation", message } }), { status: 400 }) : new Response('{"results":[]}', { status: 200 });
+		};
+		try {
+			const batch = { session: { client: "codex", id: "x", ended: true, files_changed: 3 }, digests: [], manifests: [] };
+			assert.deepEqual(await s.ingest(batch), []);
+			assert.deepEqual(sent, [{ client: "codex", id: "x", ended: true, files_changed: 3 }, { client: "codex", id: "x" }]);
+			assert.deepEqual(batch.session, { client: "codex", id: "x", ended: true, files_changed: 3 });
+			sent.length = 0;
+			message = "session: Unrecognized key: \"ended\"; digests.0: Unrecognized key: \"zz\"";
+			await assert.rejects(s.ingest(batch), (e) => e.status === 400);
+			assert.equal(sent.length, 1, "any other refusal is not retried");
+		} finally { globalThis.fetch = real; }
+	});
+
+	it("installs PreCompact async for both clients, UserPromptSubmit only with injection on, and writes the test-label plist without loading it", () => {
+		const fakeHome = fs.mkdtempSync(path.join(tmp, "user-home-")), saved = process.env.HOME;
+		process.env.HOME = fakeHome;
+		try {
+			const r = am.install({ platform: "darwin" });
+			assert.deepEqual(Object.keys(r.claude.hooks), ["Stop", "SessionEnd", "SessionStart", "PreCompact"]);
+			assert.equal(r.claude.hooks.PreCompact[0].hooks[0].async, true);
+			assert.match(r.codex, /\[\[hooks\.PreCompact\.hooks\]\]\ntype = "command"\ncommand = ".*hook codex"\nasync = true/);
+			assert.equal(r.launchd.label, "com.agent-memory.batch.test");
+			assert.equal(r.launchd.plist, path.join(fakeHome, "Library", "LaunchAgents", "com.agent-memory.batch.test.plist"));
+			assert.equal(fs.statSync(r.launchd.plist).mode & 0o777, 0o644);
+			// Compared with whitespace between tags removed; the test paths hold no characters the plist escapes besides & < >.
+			const job = fs.readFileSync(r.launchd.plist, "utf8").replace(/>\s+</g, "><"), esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+			assert.ok(job.includes(`<array><string>${esc(process.execPath)}</string><string>${esc(r.bin)}</string><string>run</string><string>--scheduled</string></array>`), "node, then the CLI, then run --scheduled");
+			assert.ok(job.includes(`<key>AGENT_MEMORY_HOME</key><string>${esc(am.home())}</string>`));
+			assert.ok(job.includes(`<key>PATH</key><string>${esc(process.env.PATH)}</string>`));
+			assert.match(r.launchd.load, /^launchctl bootstrap gui\//);
+			for (const f of am.V2_LOCAL) assert.deepEqual(fs.readFileSync(path.join(path.dirname(r.bin), f)), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+			am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ inject: { enabled: true, profile: "work", timeout_ms: 1500 } }));
+			const on = am.install({ platform: "linux" });
+			assert.equal(on.launchd, null);
+			assert.deepEqual(on.claude.hooks.UserPromptSubmit[0].hooks[0], { type: "command", command: `${on.bin} hook claude-code`, timeout: 3 });
+			assert.match(on.codex, /\[\[hooks\.UserPromptSubmit\.hooks\]\][^[]*timeout = 3/);
+		} finally { process.env.HOME = saved; }
+	});
+
+	it("run --scheduled with nothing queued or due sends its status and returns without a runner, and a batch lease within 20 hours is not due", async () => {
+		const reports = [], server = { ...fakeServer(), status: async (b) => { reports.push(b); } };
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [] }));
+		const idle = await am.run({ server, runner: { available: false, run() { throw new Error("no runner"); } }, trigger: "scheduled" });
+		assert.equal(idle.status, "idle");
+		assert.equal(idle.results.status, "sent");
+		assert.deepEqual(Object.keys(reports[0]).sort(), ["clients", "hooks", "inject", "last_digest_at", "launchd_loaded", "missing_sources", "oldest_pending_at",
+			"oldest_spool_at", "pending_ranges", "refused_since_last", "spool_bytes", "spool_files", "stuck_ranges"]);
+		am.writePrivate(path.join(am.home(), "batch", "last.json"), JSON.stringify({ at: new Date().toISOString(), profiles: { work: { status: "completed" } } }));
+		assert.equal(am.batchDue({ batch_profiles: ["work"] }), false);
+		assert.equal(am.batchDue({ batch_profiles: ["work", "personal"] }), true);
+	});
+
+	it("run --scheduled recovers a trigger a crashed run left claimed, instead of returning idle", async () => {
+		const server = { ...fakeServer(), status: async () => {} };
+		const f = transcript("stranded", [claudeLine("user", "We decided to keep the claim recovery.")]);
+		// A claim is renamed out of queue/, so the queue directory exists whenever a claim does.
+		fs.mkdirSync(path.join(am.home(), "queue"), { recursive: true });
+		am.writePrivate(path.join(am.home(), "claimed", "claude-code-stranded.json"), JSON.stringify({ ...trigger("claude-code", "stranded", f), gen: "crashed" }));
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0, trigger: "scheduled" });
+		assert.equal(r.status, "ran");
+		assert.equal(r.results["claude-code-stranded.json"].status, "done");
+		assert.ok(server.log.some((b) => b.session.id === "stranded"), "the stranded session was captured");
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "claimed")), []);
+	});
+
+	it("run --scheduled drains a hook that fired while its idle status report held the lock", async () => {
+		const f = transcript("late", [claudeLine("user", "We decided to keep the late hook.")]);
+		let fired = 0;
+		// The lock is held, so even a spawning hook would start no run; spawnRun: false keeps the test from ever spawning one.
+		const server = { ...fakeServer(), status: async () => { if (!fired++) am.hook("claude-code", JSON.stringify({ session_id: "late", transcript_path: f, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false }); } };
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0, trigger: "scheduled" });
+		assert.equal(r.status, "ran");
+		assert.equal(r.results["claude-code-late.json"].status, "done");
+		assert.ok(server.log.some((b) => b.session.id === "late"), "the late session was captured");
+		assert.deepEqual(fs.readdirSync(path.join(am.home(), "queue")), []);
+	});
+
+	it("keeps a recovered claim when returning it to the queue fails for any reason but a newer trigger", async () => {
+		const f = transcript("nospace", [claudeLine("user", "We decided to keep the claim on a full disk.")]);
+		fs.mkdirSync(path.join(am.home(), "queue"), { recursive: true });
+		const claimed = path.join(am.home(), "claimed", "claude-code-nospace.json");
+		am.writePrivate(claimed, JSON.stringify({ ...trigger("claude-code", "nospace", f), gen: "crashed" }));
+		const server = { ...fakeServer(), status: async () => {} }, link = fs.linkSync;
+		fs.linkSync = () => { throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }); };
+		try { await assert.rejects(am.run({ server, runner: keepAllRunner(), debounceMs: 0, trigger: "scheduled" }), { code: "ENOSPC" }); } finally { fs.linkSync = link; }
+		assert.ok(fs.existsSync(claimed), "the sole trigger survives");
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 0, trigger: "scheduled" });
+		assert.equal(r.results["claude-code-nospace.json"].status, "done");
+		assert.ok(server.log.some((b) => b.session.id === "nospace"));
 	});
 });

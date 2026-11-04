@@ -1,0 +1,138 @@
+{
+	"verdict": "warn",
+	"checks": [
+		{
+			"check_id": "batch_overdue",
+			"subject": "demo",
+			"state": "warn",
+			"detail": "No completed batch since 2026-10-31T03:10:00Z.",
+			"at": "2026-11-02T09:00:00Z"
+		},
+		{
+			"check_id": "lease_expired",
+			"subject": "me",
+			"state": "ok",
+			"detail": "No expired leases.",
+			"at": "2026-11-02T09:00:00Z"
+		},
+		{
+			"check_id": "capture_stale",
+			"subject": "dev_fixture_mac",
+			"state": "ok",
+			"detail": "Last digest 2026-11-02T09:12:00Z.",
+			"at": "2026-11-02T09:00:00Z"
+		},
+		{
+			"check_id": "capture_pending",
+			"subject": "dev_fixture_mac",
+			"state": "warn",
+			"detail": "2 stuck ranges; oldest pending range 2026-10-24T14:05:00Z.",
+			"at": "2026-11-02T09:00:00Z"
+		},
+		{
+			"check_id": "capture_stale",
+			"subject": "dev_fixture_old",
+			"state": "fail",
+			"detail": "No status report since 2026-10-12T18:40:00Z.",
+			"at": "2026-11-02T09:00:00Z"
+		},
+		{
+			"check_id": "backup_overdue",
+			"subject": "account",
+			"state": "ok",
+			"detail": "Last export 2026-11-02T02:00:00Z.",
+			"at": "2026-11-02T09:00:00Z"
+		}
+	],
+	"devices": [
+		{
+			"device_id": "dev_fixture_mac",
+			"device_name": "Fixture Mac",
+			"revoked": false,
+			"reported_at": "2026-11-02T09:12:30Z",
+			"body": {
+				"device": "dev_fixture_mac",
+				"clients": {
+					"claude-code": "2.3.1",
+					"codex": "0.165.0"
+				},
+				"hooks": [
+					"Stop",
+					"SessionEnd",
+					"SessionStart",
+					"PreCompact"
+				],
+				"inject": false,
+				"spool_files": 0,
+				"spool_bytes": 0,
+				"oldest_spool_at": null,
+				"last_digest_at": "2026-11-02T09:12:00Z",
+				"refused_since_last": 0,
+				"launchd_loaded": true,
+				"pending_ranges": 3,
+				"stuck_ranges": 2,
+				"oldest_pending_at": "2026-10-24T14:05:00Z",
+				"missing_sources": 1
+			}
+		},
+		{
+			"device_id": "dev_fixture_old",
+			"device_name": null,
+			"revoked": true,
+			"reported_at": "2026-10-12T18:40:00Z",
+			"body": {
+				"clients": {
+					"claude-code": "2.1.0"
+				},
+				"hooks": [
+					"Stop",
+					"SessionEnd"
+				],
+				"inject": false,
+				"spool_files": 2,
+				"spool_bytes": 18432,
+				"oldest_spool_at": "2026-10-12T18:02:00Z",
+				"last_digest_at": null,
+				"refused_since_last": 1,
+				"launchd_loaded": false
+			}
+		}
+	],
+	"consolidation": [
+		{
+			"profile": "demo",
+			"last_batch_at": "2026-10-31T03:10:00Z",
+			"outcome": "completed",
+			"next_due_at": "2026-11-01T03:00:00Z",
+			"flags": [
+				"batch_overdue"
+			]
+		},
+		{
+			"profile": "me",
+			"last_batch_at": null,
+			"outcome": null,
+			"next_due_at": null,
+			"flags": []
+		}
+	],
+	"backups": {
+		"last_export_at": "2026-11-02T02:00:00Z",
+		"retained": [
+			{
+				"id": "export-2026-11-02",
+				"at": "2026-11-02T02:00:00Z"
+			},
+			{
+				"id": "export-2026-11-01",
+				"at": "2026-11-01T02:00:00Z"
+			}
+		]
+	},
+	"search": {
+		"lexical_documents": null,
+		"vectors": 0,
+		"embeddings": false,
+		"semantic_ms": 3000
+	}
+}

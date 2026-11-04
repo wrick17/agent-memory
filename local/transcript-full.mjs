@@ -76,8 +76,9 @@ function inputText(v) {
 		const cmd = v.command ?? v.cmd;
 		if (Array.isArray(cmd)) return cmd.length === 3 && /^-l?c$/.test(cmd[1]) ? String(cmd[2]) : cmd.join(" ");
 		if (typeof cmd === "string") return cmd;
-		const vals = Object.values(v);
-		if (vals.length === 1 && typeof vals[0] === "string") return vals[0];
+		const vals = Object.values(v), json = JSON.stringify(v);
+		// Key-based redaction needs the key, so a lone argument the redactor would touch in JSON form stays as JSON.
+		if (vals.length === 1 && typeof vals[0] === "string" && redact(json) === json) return vals[0];
 	}
 	return text(v);
 }
@@ -130,7 +131,8 @@ export function readFull(client, file) {
 		const say = (l) => { for (const m of extract(client, [l])) push(m.role === "owner" ? "prompt" : "response", m.text, offset, { role: m.role }); };
 		if (client === "claude-code") {
 			if ((o.type !== "user" && o.type !== "assistant") || o.isMeta || o.isSidechain || !Array.isArray(o.message?.content)) { say(line); continue; }
-			// Blocks in source order, each text block through extract alone; a record the hook drops as a whole stays dropped.
+			// Blocks in source order, each text block through extract alone; a record the hook drops as a whole (a command
+			// record) stays dropped. Owner text after injected context in one record survives only where extract keeps it.
 			const keep = extract(client, [line]).length > 0;
 			for (const b of o.message.content) {
 				if (b?.type === "text") { if (keep) say({ ...line, obj: { ...o, message: { ...o.message, content: [b] } } }); }

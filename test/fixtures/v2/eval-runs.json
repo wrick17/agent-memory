@@ -1,0 +1,7 @@
+{
+	"runs": [
+		{ "id": "evr_fixture_3", "device_id": "dev_fixture_mac", "profile": "demo", "at": "2026-11-02T07:30:00Z", "channels": "lexical", "k": 5, "cases": 20, "recall_all_at_k": 0.7, "any_hit_at_k": 0.85, "mrr": 0.66 },
+		{ "id": "evr_fixture_2", "device_id": "dev_fixture_mac", "profile": "demo", "at": "2026-10-28T07:20:00Z", "channels": "hybrid", "k": 5, "cases": 20, "recall_all_at_k": 0.75, "any_hit_at_k": 0.9, "mrr": 0.71 },
+		{ "id": "evr_fixture_1", "device_id": "dev_fixture_mac", "profile": "demo", "at": "2026-10-28T07:10:00Z", "channels": "vector", "k": 5, "cases": 20, "recall_all_at_k": 0.55, "any_hit_at_k": 0.8, "mrr": 0.58 }
+	]
+}

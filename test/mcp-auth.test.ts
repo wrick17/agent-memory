@@ -1289,3 +1289,170 @@ it("routing rules and the restore drill are owner only: stored rules, validated 
 	expect((await listExports(env, "profile-personal")).length).toBeGreaterThanOrEqual(3);
 	expect(await http("/api/rules", "PUT", { rules: restore })).toMatchObject({ status: 200 });
 });
+
+describe("v2 request plumbing (#4)", () => {
+	it("gives an enabled device its own whoami facts, keeps the owner reply, and refuses revoked, forged and missing tokens", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const whoami = (token?: string) => exports.default.fetch(new Request(`${origin}/v1/whoami`, { headers: token ? { authorization: `Bearer ${token}` } : {} }))
+			.then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) as Record<string, unknown> | null }));
+		const { id, token } = await deviceToken(`whoami-device-${Date.now()}`, ["read"], ["personal", "me"], "personal");
+		expect(await whoami(token)).toEqual({ status: 200, body: { kind: "device", device_id: id, scopes: ["read"], profiles: ["personal", "me"] } });
+		const owner = await whoami(await jwt({}));
+		expect(owner.status).toBe(200);
+		expect(Object.keys(owner.body!)).toEqual(["claims"]);
+		expect((await whoami(token.replace(/.$/, (c) => (c === "0" ? "1" : "0")))).status).toBe(401);
+		expect((await whoami()).status).toBe(401);
+		const { accountStub } = await import("../src/mcp");
+		await accountStub(env, env.OWNER_USER_ID).admin({ op: "revokeDevice", id });
+		expect((await whoami(token)).status).toBe(401);
+		// /api/* stays owner-only for the same device token.
+		const fresh = await deviceToken(`whoami-api-${Date.now()}`, ["read"], ["personal"], "personal");
+		expect((await exports.default.fetch(new Request(`${origin}/api/profiles`, { headers: { authorization: `Bearer ${fresh.token}` } }))).status).toBe(403);
+	});
+});
+
+// v2 route wiring (#4, #9, #10, #11, #12, #15, #27, and the wipe-fence glue): who may call each route, and what reaches the store.
+describe("v2 routes", () => {
+	const origin = new URL(env.RESOURCE_URL).origin;
+	const req = (path: string, token: string, method = "GET", body?: unknown) => exports.default.fetch(new Request(`${origin}${path}`, { method,
+		headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }))
+		.then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+
+	it("gives a device its own whoami facts, keeps the owner reply, and splits read, job and owner routes", async () => {
+		serveJwks();
+		const tag = Date.now();
+		const reader = await deviceToken(`v2-reader-${tag}`, ["read"], ["test"], "test");
+		const job = await deviceToken(`v2-job-${tag}`, ["ingest", "maintenance"], ["test"]);
+		const owner = await jwt({}), session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		expect(await req("/v1/whoami", reader.token)).toMatchObject({ status: 200, body: { kind: "device", device_id: reader.id, scopes: ["read"], profiles: ["test"] } });
+		expect((await req("/v1/whoami", owner)).body).toHaveProperty("claims");
+		// Recall: the read scope, never the job token.
+		await call(await contextFor(), "save_memory", { name: "v2 heron note", type: "project", description: "heron", content: "the heron text", profile: "test" });
+		const recalled = await req("/v1/recall", reader.token, "POST", { keyword: "heron", profile: "test", channels: ["lexical"] });
+		expect(recalled.status).toBe(200);
+		expect((recalled.body.results as { name: string }[]).map((r) => r.name)).toContain("v2 heron note");
+		expect((await req("/v1/recall", job.token, "POST", { keyword: "heron", profile: "test" })).status).toBe(403);
+		expect((await req("/v1/recall", reader.token, "POST", { keyword: "heron", profile: "test", channels: ["sql"] })).status).toBe(400);
+		// Accepted candidates: read scope and an explicit profile the token may use.
+		expect(await req("/v1/eval/candidates?profile=test", reader.token)).toMatchObject({ status: 200, body: { rows: [], next_cursor: null } });
+		expect((await req("/v1/eval/candidates?profile=test", job.token)).status).toBe(403);
+		expect((await req("/v1/eval/candidates?profile=work", reader.token)).status).toBe(403);
+		expect((await req("/v1/eval/candidates", reader.token)).status).toBe(400);
+		// Eval scores and client status: the job token only; the device is the token's.
+		const run = { profile: "test", at: "2026-11-04T10:00:00Z", channels: "lexical", k: 5, cases: 2, recall_all_at_k: 0.5, any_hit_at_k: 1, mrr: 0.75 };
+		expect((await req("/v1/eval/runs", reader.token, "POST", run)).status).toBe(403);
+		expect((await req("/v1/eval/runs", job.token, "POST", { ...run, profile: "work" })).status).toBe(403);
+		const stored = await req("/v1/eval/runs", job.token, "POST", run);
+		expect(stored.status).toBe(200);
+		const runs = await req("/api/eval/runs?profile=test", session);
+		expect((runs.body.runs as { id: string; device_id: string }[]).find((r) => r.id === stored.body.id)).toMatchObject({ device_id: job.id });
+		const status = { clients: {}, hooks: ["Stop"], inject: false, spool_files: 0, spool_bytes: 0, oldest_spool_at: null, last_digest_at: null, refused_since_last: 0, launchd_loaded: false };
+		expect((await req("/v1/status", reader.token, "POST", status)).status).toBe(403);
+		expect((await req("/v1/status", job.token, "POST", { ...status, device: "dev_other" })).status).toBe(400);
+		expect((await req("/v1/status", job.token, "POST", status)).status).toBe(200);
+		// Every /api route refuses a device token.
+		for (const [path, method] of [["/api/health", "GET"], ["/api/health/sweep", "POST"], ["/api/sessions", "GET"], ["/api/eval/runs", "GET"],
+			["/api/profiles/test/sessions", "GET"], ["/api/profiles/test/recall-strength?ids=x", "GET"], ["/api/profiles/test/eval-candidates", "GET"],
+			["/api/profiles/test/activity-summary?from=2026-11-01&to=2026-11-04", "GET"], ["/api/profiles/test/projects", "GET"]] as const) {
+			expect((await req(path, reader.token, method)).status, path).toBe(403);
+		}
+		// The owner's health report: a sweep, the device's report, and a known lexical count when every profile answers.
+		expect((await req("/api/health/sweep", session, "POST")).status).toBe(200);
+		const health = await req("/api/health", session);
+		expect(health.status).toBe(200);
+		expect((health.body.devices as { device_id: string }[]).map((d) => d.device_id)).toContain(job.id);
+		expect(typeof (health.body.search as { lexical_documents: unknown }).lexical_documents).toBe("number");
+	});
+
+	it("takes ended and files_changed on ingest, stores the token's device, and refuses a body device", async () => {
+		serveJwks();
+		const tag = Date.now();
+		const job = await deviceToken(`v2-ingest-${tag}`, ["ingest", "maintenance"], ["test"]);
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const sid = `v2s${tag}`;
+		expect((await req("/v1/ingest", job.token, "POST", { session: { client: "codex", id: sid, device_id: "spoof" }, profile: "test" })).status).toBe(400);
+		expect((await req("/v1/ingest", job.token, "POST", { session: { client: "codex", id: sid, files_changed: 100_001 }, profile: "test" })).status).toBe(400);
+		expect((await req("/v1/ingest", job.token, "POST", { session: { client: "codex", id: sid, ended: true, files_changed: 3 }, profile: "test" })).status).toBe(200);
+		// v1 shape still works.
+		expect((await req("/v1/ingest", job.token, "POST", { session: { client: "codex", id: `${sid}b` }, profile: "test" })).status).toBe(200);
+		const list = await req("/api/profiles/test/sessions?client=codex", session);
+		expect(list.status).toBe(200);
+		const merged = await req("/api/sessions?limit=100", session);
+		expect(merged.status).toBe(200);
+		expect((merged.body.rows as { profile: string }[]).every((r) => typeof r.profile === "string")).toBe(true);
+		expect((await req("/api/sessions?cursor=nope", session)).status).toBe(400);
+	});
+
+	it("queues owner maintenance through the fingerprinted queue, and reads strength, insights, lessons and the board", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const c = await contextFor();
+		const rule = await call(c, "save_memory", { name: "v2 always lint", type: "feedback", description: "run lint", content: "x", profile: "test" });
+		await call(c, "save_memory", { name: "v2 short replies", type: "user", description: "prefer short", content: "x", profile: "test" });
+		expect(await req("/api/profiles/test/maintenance/queue", session, "POST", { kind: "unlinked", ids: [rule.memory_id] })).toMatchObject({ status: 200, body: { queued: 1 } });
+		expect(await req("/api/profiles/test/maintenance/queue", session, "POST", { kind: "unlinked", ids: [rule.memory_id] })).toMatchObject({ status: 200, body: { queued: 0 } });
+		expect((await req("/api/profiles/test/maintenance/queue", session, "POST", { kind: "unlinked", ids: ["nope"] })).status).toBe(404);
+		expect((await req("/api/profiles/test/sessions/nope/consolidate", session, "POST")).status).toBe(404);
+		const strength = await req(`/api/profiles/test/recall-strength?ids=${rule.memory_id}`, session);
+		expect(strength).toMatchObject({ status: 200, body: { strength: { [rule.memory_id as string]: { hits_90d: expect.any(Number) } } } });
+		expect((await req("/api/profiles/test/activity-summary?from=2026-11-01&to=2026-11-04", session)).status).toBe(200);
+		expect((await req("/api/profiles/test/activity-summary?from=2026-11-04", session)).status).toBe(400);
+		expect(await req("/api/profiles/test/projects", session)).toMatchObject({ status: 200, body: { projects: expect.any(Array) } });
+		expect((await req("/api/profiles/test/projects/nope/profile", session)).status).toBe(404);
+		// Lessons: preferences and rules on request; About you keeps preferences only.
+		const about = await req("/api/profiles/test/owner-model", session);
+		expect((about.body.items as { kind: string }[]).every((i) => i.kind === "preference")).toBe(true);
+		const lessons = await req("/api/profiles/test/owner-model?kinds=preference,rule", session);
+		expect((lessons.body.items as { name: string; kind: string }[]).find((i) => i.name === "v2 always lint")).toMatchObject({ kind: "rule" });
+		expect((await req("/api/profiles/test/owner-model?kinds=decision", session)).status).toBe(400);
+		for (const s of ["open", "closed", "all"]) expect((await req(`/api/profiles/test/board?state=${s}`, session)).status).toBe(200);
+		expect((await req("/api/profiles/test/board?state=merged", session)).status).toBe(400);
+	});
+
+	it("fences a restored generation against every wiped id and drops the side rows that name one", async () => {
+		const c = await contextFor();
+		const ref = c.account.profiles.find((p) => p.profile === "test")!;
+		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`));
+		await call(c, "save_memory", { name: "v2 fence seed", type: "project", description: "seed", content: "x", profile: "test" });
+		await runInDurableObject(stub, (_i, state) => {
+			const sql = state.storage.sql;
+			sql.exec("INSERT INTO eval_candidates (id, query, expected_json, evidence_json, status, created_at, seq) VALUES ('f1','q','[\"W\"]','[]','accepted','2026-11-04',1), ('f2','q','[\"x\"]','[{\"kind\":\"node\",\"ref\":\"W\"}]','pending','2026-11-04',1), ('f3','q','[\"keep\"]','[]','dismissed','2026-11-04',1)");
+			sql.exec("INSERT INTO recall_daily (node_id, day, hits, seq) VALUES ('W','2026-11-01',3,1), ('keep','2026-11-01',1,1)");
+		});
+		const r = await (stub as unknown as { fenceWiped(w: unknown, ids: unknown): Promise<{ ok: boolean; value?: { done: boolean } }> }).fenceWiped(ref, [{ id: "W", mark: "me" }]);
+		expect(r).toEqual({ ok: true, value: { done: true } });
+		const left = await runInDurableObject(stub, (_i, state) => ({
+			candidates: state.storage.sql.exec<{ id: string }>("SELECT id FROM eval_candidates WHERE id LIKE 'f%' ORDER BY id").toArray().map((x) => x.id),
+			recall: state.storage.sql.exec<{ node_id: string }>("SELECT node_id FROM recall_daily WHERE node_id IN ('W', 'keep') ORDER BY node_id").toArray().map((x) => x.node_id),
+			fence: state.storage.sql.exec("SELECT 1 FROM profile_meta WHERE key = 'wiped:W'").toArray().length,
+		}));
+		expect(left).toEqual({ candidates: ["f3"], recall: ["keep"], fence: 1 });
+	});
+});
+
+describe("v2 viewer routes", () => {
+	it("serves the owner a snapshot with the deployed version, refuses devices, and streams from a valid cursor only", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const reader = await deviceToken(`viewer-reader-${Date.now()}`, ["read"], ["test"], "test");
+		const get = (path: string, token: string, signal?: AbortSignal) => exports.default.fetch(new Request(`${origin}${path}`, { headers: { authorization: `Bearer ${token}` }, ...(signal ? { signal } : {}) }));
+		const snap = await get("/api/viewer/snapshot", session);
+		expect(snap.status).toBe(200);
+		const body = await snap.json() as { profiles: string[]; version: string; cursor: string; counts: Record<string, number> };
+		expect(body.profiles).toEqual(expect.arrayContaining(["personal", "test", "work", "me"]));
+		expect(typeof body.version).toBe("string");
+		expect(typeof body.counts.memories).toBe("number");
+		expect((await get("/api/viewer/snapshot", reader.token)).status).toBe(403);
+		expect((await get("/api/viewer/events", reader.token)).status).toBe(403);
+		expect((await get("/api/viewer/events?cursor=not-a-cursor", session)).status).toBe(400);
+		// The stream opens with the current health checks, resumable from the snapshot's cursor.
+		const stop = new AbortController();
+		const stream = await get(`/api/viewer/events?cursor=${encodeURIComponent(body.cursor)}`, session, stop.signal);
+		expect(stream.headers.get("content-type")).toContain("text/event-stream");
+		const first = await stream.body!.getReader().read();
+		expect(new TextDecoder().decode(first.value)).toMatch(/^event: health$/m);
+		stop.abort();
+	});
+});

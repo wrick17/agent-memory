@@ -112,11 +112,26 @@ describe("local transcripts", () => {
 				{ type: "text", text: "Please fix that failure.<system-reminder>REMINDER-TEXT</system-reminder>" }, { type: "text", text: "<environment_context>INJECTED-CONTEXT</environment_context>" }] } },
 			// A record the hook drops as a whole keeps its text out even when a later block alone would pass.
 			{ type: "user", timestamp: ts(6), message: { content: [{ type: "text", text: "<command-name>INJECTED-CONTEXT" }, { type: "text", text: "META-ONLY" }] } },
+			// Owner text after injected context in the same record is kept.
+			{ type: "user", timestamp: ts(7), message: { content: [{ type: "text", text: "<environment_context>INJECTED-CONTEXT</environment_context>" }, { type: "text", text: "Then run lint." }] } },
 		]));
 		const events = readFull("claude-code", file);
 		assert.deepEqual(events.map((e) => [e.kind, e.label]), [["response", "First."], ["tool_call", "Bash"], ["response", "Second. password=[REDACTED]"],
-			["tool_result", "Bash result"], ["prompt", "Please fix that failure."]]);
+			["tool_result", "Bash result"], ["prompt", "Please fix that failure."], ["prompt", "Then run lint."]]);
 		assert.deepEqual(leaks(JSON.stringify(events)), []);
+	});
+
+	it("keeps a lone sensitive argument's key so Claude and Codex tool inputs are redacted", () => {
+		const file = path.join(tmp, "lone-claude.jsonl"), rollout = path.join(tmp, "lone-codex.jsonl");
+		fs.writeFileSync(file, jsonl([{ type: "assistant", timestamp: ts(0), message: { content: [
+			{ type: "tool_use", id: "k1", name: "Login", input: { api_key: PW } }, { type: "tool_use", id: "k2", name: "Read", input: { file_path: "src/a.ts" } }] } }]));
+		fs.writeFileSync(rollout, jsonl([
+			{ type: "response_item", timestamp: ts(0), payload: { type: "function_call", name: "login", call_id: "k3", arguments: JSON.stringify({ password: PW }) } },
+			{ type: "event_msg", timestamp: ts(1), payload: { type: "item_completed", item: { type: "McpToolCall", id: "k4", server: "gh", tool: "auth", arguments: { github_token: PW }, result: { content: [] } } } },
+		]));
+		const calls = [...readFull("claude-code", file), ...readFull("codex", rollout)].filter((e) => e.kind === "tool_call");
+		assert.deepEqual(calls.map((e) => e.detail.input), ['{\n  "api_key":[REDACTED]\n}', "src/a.ts", '{\n  "password":[REDACTED]\n}', '{\n  "github_token":[REDACTED]\n}']);
+		assert.deepEqual(leaks(JSON.stringify(calls)), []);
 	});
 });
 
@@ -226,7 +241,8 @@ function makeDom() {
 
 describe("installed command", () => {
 	it("installs the replay closure beside the CLI and serves a session that mounts the real shared player", async () => {
-		const { bin } = am.install();
+		// Off macOS, so install writes no LaunchAgents plist into the real home.
+		const { bin } = am.install({ platform: "linux" });
 		const dir = path.dirname(bin);
 		for (const f of ["replay.mjs", "transcript-full.mjs", "replay-player.js"]) {
 			assert.equal(fs.statSync(path.join(dir, f)).mode & 0o777, 0o600);

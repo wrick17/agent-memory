@@ -548,13 +548,21 @@ describe("import audit", () => {
 		const state = async () => [await profileSql("test", (sql) => [...["nodes", "texts", "revisions", "requests", "import_records", "import_parts", "activity"].map((t) => sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
 			sql.exec("SELECT value FROM profile_meta WHERE key = 'write_seq'").one().value]), await accountSql((sql) => sql.exec("SELECT count(*) AS n, sum(pending) AS p FROM request_index").one())];
 		// The import arms the profile's alarm for its follow-up background work, which writes on its own schedule (it re-arms at most a
-		// second ahead while work remains). Drive it until none is due, so the no-write window below measures only the audit.
+		// second ahead while work remains). Drive it until none is due, so the no-write window below measures only the audit. An alarm
+		// the runtime fired itself reads null until it re-arms (every run does), so null waits for that run instead of passing as settled.
 		const ref = c.account.profiles.find((p) => p.profile === "test")!, stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`));
+		const armed = async () => {
+			for (let i = 0; i < 250; i++) {
+				const at = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm());
+				if (at !== null) return at;
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			throw new Error("the profile's running alarm did not re-arm in 5s");
+		};
 		for (let i = 0; ; i++) {
 			if (i === 20) throw new Error("the profile's background work did not settle in 20 alarms");
 			await runDurableObjectAlarm(stub);
-			const at = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm());
-			if (at === null || at > Date.now() + 10_000) break;
+			if ((await armed()) > Date.now() + 10_000) break;
 		}
 		const before = await state();
 

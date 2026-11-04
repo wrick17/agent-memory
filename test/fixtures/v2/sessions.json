@@ -1,0 +1,65 @@
+{
+	"rows": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000a1",
+			"client": "claude-code",
+			"session": "fixture-session-1",
+			"profile": "demo",
+			"device": "dev_fixture_mac",
+			"project": "00000000-0000-5000-8000-0000000000b1",
+			"first_upload_at": "2026-11-02T08:41:00Z",
+			"last_upload_at": "2026-11-02T09:12:00Z",
+			"status": "active",
+			"first_ask": "Why does the nightly export skip the second profile?",
+			"counts": {
+				"asks": 3,
+				"decisions": 2,
+				"corrections": 1,
+				"outcomes": 2,
+				"parts": 4,
+				"files_changed": 5
+			}
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000a2",
+			"client": "codex",
+			"session": "fixture-session-2",
+			"profile": "me",
+			"device": "dev_fixture_mac",
+			"project": null,
+			"first_upload_at": "2026-11-01T16:05:00Z",
+			"last_upload_at": "2026-11-01T16:20:00Z",
+			"status": "completed",
+			"first_ask": "Rename the config loader and keep the old name as an alias.",
+			"counts": {
+				"asks": 1,
+				"decisions": 0,
+				"corrections": 0,
+				"outcomes": 1,
+				"parts": 1,
+				"files_changed": 0
+			}
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000a3",
+			"client": "claude-code",
+			"session": "fixture-session-0",
+			"profile": "demo",
+			"device": null,
+			"project": null,
+			"first_upload_at": "2026-10-20T11:00:00Z",
+			"last_upload_at": "2026-10-20T11:00:00Z",
+			"status": "completed",
+			"first_ask": null,
+			"counts": {
+				"asks": 0,
+				"decisions": 0,
+				"corrections": 0,
+				"outcomes": 0,
+				"parts": 1,
+				"files_changed": null
+			}
+		}
+	],
+	"next_cursor": "fixture-opaque-sessions-cursor"
+}

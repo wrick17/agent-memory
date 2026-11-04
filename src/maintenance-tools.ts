@@ -25,11 +25,15 @@ const op = z.discriminatedUnion("op", [
 		how_to_apply: z.string().max(10_000).optional(), scope: z.string().min(1).max(128).optional(),
 		evidence: z.array(z.object({ kind: z.literal("node"), ref: id, note: z.string().max(512).optional() }).strict()).min(1).max(10) }).strict(),
 	z.object({ op: z.literal("promote_to_me"), memory_id: id.optional(), from_op: z.number().int().min(0).max(9).optional(), company_free: z.literal(true) }).strict(),
+	// #10: an eval case from a recall the owner corrected; M1 decides which items allow it, and the store refuses wiped ids.
+	z.object({ op: z.literal("suggest_eval_case"), query: z.string().min(1).max(280), expected: z.array(id).min(1).max(20), evidence: z.array(evidence).min(1).max(20) }).strict(),
 	z.object({ op: z.literal("strategic_review"), summary: z.string().min(1).max(600), content: z.string().min(1).max(20_000),
 		links: z.array(z.object({ to: id, reason, evidence: z.array(z.object({ kind: z.literal("node"), ref: id, note: z.string().max(512).optional() }).strict()).min(1).max(5) }).strict()).max(20) }).strict(),
 ]);
 const nextSchema = z.object({ profile, kinds: z.array(z.string().regex(/^[a-z_]{1,32}$/)).max(8).optional(), limit: z.number().int().min(1).max(40).optional(),
-	lease_seconds: z.number().int().min(30).max(900).optional() }).strict();
+	lease_seconds: z.number().int().min(30).max(900).optional(),
+	// #10: one id per profile per batch run; a repeat returns the same lease, an expired one lease_expired. v1 runners omit it.
+	request_id: z.string().min(1).max(256).optional() }).strict();
 const code = z.string().regex(/^[a-z_]{1,64}$/);
 const completeSchema = z.union([
 	z.object({ profile, lease_id: z.uuid(), results: z.array(z.object({ item_id: z.number().int().positive(), ops: z.array(op).max(10) }).strict()).min(1).max(40) }).strict(),
