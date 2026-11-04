@@ -2221,6 +2221,27 @@ describe("dashboard Activity tab", () => {
 		b.listeners.pagehide!();
 		stream.close();
 	});
+
+	it("moves its rolling year forward on Refresh after UTC midnight, with today's cell", async () => {
+		const reads: string[] = [], realNow = Date.now;
+		Date.now = () => Date.parse("2026-11-04T23:59:30Z");
+		try {
+			const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
+				const u = new URL(path, "https://x");
+				if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+				reads.push(u.searchParams.get("to")!);
+				return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, { observations: 1, sessions: 1, active_days: 1 }));
+			} });
+			await dashboardMain(b.win);
+			for (let i = 0; i < 3; i++) await settle();
+			const day = (d: string) => find(b.view(), "button").some((x) => x.attrs["data-day"] === d);
+			expect([reads.at(-1), day("2026-11-04"), day("2026-11-05")]).toEqual(["2026-11-04", true, false]);
+			Date.now = () => Date.parse("2026-11-05T00:00:30Z"); // the tab stays open past midnight
+			click(button(b.view(), "Refresh")); // the minute poll runs the same refresh
+			for (let i = 0; i < 3; i++) await settle();
+			expect([reads.at(-1), day("2026-11-05")]).toEqual(["2026-11-05", true]);
+		} finally { Date.now = realNow; }
+	});
 });
 
 describe("dashboard Memories tab", () => {

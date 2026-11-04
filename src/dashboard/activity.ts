@@ -77,7 +77,7 @@ export function activityTab(am: Am): void {
 		am.help(scope, "profile_choice");
 		if (all && !am.active().length) { am.empty(root, "No active profiles yet."); return h; }
 
-		const to = iso(Date.now()), asked = iso(ms(to) - 364 * DAY_MS);
+		let to = iso(Date.now()), asked = iso(ms(to) - 364 * DAY_MS); // refresh moves both forward past UTC midnight
 		const path = (p: string, a: string, b: string) => `/api/profiles/${am.enc(p)}/activity-summary?from=${a}&to=${b}`;
 		const filters: Filters = {};
 		if (isDay(route.query.day) && route.query.day >= asked && route.query.day <= to) filters.day = route.query.day;
@@ -437,6 +437,8 @@ export function activityTab(am: Am): void {
 
 		const refresh = async (quiet: boolean) => {
 			if (!quiet) msg.textContent = "Refreshing…";
+			to = iso(Date.now()); // the heatmap, its label and Copy curl read these when drawn, so they follow
+			asked = iso(ms(to) - 364 * DAY_MS);
 			const y = await load(asked, to);
 			if (version !== am.pageVersion) return;
 			year = y;
