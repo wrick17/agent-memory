@@ -1,0 +1,71 @@
+{
+	"key": "github.com/example/fixture-app",
+	"name": "fixture-app",
+	"sessions": 2,
+	"last_activity": "2026-11-02T09:12:00Z",
+	"concepts": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000d1",
+			"name": "nightly export",
+			"kind": "feature",
+			"count": 6
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000d2",
+			"name": "profile list",
+			"kind": "component",
+			"count": 3
+		}
+	],
+	"files": [
+		{
+			"path": "src/export.ts",
+			"count": 5
+		},
+		{
+			"path": "src/backup.ts",
+			"count": 2
+		}
+	],
+	"conventions": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000c7",
+			"name": "Run typecheck before each commit",
+			"kind": "rule",
+			"origin": "stated"
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000c2",
+			"name": "Keep export order stable by profile name",
+			"kind": "preference",
+			"origin": "inferred"
+		}
+	],
+	"recurring_errors": [
+		{
+			"entity_id": "00000000-0000-5000-8000-0000000000d3",
+			"entity": "export cursor",
+			"count": 2,
+			"corrections": [
+				{
+					"id": "00000000-0000-5000-8000-0000000000e1",
+					"text": "Keep the export order stable by profile name"
+				}
+			]
+		}
+	],
+	"highlights": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000c1",
+			"title": "Nightly export iterates the account profile list",
+			"at": "2026-11-02T09:12:10Z"
+		}
+	],
+	"budget": {
+		"edges_read": 2000,
+		"limit": 2000,
+		"exhausted": true,
+		"stopped": "level 2 edges",
+		"skipped": 14
+	}
+}
