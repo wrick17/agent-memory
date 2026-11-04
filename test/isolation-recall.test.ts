@@ -358,19 +358,20 @@ describe("recall channels and the vector fallback", () => {
 	it("fuses more candidates than one statement's 100 bound parameters, with and without filters, and keeps every one", async () => {
 		const c = await contextFor();
 		// 130 records share the query's words, so the lexical channels and the 100 vector hits pass 100 distinct candidates.
+		// They stay in work, which no later vector probe reads. In test they would fill a probe's Vectorize top 100 whenever its random keyword shares a fake bucket.
 		for (let i = 0; i < 130; i++) {
-			await call(c, "save_memory", { name: `wombat ledger ${i}`, type: i < 110 ? "reference" : "feedback", description: "wombat ledger", content: "wombat ledger", profile: "test" });
+			await call(c, "save_memory", { name: `wombat ledger ${i}`, type: i < 110 ? "reference" : "feedback", description: "wombat ledger", content: "wombat ledger", profile: "work" });
 		}
-		const target = await call(c, "save_memory", { name: "Wombat ledger", type: "feedback", description: "wombat ledger", content: "wombat ledger", profile: "test" });
-		const stub = profileStub(c, "test");
+		const target = await call(c, "save_memory", { name: "Wombat ledger", type: "feedback", description: "wombat ledger", content: "wombat ledger", profile: "work" });
+		const stub = profileStub(c, "work");
 		for (let i = 0; i < 40; i++) {
 			await runDurableObjectAlarm(stub);
 			if (!await runInDurableObject(stub, (_i, s) => s.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE embed_hash IS NOT card_hash AND status = 'active'").one().n)) break;
 		}
 		type R = { results: { memory_id: string; type: string; kind: string; score: number; matched_by: string[] }[]; diagnostics: Record<string, Record<string, string>> };
-		const recall = (extra: Record<string, unknown>) => call<R>(c, "recall_memories", { keyword: "wombat ledger", profile: "test", limit: 100, ...extra });
+		const recall = (extra: Record<string, unknown>) => call<R>(c, "recall_memories", { keyword: "wombat ledger", profile: "work", limit: 100, ...extra });
 		const all = await recall({});
-		expect(all.diagnostics.test!.vector).toBe("hits:100");
+		expect(all.diagnostics.work!.vector).toBe("hits:100");
 		// The exact-name record was created after the other 130 candidates and still ranks first, over the full candidate set.
 		expect(all.results[0]).toMatchObject({ memory_id: target.memory_id, matched_by: ["exact", "fulltext", "literal", "vector"] });
 		expect(new Set(all.results.map((r) => r.memory_id)).size).toBe(100);
@@ -381,7 +382,7 @@ describe("recall channels and the vector fallback", () => {
 		expect(feedback.results[0]!.memory_id).toBe(target.memory_id);
 		expect(feedback.results.every((r) => r.type === "feedback")).toBe(true);
 		const documents = await recall({ kinds: ["document"] });
-		expect(documents.diagnostics.test!.vector).toBe("hits:100");
+		expect(documents.diagnostics.work!.vector).toBe("hits:100");
 		expect(documents.results).toHaveLength(100);
 		expect(documents.results.every((r) => r.kind === "document" && r.matched_by.includes("literal"))).toBe(true);
 	});
