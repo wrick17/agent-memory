@@ -2585,4 +2585,28 @@ describe("dashboard Overview and Health tabs", () => {
 		const legend = find(svg, "text").map((x) => x.textContent).filter((t) => t.includes("k=5"));
 		expect(legend).toEqual([expect.stringMatching(/^work hybrid k=5:/), expect.stringMatching(/^personal hybrid k=5:/)]);
 	});
+
+	it("keeps health checks that stream in while the first report is loading, instead of painting the older report over them", async () => {
+		const held = gate();
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const check = (state: string, at: string) => ({ check_id: "capture_stale", subject: "laptop", state, detail: `capture ${state}`, at });
+		const b = browser({ signedIn: true, hash: "#health", api: async (path) => {
+			if (path === "/api/health") { await held.wait; return Response.json({ verdict: "ok", checks: [check("ok", "2026-11-04T10:00:00Z")], devices: [], consolidation: [],
+				backups: { last_export_at: null, retained: [] }, search: { lexical_documents: 0, vectors: 0, embeddings: false, semantic_ms: 3000 } }); } // read before the sweep
+			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [] });
+			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
+			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		stream.enqueue(new TextEncoder().encode(`event: health\ndata: ${JSON.stringify([check("fail", "2026-11-04T10:05:00Z")])}\nid: 2\n\n`)); // a newer sweep
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain("1 failed.");
+		held.open();
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("1 failed."); // the newer check stays; the stream will not send it again
+		expect(text(b.view())).not.toContain("Every check passed");
+		b.listeners.pagehide!();
+		stream.close();
+	});
 });
