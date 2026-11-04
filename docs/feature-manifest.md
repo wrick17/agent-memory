@@ -97,7 +97,7 @@ The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTIO
 
 ### Session replay player (#21), 2026-11-04
 
-`local/replay-player.js` holds the shared v2 replay player. It is implemented, but nothing loads it yet. The dashboard Replay tab and `agent-memory replay` will each load it in their own changes.
+`local/replay-player.js` holds the shared v2 replay player. `agent-memory replay` (#22) loads it, and `/app.js` embeds its exact bytes (#23, #24). The dashboard Replay tab mounts it in its own change (#29).
 
 - Contract: `globalThis.amReplayPlayer.mount(root, events, options)` returns `play`, `pause`, `step`, `seek`, `setSpeed` and `destroy`. `options` takes `speeds` (default 0.5, 1, 2 and 4) and `onEvent`.
 - Draws start, previous, play/pause and next controls, speed buttons, "event i of n · t of total", the event list and the event detail. Every value is set as text.
@@ -253,7 +253,7 @@ Server source ready, not deployed; the Lessons, Crystals and Actions tabs land s
 Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 
 - `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
-- Nothing imports the player yet, so the Worker bundle is unchanged until the dashboard tabs land.
+- `/app.js` now embeds the player's exact bytes (#23, #24), so the Worker bundle includes it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`.
 
 ### v2 CLI config defaults and read and job clients (#6), 2026-11-04
@@ -321,3 +321,9 @@ Source in review; not deployed or installed. Extends AM-09 capture and AM-10 sch
 - `extract()` drops injected text block by block and still drops a Claude Code command record whole. Only `EEXIST` counts as a newer trigger when a claim goes back to the queue.
 - End marker: a `Stop` that replaces a `SessionEnd` a crashed run had claimed keeps `ended`, so the session still reports its end after recovery drops the old claim.
 - Evidence: the tests for hooks, install, the plist (written, never loaded), scheduled runs, session facts and status are in `local/agent-memory.test.mjs` in this change. On the integrated tree they passed in the combined local run of 2026-11-04 (120 of 120), before the current review fixes; the end-marker case passed in a scoped run in the current review batch. No client install, `launchctl` load or physical job run has happened.
+
+### AM-13 v2 dashboard tabs (#23 to #31), 2026-11-04
+
+Source in review; not deployed. Each change carries its own dashboard tests. Each count below is that stage's scoped `test/dashboard.test.ts` run after the current review fixes, with the type check, in synthetic homes; the stages' first runs had 53 to 58 cases. Hosted acceptance is pending for every tab, and the earlier combined local run does not cover the current review fixes.
+
+- Shell and live data client (#23, #24): after sign-in the dashboard loads one viewer snapshot, then reads the event stream with the token in a header. It resumes from the last cursor with backoff and shows "Live updates paused" while disconnected. `/app.js` starts with the replay player's exact bytes. A tab can opt in to `?profile=NAME`; no query means All profiles, and an unknown or inactive profile is refused before anything is read. Nav counts are snapshot totals labelled "across all profiles". The site root opens Overview once that tab is registered, and the graph until then. Evidence: `test/dashboard-data.test.ts`, and `test/dashboard.test.ts` 53 of 53.

@@ -2,6 +2,7 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { DASHBOARD_HTML, DASHBOARD_JS, dashboardMain } from "../src/dashboard";
+import REPLAY_PLAYER from "../local/replay-player.js";
 import { call, contextFor, deviceToken } from "./helpers";
 
 type El = { tag: string; tagName: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
@@ -46,12 +47,23 @@ const DEVICES = [
 ];
 const BATCH = { last_lease_at: null, last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0, at: "2026-10-29T07:00:00Z" } };
 
+// What GET /api/viewer/snapshot answers by default: a valid snapshot, so the data client starts quietly. Tests of the live
+// chrome pass their own (or a refusal) through `api`.
+const SNAPSHOT = { at: "2026-11-04T10:00:00.000Z", version: "9f2c4e1a-0000-4000-8000-000000000000", deployed_at: "2026-11-04T09:00:00.000Z", profiles: ["personal", "work"], cursor: "c1",
+	counts: { memories: 12, revisions: 3, observations: 4, sessions: 2, sessions_active: 1, lessons: 7, crystals: 1, actions: 5, graph_nodes: 30, graph_edges: 40 },
+	usage: { recalls_today: 1, recall_tokens_today: 10, writes_today: 2, storage_bytes: 1024, storage_limit: 10 * 1024 ** 3, vectors: 9 },
+	health: { verdict: "ok", checks: [] }, recent_sessions: [], feed: [], layers: [],
+	flags: [{ id: "embeddings", state: "on", tabs: ["memories"], how: "" }, { id: "inject", state: "off", tabs: ["sessions"], how: "Run agent-memory install --inject." }] };
+const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+
 type Api = (path: string, method: string, body?: unknown) => Response | undefined | Promise<Response | undefined>;
 function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles?: unknown[]; api?: Api; storage?: Map<string, string> } = {}) {
 	const els: Record<string, El> = {};
 	const listeners: Record<string, (event?: unknown) => void> = {};
 	const html = make("html"), storage = o.storage ?? new Map<string, string>();
-	const seen: { fetched: string[]; auth: string[]; posted: string[]; bodies: unknown[]; mounted?: unknown } = { fetched: [], auth: [], posted: [], bodies: [] };
+	// The data client's /api/viewer/ reads go to `viewer`, so the page reads in `fetched` stay as they were before it.
+	const seen: { fetched: string[]; auth: string[]; posted: string[]; bodies: unknown[]; viewer: string[]; mounted?: unknown } = { fetched: [], auth: [], posted: [], bodies: [], viewer: [] };
+	const timers: number[] = []; // the data client's retry delays, recorded and never run, so no reconnect outlives its test
 	const clerk = {
 		user: o.signedIn ? { id: env.OWNER_USER_ID } : null,
 		session: { getToken: async () => "session-token" },
@@ -63,10 +75,11 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 			documentElement: html, addEventListener(type: string, f: (event?: unknown) => void) { listeners[`doc:${type}`] = f; } },
 		location: { hash: o.hash ?? "", origin: "https://memory.example" },
 		localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => { storage.set(k, v); } },
+		setTimeout: (_f: () => void, ms: number) => timers.push(ms), clearTimeout() {},
 		addEventListener(type: string, f: () => void) { listeners[type] = f; },
 		fetch: async (path: string, init: { method?: string; headers: Record<string, string>; body?: string }) => {
-			seen.fetched.push(path);
-			seen.auth.push(init.headers.authorization!);
+			if (path.startsWith("/api/viewer/")) seen.viewer.push(path);
+			else { seen.fetched.push(path); seen.auth.push(init.headers.authorization!); }
 			const body = init.body === undefined ? undefined : JSON.parse(init.body) as unknown;
 			if (init.method === "POST") { seen.posted.push(path); seen.bodies.push(body); }
 			if (o.fail) return Response.json({ error: "forbidden" }, { status: o.fail });
@@ -75,6 +88,7 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 			if (path === "/api/profiles" && o.profiles) return Response.json(o.profiles);
 			if (path === "/api/profiles/personal/batch") return Response.json({ error: { code: "unavailable", message: "profile store unreachable" } }, { status: 503 });
 			if (path === "/api/profiles/work/batch") return Response.json(BATCH);
+			if (path === "/api/viewer/snapshot") return Response.json(SNAPSHOT);
 			return Response.json(path === "/api/profiles" ? PROFILES : DEVICES);
 		},
 		Clerk: clerk,
@@ -83,7 +97,7 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 	const go = (hash: string) => { win.location.hash = hash; listeners.hashchange!(); };
 	// A key pressed with focus on `target` (default: the focused stand-in element); returns whether the shell took it.
 	const key = (k: string, target: El | null = active ?? null) => { let taken = false; listeners["doc:keydown"]!({ key: k, target, preventDefault() { taken = true; } }); return taken; };
-	return { win, els, seen, listeners, go, key, html, storage, view: () => els.view! };
+	return { win, els, seen, listeners, go, key, html, storage, timers, view: () => els.view! };
 }
 
 // About you fixtures: owner-model items as the server sends them, and a gate to answer a request later.
@@ -126,8 +140,10 @@ const navOf = (b: ReturnType<typeof browser>) => b.els.nav!.children.map((g) => 
 const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/activity", "Timeline #/timeline", "Journals #/journals", "Paths #/path", "Work #/work",
 	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
 
-const GROUPED_NAV = [["Memory", ["Graph #/", "Memories #/memories"]], ["System", ["Activity #/activity"]],
-	["Admin", NAV.filter((l) => !["Graph #/", "Memories #/memories", "Activity #/activity"].includes(l))]];
+// The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
+const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #/memories"]], ["System", ["Audit #/activity"]],
+	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
+		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
 describe("dashboard", () => {
 	it("mounts sign-in and fetches nothing until the owner signs in", async () => {
@@ -136,6 +152,8 @@ describe("dashboard", () => {
 		expect(b.els.status!.textContent).toBe("Sign in as the owner.");
 		expect(b.seen.mounted).toBe(b.els.signin);
 		expect(b.seen.fetched).toEqual([]);
+		await settle();
+		expect([b.seen.viewer, b.timers]).toEqual([[], []]); // no snapshot or stream before sign-in
 		expect(DASHBOARD_HTML(env)).toContain(`data-clerk-publishable-key="${env.CLERK_PUBLISHABLE_KEY}"`);
 	});
 
@@ -205,9 +223,15 @@ describe("dashboard", () => {
 		// The pages now live in separate serialized parts; one that used anything but `am` and browser globals fails here.
 		const nav = /<nav[^>]*aria-label="Dashboard">(.*?)<\/nav>/.exec(DASHBOARD_HTML(env))![1]!;
 		expect([...nav.matchAll(/<a href="([^"]+)">([^<]+)<\/a>/g)].map((m) => `${m[2]} ${m[1]}`)).toEqual(NAV);
-		const response = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/app.js`));
+		const response = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/app.js`)), script = await response.text();
+		// The shared replay player's exact bytes come right after the directive, before any part runs.
+		expect(script.startsWith(`"use strict";\n${REPLAY_PLAYER}\nvar __name = (fn) => fn;\n`)).toBe(true);
 		const b = browser({ signedIn: true, hash: "#/profiles" });
-		new Function("window", await response.text())(b.win);
+		new Function("window", script)(b.win);
+		// In a browser globalThis is window; here the player's global lands on the test's globalThis.
+		const g = globalThis as unknown as { amReplayPlayer?: { mount: unknown } };
+		expect(typeof g.amReplayPlayer?.mount).toBe("function");
+		delete g.amReplayPlayer;
 		await settle();
 		const seen: [string, string][] = [];
 		for (const [hash] of ROUTES) { b.go(hash); await settle(); seen.push([hash, find(b.view(), "h2")[0]?.textContent ?? ""]); }
@@ -238,14 +262,23 @@ describe("dashboard shell", () => {
 		expect(current()).toEqual(["Memories"]);
 		b.go("#audit");
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Activity: work");
-		expect(current()).toEqual(["Activity"]);
+		expect(current()).toEqual(["Audit"]);
 		b.go("#memories?profile=nobody");
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("No active profile named nobody");
 		b.go("#/backups");
-		expect(current()).toEqual(["Backups"]);
+		expect(current()).toEqual(["Backups and recovery"]);
 		expect(b.els.nav!.children.at(-1)!.attrs.class).toBe("navgroup current");
 		b.go("");
 		expect(current()).toEqual(["Graph"]);
+		// Once an Overview tab registers, the site root opens it; Graph's link and #/graph/NAME still open the graph.
+		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
+		am.tab({ id: "overview", group: null, label: "Overview", key: "o", render: (root: El) => am.el("h2", root, "Overview") });
+		for (const [hash, heading, mark] of [["", "Overview", "Overview"], ["#/", "Overview", "Overview"], ["#/graph", "Knowledge graph: work", "Graph"],
+			["#/graph/personal", "Knowledge graph: personal", "Graph"]]) {
+			b.go(hash!);
+			expect([find(b.view(), "h2")[0]!.textContent, current()]).toEqual([heading, [mark]]);
+		}
+		expect(find(b.els.nav!, "a").find((a) => a.textContent === "Graph")!.attrs.href).toBe("#/graph");
 	});
 
 	it("takes g then a letter, / for search, ? for the glossary and Esc, but not while typing", async () => {
@@ -262,8 +295,8 @@ describe("dashboard shell", () => {
 		expect(b.win.location.hash).toBe("#/activity");
 		expect(b.key("?", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(false);
-		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Activity", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("g Graph, m Memories, u Activity");
+		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
+		expect(text(b.els.gloss!)).toContain("g Graph, m Memories, u Audit");
 		expect(b.key("Escape", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(true);
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
@@ -310,6 +343,46 @@ describe("dashboard shell", () => {
 		const body = await res.text(), data = JSON.parse(body.startsWith("{") ? body : body.split("\n").find((l) => l.startsWith("data: "))!.slice(6));
 		expect(res.status).toBe(200);
 		expect(data.result.isError).toBeFalsy();
+	});
+});
+
+describe("dashboard live chrome", () => {
+	it("shows no numbers, version or live state until the data client reports them, then only what it reported", async () => {
+		const refused = browser({ signedIn: true, api: (path) => path === "/api/viewer/snapshot" ? Response.json({ error: { code: "not_found", message: "no snapshot" } }, { status: 404 }) : undefined });
+		await dashboardMain(refused.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const tools = (b: ReturnType<typeof browser>) => text(b.els.tools!);
+		expect([refused.els.pause!.hidden, refused.els.pause!.textContent]).toEqual([false, "Live updates paused. No numbers have loaded yet."]);
+		expect(tools(refused)).toContain("Paused");
+		expect(tools(refused)).not.toMatch(/features|live\b/i);
+		expect([refused.els.ver!.textContent, find(refused.els.foot!, "span")[0]!.textContent]).toEqual(["", ""]);
+		expect(refused.seen.viewer).toEqual(["/api/viewer/snapshot"]); // read only after sign-in
+		expect(refused.timers).toEqual([1000]); // one retry, scheduled, not run
+
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const frame = `event: change\ndata: ${JSON.stringify({ kind: "MEMORY", profile: "work", id: "r1", summary: "Saved a memory", at: SNAPSHOT.at })}\nid: 1\n\n`;
+		const b = browser({ signedIn: true, api: (path) => path.startsWith("/api/viewer/events?cursor=c1") ? new Response(new ReadableStream<Uint8Array>({
+			start(c) { stream = c; c.enqueue(new TextEncoder().encode(frame)); } }), { headers: { "content-type": "text/event-stream" } }) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.viewer).toEqual(["/api/viewer/snapshot", "/api/viewer/events?cursor=c1"]);
+		expect(b.els.ver!.textContent).toBe("9f2c4e1a");
+		expect(b.els.pause!.hidden).toBe(true);
+		const chips = find(b.els.tools!, "span").filter((x) => x.attrs.class?.startsWith("chip"));
+		expect(chips.map((x) => [x.textContent, x.attrs.class, x.hidden])).toEqual([["Live", "chip c-ok", false]]);
+		expect(find(b.els.foot!, "span")[0]!.textContent).toMatch(new RegExp(`^Agent Memory ${SNAPSHOT.version} · full sync ${hhmm(SNAPSHOT.at)}, live since \\d\\d:\\d\\d$`));
+		const features = find(b.els.tools!, "button").find((x) => x.textContent === "1 of 2 features on")!;
+		click(features);
+		expect(text(b.els.features!)).toContain("Prompt injection");
+		expect(text(b.els.features!)).toContain("To turn it on: Run agent-memory install --inject.");
+		expect(text(b.els.features!)).toContain("Affects: memories.");
+		// A tab registered with a count shows the snapshot's number; today's built-in pages show none.
+		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
+		am.tab({ id: "lessons", group: "memory", label: "Lessons", key: "l", count: (s: typeof SNAPSHOT) => s.counts.lessons, render: (root: El) => am.el("h2", root, "Lessons") });
+		am.render(false);
+		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories", "Lessons 7 across all profiles", "Audit"]));
+		b.listeners.pagehide!(); // the client lets go of its connection before the test closes the stream
+		stream.close();
 	});
 });
 
@@ -552,7 +625,8 @@ describe("dashboard About you", () => {
 		expect([pinButton.attrs.type, pinButton.attrs["aria-label"]]).toEqual(["button", "Pin Dark mode"]);
 		click(pinButton);
 		expect(status(b).textContent).toBe("Working: pin “Dark mode”…");
-		expect(find(b.view(), "button").filter((x) => x.textContent !== "Load more").every((x) => x.disabled)).toBe(true);
+		// Every write control waits; a glossary ? beside the intro is not a write, so it stays usable.
+		expect(find(b.view(), "button").filter((x) => x.textContent !== "Load more" && x.attrs.class !== "help").every((x) => x.disabled)).toBe(true);
 		click(pinButton); // a second press while the first is in flight sends nothing
 		pin.open();
 		await settle();
@@ -568,7 +642,7 @@ describe("dashboard About you", () => {
 		expect(button(b.view(), "Undo last change")).toBeDefined(); // still there for the owner to try by hand
 		const forget = button(b.view(), "Forget");
 		click(forget);
-		const ask = find(b.view(), "span")[0]!;
+		const ask = find(b.view(), "span").find((x) => x.textContent.startsWith("Forget “"))!; // not the intro's spans
 		expect(ask.textContent).toBe("Forget “Dark mode”? It moves to the archive and leaves this list; Undo brings it back. ");
 		expect(active).toBe(ask);
 		click(button(b.view(), "Cancel"));
@@ -1872,5 +1946,62 @@ describe("dashboard moves", () => {
 		expect(find(b.view(), "a").find((x) => x.textContent === "Open it in personal")!.attrs.href).toBe("#/memory/personal/m1");
 		b.go("#/move");
 		expect(text(b.view())).toContain("Moved to personal.");
+	});
+});
+
+describe("dashboard profile choice", () => {
+	it("takes the profile only from ?profile, refuses an unknown one with a chooser, asks a one-profile tab, and keeps the rest of the link", async () => {
+		const b = browser({ signedIn: true, hash: "#/memories" });
+		await dashboardMain(b.win);
+		type Route = { query: Record<string, string>; hash: string };
+		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El;
+			eachProfile<T>(only: string | null, fn: (p: { name: string }) => Promise<T>): Promise<({ profile: string; ok: true; value: T } | { profile: string; ok: false; error: Error & { code?: string } })[]> } }).__am;
+		const seen: Route[] = [];
+		am.tab({ id: "probe", group: "memory", label: "Probe", key: "q", profiles: "any", render: (root: El, r: Route) => { seen.push(r); return am.el("h2", root, "Probe"); } });
+		am.tab({ id: "solo", group: "work", label: "Solo", key: "z", profiles: "one", render: (root: El, r: Route) => { seen.push(r); return am.el("h2", root, "Solo"); } });
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!, h2 = () => find(b.view(), "h2")[0]!.textContent;
+		const hrefs = () => find(b.view(), "a").map((a) => `${a.textContent} ${a.attrs.href}`);
+		b.go("#/memories");
+		expect(pick.hidden).toBe(true); // old routes keep their own path profile
+
+		b.go("#probe");
+		expect([h2(), seen.at(-1)!.query.profile, pick.hidden, pick.value]).toEqual(["Probe", undefined, false, ""]); // no query is All
+		expect(find(pick, "option").map((o) => o.textContent)).toEqual(["All profiles", "personal", "work"]);
+		b.go("#probe/r1?q=x&profile=nobody");
+		expect([h2(), seen.length]).toEqual(["Probe: no active profile named nobody", 1]); // nothing read for it
+		expect(hrefs()).toEqual(["personal #probe/r1?q=x&profile=personal", "work #probe/r1?q=x&profile=work", "All profiles #probe/r1?q=x"]);
+		expect(pick.value).toBe("nobody");
+
+		b.go("#solo/r1?q=x");
+		expect([h2(), seen.length]).toEqual(["Solo: choose a profile", 1]); // never a silent work
+		expect(hrefs()).toEqual(["personal #solo/r1?q=x&profile=personal", "work #solo/r1?q=x&profile=work"]);
+		b.go("#solo/r1?q=x&profile=work");
+		expect([h2(), seen.at(-1)!.query.profile]).toEqual(["Solo", "work"]);
+
+		// The picker rewrites only the profile query. Without history.replaceState it sets the hash, whose change renders once.
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#solo/r1?q=x&profile=personal");
+		const replaced: string[] = [];
+		Object.assign(b.win, { history: { replaceState: (_s: unknown, _t: string, url: string) => { replaced.push(url); b.win.location.hash = url; } } });
+		b.go("#probe/r1?q=x&profile=work");
+		const before = seen.length;
+		pick.value = "";
+		pick.on.change!();
+		expect([replaced, b.win.location.hash, seen.length - before, seen.at(-1)!.query.profile]).toEqual([["#probe/r1?q=x"], "#probe/r1?q=x", 1, undefined]);
+	});
+
+	it("reports every profile's own outcome from eachProfile and never reads for an unknown one", async () => {
+		const b = browser({ signedIn: true });
+		await dashboardMain(b.win);
+		const am = (b.win as unknown as { __am: { eachProfile<T>(only: string | null, fn: (p: { name: string }) => Promise<T>): Promise<unknown[]> } }).__am;
+		const calls: string[] = [];
+		const read = async (p: { name: string }) => { calls.push(p.name); if (p.name === "personal") throw Object.assign(new Error("store unreachable"), { status: 503 }); return 3; };
+		const all = await am.eachProfile(null, read) as { profile: string; ok: boolean; value?: number; error?: Error }[];
+		expect(all.map((r) => [r.profile, r.ok, r.ok ? r.value : r.error!.message])).toEqual([["personal", false, "store unreachable"], ["work", true, 3]]);
+		expect(await am.eachProfile("work", read)).toEqual([{ profile: "work", ok: true, value: 3 }]);
+		const unknown = await am.eachProfile("nope", read) as { profile: string; ok: false; error: Error & { code?: string } }[];
+		expect([unknown.length, unknown[0]!.profile, unknown[0]!.ok, unknown[0]!.error.code]).toEqual([1, "nope", false, "unknown_profile"]);
+		expect(calls).toEqual(["personal", "work", "work"]);
 	});
 });
