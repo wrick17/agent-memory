@@ -190,7 +190,7 @@ export function graphTab(am: Am): void {
 		const hidden = new Set<string>();
 		let typeFilter = "", typeKey = "";
 		let query = "", selected: string | null = selectId ?? null, hover: string | null = null, matched: GNode[] = [], matchSet = new Set<string>();
-		let discs: ReturnType<typeof layout> = [], grid = new Map<string, GNode[]>(), cam = { x: 0, y: 0, k: 1 }, fitted = false, moved = false, frame = false, detailRequest = 0;
+		let discs: ReturnType<typeof layout> = [], grid = new Map<string, GNode[]>(), cam = { x: 0, y: 0, k: 1 }, fitted = false, moved = false, frame = false, detailRequest = 0, partial = false;
 		// Per-layout state, so a frame reads no DOM and filters nothing: the drawable records, their ids, and each record's linked ids.
 		let vis: GNode[] = [], visIds = new Set<string>(), adj = new Map<string, string[]>(), showPast = false, onlyLinked = false;
 		const ctx = canvas.getContext?.("2d") ?? null;
@@ -493,6 +493,7 @@ export function graphTab(am: Am): void {
 		};
 		const refresh = () => {
 			if (version !== am.pageVersion) return;
+			if (partial && selected && g.parts.nodes.done && g.parts.edges.done) select(selected, true);
 			const nodes = g.parts.nodes, edges = g.parts.edges, links = [...g.edges.values()].filter((e) => e.b).length;
 			const past = [...g.nodes.values()].filter((n) => n.status !== "active").length, waiting = [...g.pending.values()].reduce((s, l) => s + l.length, 0);
 			const parts = g.missing ? ["This server does not offer the whole-graph read yet, so the graph cannot be drawn. Browse records in Memories meanwhile."]
@@ -614,6 +615,8 @@ export function graphTab(am: Am): void {
 		const select = (id: string | null, reveal = false) => {
 			selected = id;
 			const req = ++detailRequest, syncs: (() => void)[] = [];
+			// Relations, origin and memories come from the loaded graph; refresh draws them again once it has loaded.
+			partial = !!id && !(g.parts.nodes.done && g.parts.edges.done);
 			detail.replaceChildren();
 			detailSync = () => { for (const f of syncs) f(); };
 			schedule();

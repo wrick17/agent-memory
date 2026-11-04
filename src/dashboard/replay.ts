@@ -29,8 +29,9 @@ export function replayTab(am: Am): void {
 		const stage = el("section", root);
 		stage.setAttribute("aria-label", "Player");
 
-		let rows: J[] = [];
+		let rows: J[] = [], opened = 0;
 		const open = async (id: string) => {
+			const req = ++opened; // the form replaces the address without a render, so pageVersion alone cannot tell opens apart
 			stop();
 			stage.replaceChildren();
 			loading(stage, 4);
@@ -38,12 +39,12 @@ export function replayTab(am: Am): void {
 			let d: J;
 			try { d = await call(`/api/profiles/${enc(profile)}/sessions/${enc(id)}`); }
 			catch (err) {
-				if (version !== am.pageVersion) return;
+				if (version !== am.pageVersion || req !== opened) return;
 				stage.replaceChildren();
 				say((err as J).status === 404 ? `No session with id ${id} in ${profile}.` : `Could not load this session: ${why(err)}`);
 				return;
 			}
-			if (version !== am.pageVersion) return;
+			if (version !== am.pageVersion || req !== opened) return;
 			stage.replaceChildren();
 			if (typeof d?.id !== "string" || !Array.isArray(d.events)) { say(`${profile} sent a session without its events.`); return; }
 			say("");

@@ -1,8 +1,11 @@
 // v2 H1 (#11): the deterministic health rules on a fixed clock, and the strict, device-bound status body.
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { describe, expect, it, vi } from "vitest";
 import { parseClientStatus, STATUS_MAX_BYTES } from "../src/client-status";
 import { sweepRows } from "../src/health";
-import type { ClientStatusBody, LeaseFacts, SweepInput } from "../src/viewer/types";
+import { accountStub } from "../src/mcp";
+import type { ClientStatusBody, HealthCheck, LeaseFacts, SweepInput } from "../src/viewer/types";
+import { contextFor, OWNER } from "./helpers";
 
 const NOW = Date.parse("2026-11-04T12:00:00.000Z"), H = 3_600_000;
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
@@ -38,6 +41,36 @@ describe("v2 H1: health rules on a fixed clock", () => {
 		expect(sweepRows(input, status)).toEqual(rows);
 		expect(state(sweepRows({ ...input, last_export_at: ago(30 * H + 1) }, status))["backup_overdue:account"]).toBe("warn");
 		expect(state(sweepRows({ ...input, last_export_at: null }, status))["backup_overdue:account"]).toBe("warn");
+	});
+});
+
+describe("v2 H1: backup freshness in the account store", () => {
+	it("counts only a successful export of every store, so a later profile-only export leaves an old account backup flagged", async () => {
+		await contextFor();
+		const admin = (cmd: Parameters<ReturnType<typeof accountStub>["admin"]>[0]) => accountStub(env, OWNER).admin(cmd);
+		const backup = async () => {
+			const r = await admin({ op: "health_sweep" });
+			if (!r.ok) throw new Error(JSON.stringify(r.error));
+			return (r.value as HealthCheck[]).find((c) => c.check_id === "backup_overdue");
+		};
+		const lastAt = async () => {
+			const r = await admin({ op: "accountHealth" });
+			if (!r.ok) throw new Error(JSON.stringify(r.error));
+			return (r.value as { last_export_at: string | null }).last_export_at;
+		};
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			vi.setSystemTime(NOW - 31 * H);
+			expect((await admin({ op: "export" })).ok).toBe(true);
+			vi.setSystemTime(NOW);
+			expect((await admin({ op: "export", profile: "personal" })).ok).toBe(true);
+			expect(await backup()).toMatchObject({ state: "warn", detail: `The last encrypted export was at ${ago(31 * H)}, more than 30 hours ago.` });
+			expect(await lastAt()).toBe(ago(31 * H));
+			// A keep-all manual export of every store is a full backup like the nightly one.
+			expect((await admin({ op: "export", preserve_existing: true })).ok).toBe(true);
+			expect(await backup()).toMatchObject({ state: "ok", detail: `The last encrypted export was at ${ago(0)}.` });
+			expect(await lastAt()).toBe(ago(0));
+		} finally { vi.useRealTimers(); }
 	});
 });
 

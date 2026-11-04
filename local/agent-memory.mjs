@@ -77,11 +77,12 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	if (h.hook_event_name === "SessionStart") writePrivate(file.replace(/\.json$/, ".start"), "");
 	// last_assistant_message is never stored: it cannot stand in for a range. client_home keeps the session's origin, so whichever
 	// process later holds the run lock looks for this transcript only in the store of the client that fired the hook.
-	// ended is sticky: a later trigger that replaces a queued SessionEnd keeps it, so the session still reports that it ended.
+	// ended is sticky: a later trigger that replaces a queued or claimed SessionEnd keeps it, so the session still reports that it
+	// ended even when a crashed run's claim of the SessionEnd is dropped in favor of this trigger.
 	writePrivate(file, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event: h.hook_event_name ?? null, client_home: clientHome(client),
 		transcript_path: h.transcript_path ?? prior?.transcript_path ?? claimed?.transcript_path ?? null, cwd: h.cwd ?? prior?.cwd ?? claimed?.cwd ?? null,
 		turn_id: h.turn_id ?? null, at: Date.now(), first_at: prior?.first_at ?? Date.now(),
-		...(h.hook_event_name === "SessionEnd" || prior?.ended === true ? { ended: true } : {}) }));
+		...(h.hook_event_name === "SessionEnd" || prior?.ended === true || claimed?.ended === true ? { ended: true } : {}) }));
 	if (spawnRun && !lockHeld()) {
 		spawn(process.execPath, [fileURLToPath(import.meta.url), "run"], { detached: true, stdio: "ignore", env: process.env }).unref();
 	}
