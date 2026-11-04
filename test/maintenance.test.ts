@@ -18,7 +18,7 @@ import { mayChange } from "../src/profile/protect";
 import { undo } from "../src/profile/undo";
 import { runWrite, type Who } from "../src/profile/write";
 import { nextSeq } from "../src/storage";
-import { call, contextFor, devicePrincipal, deviceToken, outcome, OWNER, registered } from "./helpers";
+import { call, contextFor, devicePrincipal, deviceToken, outcome, OWNER, registered, tempDir } from "./helpers";
 import { accountTransfer } from "../src/account/transfers";
 import { uuid5 } from "../src/domain/ids";
 import { statedFirst } from "../src/domain/rank";
@@ -32,6 +32,8 @@ import { driveTransfer, transferPorts } from "../src/transfer";
 import { wipeAccount, wipeProfile } from "../src/wipe";
 import { danglingPage, enqueueDangling } from "../src/profile/dangling";
 import { flushRows, pendingRows, ROW_PAUSE } from "../src/profile/meter";
+import { noteRecall } from "../src/profile/recall-stats";
+import { ingest } from "../src/profile/capture";
 
 it("embedding failures keep housekeeping running and retain the embedding retry", async () => {
 	const who = (await contextFor()).account.profiles.find((p) => p.profile === "personal")!;
@@ -2187,7 +2189,7 @@ describe("Weekly strategic review", () => {
 				? [{ op: "infer_preference", name: "Prefers tabs", description: "Indents with tabs.", why: null, how_to_apply: null, evidence: [{ kind: "node", ref: i.subjects[0] }] },
 					{ op: "promote_to_me", memory_id: null, from_op: 0, company_free: true }] : [{ op: "dismiss" }] })) } };
 		} };
-		process.env.AGENT_MEMORY_HOME = `/tmp/am-replay-${crypto.randomUUID()}`;
+		process.env.AGENT_MEMORY_HOME = tempDir("am-replay-");
 		const report = await batch({ runner, config: { batch_profiles: [name] }, server: { call: (tool: string, args: Record<string, unknown>) => job(token, tool, args) } });
 		const signal = seen.find((i) => i.kind === "preference_signal")!;
 		expect(signal.allowed_ops).toContain("infer_preference");
@@ -2404,4 +2406,157 @@ describe("Weekly strategic review", () => {
 		await runInDurableObject(r.stub, (_i, s) => s.storage.deleteAlarm());
 	});
 
+});
+
+describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall retention", () => {
+	it("gives a capture item only the parts its accepted manifest lists", async () => {
+		await inStore((storage, who) => {
+			const one = (text: string) => JSON.stringify({ asks: [{ text, pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			const range = "codex:ctx-m:0a1b2c3d:0-10", p = (id: string, text: string) => { const body = one(text); return { range_id: range, capture_status: "consolidated" as const, part_id: id, sha256: sha256(body), body }; };
+			const whole = p("0-10", "listed whole"), a = p("0-5", "unlisted half"), b = p("5-10", "unlisted other half");
+			expect(ingest(storage, who, { session: { client: "codex", id: "ctx-m" }, digests: [whole, a, b], manifests: [{ range_id: range, parts: [{ part_id: "0-10", sha256: whole.sha256 }] }] })
+				.map((r) => r.status)).toEqual(["stored", "stored", "stored", "stored"]);
+			const item = next(storage, { kinds: ["unprocessed_capture"] }).items[0]!;
+			const text = JSON.stringify(item.context);
+			expect(text).toContain("listed whole");
+			expect(text).not.toContain("unlisted");
+		});
+	});
+
+	const DAY = 86_400_000, job = { platform: "test", userId: USER };
+	const only = (storage: DurableObjectStorage, who: Who, stage: Stage) => {
+		for (const s of ["dedupe", "ttl", "purge", "queue"]) {
+			storage.sql.exec("INSERT INTO cursors (stage, due_at) VALUES (?, ?) ON CONFLICT (stage) DO UPDATE SET due_at = excluded.due_at", s, s === stage ? 0 : Date.now() + DAY);
+		}
+		return housekeep(storage, who);
+	};
+	const queued = (sql: SqlStorage, kind: string) => sql.exec<{ subjects: string }>("SELECT subjects FROM maintenance WHERE kind = ? ORDER BY id", kind).toArray().map((r) => JSON.parse(r.subjects)[0] as string);
+
+	it("returns one lease per request_id without a second attempt, refuses changed arguments and reports an expired lease", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql;
+			enqueue(storage, [{ kind: "unlinked", subjects: ["m1-a"] }, { kind: "unlinked", subjects: ["m1-b"] }]);
+			const first = next(storage, { request_id: "run-1", lease_seconds: 60 });
+			const clock = sql.exec("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").one().last_run_at;
+			const again = next(storage, { request_id: "run-1", lease_seconds: 60 });
+			expect(again).toMatchObject({ lease_id: first.lease_id, lease_until: first.lease_until, replayed: true });
+			expect(again.items.map((i) => i.item_id)).toEqual(first.items.map((i) => i.item_id));
+			expect(sql.exec("SELECT attempts FROM maintenance ORDER BY id").toArray().map((r) => r.attempts)).toEqual([1, 1]);
+			expect(sql.exec("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").one().last_run_at).toBe(clock);
+			// A v1 runner without an id is gated as before; the same id with other arguments is refused.
+			expect(next(storage, { lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], next_allowed_at: expect.any(String) });
+			expect(() => next(storage, { request_id: "run-1", lease_seconds: 30 })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "idempotency_mismatch" }) }));
+			// Only items still leased come back once one is completed.
+			complete(storage, who, { lease_id: first.lease_id!, results: [{ item_id: first.items[0]!.item_id, ops: [{ op: "dismiss" }] }] }, job);
+			expect(next(storage, { request_id: "run-1", lease_seconds: 60 }).items.map((i) => i.item_id)).toEqual([first.items[1]!.item_id]);
+			sql.exec("UPDATE profile_meta SET value = json_set(value, '$.lease_until', ?) WHERE key LIKE 'lease\\_request%' ESCAPE '\\'", new Date(Date.now() - 60_000).toISOString());
+			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
+			// A later run's lease keeps run-1's binding: a delayed run-1 retry, past both gates, still finds it expired, and with other
+			// arguments is still refused; it never becomes a new run.
+			const past = () => sql.exec("UPDATE cursors SET last_run_at = ? WHERE stage = 'maintenance_batch'", new Date(Date.now() - 21 * 3_600_000).toISOString());
+			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
+			past();
+			const second = next(storage, { request_id: "run-2", lease_seconds: 60 });
+			expect(second.lease_id).toEqual(expect.any(String));
+			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
+			past();
+			const attempts = () => sql.exec("SELECT attempts FROM maintenance ORDER BY id").toArray().map((r) => r.attempts);
+			const before = attempts();
+			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
+			expect(() => next(storage, { request_id: "run-1", lease_seconds: 30 })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "idempotency_mismatch" }) }));
+			expect(attempts()).toEqual(before);
+		});
+	});
+
+	it("queues stale_memory only for unprotected, unrecalled records untouched for 90 days, and only retires or flags them", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql, old = new Date(Date.now() - 91 * DAY).toISOString(), today = new Date().toISOString().slice(0, 10);
+			const id = (name: string, extra: Record<string, unknown> = {}) => String(wired(storage, who, save({ name, content: name, ...extra })).memory_id);
+			const plain = id("Plain old"), stated = id("Stated old", { origin: "stated" }), pinned = id("Pinned old"), pref = id("Preference old"), fresh = id("Fresh");
+			const recalled = id("Recalled old"), longAgo = id("Recalled long ago"), toPin = id("Pinned after queueing");
+			const journal = String(wired(storage, who, save({ name: "Journal old", type: "project", kind: "journal", content: "" })).memory_id);
+			// Graph nodes without a memory type (an uploaded session, a component) cannot take the retire-only save: never stale_memory.
+			const digest = JSON.stringify({ asks: [{ text: "old ask", pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			expect(ingest(storage, who, { session: { client: "codex", id: "stale-session" }, manifests: [],
+				digests: [{ range_id: "codex:stale-session:0a1b2c3d:0-10", capture_status: "heuristic", part_id: "-", sha256: sha256(digest), body: digest }] }).map((r) => r.status)).toEqual(["stored"]);
+			wired(storage, who, { op: "knowledge", args: { nodes: [{ kind: "component", name: "Stale component", description: "a component" }] } });
+			const graphOnly = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE memory_type IS NULL AND kind IN ('session', 'component') AND status = 'active'").toArray().map((r) => r.id);
+			expect(graphOnly).toHaveLength(2);
+			sql.exec("UPDATE nodes SET pinned = 1 WHERE id = ?", pinned);
+			sql.exec("UPDATE nodes SET kind = 'preference' WHERE id = ?", pref);
+			sql.exec("UPDATE nodes SET updated_at = ? WHERE id <> ?", old, fresh);
+			noteRecall(sql, nextSeq(sql, "profile_meta"), today, [recalled], 10);
+			noteRecall(sql, nextSeq(sql, "profile_meta"), new Date(Date.now() - 120 * DAY).toISOString().slice(0, 10), [longAgo], 10);
+			only(storage, who, "queue");
+			expect(queued(sql, "stale_memory").sort()).toEqual([plain, longAgo, toPin].sort());
+			expect([stated, pinned, pref, fresh, recalled, journal, ...graphOnly].some((n) => queued(sql, "stale_memory").includes(n))).toBe(false);
+
+			const lease = next(storage, { kinds: ["stale_memory"] });
+			expect(lease.items.every((i) => JSON.stringify(i.allowed_ops) === JSON.stringify(["save", "flag", "dismiss"]))).toBe(true);
+			sql.exec("UPDATE nodes SET pinned = 1 WHERE id = ?", toPin);
+			const item = (n: string) => lease.items.find((i) => i.subjects[0] === n)!.item_id;
+			const out = complete(storage, who, { lease_id: lease.lease_id!, results: [
+				{ item_id: item(plain), ops: [{ op: "save", memory_id: plain, description: "rewritten" }, { op: "save", memory_id: plain, retire: true, new_name: "Renamed" },
+					{ op: "infer_preference", name: "x", description: "x", evidence: [{ kind: "node", ref: plain }] }, { op: "save", memory_id: plain, retire: true }] },
+				{ item_id: item(toPin), ops: [{ op: "save", memory_id: toPin, retire: true }] },
+			] }, job);
+			expect(out.results[0]).toMatchObject({ status: "done", ops: [{ status: "rejected", reason: "retire_only" }, { status: "rejected", reason: "retire_only" },
+				{ status: "rejected", reason: "op_not_allowed" }, { op: "save", status: "applied" }] });
+			expect(out.results[1]).toMatchObject({ ops: [{ op: "save", status: "flagged" }] });
+			expect(sql.exec("SELECT id, status FROM nodes WHERE id IN (?, ?) ORDER BY id", plain, toPin).toArray())
+				.toEqual([{ id: plain, status: "retired" }, { id: toPin, status: "active" }].sort((a, b) => a.id.localeCompare(b.id)));
+		});
+		// No background item is queued for me records.
+		await inStore((storage, who) => {
+			wired(storage, who, save({ name: "Me old", content: "me" }));
+			storage.sql.exec("UPDATE nodes SET updated_at = ?", new Date(Date.now() - 91 * DAY).toISOString());
+			only(storage, who, "queue");
+			expect(queued(storage.sql, "stale_memory")).toEqual([]);
+		}, "me");
+	});
+
+	it("stores suggest_eval_case only from capture items, with the item's node evidence, a deterministic id and no wiped id", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql;
+			const capture = String(wired(storage, who, { op: "capture", args: { content: "the owner corrected a date format" } }).capture_id);
+			const target = String(wired(storage, who, save({ name: "Date format", content: "YYYY-MM-DD" })).memory_id);
+			sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, '1')", "wiped:gone-node");
+			enqueue(storage, [{ kind: "unprocessed_capture", subjects: [capture] }, { kind: "near_duplicate", subjects: [target, capture] }]);
+			const lease = next(storage, {});
+			const cap = lease.items.find((i) => i.kind === "unprocessed_capture")!, dup = lease.items.find((i) => i.kind === "near_duplicate")!;
+			expect(cap.allowed_ops).toContain("suggest_eval_case");
+			expect(dup.allowed_ops).not.toContain("suggest_eval_case");
+			const good = { op: "suggest_eval_case" as const, query: "how should dates be written", expected: [target], evidence: [{ kind: "node" as const, ref: capture }] };
+			const out = complete(storage, who, { lease_id: lease.lease_id!, results: [
+				{ item_id: cap.item_id, ops: [good, { ...good, evidence: [{ kind: "node", ref: target }] }, { ...good, evidence: [{ kind: "url", ref: "https://example.invalid" }] },
+					{ ...good, query: " " }, { ...good, expected: [] }, { ...good, expected: ["gone-node"] }] },
+				{ item_id: dup.item_id, ops: [good] },
+			] }, job);
+			expect(out.results[0]).toMatchObject({ status: "done", ops: [{ status: "applied" }, { code: "outside_subjects" }, { code: "outside_subjects" },
+				{ reason: "bad_query" }, { reason: "bad_expected" }, { status: "rejected", code: "profile_wiped" }] });
+			expect(out.results[1]).toMatchObject({ ops: [{ status: "rejected", reason: "op_not_allowed" }] });
+			const rows = sql.exec<{ id: string; expected_json: string; evidence_json: string; status: string }>("SELECT id, expected_json, evidence_json, status FROM eval_candidates").toArray();
+			expect(rows).toEqual([{ id: uuid5(`${USER}:eval:${lease.lease_id}:${cap.item_id}:0`), expected_json: JSON.stringify([target]), evidence_json: JSON.stringify(good.evidence), status: "pending" }]);
+			// A retried completion replays the stored outcome and adds no candidate.
+			expect(complete(storage, who, { lease_id: lease.lease_id!, results: [{ item_id: cap.item_id, ops: [good] }] }, job).results[0]).toMatchObject({ replayed: true });
+			expect(sql.exec("SELECT count(*) AS c FROM eval_candidates").one().c).toBe(1);
+		});
+	});
+
+	it("purges recall counts older than 400 days in pages of PURGE_ROWS inside the soft budget", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql, today = new Date().toISOString().slice(0, 10);
+			for (let i = 0; i < 230; i++) sql.exec("INSERT INTO recall_daily (node_id, day, hits, seq) VALUES (?, '2024-01-01', 1, 1)", `old-${i}`);
+			for (let d = 1; d <= 20; d++) sql.exec("INSERT INTO recall_totals (day, recalls, tokens, seq) VALUES (?, 1, 1, 1)", `2024-02-${String(d).padStart(2, "0")}`);
+			sql.exec("INSERT INTO recall_daily (node_id, day, hits, seq) VALUES ('kept', ?, 1, 1)", today);
+			sql.exec("INSERT INTO recall_totals (day, recalls, tokens, seq) VALUES (?, 1, 1, 1)", today);
+			const pages = [0, 1, 2].map(() => {
+				const r = only(storage, who, "purge");
+				return { more: r.more, recall: JSON.parse(String(sql.exec("SELECT stats FROM cursors WHERE stage = 'purge'").one().stats)).recall as number };
+			});
+			expect(pages).toEqual([{ more: true, recall: 100 }, { more: true, recall: 100 }, { more: false, recall: 50 }]);
+			expect(sql.exec("SELECT (SELECT count(*) FROM recall_daily) AS d, (SELECT count(*) FROM recall_totals) AS t").one()).toEqual({ d: 1, t: 1 });
+			expect(sql.exec("SELECT count(*) AS c FROM deleted_rows WHERE tbl IN ('recall_daily', 'recall_totals')").one().c).toBe(250);
+		});
+	});
 });

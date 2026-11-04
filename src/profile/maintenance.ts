@@ -12,7 +12,10 @@ import { assertWritable, RESUME_MS } from "./transfer";
 import { assertNotWiped, assertOpen } from "./wipe";
 import { fenceOf } from "./compact";
 import { captureText, readPrefix, runWrite, type Who } from "./write";
+import { manifestListed } from "./capture";
 import { reviewBoard } from "./board";
+import { insertCandidate } from "./eval-candidates";
+import { ACTIVITY_DAYS } from "./housekeeping";
 import { readableNodeIds } from "./graph";
 
 export const MAX_ITEMS = 40;
@@ -27,8 +30,10 @@ export function opsFor(kind: string): string[] {
 	if (kind === "dangling_link") return ["end_link", "flag", "dismiss"];
 	// The weekly item only writes the review document; its subjects are board items it may link to, never change.
 	if (kind === "weekly_review") return ["strategic_review", "dismiss"];
+	// A stale record may only be retired (a save with retire: true and nothing else), flagged for the owner, or kept. Never deleted.
+	if (kind === "stale_memory") return ["save", "flag", "dismiss"];
 	const infer = kind === "preference_signal" || kind === "unprocessed_capture";
-	return [...ALLOWED_OPS, ...(infer ? ["infer_preference"] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
+	return [...ALLOWED_OPS, ...(infer ? ["infer_preference", "suggest_eval_case"] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
 }
 
 type Evidence = { kind: "entry" | "commit" | "pr" | "ticket" | "session" | "file" | "node" | "url" | "corpus"; ref: string; note?: string };
@@ -42,12 +47,13 @@ export type MaintenanceOp =
 	| { op: "dismiss" }
 	| { op: "infer_preference"; name: string; description: string; why?: string; how_to_apply?: string; scope?: string; evidence: Evidence[] }
 	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true }
-	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] };
+	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] }
+	| { op: "suggest_eval_case"; query: string; expected: string[]; evidence: Evidence[] };
 /** A review's link to one board item it discusses (relates_to), cited by node pointers to the item's subjects. */
 export type ReviewLink = { to: string; reason: string; evidence: { kind: "node"; ref: string; note?: string }[] };
 export const REVIEW_LINKS = 20;
 export type MaintenanceCmd =
-	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number }
+	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number; request_id?: string }
 	| { op: "complete"; lease_id: string; results: { item_id: number; ops: MaintenanceOp[] }[] }
 	| { op: "complete"; lease_id: string; status: "batch_skipped" | "stuck"; reason: string }
 	| { op: "complete"; status: "batch_skipped"; reason: string };
@@ -96,14 +102,33 @@ export function enqueueIn(sql: SqlStorage, tx: () => BudgetTx, items: { kind: st
 }
 
 /**
+ * profile_meta key prefix binding each maintenance_next request_id to the lease it made: ids, a request hash and a date only. One
+ * key per request, so a later run's lease never erases an earlier run's binding; bindings go after ACTIVITY_DAYS, as request rows do.
+ */
+const LEASE_REQUEST = "lease_request:";
+type LeaseRequest = { request_id: string; hash: string; lease_id: string; lease_until: string };
+
+/**
  * Leases up to 40 open items for at most 900 s, at most once per profile in 20 hours. Expired leases go back to the queue
  * first (stuck after 3 attempts). Each item carries its subjects' cards, a passage of up to 1,200 characters and current edges.
+ * With a request_id, the lease and its binding commit together: a repeat of the same request returns that lease and its items
+ * still leased, takes no attempt and moves no clock; once the lease expired it returns lease_id null, reason lease_expired.
+ * The same id with other arguments is refused. Without a request_id (v1 runners) nothing is bound.
  */
-export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit?: number; lease_seconds?: number }) {
+export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit?: number; lease_seconds?: number; request_id?: string }) {
 	const limit = Math.min(q.limit ?? MAX_ITEMS, MAX_ITEMS), lease = Math.min(q.lease_seconds ?? MAX_LEASE_S, MAX_LEASE_S);
 	if (limit < 1 || lease < 1) throw Fail.of("validation", "limit and lease_seconds must be positive");
+	if (q.request_id !== undefined && (typeof q.request_id !== "string" || q.request_id.length < 1 || q.request_id.length > 256)) throw Fail.of("validation", "request_id is 1 to 256 characters");
+	const hash = sha256(JSON.stringify([q.kinds?.length ? [...q.kinds].sort() : null, limit, lease]));
 	return storage.transactionSync(() => {
 		const sql = storage.sql, now = Date.now(), iso = new Date(now).toISOString();
+		const bound = q.request_id === undefined ? undefined : leaseRequest(sql, q.request_id);
+		if (bound && bound.request_id === q.request_id) {
+			if (bound.hash !== hash) throw Fail.of("idempotency_mismatch", "this request_id already leased with other arguments", { reason: "request_mismatch" });
+			if (Date.parse(bound.lease_until) < now) return { lease_id: null, items: [], next_allowed_at: cooldownUntil(sql, now), reason: "lease_expired" as const };
+			const still = sql.exec<LeaseRow>("SELECT id, kind, subjects, created_at FROM maintenance WHERE lease_id = ? AND state = 'leased' ORDER BY created_at, id", bound.lease_id).toArray();
+			return { lease_id: bound.lease_id, lease_until: bound.lease_until, items: still.map((i) => leasedItem(sql, i)), replayed: true };
+		}
 		const gated = cooldownUntil(sql, now);
 		if (gated) return { lease_id: null, items: [], next_allowed_at: gated };
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), iso);
@@ -115,12 +140,30 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 			leaseId, until, tx.seq, JSON.stringify(items.map((i) => i.id)));
 		tx.run(`INSERT INTO cursors (stage, due_at, last_run_at) VALUES ('maintenance_batch', 0, ?)
 			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at`, iso);
-		return {
-			lease_id: leaseId, lease_until: until,
-			items: items.map((i) => ({ item_id: i.id, kind: i.kind, subjects: JSON.parse(i.subjects) as string[], context: context(sql, JSON.parse(i.subjects) as string[], i.kind), allowed_ops: opsFor(i.kind),
-				...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, JSON.parse(i.subjects) as string[]) } : {}) })),
-		};
+		if (q.request_id !== undefined) {
+			tx.run("DELETE FROM profile_meta WHERE key LIKE 'lease\\_request:%' ESCAPE '\\' AND json_extract(value, '$.lease_until') < ?", new Date(now - ACTIVITY_DAYS * 86_400_000).toISOString());
+			tx.run("INSERT INTO profile_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+				LEASE_REQUEST + q.request_id, JSON.stringify({ request_id: q.request_id, hash, lease_id: leaseId, lease_until: until } satisfies LeaseRequest));
+		}
+		return { lease_id: leaseId, lease_until: until, items: items.map((i) => leasedItem(sql, i)) };
 	});
+}
+
+type LeaseRow = { id: number; kind: string; subjects: string; created_at: string };
+/** One leased item as the batch sees it, for a fresh lease and its replay alike. */
+function leasedItem(sql: SqlStorage, i: LeaseRow) {
+	const subjects = JSON.parse(i.subjects) as string[];
+	return { item_id: i.id, kind: i.kind, subjects, context: context(sql, subjects, i.kind), allowed_ops: opsFor(i.kind),
+		...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, subjects) } : {}) };
+}
+
+/** The request's stored binding, or undefined when none or unreadable (a damaged value never replays). */
+function leaseRequest(sql: SqlStorage, requestId: string): LeaseRequest | undefined {
+	const raw = sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", LEASE_REQUEST + requestId).toArray()[0]?.value;
+	try {
+		const v = raw ? JSON.parse(raw) as Partial<LeaseRequest> : undefined;
+		return v && typeof v.request_id === "string" && typeof v.hash === "string" && typeof v.lease_id === "string" && typeof v.lease_until === "string" ? v as LeaseRequest : undefined;
+	} catch { return undefined; }
 }
 
 /** The 20-hour gate: when the next lease is allowed, or null when a lease may run now. */
@@ -177,8 +220,10 @@ function context(sql: SqlStorage, subjects: string[], kind: string) {
 	const nodes = sql.exec<{ id: string; kind: string; other_label: string | null; memory_type: string | null; scope: string; name: string; description: string; status: string; origin: string; pinned: number; revision: number }>(
 		"SELECT id, kind, other_label, memory_type, scope, name, description, status, origin, pinned, revision FROM nodes WHERE id IN (SELECT value FROM json_each(?))", ids).toArray()
 		.map((n) => ({ ...n, ...(n.kind === "journal" ? journalPrefix(sql, n.id) : {}), passage: n.other_label === "capture" ? captureText(sql, n.id).slice(0, 1200)
-			// A capture item's session text is its current digest parts (read.ts captureVisible): never a manifest or a superseded heuristic.
-			: n.kind === "session" && (kind === "unprocessed_capture" || kind === "preference_signal") ? sql.exec<{ body: string }>("SELECT body FROM texts WHERE node_id = ? AND part = 'capture' AND lane = 'capture' AND live = 1 AND capture_part IS NOT 'manifest' ORDER BY rowid", n.id)
+			// A capture item's session text is its current digest parts (read.ts captureVisible): never a manifest, a superseded heuristic
+			// or a consolidated part the accepted manifest leaves out.
+			: n.kind === "session" && (kind === "unprocessed_capture" || kind === "preference_signal") ? sql.exec<{ body: string }>(`SELECT t.body FROM texts t WHERE t.node_id = ? AND t.part = 'capture'
+				AND t.lane = 'capture' AND t.live = 1 AND t.capture_part IS NOT 'manifest' AND (t.capture_status IS NOT 'consolidated' OR coalesce(${manifestListed}, 1) > 0) ORDER BY t.rowid`, n.id)
 				.toArray().map((r) => r.body).join("\n").slice(0, 1200)
 			: readPrefix(sql, n.id) }));
 	const refs = sql.exec<{ id: number; src: string }>("SELECT id, src FROM edges WHERE ended_at IS NULL AND (src IN (SELECT value FROM json_each(?)) OR dst IN (SELECT value FROM json_each(?))) LIMIT 50", ids, ids).toArray();
@@ -347,15 +392,21 @@ function lastCompletedLease(sql: SqlStorage) {
 	}) };
 }
 
-/** `earlier`: this item's outcomes so far, so a from_op can name only an op before it. `item`: the leased item, which dates a review. */
+/**
+ * `earlier`: this item's outcomes so far, so a from_op can name only an op before it. `item`: the leased item, which dates a
+ * review and limits a stale record's save to retiring it.
+ */
 function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subjects: Set<string>, job: JobContext, requestId: string, earlier: OpOutcome[],
-	item: { id: number; created_at: string }): { outcome: OpOutcome; embedDue: boolean } {
+	item: { id: number; kind: string; created_at: string }): { outcome: OpOutcome; embedDue: boolean } {
 	const sql = storage.sql;
 	const done = (outcome: Omit<OpOutcome, "op">, embedDue = false) => ({ outcome: { op: op.op, ...outcome }, embedDue });
 	const refuse = (reason: string) => done({ status: "rejected", code: "validation", reason });
 	// A shared-writer refusal keeps its content-free reason code (details.reason), never its message.
 	const failed = (e: Fail) => { const r = e.failure.details?.reason; return done({ status: "rejected", code: e.failure.code, ...(typeof r === "string" && CODE.test(r) ? { reason: r } : {}) }); };
 	if (op.op === "dismiss") return done({ status: "applied" });
+	if (op.op === "suggest_eval_case") return suggestEvalCase(storage, who, op, subjects, requestId, done, refuse, failed);
+	// A stale record's save only retires it: no rename or content change rides along. mayChange still decides below.
+	if (item.kind === "stale_memory" && op.op === "save" && (op.retire !== true || Object.keys(op).some((k) => !["op", "memory_id", "retire", "expected_revision"].includes(k)))) return refuse("retire_only");
 	let touched: string[], local = true;
 	if (op.op === "end_link") {
 		const e = sql.exec<{ src: string; dst: string; dst_profile: string }>("SELECT src, dst, dst_profile FROM edges WHERE id = ? AND ended_at IS NULL", op.edge).toArray()[0];
@@ -462,3 +513,32 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 }
 
 const withoutOp = ({ op: _op, ...rest }: Extract<MaintenanceOp, { op: "save" }>) => rest;
+
+type Done = (outcome: Omit<OpOutcome, "op">, embedDue?: boolean) => { outcome: OpOutcome; embedDue: boolean };
+/**
+ * Stores an eval candidate from a corrected recall. Its evidence is the item's own subjects as node pointers; expected ids
+ * may name records in other profiles. The candidate id derives from the op's request id (lease, item, op index), so a retried
+ * completion returns the stored candidate. insertCandidate runs inside this transaction and refuses any id a wipe fenced.
+ * No node changes, so there is nothing for mayChange to protect.
+ */
+function suggestEvalCase(storage: DurableObjectStorage, who: Who, op: Extract<MaintenanceOp, { op: "suggest_eval_case" }>, subjects: Set<string>, requestId: string,
+	done: Done, refuse: (reason: string) => ReturnType<Done>, failed: (e: Fail) => ReturnType<Done>): ReturnType<Done> {
+	const sql = storage.sql;
+	if (typeof op.query !== "string" || !op.query.trim() || op.query.length > 280) return refuse("bad_query");
+	if (!Array.isArray(op.expected) || op.expected.length < 1 || op.expected.length > 20 || op.expected.some((id) => typeof id !== "string" || !id || id.length > 128)) return refuse("bad_expected");
+	if (!Array.isArray(op.evidence) || op.evidence.length < 1 || op.evidence.length > 20) return refuse("bad_evidence");
+	if (op.evidence.some((e) => e?.kind !== "node" || !subjects.has(e.ref))) return done({ status: "rejected", code: "outside_subjects" });
+	// A local record in the archive is not a recall answer; a foreign id is not checked here.
+	if (archiveNodeIds(sql, [...subjects, ...op.expected]).length) return refuse("archival_reference");
+	const id = uuid5(requestId.replace(/^maint:/, `${who.userId}:eval:`));
+	try {
+		storage.transactionSync(() => {
+			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+			insertCandidate(sql, tx.seq, tx.now, id, { query: op.query, expected: op.expected, evidence: op.evidence });
+		});
+		return done({ status: "applied" });
+	} catch (e) {
+		if (e instanceof Fail) return failed(e);
+		throw e;
+	}
+}

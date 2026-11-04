@@ -146,6 +146,13 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		}
 		return json(mergeSessions(pages, rest.limit ?? 50));
 	}
+	// #10 owner queue: link maintenance for 1 to 40 memories, and consolidation for one session.
+	if (p && method === "POST" && (sub === "maintenance/queue" || /^sessions\/[^/]+\/consolidate$/.test(sub))) {
+		if (!ref) return notActive();
+		if (sub !== "maintenance/queue") return reply(await profileStub(env, ref).queueOwner(ref, { kind: "unprocessed_capture", session: decodeURIComponent(sub.split("/")[1]!) }));
+		const b = z.object({ kind: z.literal("unlinked"), ids: z.array(z.string().min(1).max(128)).min(1).max(40) }).strict().safeParse(await request.json().catch(() => null));
+		return b.success ? reply(await profileStub(env, ref).queueOwner(ref, b.data)) : invalid("send JSON with kind unlinked and 1 to 40 ids");
+	}
 	if (p && sub === "recall-strength" && method === "GET") {
 		if (!ref) return notActive();
 		const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);

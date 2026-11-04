@@ -1,6 +1,6 @@
 import { purgePersonCounts, sealObservation } from "./work-counts";
 // Housekeeping (section 12): deterministic alarm stages, one bounded step per call, with cursors. Exact dedupe, the 90-day
-// capture TTL into the archive, and the 300-day purge. Every change except purge keeps its undo; protected nodes are only
+// capture TTL into the archive, the 300-day purge and the 400-day recall count purge. Every change except purge keeps its undo; protected nodes are only
 // flagged. The size level (section 6) is measured on every call.
 import { retireArchivePage } from "./archive-operations";
 import { cleanupTerminal } from "./daily-proof";
@@ -12,10 +12,18 @@ import { archiveNode, archiveRows, BudgetTx, purgeAfter, type Row } from "./arch
 import { flagProtected, mayChange } from "./protect";
 import { board, REVIEW_ITEMS } from "./board";
 import { enqueue } from "./maintenance";
+import { purgeRecallBefore, PURGE_ROWS } from "./recall-stats";
 import { runWrite, type Who } from "./write";
 
 export const TTL_DAYS = 90;
 export const ACTIVITY_DAYS = 400;
+/** stale_memory: untouched and unrecalled for this many days (the recall strength window). */
+export const STALE_DAYS = 90;
+/**
+ * Rows one full purgeRecallBefore call writes as measured in workerd (PURGE_ROWS deletes with their tombstones and index
+ * entries, plus the seq row). Its raw SQL bypasses BudgetTx, so the stage reserves this much of the soft share and charges it.
+ */
+const RECALL_WRITES = 301;
 /** 10 GB per Durable Object on the Paid plan. */
 export const OBJECT_LIMIT = 10 * 1024 ** 3;
 const DAY = 86_400_000;
@@ -146,11 +154,11 @@ function ttl(storage: DurableObjectStorage, who: Who, now: number, cursor: strin
 
 /**
  * Archive rows past purge_after are deleted for good, the one change without undo. A purged node's request records go with
- * it, a bounded batch per step. Activity older than 400 days is deleted. The activity row keeps counts and ids only.
+ * it, a bounded batch per step. Activity and recall counts older than 400 days are deleted. The activity row keeps counts and ids only.
  */
 function purge(storage: DurableObjectStorage, who: Who, now: number): StepResult {
 	if (storage.sql.exec("SELECT 1 FROM cursors WHERE stage = 'purge_cleanup'").toArray().length) return { more: true, stats: { pending_cleanup: 1 } };
-	return storage.transactionSync(() => {
+	const main: StepResult = storage.transactionSync(() => {
 		const sql = storage.sql;
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date(now).toISOString());
 		const rows = sql.exec<{ id: number; node: string | null }>(`SELECT id, CASE WHEN source = 'nodes' THEN json_extract(payload, '$.id') END AS node
@@ -193,13 +201,39 @@ function purge(storage: DurableObjectStorage, who: Who, now: number): StepResult
 		if (purged.length || requests.length) tx.run("INSERT INTO cursors (stage, cursor, due_at) VALUES ('purge_cleanup', ?, 0)", JSON.stringify({ nodes: purged, requests }));
 		return { more, purged, stats: { rows: done, nodes: purged.length, activity: expired } };
 	});
+	const recall = purgeRecall(storage, now);
+	return { ...main, more: main.more || recall.more, stats: { ...main.stats, recall: recall.deleted } };
+}
+
+/**
+ * Recall counts (recall_daily, recall_totals) for days more than 400 days old, one bounded page in its own transaction so
+ * the archive purge keeps its whole budget. The rows hold ids and counts only, so they go without undo, like old activity.
+ */
+function purgeRecall(storage: DurableObjectStorage, now: number): { deleted: number; more: boolean } {
+	const sql = storage.sql, cutoff = new Date(now - ACTIVITY_DAYS * DAY).toISOString().slice(0, 10);
+	if (!sql.exec("SELECT 1 FROM recall_daily WHERE day < ?1 UNION ALL SELECT 1 FROM recall_totals WHERE day < ?1 LIMIT 1", cutoff).toArray().length) return { deleted: 0, more: false };
+	return storage.transactionSync(() => {
+		// The tombstones the deletes write take this transaction's seq, so exports and the change feed see the removal.
+		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date(now).toISOString());
+		// The page runs only with room for a full call inside the soft share; its untracked writes are then charged to tx.
+		if (tx.spent(SOFT - RECALL_WRITES / 1_000)) return { deleted: 0, more: true };
+		const deleted = purgeRecallBefore(sql, cutoff);
+		tx.rows += RECALL_WRITES - 1; // tx already counted the seq row
+		return { deleted, more: deleted === PURGE_ROWS };
+	});
 }
 
 /** Nightly node scan, bounded to 200 nodes. Fingerprints make repeats harmless and changed cards eligible again. */
 function queueStep(storage: DurableObjectStorage, who: Who, after: number, now: number): StepResult {
 	const sql = storage.sql;
-	const rows = sql.exec<{ r: number; id: string; kind: string; attrs: string; memory_type: string | null; chars: number; updated_at: string; created_at: string }>(
-		"SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at FROM nodes WHERE rowid > ? AND status IN ('active','candidate') ORDER BY rowid LIMIT ?", after, STEP.queue).toArray();
+	// stale_memory (decay without deletion): an active memory, not a journal or preference, untouched for 90 days and with no
+	// recall hit in the 90 UTC days ending today. Never stated, pinned or in me, so a protected record is never queued. Graph
+	// nodes without a memory type (sessions, entities) are excluded: the retire-only save cannot find them.
+	const staleBefore = new Date(now - STALE_DAYS * DAY).toISOString(), hitsFrom = new Date(now - (STALE_DAYS - 1) * DAY).toISOString().slice(0, 10);
+	const rows = sql.exec<{ r: number; id: string; kind: string; attrs: string; memory_type: string | null; chars: number; updated_at: string; created_at: string; stale: number }>(
+		`SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at, (status = 'active' AND memory_type IS NOT NULL AND kind NOT IN ('journal', 'preference') AND origin <> 'stated'
+			AND pinned = 0 AND ?1 <> 'me' AND updated_at < ?2 AND NOT EXISTS (SELECT 1 FROM recall_daily d WHERE d.node_id = nodes.id AND d.day >= ?3)) AS stale
+		FROM nodes WHERE rowid > ?4 AND status IN ('active','candidate') ORDER BY rowid LIMIT ?5`, who.profile, staleBefore, hitsFrom, after, STEP.queue).toArray();
 	let items = 0;
 	for (const n of rows) {
 		const kinds: string[] = [];
@@ -212,6 +246,7 @@ function queueStep(storage: DurableObjectStorage, who: Who, after: number, now: 
 		const F = fenceOf(n.attrs);
 		const uncompacted = n.kind === "journal" ? Number(sql.exec<{ chars: number }>("SELECT COALESCE(SUM(length(body) + CASE WHEN chunk = 0 THEN length(COALESCE(separator, '')) ELSE 0 END), 0) AS chars FROM texts WHERE node_id = ? AND part = 'entry' AND live <> 0 AND seq_no > ?", n.id, F).one().chars) : 0;
 		if (n.kind === "journal" && uncompacted >= 8000 && Date.parse(n.updated_at) <= now - 7 * DAY) kinds.push("stale_journal");
+		if (n.stale) kinds.push("stale_memory");
 		const digests = sql.exec<{ body: string; capture_status: string }>(`SELECT body, capture_status FROM texts t WHERE node_id = ? AND lane = 'capture' AND live = 1 AND capture_part IS NOT 'manifest'
 			AND NOT EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id AND m.capture_part = 'manifest') ORDER BY rowid LIMIT 100`, n.id).toArray();
 		if (digests.length) kinds.push("unprocessed_capture");

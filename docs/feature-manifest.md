@@ -148,3 +148,16 @@ Source ready, not deployed. Depends on the v2 request plumbing and #9 above. Ses
 - Capture recall (`include_captures`) reads the same current parts as Sessions: once a range's manifest is accepted, only the parts it lists, as of the requested time when one is given.
 - Evidence for the manifest-selected parts, the last-upload time and capture recall: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 replay-safe maintenance and stale records (#10), 2026-11-04
+
+Source ready, not deployed. Depends on #9 above for the recall counts and eval candidates.
+
+- `maintenance_next` takes an optional `request_id`. The first call binds it to the lease; an identical retry returns the same lease and only items still leased, a changed retry is refused, and an expired binding returns `lease_id: null` with `reason: "lease_expired"`. Each request id keeps its own binding for 400 days, so a later run's lease never lets an earlier id lease again. Without `request_id` the v1 behavior is unchanged, and `maintenance_complete` per-op replay stays exactly once.
+- Housekeeping queues `stale_memory` only for active memories older than 90 days with no recall hit in 90 days. Journals, preferences, stated, pinned and `me` records are excluded, and so are graph nodes without a memory type, such as uploaded sessions and entities, which the retire-only save cannot reach. A stale item allows only a retire-only save, `flag` and `dismiss`; every change still goes through `mayChange`, and nothing is deleted automatically.
+- `suggest_eval_case` is allowed only on `unprocessed_capture` and `preference_signal` items. Its query, expected ids and evidence are checked against the item's subjects and stored through the #9 candidate store, which refuses wiped ids.
+- Housekeeping purges `recall_daily` and `recall_totals` rows older than 400 days in bounded pages.
+- The owner can queue link maintenance for 1 to 40 memories (`POST /api/profiles/:p/maintenance/queue`) and consolidation for one session (`POST /api/profiles/:p/sessions/:id/consolidate`) through the existing fingerprinted queue, so a repeat queues nothing.
+- The batch's capture context reads the same current parts as Sessions: once a range's manifest is accepted, it leaves out consolidated parts the manifest does not list.
+- Evidence for the stale-memory rule and the capture context: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase; the original module tests were not preserved and are listed as needed coverage.

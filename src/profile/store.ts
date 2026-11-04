@@ -15,8 +15,9 @@ import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPr
 import { ownerModel } from "./owner-model";
 import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
 import { noteRecall, recallStrength } from "./recall-stats";
-import type { EvalCandidateQuery, EvalCandidateStatus, RecallOptions, SessionQuery } from "../viewer/types";
+import type { EvalCandidateQuery, EvalCandidateStatus, OwnerQueue, RecallOptions, SessionQuery } from "../viewer/types";
 import { listSessions, sessionDetail } from "./sessions";
+import { enqueueIn } from "./maintenance";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -744,6 +745,29 @@ export class ProfileStore extends DurableObject<Env> {
 			const sql = this.ctx.storage.sql;
 			const c = this.ctx.storage.transactionSync(() => decideCandidate(sql, nextSeq(sql, "profile_meta"), id, status));
 			return c ? ok(c) : fail("not_found", "no such eval candidate");
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/**
+	 * Owner queue (#10: "Queue link maintenance" and "Queue consolidation"): the existing fingerprinted queue, so a repeat
+	 * queues nothing. Every subject must be this profile's: active memories for unlinked, a session node for consolidation.
+	 */
+	async queueOwner(who: Who, q: OwnerQueue): Promise<Outcome<{ queued: number }>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql, ids = q.kind === "unlinked" ? q.ids : [q.session];
+			const held = sql.exec<{ id: string }>(q.kind === "unlinked"
+				? "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND memory_type IS NOT NULL"
+				: "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND kind = 'session' AND status = 'active'", JSON.stringify(ids)).toArray().map((r) => r.id);
+			if (held.length !== new Set(ids).size) return fail("not_found", q.kind === "unlinked" ? "every id must be an active memory in this profile" : "no such session");
+			return ok(this.ctx.storage.transactionSync(() => {
+				let tx: BudgetTx | undefined;
+				return { queued: enqueueIn(sql, () => (tx ??= new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString())), held.map((id) => ({ kind: q.kind, subjects: [id] }))) };
+			}));
 		} catch (e) {
 			if (e instanceof Fail) return { ok: false, error: e.failure };
 			throw e;
