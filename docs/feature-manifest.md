@@ -229,6 +229,20 @@ Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 - `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
 - Nothing imports the player yet, so the Worker bundle is unchanged until the dashboard tabs land.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`.
+
+### v2 CLI config defaults and read and job clients (#6), 2026-11-04
+
+Source in review; not installed. These are CLI helpers for later v2 commands. This change adds no command, and a v1 install behaves as before.
+
+- `loadConfig()` fills in `batch_hour` (4), `read_token_file` (`<home>/read-token`) and `inject` (`enabled: false`, `profile: null`, `max_tokens: 600`, `timeout_ms: 1500`), and returns every other key as written.
+- Profile choice stays explicit. `inject.enabled` is true only when the config sets both `inject.enabled: true` and a valid `inject.profile`, and nothing picks a profile. `readServer().recall(body)` requires `body.profile`.
+- `readToken()` reads the separate read credential at `read_token_file`. It refuses a path that resolves to `token_file`, a symlink, a file another user owns, and a file with group or other access.
+- Read client: `readServer().recall(body)` posts `/v1/recall`, and `readServer().acceptedCandidates({ profile, cursor, limit })` reads one page of `GET /v1/eval/candidates`, both with the read token only. The profile is required, a cursor is 1 to 2,048 characters, and a limit is an integer from 1 to 100. Neither falls back to the job token.
+- Job client: `httpServer()` adds `status`, `evalRun` and `whoami`, all with the job token.
+- Every new request sets `redirect: "error"` and a timeout. A bad argument throws before any request is sent.
+- Nothing calls these helpers in this change. Hook, run, install, usage text and dispatch are unchanged. `eval`, `backfill`, `doctor`, `run --scheduled` and the prompt hook use them from #16 on.
+- Evidence: 4 cases in `local/agent-memory.test.mjs`. The latest combined local run on the final integrated source, which includes this change, passed 138 of 138. That is combined-source evidence, not a run of this commit alone. CI on this head is pending.
+
 ### Local full-transcript replay (#22), 2026-11-04
 
 `agent-memory replay` serves full local Claude Code and Codex transcripts to a browser on the recording machine. It loads the shared player above, byte for byte. Nothing it reads is uploaded or stored in a hosted system.
