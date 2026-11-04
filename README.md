@@ -61,6 +61,8 @@ Codex may open a browser during setup. Sign-in uses Clerk; scoped device access 
 
 The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Personal capture hooks are enabled; bounded Main and T3 capture passed, while MacBook capture and full parity remain pending. The separate own-app model path remains blocked after eight diagnostic requests.
 
+To review a full session on the machine that recorded it, run `agent-memory replay --list`, then `agent-memory replay --session ID`. The viewer listens on 127.0.0.1 only, behind a private URL token, and uploads nothing.
+
 ## Explore the project
 
 The [feature manifest](docs/feature-manifest.md) tracks what is implemented, tested, and still planned. The [architecture](docs/architecture.md) explains the design and its checks. For local development, install dependencies with `npm ci` and run `npm run check` to run the repository checks.

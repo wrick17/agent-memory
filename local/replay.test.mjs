@@ -112,13 +112,15 @@ describe("local transcripts", () => {
 				{ type: "text", text: "Please fix that failure.<system-reminder>REMINDER-TEXT</system-reminder>" }, { type: "text", text: "<environment_context>INJECTED-CONTEXT</environment_context>" }] } },
 			// A record the hook drops as a whole keeps its text out even when a later block alone would pass.
 			{ type: "user", timestamp: ts(6), message: { content: [{ type: "text", text: "<command-name>INJECTED-CONTEXT" }, { type: "text", text: "META-ONLY" }] } },
+			// Owner text after injected context in the same record is kept.
+			{ type: "user", timestamp: ts(7), message: { content: [{ type: "text", text: "<environment_context>INJECTED-CONTEXT</environment_context>" }, { type: "text", text: "Then run lint." }] } },
 			// A secret split across text blocks, or across a tool block, is redacted as in the whole message.
 			{ type: "user", timestamp: ts(8), message: { content: [{ type: "text", text: "password=" }, { type: "text", text: PW }] } },
 			{ type: "assistant", timestamp: ts(9), message: { content: [{ type: "text", text: "Checking. api_key=" }, { type: "tool_use", id: "t2", name: "Bash", input: { command: "ls" } }, { type: "text", text: PW }] } },
 		]));
 		const events = readFull("claude-code", file);
 		assert.deepEqual(events.map((e) => [e.kind, e.label]), [["response", "First."], ["tool_call", "Bash"], ["response", "Second. password=[REDACTED]"],
-			["tool_result", "Bash result"], ["prompt", "Please fix that failure."], ["prompt", "password=[REDACTED]"],
+			["tool_result", "Bash result"], ["prompt", "Please fix that failure."], ["prompt", "Then run lint."], ["prompt", "password=[REDACTED]"],
 			["response", "Checking. api_key=[REDACTED]"], ["tool_call", "Bash"]]);
 		assert.deepEqual(leaks(JSON.stringify(events)), []);
 	});
