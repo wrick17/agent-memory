@@ -2130,6 +2130,42 @@ describe("dashboard Activity tab", () => {
 		expect(text(b.view())).toContain(`asked on ${dayA}`);
 		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
 	});
+
+	// One profile's year as the activity-summary route answers it; `extra` replaces fields.
+	const year = (from: string, to: string, extra: Record<string, unknown> = {}) => ({ from, to, active_days: 0, sessions: 0, observations: 0, busiest_day: null, days: [],
+		kinds: { asks: 0, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [], busiest_sessions: [], latest: [], ...extra });
+	const yearApi: (extra?: Record<string, unknown>) => Api = (extra) => (path) => {
+		const u = new URL(path, "https://x");
+		if (u.pathname === "/api/profiles/work/activity-summary") return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, extra));
+	};
+
+	it("moves through the heatmap by date: Up and Down a day, Left and Right a week, Home and End to the first and last day", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ observations: 1, sessions: 1, active_days: 1 }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const cells = find(b.view(), "button").filter((x) => x.attrs["data-day"]), days = cells.map((x) => x.attrs["data-day"]!).sort();
+		const cell = (d: string) => cells.find((x) => x.attrs["data-day"] === d)!, table = find(b.view(), "table")[0]!;
+		const press = (key: string, from: string) => { table.on.keydown!({ key, target: cell(from), preventDefault() {} } as never); return active?.attrs["data-day"]; };
+		const last = days.at(-1)!, back = (n: number) => days[days.length - 1 - n];
+		let at = last; // the roving stop: today
+		const seen = ["ArrowUp", "ArrowLeft", "ArrowRight", "ArrowDown", "Home", "End"].map((k) => (at = press(k, at)!));
+		expect(seen).toEqual([back(1), back(8), back(1), last, days[0], last]);
+		expect(cells.filter((x) => x.attrs.tabindex === "0").map((x) => x.attrs["data-day"])).toEqual([last]); // still one roving stop
+	});
+
+	it("lists the corpus's most touched files when a year has no observations, and keeps them selectable", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ top_files: [{ path: "src/a.ts", count: 3 }] }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("No observations in work in the last 12 months.");
+		const file = () => find(b.view(), "button").find((x) => x.attrs["data-f"] === "file:src/a.ts")!;
+		expect(file()).toBeDefined(); // a selectable file filter
+		expect(file().attrs["aria-pressed"]).toBe("false");
+		file().on.click!();
+		await settle();
+		expect(file().attrs["aria-pressed"]).toBe("true");
+		expect(b.win.location.hash).toBe("#activity?profile=work&file=src%2Fa.ts");
+	});
 });
 
 describe("dashboard Memories tab", () => {
