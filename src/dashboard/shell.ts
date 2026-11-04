@@ -290,7 +290,10 @@ export function shell(win: any): void {
 		ui.profile.hidden = true;
 		ui.profile.addEventListener("change", () => {
 			if (!picked) return;
-			const to = withProfile(picked.hash, ui.profile.value || null);
+			// Tabs keep their address current with replaceState (an open record, a search, a filter) without a render, so the picker
+			// rewrites the current address while it still names the picked tab.
+			const now = String(win.location.hash ?? ""), here = /^#([a-z]+)/.exec(now)?.[1] === picked.tab ? now : picked.hash;
+			const to = withProfile(here, ui.profile.value || null);
 			// replaceState and one render keep focus on the select; without it the hash change renders once instead.
 			if (typeof win.history?.replaceState === "function") { win.history.replaceState(null, "", to); render(false); } else win.location.hash = to;
 		});
