@@ -1,0 +1,215 @@
+{
+	"at": "2026-11-02T09:15:00Z",
+	"version": "00000000-0000-4000-8000-00000000f0f0",
+	"deployed_at": "2026-11-01T20:00:00Z",
+	"profiles": [
+		"demo",
+		"me"
+	],
+	"cursor": "fixture-opaque-events-cursor",
+	"counts": {
+		"memories": 128,
+		"revisions": 341,
+		"observations": 2210,
+		"sessions": 3,
+		"sessions_active": 1,
+		"lessons": 12,
+		"crystals": 0,
+		"actions": 4,
+		"graph_nodes": 506,
+		"graph_edges": 1290
+	},
+	"usage": {
+		"recalls_today": 14,
+		"recall_tokens_today": 5120,
+		"writes_today": 0,
+		"storage_bytes": 48234496,
+		"storage_limit": 10737418240,
+		"vectors": 0
+	},
+	"health": {
+		"verdict": "warn",
+		"checks": [
+			{
+				"check_id": "batch_overdue",
+				"subject": "demo",
+				"state": "warn",
+				"detail": "No completed batch since 2026-10-31T03:10:00Z.",
+				"at": "2026-11-02T09:00:00Z"
+			},
+			{
+				"check_id": "capture_stale",
+				"subject": "dev_fixture_mac",
+				"state": "ok",
+				"detail": "Last digest 2026-11-02T09:12:00Z.",
+				"at": "2026-11-02T09:00:00Z"
+			},
+			{
+				"check_id": "capture_pending",
+				"subject": "dev_fixture_mac",
+				"state": "warn",
+				"detail": "2 stuck ranges; oldest pending range 2026-10-24T14:05:00Z.",
+				"at": "2026-11-02T09:00:00Z"
+			}
+		]
+	},
+	"recent_sessions": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000a1",
+			"client": "claude-code",
+			"session": "fixture-session-1",
+			"profile": "demo",
+			"device": "dev_fixture_mac",
+			"project": "00000000-0000-5000-8000-0000000000b1",
+			"first_upload_at": "2026-11-02T08:41:00Z",
+			"last_upload_at": "2026-11-02T09:12:00Z",
+			"status": "active",
+			"first_ask": "Why does the nightly export skip the second profile?",
+			"counts": {
+				"asks": 3,
+				"decisions": 2,
+				"corrections": 1,
+				"outcomes": 2,
+				"parts": 4,
+				"files_changed": 5
+			}
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000a3",
+			"client": "claude-code",
+			"session": "fixture-session-0",
+			"profile": "demo",
+			"device": null,
+			"project": null,
+			"first_upload_at": "2026-10-20T11:00:00Z",
+			"last_upload_at": "2026-10-20T11:00:00Z",
+			"status": "completed",
+			"first_ask": null,
+			"counts": {
+				"asks": 0,
+				"decisions": 0,
+				"corrections": 0,
+				"outcomes": 0,
+				"parts": 1,
+				"files_changed": null
+			}
+		}
+	],
+	"feed": [
+		{
+			"kind": "MEMORY",
+			"profile": "demo",
+			"id": "1042",
+			"summary": "Saved: Nightly export iterates the account profile list",
+			"at": "2026-11-02T09:12:10Z",
+			"target": "00000000-0000-5000-8000-0000000000c1"
+		},
+		{
+			"kind": "PREFERENCE",
+			"profile": "me",
+			"id": "87",
+			"summary": "Inferred: Keep export order stable by profile name",
+			"at": "2026-11-02T09:12:05Z",
+			"target": "00000000-0000-5000-8000-0000000000c2"
+		},
+		{
+			"kind": "IMPORT",
+			"profile": "demo",
+			"id": "1039",
+			"summary": "Imported 2 records, including <script>alert(1)</script> as text",
+			"at": "2026-11-02T08:00:00Z"
+		},
+		{
+			"kind": "FORGET",
+			"profile": "demo",
+			"id": "1031",
+			"summary": "Forgot: Old export cursor note",
+			"at": "2026-11-01T22:30:00Z",
+			"target": "00000000-0000-5000-8000-0000000000c4"
+		},
+		{
+			"kind": "BATCH",
+			"profile": "demo",
+			"id": "1027",
+			"summary": "Batch completed: 6 items, 2 merged",
+			"at": "2026-10-31T03:10:00Z"
+		}
+	],
+	"layers": [
+		{
+			"layer": "digests",
+			"count": 42,
+			"state": "ok",
+			"waits_for": null
+		},
+		{
+			"layer": "parts",
+			"count": 97,
+			"state": "ok",
+			"waits_for": null
+		},
+		{
+			"layer": "memories",
+			"count": 128,
+			"state": "ok",
+			"waits_for": null
+		},
+		{
+			"layer": "preferences",
+			"count": 0,
+			"state": "waiting",
+			"waits_for": "the next scheduled batch"
+		},
+		{
+			"layer": "me",
+			"count": 0,
+			"state": "off",
+			"waits_for": null
+		}
+	],
+	"flags": [
+		{
+			"id": "embeddings",
+			"state": "off",
+			"tabs": [
+				"memories",
+				"graph"
+			],
+			"how": "Add the Workers AI binding and redeploy."
+		},
+		{
+			"id": "corpus",
+			"state": "on",
+			"tabs": [
+				"activity",
+				"profile"
+			],
+			"how": "On. Commit paths feed most touched files."
+		},
+		{
+			"id": "capture",
+			"state": "on",
+			"tabs": [
+				"sessions",
+				"replay",
+				"activity"
+			],
+			"how": "Hooks are installed on 1 device."
+		},
+		{
+			"id": "inject",
+			"state": "off",
+			"tabs": [],
+			"how": "Set inject.enabled to true in the local config on each device."
+		},
+		{
+			"id": "scheduled_batch",
+			"state": "on",
+			"tabs": [
+				"lessons",
+				"crystals"
+			],
+			"how": "The launchd job runs the batch daily."
+		}
+	]
+}

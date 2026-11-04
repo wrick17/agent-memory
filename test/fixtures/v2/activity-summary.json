@@ -1,0 +1,14 @@
+{
+	"from": "2025-11-03", "to": "2026-11-02", "active_days": 3, "sessions": 3, "observations": 57, "busiest_day": "2026-11-02",
+	"days": [ { "day": "2026-10-20", "count": 4 }, { "day": "2026-11-01", "count": 9 }, { "day": "2026-11-02", "count": 44 } ],
+	"kinds": { "asks": 4, "decisions": 2, "corrections": 1, "commits": 3, "tests": 2, "prs": 0 },
+	"top_files": [ { "path": "src/export.ts", "count": 5 }, { "path": "src/backup.ts", "count": 2 }, { "path": "test/backup.test.ts", "count": 1 } ],
+	"busiest_sessions": [
+		{ "id": "00000000-0000-5000-8000-0000000000a1", "title": "Why does the nightly export skip the second profile?", "observations": 44 },
+		{ "id": "00000000-0000-5000-8000-0000000000a3", "title": null, "observations": 4 }
+	],
+	"latest": [
+		{ "session": "00000000-0000-5000-8000-0000000000a1", "kind": "outcome", "text": "Typecheck passes", "at": "2026-11-02T09:12:00Z" },
+		{ "session": "00000000-0000-5000-8000-0000000000a1", "kind": "correction", "text": "Keep the export order stable by profile name", "at": "2026-11-02T08:55:00Z" }
+	]
+}
