@@ -1,9 +1,11 @@
-// Graph: today's knowledge graph canvas at #/ and #/graph, moved here unchanged. The Graph tab ticket registers its tab here.
-// Browser code, serialized into /app.js: it may use only `am` and browser globals (type imports are erased).
+// Graph: the knowledge graph canvas at #/, #/graph/P(/ID) and #graph(/ID)?profile=P, restyled after agentmemory v0.9.31 with
+// shapes by kind, a toolbar, zoom, a node detail panel and "Queue link maintenance". It stays a page, not a registered tab, so
+// the site root and every old route keep opening it. Browser code, serialized into /app.js: it may use only `am` and browser
+// globals (type imports are erased).
 import type { Am, Failure, GEdge, GNode, Graph, J, Node, Profile } from "./am";
 
 export function graphTab(am: Am): void {
-	const { btn, call, doc, el, enc, facts, input, link, live, note, recorded, render, switcher, textBlock, why, win } = am;
+	const { act, btn, call, copy, curl, doc, el, enc, facts, input, link, live, mcpCall, note, recorded, render, switcher, textBlock, why, win } = am;
 
 	// The knowledge graph (section 15), the dashboard's home: every record and link of one profile, drawn on one canvas from the
 	// owner whole-graph read (metadata only, paged), so loaded and total counts are the server's. A selected record's detail is read
@@ -13,8 +15,23 @@ export function graphTab(am: Am): void {
 		["m:procedural", "Procedures"], ["e:project", "Projects"], ["e:component", "Components"], ["e:person", "People"], ["e:ticket", "Tickets"], ["e:bug", "Bugs"],
 		["e:feature", "Features"], ["e:pr", "Pull requests"], ["e:commit", "Commits"], ["e:release", "Releases"], ["e:decision", "Decisions"], ["e:other", "Other"]];
 	const GROUP_NAME = new Map(GROUPS);
-	// Three categorical hues (they stay apart for every pair, including colour-blind readers); each group's place and label name it too.
-	const hueOf = (g: string) => g.startsWith("m:") ? "#2a78d6" : g === "e:person" ? "#1baf7a" : "#eb6834";
+	// Five kinds of node, each with its own shape and hue, so a node reads by shape alone; the legend and detail chip show both.
+	// Index order is SHAPES; HUES hold the light and dark steps, each at least 3:1 against the canvas in its theme.
+	const SHAPES = ["circle", "star", "diamond", "hexagon", "square"] as const;
+	type Shape = (typeof SHAPES)[number];
+	const GLYPH = ["●", "★", "◆", "⬢", "■"];
+	const HUES = { light: ["#2a78d6", "#c4402c", "#1d8a57", "#7c4dbd", "#9a6200"], dark: ["#5b9ee9", "#f0806f", "#6cc79b", "#b294ee", "#e2ad55"] };
+	const shapeAt = (g: string) => g.startsWith("m:") ? 0 : g === "e:project" ? 1 : g === "e:person" ? 2 : ["e:ticket", "e:bug", "e:feature", "e:decision"].includes(g) ? 3 : 4;
+	/** One shape as a closed subpath around (x, y); points and corners are scaled so every shape covers about the same area. */
+	const shapePath = (c: J, s: Shape, x: number, y: number, r: number) => {
+		if (s === "circle") { c.moveTo(x + r, y); c.arc(x, y, r, 0, 2 * Math.PI); return; }
+		const n = s === "hexagon" ? 6 : s === "star" ? 10 : 4, turn = s === "square" ? Math.PI / 4 : s === "hexagon" ? Math.PI / 6 : -Math.PI / 2;
+		const R = r * (s === "square" ? 1.25 : s === "star" ? 1.45 : s === "diamond" ? 1.35 : 1.1);
+		for (let i = 0; i < n; i++) {
+			const a = turn + (i * 2 * Math.PI) / n, rr = s === "star" && i % 2 ? R * 0.45 : R, px = x + rr * Math.cos(a), py = y + rr * Math.sin(a);
+			if (i) c.lineTo(px, py); else c.moveTo(px, py);
+		}
+	};
 	const groupOf = (type: string | null, kind: string) => type ? (GROUP_NAME.has(`m:${type}`) ? `m:${type}` : "e:other") : GROUP_NAME.has(`e:${kind}`) ? `e:${kind}` : "e:other";
 	const SPACING = 14, GOLDEN = Math.PI * (3 - Math.sqrt(5));
 	const str = (v: unknown) => (typeof v === "string" && v ? v : null);
@@ -35,7 +52,7 @@ export function graphTab(am: Am): void {
 		list.push(id);
 		g.groups.set(group, list);
 		g.dirty = true;
-		for (const e of g.pending.get(id) ?? []) link2(g, e);
+		for (const e of g.pending.get(id) ?? []) if (e.b) link2(g, e); else g.nodes.get(id)!.opaque++; // b "": a link out of this profile
 		g.pending.delete(id);
 	};
 	/** A link joins the drawing once both ends are loaded records; until then it waits, so no end is invented. */
@@ -53,7 +70,13 @@ export function graphTab(am: Am): void {
 		if (!id || !a || !b) return;
 		// A far end that is not a record shown here (another profile, a moved record, a capture) is counted on its record, never drawn.
 		if (it.dst.readable !== true) {
-			if (!g.edges.has(`x:${id}`)) { g.edges.set(`x:${id}`, { id: `x:${id}`, a, b: "", rel: str(it.rel) ?? "" }); g.opaque++; const n = g.nodes.get(a); if (n) n.opaque++; }
+			if (!g.edges.has(`x:${id}`)) {
+				const e = { id: `x:${id}`, a, b: "", rel: str(it.rel) ?? "" }, n = g.nodes.get(a);
+				g.edges.set(e.id, e);
+				g.opaque++;
+				// Edges and nodes page in parallel: a source not loaded yet gets the count when addNode takes it from pending.
+				if (n) n.opaque++; else g.pending.set(a, [...(g.pending.get(a) ?? []), e]);
+			}
 			return;
 		}
 		link2(g, { id, a, b, rel: str(it.rel) ?? "relates_to" });
@@ -107,6 +130,7 @@ export function graphTab(am: Am): void {
 
 	const graphPage = (view: Node, p: Profile, selectId?: string) => {
 		const version = am.pageVersion, g = graphOf(p);
+		am.intro(view, "Knowledge graph", "graph", "Every record of one profile and the links the server holds between them. Shape and colour show the kind. Select a node for its relations, where it came from and its raw record.");
 		const wrap = el("div", view);
 		wrap.setAttribute("class", "graph");
 		const stage = el("section", wrap), side = el("aside", wrap);
@@ -117,19 +141,37 @@ export function graphTab(am: Am): void {
 		const h = el("h2", head, `Knowledge graph: ${p.name}`);
 		switcher(head, "graph", p.name);
 		const statusLine = live(stage);
+		am.pageStatus(stage); // the queue's outcome after a write
+		// Toolbar: find (press /), the type filter with counts, node and relation counts, zoom, and the owner's one write here.
 		const tools = el("div", stage);
-		tools.setAttribute("class", "graph-tools");
+		tools.setAttribute("class", "toolbar");
+		const qLabel = el("label", tools, "Find a node");
+		qLabel.setAttribute("for", "graph-q");
+		qLabel.setAttribute("class", "vh");
+		const search = el("input", tools);
+		search.setAttribute("id", "graph-q");
+		search.setAttribute("type", "search");
+		search.setAttribute("placeholder", "Find a node (press /)");
+		search.setAttribute("aria-keyshortcuts", "/");
+		search.setAttribute("data-search", "");
+		const tLabel = el("label", tools, "Filter by type");
+		tLabel.setAttribute("for", "graph-type");
+		tLabel.setAttribute("class", "vh");
+		const typeSel = el("select", tools);
+		typeSel.setAttribute("id", "graph-type");
+		const counts = el("span", tools);
+		counts.setAttribute("class", "muted mono");
+		am.help(tools, "relations");
+		const confirmBox = el("div", stage);
 		const canvas: J = el("canvas", stage);
 		canvas.setAttribute("tabindex", "0");
 		canvas.setAttribute("role", "img");
-		canvas.setAttribute("aria-label", "Graph of this profile's records. Arrow keys pan, plus and minus zoom, 0 fits, Enter selects the first match. Use the search beside it to find records.");
+		canvas.setAttribute("aria-label", "Graph of this profile's records. Arrow keys pan, plus and minus zoom, 0 fits, Enter selects the first match. Press / to find a node.");
 		const legend = el("ul", stage);
 		legend.setAttribute("class", "legend");
-		legend.setAttribute("aria-label", "Groups; uncheck to hide");
-		el("p", stage, "Dot size grows with links. A ring marks a record with links into another profile. Records with no links are drawn without lines; that is what the server holds.").setAttribute("class", "na");
-		// Side panel: search and the selected record.
-		const search = input(side, "graph-q", "Find records by name, type or scope");
-		search.setAttribute("type", "search");
+		legend.setAttribute("aria-label", "Kinds by shape and colour; uncheck to hide");
+		el("p", stage, "Shape and colour show the kind; size grows with links. A ring marks a record with links into another profile. Records with no links are drawn without lines; that is what the server holds.").setAttribute("class", "na");
+		// Side panel: matches, the selected record, and what-if changes.
 		const linkedOnly = el("label", side);
 		linkedOnly.setAttribute("class", "field");
 		const linkedBox = el("input", linkedOnly);
@@ -144,14 +186,17 @@ export function graphTab(am: Am): void {
 		const matches = el("ul", side);
 		matches.setAttribute("class", "matches");
 		matches.setAttribute("aria-label", "Matching records");
-		const scenario = el("section", side);
-		scenario.setAttribute("aria-label", "What-if changes, not saved");
+		matches.setAttribute("data-list", "");
 		const detail = el("section", side);
 		detail.setAttribute("aria-label", "Selected record");
+		detail.setAttribute("class", "panel");
+		const scenario = el("section", side);
+		scenario.setAttribute("aria-label", "What-if changes, not saved");
 
 		const hidden = new Set<string>();
+		let typeFilter = "", typeKey = "";
 		let query = "", selected: string | null = selectId ?? null, hover: string | null = null, matched: GNode[] = [], matchSet = new Set<string>();
-		let discs: ReturnType<typeof layout> = [], grid = new Map<string, GNode[]>(), cam = { x: 0, y: 0, k: 1 }, fitted = false, moved = false, frame = false, detailRequest = 0;
+		let discs: ReturnType<typeof layout> = [], grid = new Map<string, GNode[]>(), cam = { x: 0, y: 0, k: 1 }, fitted = false, moved = false, frame = false, detailRequest = 0, partial = false;
 		// Per-layout state, so a frame reads no DOM and filters nothing: the drawable records, their ids, and each record's linked ids.
 		let vis: GNode[] = [], visIds = new Set<string>(), adj = new Map<string, string[]>(), showPast = false, onlyLinked = false;
 		const ctx = canvas.getContext?.("2d") ?? null;
@@ -166,9 +211,9 @@ export function graphTab(am: Am): void {
 		};
 		measure();
 		// Canvas pixels follow neither CSS nor a browser's forced dark mode, so the canvas palette follows the canvas's actual computed
-		// background: read once here and again only on a resize or a colour-scheme change, never per frame. Text takes the first
-		// candidate reaching 4.5:1 against it; dots use the dark or light steps of the same three hues.
-		type Theme = { id: string; bg: string; ink: string; muted: string; match: string; ring: string; edge: string; hues: string[] };
+		// background: read once here and again only on a resize or a theme change, never per frame. Text takes the first candidate
+		// reaching 4.5:1 against it; shapes and the legend use the dark or light steps of the same five hues.
+		type Theme = { id: string; bg: string; ink: string; muted: string; ring: string; edge: string; hues: string[] };
 		const rgbOf = (c: unknown): number[] | null => {
 			const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?/.exec(typeof c === "string" ? c : "");
 			return m && (m[4] === undefined || parseFloat(m[4]) > 0) ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
@@ -182,15 +227,13 @@ export function graphTab(am: Am): void {
 			const bg = rgbOf(css(canvas)) ?? rgbOf(css(doc.body)) ?? (win.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? [26, 28, 29] : [251, 252, 253]);
 			const dark = lum(bg) < 0.18, pick = (c: string[]) => c.find((x) => ratio(hex(x), bg) >= 4.5) ?? (dark ? "#ffffff" : "#000000");
 			const next: Theme = { id: bg.join(","), bg: `rgb(${bg.join(",")})`, ink: pick(dark ? ["#e6edf3"] : ["#1b1f24"]), muted: pick(dark ? ["#9da7b3", "#c9d1d9"] : ["#57606a", "#424a53"]),
-				match: pick(dark ? ["#d29922", "#e3b341"] : ["#9a6700", "#7d4e00"]), ring: dark ? "#e6edf3" : "#1b1f24", edge: dark ? "rgba(157,167,179,0.65)" : "rgba(87,96,106,0.65)",
-				hues: dark ? ["#3987e5", "#d95926", "#199e70"] : ["#2a78d6", "#eb6834", "#1baf7a"] };
+				ring: dark ? "#e6edf3" : "#1b1f24", edge: dark ? "rgba(157,167,179,0.65)" : "rgba(87,96,106,0.65)", hues: dark ? HUES.dark : HUES.light };
 			const changed = next.id !== theme?.id;
 			theme = next;
 			return changed;
 		};
 		readTheme();
-		const hueAt = (group: string) => (group.startsWith("m:") ? 0 : group === "e:person" ? 2 : 1);
-		const shown = (n: GNode) => !hidden.has(n.group) && (n.status === "active" || showPast) && (!onlyLinked || n.deg > 0 || n.opaque > 0);
+		const shown = (n: GNode) => !hidden.has(n.group) && (!typeFilter || n.group === typeFilter) && (n.status === "active" || showPast) && (!onlyLinked || n.deg > 0 || n.opaque > 0);
 		// The what-if view over loaded metadata only; the saved graph `g` is never changed. A removed record takes its loaded links with it.
 		let linkFrom: string | null = null; // a record waiting for the other end of a what-if link
 		const editsOf = () => { let e = am.whatIfEdits.get(p.name); if (!e) am.whatIfEdits.set(p.name, e = { add: [], cut: new Set(), drop: new Set() }); return e; };
@@ -234,20 +277,19 @@ export function graphTab(am: Am): void {
 			}
 			return best;
 		};
-		// Dots are drawn as one native path per colour (three fills for the whole library), into a cached layer: a frame stamps that one
+		// Nodes are drawn as one native path per kind (five fills for the whole library), into a cached layer: a frame stamps that one
 		// bitmap (a pan moves it, a wheel zoom in progress scales it) and the dots are drawn again only when the zoom settles, the layout
 		// changes or the pixel ratio does. Zoomed in past the layer's size cap, the dots in view are drawn directly, the same way.
 		const LAYER_PIXELS = 16_000_000, PAD = 12;
 		const dots = (c: J, k: number, ox: number, oy: number, keep: (n: GNode) => boolean) => {
 			let n = 0;
 			const scale = Math.min(1.6, Math.max(0.6, Math.sqrt(k)));
-			for (let hue = 0; hue < 3; hue++) {
-				c.fillStyle = theme!.hues[hue];
+			for (let s = 0; s < SHAPES.length; s++) {
+				c.fillStyle = theme!.hues[s];
 				c.beginPath();
 				for (const d of vis) {
-					if (hueAt(d.group) !== hue || !keep(d)) continue;
-					const x = d.x * k + ox, y = d.y * k + oy, r = radius(d) * scale;
-					c.moveTo(x + r, y); c.arc(x, y, r, 0, 2 * Math.PI);
+					if (shapeAt(d.group) !== s || !keep(d)) continue;
+					shapePath(c, SHAPES[s]!, d.x * k + ox, d.y * k + oy, radius(d) * scale);
 					n++;
 				}
 				c.fill();
@@ -332,16 +374,17 @@ export function graphTab(am: Am): void {
 				if (layerAt.k !== k) { clearTimeout(settleTimer); settleTimer = setTimeout(schedule, 160); }
 			} else count = dots(ctx, k, ox, oy, inView);
 			ctx.globalAlpha = 1;
-			const emphasise = (n: GNode, ring: string) => {
-				const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale;
-				ctx.fillStyle = t.hues[hueAt(n.group)]!; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
-				ctx.strokeStyle = ring; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, r + 2, 0, 2 * Math.PI); ctx.stroke();
+			// The emphasis ring is a circle just outside the shape's points; the selected node's is thicker than a match's.
+			const emphasise = (n: GNode, ring: string, width: number) => {
+				const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale, s = shapeAt(n.group);
+				ctx.fillStyle = t.hues[s]!; ctx.beginPath(); shapePath(ctx, SHAPES[s]!, x, y, r); ctx.fill();
+				ctx.strokeStyle = ring; ctx.lineWidth = width; ctx.beginPath(); ctx.arc(x, y, r * 1.45 + 2, 0, 2 * Math.PI); ctx.stroke();
 			};
-			if (k > 0.6) { ctx.strokeStyle = t.muted; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
-			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, t.match); }
-			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? t.ring : t.bg); }
+			if (k > 0.6) { ctx.strokeStyle = t.muted; ctx.lineWidth = 1; ctx.beginPath(); for (const n of vis) if (n.opaque && inView(n)) { const x = n.x * k + ox, y = n.y * k + oy, r = radius(n) * scale * 1.45 + 3; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 2 * Math.PI); } ctx.stroke(); }
+			for (const id of matchSet) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, t.ink, 2); }
+			if (focus) for (const id of focus) { const n = g.nodes.get(id); if (n && visIds.has(id) && inView(n)) emphasise(n, id === selected ? t.ring : t.bg, id === selected ? 3 : 2); }
 			// What-if changes (this tab only, never saved), dashed and outside the dot layer: a new memory is a ring on a line from its real
-			// record, an added link a line in the match colour; a removed link is a muted dashed line and a removed record is crossed out.
+			// record, an added link a line in the text colour; a removed link is a muted dashed line and a removed record is crossed out.
 			if (sc) {
 				ctx.save?.();
 				ctx.setLineDash?.([4, 3]);
@@ -357,7 +400,7 @@ export function graphTab(am: Am): void {
 					ctx.beginPath(); ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r); ctx.moveTo(x + r, y - r); ctx.lineTo(x - r, y + r); ctx.stroke();
 					whatIfAt.push([x + 6, y + 14, `Removed: ${g.nodes.get(id)!.name}`]);
 				}
-				ctx.strokeStyle = t.match;
+				ctx.strokeStyle = t.ink;
 				for (const [a, b] of sc.added) line(a, b);
 				sc.items.forEach((w, i) => {
 					const q = xy(w.target);
@@ -407,7 +450,8 @@ export function graphTab(am: Am): void {
 		const resized = () => {
 			if (version !== am.pageVersion) { win.removeEventListener?.("resize", resized); scheme?.removeEventListener?.("change", resized); return; }
 			const sized = measure(), themed = readTheme();
-			if (sized || themed) schedule();
+			if (themed) refresh(); // the legend shares the canvas hues
+			else if (sized) schedule();
 		};
 		scheme?.addEventListener?.("change", resized);
 		win.addEventListener("resize", resized);
@@ -455,6 +499,7 @@ export function graphTab(am: Am): void {
 		};
 		const refresh = () => {
 			if (version !== am.pageVersion) return;
+			if (partial && selected && g.parts.nodes.done && g.parts.edges.done) select(selected, true);
 			const nodes = g.parts.nodes, edges = g.parts.edges, links = [...g.edges.values()].filter((e) => e.b).length;
 			const past = [...g.nodes.values()].filter((n) => n.status !== "active").length, waiting = [...g.pending.values()].reduce((s, l) => s + l.length, 0);
 			const parts = g.missing ? ["This server does not offer the whole-graph read yet, so the graph cannot be drawn. Browse records in Memories meanwhile."]
@@ -470,38 +515,84 @@ export function graphTab(am: Am): void {
 			reload.hidden = !g.changed;
 			pastText.textContent = ` Include retired and superseded records (${past.toLocaleString("en")})`;
 			if (!g.missing && nodes.done && !g.nodes.size) statusLine.textContent = "This profile holds no records yet.";
+			counts.textContent = `${count(g.nodes.size)} nodes · ${count(links)} relations`;
+			// The type filter's options change only when a count does, so an open list is not rebuilt under the pointer.
+			const opts: [string, string][] = [["", `All types (${count(g.nodes.size)})`]];
+			for (const [group, name] of GROUPS) { const n = g.groups.get(group)?.length ?? 0; if (n) opts.push([group, `${name} (${count(n)})`]); }
+			const key = opts.map((o) => o[1]).join("|");
+			if (key !== typeKey) { typeKey = key; typeSel.replaceChildren(); for (const [v, t] of opts) el("option", typeSel, t).setAttribute("value", v); typeSel.value = typeFilter; }
+			const ready = !g.missing && nodes.done && edges.done && !nodes.error && !edges.error && !g.changed;
+			queueBtn.disabled = !ready;
+			queueBtn.setAttribute("title", ready ? "Queue every unlinked active memory for the next consolidation batch" : "Available once the whole graph has loaded");
 			legend.replaceChildren();
 			for (const [group, name] of GROUPS) {
 				const n = g.groups.get(group)?.length ?? 0;
 				if (!n) continue;
-				const li = el("li", legend), l = el("label", li), box = el("input", l), dot = el("span", l);
+				const s = shapeAt(group), li = el("li", legend), l = el("label", li), box = el("input", l), glyph = el("span", l, ` ${GLYPH[s]}`);
 				box.setAttribute("type", "checkbox");
 				box.checked = !hidden.has(group);
 				box.addEventListener("change", () => { if (box.checked) hidden.delete(group); else hidden.add(group); g.dirty = true; fitted = false; runSearch(false); schedule(); });
-				dot.setAttribute("class", "dot");
-				dot.setAttribute("style", `background:${hueOf(group)}`);
+				glyph.setAttribute("aria-hidden", "true");
+				glyph.setAttribute("style", `color:${theme!.hues[s]}`);
 				el("span", l, ` ${name} (${n.toLocaleString("en")})`);
+				el("span", l, `, drawn as a ${SHAPES[s]}`).setAttribute("class", "vh");
 			}
 			runSearch(false);
 			renderScenario();
 			schedule();
 		};
+		const zoom = (f: number) => { moved = true; cam.k = Math.min(8, Math.max(0.03, cam.k * f)); schedule(); };
+		btn(tools, "+", () => zoom(1.4), "Zoom in");
+		btn(tools, "−", () => zoom(1 / 1.4), "Zoom out");
+		btn(tools, "Fit", () => { moved = false; fit(); schedule(); }, "Fit the graph to the view");
+
+		// "Queue link maintenance" (REBUILD in agentmemory): every active memory with no link the loaded graph shows, none waiting
+		// for an unlisted record, goes to the owner queue in requests of at most QUEUE_MAX. The queue is fingerprinted, so a repeat
+		// queues nothing; the next consolidation batch does the linking.
+		const QUEUE_MAX = 40;
+		const unlinked = () => {
+			const waiting = new Set<string>();
+			for (const l of g.pending.values()) for (const e of l) { waiting.add(e.a); waiting.add(e.b); }
+			return [...g.nodes.values()].filter((n) => n.type !== null && n.status === "active" && !n.deg && !n.opaque && !waiting.has(n.id)).map((n) => n.id);
+		};
+		const sendQueue = (ids: string[]) => act(async () => {
+			let queued = 0, sent = 0;
+			try {
+				for (; sent < ids.length; sent += QUEUE_MAX) {
+					const r: J = await call(`/api/profiles/${enc(p.name)}/maintenance/queue`, "POST", { kind: "unlinked", ids: ids.slice(sent, sent + QUEUE_MAX) });
+					queued += Number.isSafeInteger(r?.queued) ? r.queued : 0;
+				}
+			} catch (err) { return { queued, sent, error: why(err) }; }
+			return { queued, sent, error: null };
+		}, "queue link maintenance", undefined, (r: J) => ({ text: r.error
+			? `Queued ${r.queued} of ${ids.length} unlinked memories, then a request failed after ${r.sent} were sent: ${r.error}.`
+			: `Queued ${r.queued} of ${ids.length} unlinked memories for link maintenance${r.queued < ids.length ? `; the queue took no new item for the other ${ids.length - r.queued}` : ""}.` }));
+		const queueBtn = btn(tools, "Queue link maintenance", () => {
+			const ids = unlinked();
+			confirmBox.replaceChildren();
+			const ask = el("p", confirmBox, ids.length
+				? `Queue ${ids.length} unlinked active memor${ids.length === 1 ? "y" : "ies"} for link maintenance? The next consolidation batch looks for links for each one. Queuing changes no record.`
+				: "No active memory in this profile is without links, so there is nothing to queue.");
+			ask.setAttribute("tabindex", "-1");
+			if (ids.length) btn(confirmBox, `Queue ${ids.length}`, () => { confirmBox.replaceChildren(); void sendQueue(ids); });
+			const cancel = btn(confirmBox, ids.length ? "Cancel" : "Close", () => { confirmBox.replaceChildren(); queueBtn.focus(); });
+			cancel.setAttribute("data-close", "");
+			ask.focus();
+		});
+		link(tools, `#/memories/${enc(p.name)}`, "List view");
 		const retry = btn(tools, "Retry loading", () => { for (const ph of Object.values(g.parts)) ph.error = null; pump(p, g); refresh(); });
 		retry.hidden = true;
 		// A fresh walk replaces the cached graph; the old walk's late pages are dropped.
 		const reload = btn(tools, "Reload graph", () => { graphs.delete(`${p.name}:${p.generation ?? ""}`); render(false); });
 		reload.hidden = true;
-		btn(tools, "Zoom in", () => { moved = true; cam.k = Math.min(8, cam.k * 1.4); schedule(); });
-		btn(tools, "Zoom out", () => { moved = true; cam.k = Math.max(0.03, cam.k / 1.4); schedule(); });
-		btn(tools, "Fit", () => { moved = false; fit(); schedule(); });
-		link(tools, `#/memories/${enc(p.name)}`, "List view");
+		typeSel.addEventListener("change", () => { typeFilter = typeSel.value; g.dirty = true; fitted = false; runSearch(false); schedule(); });
 
 		const runSearch = (announce: boolean) => {
 			const q = query.trim().toLowerCase();
 			matched = q ? [...g.nodes.values()].filter((n) => shown(n) && `${n.name} ${n.type ?? n.kind} ${n.scope ?? ""}`.toLowerCase().includes(q)) : [];
 			matchSet = new Set(matched.map((n) => n.id));
 			matches.replaceChildren();
-			for (const n of matched.slice(0, 50)) btn(el("li", matches), n.name, () => select(n.id, true), `${n.name}, ${GROUP_NAME.get(n.group)}`);
+			for (const n of matched.slice(0, 50)) btn(el("li", matches), n.name, () => select(n.id, true), `${n.name}, ${GROUP_NAME.get(n.group)}`).setAttribute("data-item", "");
 			matchNote.textContent = !q ? "" : matched.length ? `${matched.length.toLocaleString("en")} match${matched.length === 1 ? "" : "es"}${matched.length > 50 ? "; the first 50 are listed" : ""}${g.parts.nodes.done ? "" : " among the records loaded so far"}.` : "No loaded record matches.";
 			if (announce) schedule();
 		};
@@ -510,28 +601,69 @@ export function graphTab(am: Am): void {
 		linkedBox.addEventListener("change", () => { onlyLinked = linkedBox.checked; g.dirty = true; fitted = false; refresh(); });
 		pastBox.addEventListener("change", () => { showPast = pastBox.checked; g.dirty = true; fitted = false; refresh(); });
 
-		/** Selects a record without moving the graph, unless asked to bring it into view; its detail is read now, once per selection. */
+		/** Brings a record into view at a readable zoom. */
+		const center = (n: GNode) => { moved = true; if (g.dirty) relayout(); cam.x = n.x; cam.y = n.y; cam.k = Math.max(cam.k, 1.4); schedule(); };
+		const kindText = (n: GNode) => (n.type ? `${n.type} memory` : `${n.kind}${n.label ? ` (${n.label})` : ""}`);
+		/** The kind as text, after its shape in its hue: the colour is never the only cue. */
+		const kindChip = (parent: Node, n: GNode) => {
+			const s = shapeAt(n.group), c = el("span", parent), gl = el("span", c, `${GLYPH[s]} `);
+			c.setAttribute("class", "chip");
+			gl.setAttribute("aria-hidden", "true");
+			gl.setAttribute("style", `color:${theme!.hues[s]}`);
+			el("span", c, kindText(n));
+		};
+		const idle = () => note(detail, "Select a node on the canvas or in the matches to see its relations, where it came from and its record.");
+		/**
+		 * Selects a record without moving the graph, unless asked to bring it into view. The panel shows at once what the loaded graph
+		 * holds (kind, relations, linked projects, sessions and memories) and reads the record once per selection for its evidence,
+		 * details, history and raw row. The address becomes #graph/ID, so a selection is a deep link.
+		 */
 		const select = (id: string | null, reveal = false) => {
 			selected = id;
 			const req = ++detailRequest, syncs: (() => void)[] = [];
+			// Relations, origin and memories come from the loaded graph; refresh draws them again once it has loaded.
+			partial = !!id && !(g.parts.nodes.done && g.parts.edges.done);
 			detail.replaceChildren();
 			detailSync = () => { for (const f of syncs) f(); };
 			schedule();
-			if (!id) return;
+			// The newer deep link keeps the profile, so it opens this profile's graph again, never work's by default.
+			try { win.history?.replaceState?.(null, "", `#graph${id ? `/${enc(id)}` : ""}?profile=${enc(p.name)}`); } catch { /* the address stays; the selection is the same */ }
+			if (!id) { idle(); return; }
 			const n = g.nodes.get(id);
-			if (n && reveal) { moved = true; if (g.dirty) relayout(); cam.x = n.x; cam.y = n.y; cam.k = Math.max(cam.k, 1.4); }
+			if (n && reveal) center(n);
+			const top = el("div", detail);
+			top.setAttribute("class", "toolbar");
+			if (n) {
+				kindChip(top, n);
+				el("span", top, `${count(n.deg)} relation${n.deg === 1 ? "" : "s"}${n.opaque ? `, ${count(n.opaque)} to other profiles` : ""}`).setAttribute("class", "muted");
+			}
+			btn(top, "Close", () => { select(null); canvas.focus?.(); }, "Close the node detail").setAttribute("data-close", "");
 			const title = el("h3", detail, n?.name ?? "Record");
-			if (n) facts(detail, [["Group", GROUP_NAME.get(n.group) ?? n.kind], ["Kind", `${n.kind}${n.label ? ` (${n.label})` : ""}`], ["Scope", recorded(n.scope)], ["Status", n.status], ["Updated", recorded(n.updated)],
-				["Links", `${n.deg}${n.opaque ? ` here, ${n.opaque} to other profiles` : ""}`]]);
+			const acts = el("div", detail);
+			acts.setAttribute("class", "toolbar");
+			btn(acts, "Center", () => { const m = g.nodes.get(id); if (m) center(m); }, "Center the graph on this node").disabled = !n;
+			copy(acts, "Copy ID", () => id);
+			copy(acts, "Copy name", () => String(title.textContent));
+			copy(acts, "Copy MCP call", () => mcpCall("explore", { node: { id }, profile: p.name }));
+			copy(acts, "Copy curl", () => curl("GET", `/api/profiles/${enc(p.name)}/nodes/${enc(id)}`));
+			const section = (label: string) => { const s = el("section", detail); el("h4", s, label); return s; };
 			const neighbours = [...g.edges.values()].filter((e) => e.b && (e.a === id || e.b === id));
+			const linked = (keep: (o: GNode) => boolean) => [...new Map(neighbours.map((e) => g.nodes.get(e.a === id ? e.b : e.a)!).filter(keep).map((o) => [o.id, o])).values()];
+			const pick = (parent: Node, o: GNode) => btn(parent, o.name, () => select(o.id, true), `Select ${o.name}, ${kindText(o)}`);
+
+			const rel = section("Relations");
 			if (neighbours.length) {
-				const ul = el("ul", detail);
+				const ul = el("ul", rel);
 				ul.setAttribute("aria-label", "Linked records");
 				for (const e of neighbours.slice(0, 30)) {
-					const other = g.nodes.get(e.a === id ? e.b : e.a)!, li = el("li", ul);
-					el("span", li, `${e.a === id ? "to" : "from"} · ${e.rel} · `);
-					btn(li, other.name, () => select(other.id, true), `Select ${other.name}`);
-					el("span", li, " ");
+					const out = e.a === id, other = g.nodes.get(out ? e.b : e.a)!, li = el("li", ul), s = shapeAt(other.group);
+					el("span", li, out ? "→" : "←").setAttribute("aria-hidden", "true");
+					el("span", li, out ? "Outgoing" : "Incoming").setAttribute("class", "vh");
+					el("span", li, ` ${e.rel} `);
+					const gl = el("span", li, `${GLYPH[s]} `);
+					gl.setAttribute("aria-hidden", "true");
+					gl.setAttribute("style", `color:${theme!.hues[s]}`);
+					pick(li, other);
 					const cut = btn(li, "", () => { const c = editsOf().cut; if (c.has(e.id)) c.delete(e.id); else c.add(e.id); changed(); });
 					syncs.push(() => {
 						const on = am.whatIfEdits.get(p.name)?.cut.has(e.id) ?? false;
@@ -539,15 +671,38 @@ export function graphTab(am: Am): void {
 						cut.setAttribute("aria-label", `${on ? "Restore" : "Remove"} the link ${e.rel} with ${other.name}, not saved`);
 					});
 				}
-				if (neighbours.length > 30) note(detail, `${neighbours.length - 30} more links; open the record for all of them.`);
-			} else if (n && g.parts.edges.done) note(detail, n.opaque ? "Its only links go to other profiles." : "No links: this record stands alone.");
-			else if (n) note(detail, "Links are still loading.");
-			const actions = el("p", detail);
-			link(actions, `#/memory/${enc(p.name)}/${enc(id)}`, "Open the record");
-			el("span", actions, " · ");
-			link(actions, `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline");
-			el("span", actions, " · ");
-			link(actions, `#/path/${enc(p.name)}/${enc(id)}`, "Find a path");
+				if (neighbours.length > 30) note(rel, `${neighbours.length - 30} more links; open the record for all of them.`);
+			} else if (n && g.parts.edges.done) note(rel, n.opaque ? "Its only links go to other profiles." : "No links: this record stands alone.");
+			else note(rel, "Links are still loading.");
+
+			// Where it came from: linked projects and sessions from the graph, then the record's own session evidence once read.
+			const origin = section("Where it came from");
+			const projects = linked((o) => o.kind === "project" && !o.type), sessions = linked((o) => o.kind === "session");
+			const projRow = el("p", origin), sessRow = el("p", origin);
+			el("span", projRow, "Projects: ");
+			for (const o of projects) pick(projRow, o);
+			if (!projects.length) el("span", projRow, "none linked").setAttribute("class", "na");
+			el("span", sessRow, "Sessions: ");
+			for (const o of sessions) pick(sessRow, o);
+			const sessEvidence = el("span", sessRow, "reading evidence…");
+			sessEvidence.setAttribute("class", "na");
+			const obs = section("Observations");
+			am.loading(obs, 2);
+			const mems = section("Memories");
+			const memories = linked((o) => o.type !== null);
+			if (memories.length) { const ul = el("ul", mems); for (const o of memories) { const li = el("li", ul); pick(li, o); el("span", li, ` ${o.type}`).setAttribute("class", "muted"); } }
+			else note(mems, n && !g.parts.edges.done ? "Links are still loading." : "No linked memories.");
+			const det = section("Details");
+			if (n) facts(det, [["ID", id], ["Kind", kindText(n)], ["Group", GROUP_NAME.get(n.group) ?? n.kind], ["Scope", recorded(n.scope)], ["Status", n.status], ["Updated", recorded(n.updated)]]);
+			const more = el("div", det);
+			am.loading(more, 3);
+
+			const nav = el("p", detail);
+			link(nav, `#/memory/${enc(p.name)}/${enc(id)}`, "Open the record");
+			el("span", nav, " · ");
+			link(nav, `#/timeline/${enc(p.name)}/${enc(id)}`, "Timeline");
+			el("span", nav, " · ");
+			link(nav, `#/path/${enc(p.name)}/${enc(id)}`, "Find a path");
 			if (n) {
 				// A local, unsaved what-if: a new memory linked to this record, drawn on the graph and compared beside it.
 				const wf = el("form", detail);
@@ -587,19 +742,44 @@ export function graphTab(am: Am): void {
 				});
 			}
 			detailSync();
-			const more = el("div", detail);
-			note(more, "Loading details…");
 			(async () => {
 				let r: J;
-				try { r = await call(`/api/profiles/${enc(p.name)}/nodes/${enc(id)}`); } catch (err) { if (version === am.pageVersion && req === detailRequest) { more.replaceChildren(); note(more, `Could not load details: ${why(err)}`); } return; }
+				const failed = (t: string) => { sessEvidence.textContent = ""; obs.replaceChildren(); el("h4", obs, "Observations"); note(obs, t); more.replaceChildren(); note(more, t); };
+				try { r = await call(`/api/profiles/${enc(p.name)}/nodes/${enc(id)}`); } catch (err) { if (version === am.pageVersion && req === detailRequest) failed(`Could not load the record: ${why(err)}`); return; }
 				if (version !== am.pageVersion || req !== detailRequest) return;
+				const node: J = r?.node ?? {}, ev: J[] = Array.isArray(r?.evidence?.items) ? r.evidence.items : [];
+				if (!n && typeof node.name === "string") title.textContent = node.name;
+				// Session evidence holds the runner's own session reference, not a node or session row id, so it stays text.
+				const sess = ev.filter((x) => x?.kind === "session");
+				sessEvidence.textContent = sess.length ? `${sessions.length ? " · " : ""}${sess.map((x) => String(x.ref)).join(", ")}` : sessions.length ? "" : "none recorded";
+				// Observations: the record's own evidence pointers, each with its kind as text.
+				obs.replaceChildren();
+				el("h4", obs, "Observations");
+				const rest = ev.filter((x) => x?.kind !== "session");
+				if (rest.length) {
+					const ul = el("ul", obs);
+					for (const x of rest) {
+						const li = el("li", ul);
+						el("span", li, String(x.kind)).setAttribute("class", "chip");
+						// A node pointer is a node id; it becomes a button only when that node is drawn here.
+						const to = x.kind === "node" ? g.nodes.get(String(x.ref)) : undefined;
+						if (to) pick(li, to); else el("span", li, String(x.ref)).setAttribute("class", "mono");
+						if (typeof x.note === "string" && x.note) el("span", li, ` · ${x.note}`);
+					}
+				} else note(obs, sess.length ? "Its only evidence is the sessions above." : "No evidence recorded on this record.");
+				if (r?.evidence?.truncated === true) note(obs, "Showing the first 50 evidence pointers.");
 				more.replaceChildren();
-				if (!n && r?.node?.name) title.textContent = String(r.node.name);
-				if (r?.node?.description) { el("h4", more, "Description"); textBlock(more, String(r.node.description)); }
+				facts(more, [["Memory type", recorded(node.memory_type)], ["Origin", recorded(node.origin)], ["Pinned", node.pinned === true ? "yes" : "no"],
+					["Flagged", node.flagged ? "yes" : "no"], ["Revision", recorded(node.revision)], ["Created", recorded(node.created_at)], ["Key", recorded(node.key)]]);
+				if (typeof node.description === "string" && node.description) { el("h4", more, "Description"); textBlock(more, node.description); }
 				const hist = Array.isArray(r?.history?.items) ? r.history.items : [];
 				el("h4", more, "Recent history");
 				if (hist.length) { const ul = el("ul", more); for (const v of hist.slice(0, 8)) el("li", ul, `Revision ${recorded(v.revision)} · ${recorded(v.op)} · ${recorded(v.at)} · ${recorded(v.actor)}`); }
 				else note(more, "No history recorded.");
+				// The raw row the server returned, as text; long fields arrive already cut to their limit.
+				const raw = el("details", more);
+				el("summary", raw, "Raw record");
+				textBlock(raw, JSON.stringify(node, null, 2));
 			})();
 		};
 
@@ -638,7 +818,7 @@ export function graphTab(am: Am): void {
 		});
 		g.listener = refresh;
 		refresh();
-		if (selected) select(selected, true);
+		if (selected) select(selected, true); else idle();
 		pump(p, g);
 		return h;
 	};
