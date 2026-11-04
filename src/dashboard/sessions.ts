@@ -191,12 +191,13 @@ export function sessionsTab(am: Am): void {
 		panel.setAttribute("class", "panel");
 		panel.setAttribute("aria-label", "Session detail");
 
-		let rows: J[] = [], cursor: string | null = null, request = 0, selected = route.id;
+		let rows: J[] = [], cursor: string | null = null, request = 0, selected = route.id, opened = 0;
 		const rowButtons = new Map<string, Node>();
 		const idle = () => { panel.replaceChildren(); note(panel, "Select a session to see its details."); };
 		const close = () => {
 			const back = selected ? rowButtons.get(selected) : undefined;
 			selected = undefined;
+			opened++;
 			for (const b of rowButtons.values()) b.setAttribute("aria-current", "false");
 			win.history?.replaceState?.(null, "", listHash);
 			idle();
@@ -204,13 +205,14 @@ export function sessionsTab(am: Am): void {
 		};
 
 		const open = async (id: string, named: string | null, obs?: number) => {
+			const req = ++opened; // the same id can be in two profiles, so the id alone cannot tell opens apart
 			selected = id;
 			for (const [rid, b] of rowButtons) b.setAttribute("aria-current", String(rid === id));
 			panel.replaceChildren();
 			loading(panel, 6);
 			// A 404 means "not in this profile"; any other failure is reported, never read as "not there".
 			const results = await am.eachProfile(named, (p) => read(p.name, id));
-			if (version !== am.pageVersion || selected !== id) return;
+			if (version !== am.pageVersion || req !== opened) return;
 			panel.replaceChildren();
 			const hits = results.filter((r) => r.ok && valid(r.value)), failed = results.filter((r) => !r.ok && r.error.status !== 404);
 			const bad = results.filter((r) => r.ok && !valid(r.value));

@@ -667,6 +667,13 @@ function saveLinks(tx: Tx, from: string, links: SaveArgs["links"]): { links?: { 
 
 type EntityInput = Pick<NonNullable<KnowledgeArgs["nodes"]>[number], "kind" | "key" | "name" | "scope" | "other_label" | "valid_from" | "valid_to">;
 
+/**
+ * SQL over a node row: it has a current vector. Only memories and entities with a description embed (entityHashes, transfer's
+ * publish); the rest (sessions, bare entities) are written with embed_hash equal to card_hash so the embed stage skips them,
+ * and that equality alone proves nothing.
+ */
+export const HAS_VECTOR = "status = 'active' AND embed_hash = card_hash AND (memory_type IS NOT NULL OR description <> '')";
+
 /** An entity's content and card hashes. Decisions are memories (BothQ type project) and get an embedding card; other entities only with a description. */
 export const entityHashes = (kind: string, name: string, description: string, why: string | null, attrs: Record<string, unknown>) => ({
 	hash: sha256(canonicalJson({ name, kind, description, why: why ?? "", attrs })),
