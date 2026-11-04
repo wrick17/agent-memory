@@ -1193,3 +1193,92 @@ describe("Claude Code query result: pure JSON, or exactly one object with prose 
 		assert.deepEqual(am.resultJson("[1]"), { value: [1] }, "pure JSON is unchanged; the schema rejects it later");
 	});
 });
+
+describe("v2 config defaults and the separate read token", () => {
+	const writeConfig = (c) => am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify(c));
+	/** Records each request; answers 200 with {ok: true}. */
+	const recordFetch = async (fn) => {
+		const seen = [], real = globalThis.fetch;
+		globalThis.fetch = async (url, init = {}) => { seen.push({ url: String(url), method: init.method ?? "GET", auth: init.headers?.authorization, redirect: init.redirect, body: init.body }); return new Response('{"ok":true}', { status: 200 }); };
+		try { await fn(); } finally { globalThis.fetch = real; }
+		return seen;
+	};
+
+	it("keeps a v1 config as written, adds the v2 defaults, and turns injection on only with enabled and an explicit profile", () => {
+		const v1 = { server: "https://memory.example", token_file: "/x/job-token", batch_profiles: ["work"], debounce_ms: 5 };
+		writeConfig(v1);
+		const c = am.loadConfig();
+		for (const [k, v] of Object.entries(v1)) assert.deepEqual(c[k], v);
+		assert.equal(c.batch_hour, 4);
+		assert.equal(c.read_token_file, path.join(am.home(), "read-token"));
+		assert.deepEqual(c.inject, { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 });
+		assert.equal(am.withDefaults({ inject: { enabled: true } }).inject.enabled, false);
+		assert.equal(am.withDefaults({ inject: { enabled: "true", profile: "work" } }).inject.enabled, false);
+		assert.deepEqual(am.withDefaults({ inject: { enabled: true, profile: "Work Stuff" } }).inject, { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 });
+		assert.deepEqual(am.withDefaults({ inject: { enabled: true, profile: "personal", max_tokens: 900, timeout_ms: 0 } }).inject, { enabled: true, profile: "personal", max_tokens: 900, timeout_ms: 1500 });
+		assert.equal(am.withDefaults({ batch_hour: 24 }).batch_hour, 4);
+		assert.equal(am.withDefaults({ batch_hour: 0 }).batch_hour, 0);
+	});
+
+	it("recalls with the read token only, never the job token, and names the caller's profile", async () => {
+		const job = path.join(am.home(), "job-token"), read = path.join(am.home(), "read-token");
+		am.writePrivate(job, "job-secret\n");
+		const config = am.withDefaults({ server: "https://memory.example", token_file: job });
+		// No read token: refused before any request, with no job-token fallback.
+		let seen = await recordFetch(() => assert.rejects(am.readServer(config).recall({ profile: "work", query: "q" }), { code: "read_token_missing" }));
+		assert.deepEqual(seen, []);
+		am.writePrivate(read, "read-secret\n");
+		seen = await recordFetch(() => assert.rejects(am.readServer(config).recall({ query: "q" }), { code: "profile_required" }));
+		assert.deepEqual(seen, []);
+		seen = await recordFetch(async () => assert.deepEqual(await am.readServer(config).recall({ profile: "work", query: "q" }), { ok: true }));
+		assert.deepEqual(seen, [{ url: "https://memory.example/v1/recall", method: "POST", auth: "Bearer read-secret", redirect: "error", body: '{"profile":"work","query":"q"}' }]);
+		// read_token_file naming the job token file is refused, even though that file is private and valid.
+		assert.equal(am.readToken({ ...config, read_token_file: job }), null);
+		assert.equal(am.readToken({ ...config, read_token_file: `${path.dirname(job)}/./job-token` }), null);
+		// A group-readable file or a symlink is refused.
+		fs.chmodSync(read, 0o640);
+		assert.equal(am.readToken(config), null);
+		fs.chmodSync(read, 0o600);
+		const link = path.join(am.home(), "read-link");
+		fs.symlinkSync(read, link);
+		assert.equal(am.readToken({ ...config, read_token_file: link }), null);
+		assert.equal(am.readToken(config), "read-secret");
+	});
+
+	it("reads accepted candidates with the read token only, an explicit profile and checked paging arguments", async () => {
+		const job = path.join(am.home(), "job-token"), read = path.join(am.home(), "read-token");
+		am.writePrivate(job, "job-secret\n");
+		const config = am.withDefaults({ server: "https://memory.example", token_file: job });
+		const list = (q) => am.readServer(config).acceptedCandidates(q);
+		let seen = await recordFetch(() => assert.rejects(list({ profile: "work" }), { code: "read_token_missing" }));
+		assert.deepEqual(seen, []);
+		am.writePrivate(read, "read-secret\n");
+		seen = await recordFetch(async () => {
+			for (const q of [{}, { profile: "" }, { profile: "Work" }, { profile: "a-profile-name" }]) await assert.rejects(list(q), { code: "profile_required" });
+			for (const cursor of ["", "x".repeat(2049), 7]) await assert.rejects(list({ profile: "work", cursor }), { code: "cursor_invalid" });
+			for (const limit of [0, 101, 1.5, "10"]) await assert.rejects(list({ profile: "work", limit }), { code: "limit_invalid" });
+		});
+		assert.deepEqual(seen, []);
+		seen = await recordFetch(async () => {
+			assert.deepEqual(await list({ profile: "work" }), { ok: true });
+			await list({ profile: "work", cursor: "c/1&x=2", limit: 100 });
+		});
+		assert.deepEqual(seen, [
+			{ url: "https://memory.example/v1/eval/candidates?profile=work", method: "GET", auth: "Bearer read-secret", redirect: "error", body: undefined },
+			{ url: "https://memory.example/v1/eval/candidates?profile=work&cursor=c%2F1%26x%3D2&limit=100", method: "GET", auth: "Bearer read-secret", redirect: "error", body: undefined }]);
+		const real = globalThis.fetch;
+		globalThis.fetch = async () => new Response('{"error":{"code":"forbidden"}}', { status: 403 });
+		try { await assert.rejects(list({ profile: "work" }), { status: 403 }); } finally { globalThis.fetch = real; }
+	});
+
+	it("sends status, eval runs and the device's own whoami with the job token", async () => {
+		const job = path.join(am.home(), "job-token");
+		am.writePrivate(job, "job-secret\n");
+		const s = am.httpServer({ server: "https://memory.example", token_file: job });
+		const seen = await recordFetch(async () => { await s.status({ device: "d" }); await s.evalRun({ profile: "work" }); await s.whoami(); });
+		assert.deepEqual(seen.map((r) => [r.method, r.url, r.auth, r.redirect]), [
+			["POST", "https://memory.example/v1/status", "Bearer job-secret", "error"],
+			["POST", "https://memory.example/v1/eval/runs", "Bearer job-secret", "error"],
+			["GET", "https://memory.example/v1/whoami", "Bearer job-secret", "error"]]);
+	});
+});

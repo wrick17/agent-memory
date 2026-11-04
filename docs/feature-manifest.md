@@ -229,3 +229,28 @@ Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 - `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
 - Nothing imports the player yet, so the Worker bundle is unchanged until the dashboard tabs land.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`.
+
+### v2 CLI config defaults and read and job clients (#6), 2026-11-04
+
+Source in review; not installed. These are CLI helpers for later v2 commands. This change adds no command, and a v1 install behaves as before.
+
+- `loadConfig()` fills in `batch_hour` (4), `read_token_file` (`<home>/read-token`) and `inject` (`enabled: false`, `profile: null`, `max_tokens: 600`, `timeout_ms: 1500`), and returns every other key as written.
+- Profile choice stays explicit. `inject.enabled` is true only when the config sets both `inject.enabled: true` and a valid `inject.profile`, and nothing picks a profile. `readServer().recall(body)` requires `body.profile`.
+- `readToken()` reads the separate read credential at `read_token_file`. It refuses a path that resolves to `token_file`, a symlink, a file another user owns, and a file with group or other access.
+- Read client: `readServer().recall(body)` posts `/v1/recall`, and `readServer().acceptedCandidates({ profile, cursor, limit })` reads one page of `GET /v1/eval/candidates`, both with the read token only. The profile is required, a cursor is 1 to 2,048 characters, and a limit is an integer from 1 to 100. Neither falls back to the job token.
+- Job client: `httpServer()` adds `status`, `evalRun` and `whoami`, all with the job token.
+- Every new request sets `redirect: "error"` and a timeout. A bad argument throws before any request is sent.
+- Nothing calls these helpers in this change. Hook, run, install, usage text and dispatch are unchanged. `eval`, `backfill`, `doctor`, `run --scheduled` and the prompt hook use them from #16 on.
+- Evidence: 4 cases in `local/agent-memory.test.mjs`. The latest combined local run on the final integrated source, which includes this change, passed 138 of 138. That is combined-source evidence, not a run of this commit alone. CI on this head is pending.
+
+### Local full-transcript replay (#22), 2026-11-04
+
+`agent-memory replay` serves full local Claude Code and Codex transcripts to a browser on the recording machine. It loads the shared player above, byte for byte. Nothing it reads is uploaded or stored in a hosted system.
+
+- Commands: `--list` prints local sessions, newest first. `--session ID` opens one session, `--port N` picks the port (default 0, a random free port), and `--help` prints usage. Bad arguments exit 2; an unknown session or a failed start exits 1.
+- Sources: `projects/<project>/<session>.jsonl` under the Claude Code home and `sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl` under the Codex home. Listed files must be regular files owned by the current user, and symlinks are not followed. Session ids are validated. Each read opens with `O_NOFOLLOW` and checks `fstat`.
+- Events: owner and assistant text comes from the hook's `extract()`, so thinking, system, meta, sidechain and injected context stay out. A Claude record whose joined text opens as injected, such as a `<command-name>` envelope, stays out whole. Tool calls and results are kept for both formats. A lone string argument shows as its bare value only when redaction would leave its JSON form unchanged; otherwise the key stays, so key-based redaction applies. Every label and detail is redacted. Claude text blocks between two tool blocks form one event and are redacted together, so a secret split across blocks is caught. If a secret is split across a tool block, the record's text shows once, before its tool events. Each tool input and output is cut at 8 KB after redaction (`truncated: "true"`).
+- Server: binds 127.0.0.1 only. A random 32-byte token is the first URL path segment and is compared in constant time. Host must be exactly `127.0.0.1:<port>`, and Origin, when sent, must be the same origin. These checks run before routing or file access. Only GET and HEAD are allowed. Responses set a self-only CSP with no inline script or style, plus `no-store`, `nosniff`, `no-referrer` and frame denial. There are no redirects. Errors carry no paths or transcript text.
+- Install: `agent-memory install` also copies `replay.mjs`, `transcript-full.mjs` and `replay-player.js` beside the CLI.
+- Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, lone sensitive tool arguments in Claude and Codex calls, secrets split across text blocks and across a tool call, the `lsof` loopback bind, and the installed command mounting the real player. Its 9 cases passed in a scoped run in the current review batch; the earlier combined 120-test local run does not cover this fix.
+
