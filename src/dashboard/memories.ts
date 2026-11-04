@@ -290,6 +290,8 @@ export function memoriesTab(am: Am): void {
 		const shown = () => [...rows.values()].filter((r) => !r.tr.hidden);
 		const setBusy = (b: boolean) => { busy = b; for (const w of writes) w.disabled = b; if (!b) refreshBulk(); };
 		const say = (t: string) => { msg.textContent = t; };
+		/** The owner changed the selection: an open bulk confirmation lists the old one, so it closes. */
+		const reselect = () => { confirmBox.replaceChildren(); refreshBulk(); };
 		const refreshBulk = () => {
 			for (const k of selected) if (!rows.has(k)) selected.delete(k);
 			count.textContent = `${selected.size} selected. `;
@@ -337,7 +339,7 @@ export function memoriesTab(am: Am): void {
 			const box = el("input", el("td", tr));
 			box.setAttribute("type", "checkbox");
 			box.setAttribute("aria-label", `Select ${name}`);
-			box.addEventListener("change", () => { if (box.checked) selected.add(key); else selected.delete(key); refreshBulk(); });
+			box.addEventListener("change", () => { if (box.checked) selected.add(key); else selected.delete(key); reselect(); });
 			const t = el("td", tr), title = el("a", t, name);
 			title.setAttribute("href", memoryHash(p, id));
 			title.setAttribute("data-item", "");
@@ -420,7 +422,7 @@ export function memoriesTab(am: Am): void {
 		for (const s of [type, project]) s.addEventListener("change", () => load());
 		mode.addEventListener("change", () => { if (q.value.trim()) load(); });
 		agent.addEventListener("change", applyAgent);
-		all.addEventListener("change", () => { for (const r of shown()) { r.box.checked = all.checked; if (all.checked) selected.add(r.key); else selected.delete(r.key); } refreshBulk(); });
+		all.addEventListener("change", () => { for (const r of shown()) { r.box.checked = all.checked; if (all.checked) selected.add(r.key); else selected.delete(r.key); } reselect(); });
 
 		// ---- Writes: forget (single and bulk), with Undo through each removal's activity row ----
 		const forgetOne = async (x: Target): Promise<{ undo?: string; staged?: boolean }> => {
