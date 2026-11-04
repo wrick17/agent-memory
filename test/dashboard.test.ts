@@ -2093,6 +2093,32 @@ describe("dashboard Sessions and Replay tabs", () => {
 		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Session B");
 		expect(find(b.view(), "h3").map((x) => x.textContent)).not.toContain("Session A");
 	});
+
+	it("keeps the open session when the header picker changes profile, in Sessions and in Replay", async () => {
+		const rows = [session("a", "work", "Session A"), session("b", "work", "Session B")];
+		const b = browser({ signedIn: true, hash: "#sessions", api: (path) => {
+			if (path.startsWith("/api/sessions?") || path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows, next_cursor: null });
+			const m = /^\/api\/profiles\/(\w+)\/sessions\/(a|b)$/.exec(path);
+			if (m) return Response.json(session(m[2]!, m[1]!, `Session ${m[2]!.toUpperCase()}`));
+		} });
+		Object.assign(b.win, { amReplayPlayer: { mount: () => ({ destroy() {} }) } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes("Session B"))!.on.click!();
+		await settle();
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#sessions/b?profile=personal"); // B stays open, now asked of personal
+		b.go("#replay?profile=work");
+		for (let i = 0; i < 3; i++) await settle();
+		find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!.value = "1";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		await settle();
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#replay/b?profile=personal");
+	});
 });
 
 describe("dashboard Activity tab", () => {
@@ -2358,6 +2384,44 @@ describe("dashboard Memories tab", () => {
 		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
 		expect(stale).toBeUndefined();
 	});
+
+	it("clears the selection, its checkboxes and an open confirmation when the Agent filter changes", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), { ...row("m2", "Second"), provenance: { source_platform: "codex" } }], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box.checked = true;
+		box.on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined();
+		const agent = find(b.view(), "select").find((x) => x.attrs.id === "mem-agent")!;
+		agent.value = "codex"; // First, a claude-code record, is now hidden
+		agent.on.change!();
+		expect([box.checked, text(b.view()).includes("0 selected.")]).toEqual([false, true]);
+		const stale = button(b.view(), "Forget 1");
+		if (stale) click(stale); // a confirmation left open would forget the hidden record
+		await settle();
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+		expect(stale).toBeUndefined();
+	});
+
+	it("keeps the search when the header picker changes profile", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) =>
+			path.endsWith("/recall") ? Response.json({ results: [], next_cursor: null, truncated: false, lexical_only: false }) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value = "diffs";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the tab writes ?q= into the address without a render
+		await settle();
+		expect(b.win.location.hash).toBe("#memories?profile=work&q=diffs");
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#memories?profile=personal&q=diffs"); // the tab's own address after it reads personal
+		expect(find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value).toBe("diffs");
+	});
 });
 
 describe("dashboard Audit tab and Admin pages", () => {
@@ -2482,5 +2546,22 @@ describe("dashboard Overview and Health tabs", () => {
 		for (let i = 0; i < 3; i++) await settle();
 		expect(text(b.view())).toContain("work: leased");
 		expect(text(b.view())).not.toContain("work: parked");
+	});
+
+	it("draws one recall-quality line per profile when All profiles holds runs from two", async () => {
+		const run = (profile: string, at: string, v: number) => ({ id: `${profile}-${at}`, device_id: "d1", profile, at, channels: "hybrid", k: 5, cases: 3,
+			recall_all_at_k: v, any_hit_at_k: v, mrr: v });
+		const b = browser({ signedIn: true, hash: "#health", api: (path) => {
+			if (path === "/api/health") return Response.json({ error: { code: "unavailable", message: "down" } }, { status: 503 });
+			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [run("work", "2026-11-03T10:00:00Z", 1), run("personal", "2026-11-04T10:00:00Z", 0)] });
+			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
+		} });
+		Object.assign(b.win.document, { createElementNS: (_ns: string, tag: string) => make(tag) }); // the chart is SVG
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const svg = find(b.view(), "svg")[0]!;
+		expect(find(svg, "polyline")).toHaveLength(2);
+		const legend = find(svg, "text").map((x) => x.textContent).filter((t) => t.includes("k=5"));
+		expect(legend).toEqual([expect.stringMatching(/^work hybrid k=5:/), expect.stringMatching(/^personal hybrid k=5:/)]);
 	});
 });
