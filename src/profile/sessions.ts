@@ -2,11 +2,10 @@
 // A session is the `session` node one client session id creates on its first upload (capture.ts). Everything here comes from
 // that node, its attrs (device_id, first_at, last_upload_at, ended, files_changed), its current digest parts, its project link and the evidence
 // rows that cite it. Nothing is invented: no cwd, no original start or end time, no tool count.
-import { sha256 } from "../domain/ids";
 import { Fail } from "../domain/types";
 import type { Client, ReplayEvent, SessionDetail, SessionQuery, SessionRow } from "../viewer/types";
 import { END_CURSOR, formatSessionCursor, parseSessionCursor } from "../sessions";
-import { manifestBody, parseRange, type DigestBody } from "./capture";
+import { manifestListed, parseRange, type DigestBody } from "./capture";
 
 /** Status turns completed once the last upload is this old, or at once when a SessionEnd batch arrived. */
 const ACTIVE_MS = 30 * 60_000;
@@ -24,36 +23,27 @@ const PROJECT = `(SELECT e.dst FROM edges e JOIN nodes p ON p.id = e.dst WHERE e
  * its newest capture row, then its first upload; never updated_at, which an owner pin or flag also moves.
  * shortcut: such an older node whose capture rows were all archived by the 90-day TTL reports its first upload as its last.
  */
-const UPLOAD = `coalesce(json_extract(n.attrs, '$.last_upload_at'), (SELECT max(t.created_at) FROM texts t WHERE t.node_id = n.id AND t.part = 'capture'),
+export const UPLOAD = `coalesce(json_extract(n.attrs, '$.last_upload_at'), (SELECT max(u.created_at) FROM texts u WHERE u.node_id = n.id AND u.part = 'capture'),
 	json_extract(n.attrs, '$.first_at'), n.created_at)`;
+/**
+ * SQL over a texts row `t`: a current digest part of its session. Per range, its live heuristic digest until the range's manifest
+ * supersedes it (ingest then takes it out of the capture lane), then only the consolidated parts that manifest lists
+ * (capture.ts manifestListed); before a manifest, its live consolidated parts.
+ * Index-backed through texts_node and texts_capture.
+ */
+export const CURRENT_PART = `t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.chunk = 0 AND t.range_id IS NOT NULL
+	AND t.capture_part IS NOT 'manifest' AND (t.capture_status = 'heuristic' OR (NOT EXISTS (SELECT 1 FROM texts h
+		WHERE h.node_id = t.node_id AND h.part = 'capture' AND h.range_id = t.range_id AND h.capture_status = 'heuristic' AND h.capture_part = '-' AND h.live = 1)
+		AND coalesce(${manifestListed}, 1) > 0))`;
 const SELECT = `SELECT n.id, n.key, n.attrs, n.created_at, ${UPLOAD} AS last_upload, ${PROJECT} AS project FROM nodes n`;
 
 /**
- * The digest parts that describe a session now, in transcript order: per range, its live heuristic digest until the range's
- * manifest supersedes it, then only the consolidated parts that manifest lists, by part id and hash; before a manifest, its live
- * consolidated parts. Ranges order by start offset (first upload breaks ties across transcript epochs), parts by their span.
+ * The digest parts that describe a session now (CURRENT_PART), in transcript order. Ranges order by start offset (first upload
+ * breaks ties across transcript epochs), parts by their span.
  */
 function currentParts(sql: SqlStorage, node: string) {
-	const all = sql.exec<{ rowid: number; range_id: string; capture_part: string; capture_status: string; sha256: string; body: string }>(`SELECT t.rowid, t.range_id, t.capture_part, t.capture_status, t.sha256, t.body
-		FROM texts t WHERE t.node_id = ? AND t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.chunk = 0 AND t.range_id IS NOT NULL
-		AND t.capture_part IS NOT 'manifest' AND (t.capture_status = 'heuristic' OR NOT EXISTS (SELECT 1 FROM texts h
-			WHERE h.range_id = t.range_id AND h.capture_status = 'heuristic' AND h.capture_part = '-' AND h.live = 1)) ORDER BY t.rowid`, node).toArray();
-	// An accepted manifest selects one tiling; other consolidated parts stored for its range are not read. A manifest whose stored
-	// bytes do not match its hash selects nothing, so no unverified tiling is shown.
-	const listed = new Map<string, Set<string> | null>();
-	const selects = (rangeId: string) => {
-		if (!listed.has(rangeId)) {
-			const text = manifestBody(sql, rangeId), hash = sql.exec<{ sha256: string }>("SELECT sha256 FROM texts WHERE range_id = ? AND capture_status = 'consolidated' AND capture_part = 'manifest' AND chunk = 0", rangeId).toArray()[0]?.sha256;
-			let parts: Set<string> | null = null;
-			if (text !== null) {
-				parts = new Set();
-				try { if (sha256(text) === hash) for (const p of (JSON.parse(text) as { parts: { part_id: string; sha256: string }[] }).parts) parts.add(`${p.part_id} ${p.sha256}`); } catch { /* selects nothing */ }
-			}
-			listed.set(rangeId, parts);
-		}
-		return listed.get(rangeId)!;
-	};
-	const rows = all.filter((r) => { const parts = r.capture_status === "consolidated" ? selects(r.range_id) : null; return !parts || parts.has(`${r.capture_part} ${r.sha256}`); });
+	const rows = sql.exec<{ rowid: number; range_id: string; capture_part: string; capture_status: string; body: string }>(`SELECT t.rowid, t.range_id, t.capture_part, t.capture_status, t.body
+		FROM texts t WHERE t.node_id = ? AND ${CURRENT_PART} ORDER BY t.rowid`, node).toArray();
 	const first = new Map<string, number>();
 	for (const r of rows) if (!first.has(r.range_id)) first.set(r.range_id, r.rowid);
 	const key = (r: (typeof rows)[number]) => {

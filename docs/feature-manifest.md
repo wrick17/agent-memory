@@ -184,4 +184,7 @@ Source ready, not deployed. Depends on #12 above for session and project semanti
 - `GET /api/profiles/:p/projects` lists projects; `GET /api/profiles/:p/projects/:key/profile` returns session count and last activity, linked-concept frequency, scoped rules and preferences, and grouped corrections and decisions from the past 30 days. Its `budget` is marked exhausted at 200 sessions, 5,000 links or 1,000 correction parts.
 - File lists (`top_files`, `files`) come only from the profile's Corpus when it is on; `me` has none. A failed Corpus read fails the request instead of showing no files, and with the Corpus off the lists are empty.
 - Data stays in the explicitly selected, authorized profile and project; no profile is inferred from content.
+- When the read budget leaves no requested day complete, the summary returns `from` after `to` with an empty file list, and no Corpus query runs. Recurring errors resolve digest entities through the same identifier rules as ingest.
+- Activity, a project's last activity and session order use the same current parts and last-upload time as Sessions (#12).
+- Evidence for these rules: scoped runs of the affected tests in the current review batch; the earlier combined 628-test run does not cover it.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
