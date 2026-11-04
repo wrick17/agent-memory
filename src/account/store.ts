@@ -11,6 +11,7 @@ import { resumeTransfer, transferPorts, type TransferInput } from "../transfer";
 import { mayUse, refreshSelectors, type RefreshSelector } from "../routing";
 import { BudgetTx, ROW_PAUSE, type ProfileStore, type RestoredPage } from "../profile/store";
 import { PROFILE_MIGRATIONS } from "../profile/schema";
+import { restorable } from "../compat";
 import { applyRows, dropExportId, dropExports, exportStore, exportTables, hasExports, listExports, readChunk, readManifest, type Manifest } from "../backup";
 import { scrubReview, wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wipe";
 import { CORPUS_MIGRATIONS, type CorpusStore } from "../corpus/store";
@@ -169,7 +170,7 @@ const boundOp = (q: RestoredPage["requests"][number]) => q.legacy_hash ? (q.lega
 /** account_meta keys a restore neither clears nor overwrites: identity, the sequence, the schema, the open recovery, restore history and wipe fences. */
 const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "recovery_state"].includes(key) || key.startsWith("restore:") || key.startsWith("wiped:") || key.startsWith("drill");
 const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%' AND key NOT LIKE 'drill%'";
-/** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. */
+/** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. v7's eval_runs, client_status and health are not merged: they are snapshot state (account/schema.ts). */
 const MERGED = ["counters", "refresh_days", "sensitive_terms"];
 const ADMIN_WHILE_RESTORING = ["drillStatus", "listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "recoveryRequest", "recheckRequests", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
 /** recoveryRequest's content-free placement of one request id. */
@@ -686,11 +687,11 @@ export class AccountStore extends DurableObject<Env> {
 			if (!p) return fail("not_found", `unknown profile '${cmd.profile}'`);
 			if (p.status !== "active") return fail("profile_wiped", "only an active profile can be drilled");
 			if (cmd.generation !== undefined && p.generation !== cmd.generation) return fail("busy", "the profile changed since it was shown; read its status", { reason: "generation_changed" });
-			// The newest complete export this code can restore: same profile and schema, and not of a wiped generation.
+			// The newest complete export this code can restore: same profile, a restorable schema (compat.ts), and not of a wiped generation.
 			let chosen: Manifest | undefined;
 			for (const id of (await listExports(this.env, `profile-${cmd.profile}`)).reverse()) {
 				const m = await readManifest(this.env, `profile-${cmd.profile}`, id, userId);
-				if (!m.ok || m.value.profile !== cmd.profile || m.value.schema_version !== PROFILE_MIGRATIONS.length) continue;
+				if (!m.ok || m.value.profile !== cmd.profile || !restorable("profile", m.value.schema_version, PROFILE_MIGRATIONS.length)) continue;
 				if (this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ?", m.value.generation ?? "").toArray()[0]?.state === "wiped") continue;
 				chosen = m.value;
 				break;
@@ -699,7 +700,7 @@ export class AccountStore extends DurableObject<Env> {
 			let account: string | null = null;
 			for (const id of (await listExports(this.env, "account")).reverse()) {
 				const m = await readManifest(this.env, "account", id, userId);
-				if (m.ok && m.value.schema_version === ACCOUNT_MIGRATIONS.length) { account = m.value.id; break; }
+				if (m.ok && restorable("account", m.value.schema_version, ACCOUNT_MIGRATIONS.length)) { account = m.value.id; break; }
 			}
 			// Rechecked after the awaits: the gate below is the only one, and it lands before anything else.
 			const late = refuse();
@@ -925,7 +926,7 @@ export class AccountStore extends DurableObject<Env> {
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				const m = await readManifest(this.env, "account", cmd.export, userId);
 				if (!m.ok) return m;
-				if (m.value.schema_version !== ACCOUNT_MIGRATIONS.length) return fail("validation", "this export's schema version does not match");
+				if (!restorable("account", m.value.schema_version, ACCOUNT_MIGRATIONS.length)) return fail("validation", "this export's schema version is not restorable");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
 				// Rechecked after the manifest read, in the same turn as the write below: a drill begun meanwhile keeps the account to itself.
 				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
@@ -1087,7 +1088,7 @@ export class AccountStore extends DurableObject<Env> {
 				if (p.status !== "active") return fail("profile_wiped", "only an active profile can be restored");
 				const m = await readManifest(this.env, `profile-${cmd.profile}`, cmd.export, userId);
 				if (!m.ok) return m;
-				if (m.value.profile !== cmd.profile || m.value.schema_version !== PROFILE_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+				if (m.value.profile !== cmd.profile || !restorable("profile", m.value.schema_version, PROFILE_MIGRATIONS.length)) return fail("validation", "this export's profile does not match or its schema version is not restorable");
 				const gen = this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ? AND profile = ?", m.value.generation ?? "", cmd.profile).toArray()[0];
 				if (gen?.state === "wiped") return fail("profile_wiped", "this export belongs to a wiped generation");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
