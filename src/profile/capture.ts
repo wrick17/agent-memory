@@ -21,7 +21,15 @@ const SPAN = /^(\d+)-(\d+)$/;
 
 export interface DigestPart { range_id: string; capture_status: "heuristic" | "consolidated"; part_id: string; sha256: string; body: string }
 export interface Manifest { range_id: string; parts: { part_id: string; sha256: string }[] }
-export interface IngestBatch { session: { client: "claude-code" | "codex"; id: string }; digests: DigestPart[]; manifests: Manifest[] }
+/**
+ * session.ended (sticky: a replay or an older batch never clears it) and session.files_changed (the runner's cumulative distinct
+ * edited-file count; keep the largest) are optional, as v1 runners omit them. device_id is set only by the Worker, from the
+ * authenticated job token; no public body field can set it. S1 stores them on the session node.
+ */
+export interface IngestBatch {
+	session: { client: "claude-code" | "codex"; id: string; ended?: boolean; files_changed?: number };
+	digests: DigestPart[]; manifests: Manifest[]; device_id?: string;
+}
 export type ItemResult = { range_id: string; part_id: string; status: "stored" | "replayed" | "refused"; reason?: string };
 
 export function parseRange(rangeId: string): { client: string; session: string; epoch: string; start: number; end: number } | null {

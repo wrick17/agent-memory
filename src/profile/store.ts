@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Fail, fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
+import { restorable } from "../compat";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
 import { candidates, filterIds, fuse, get, inventory, lexicalChannels, markers } from "./read";
 import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
@@ -11,6 +12,7 @@ import { board } from "./board";
 import { similarStep } from "./similar";
 import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
+import { enqueueIn } from "./maintenance";
 import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPreview, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
@@ -19,6 +21,14 @@ import { archivedNodeIds, archivePage } from "./archive";
 import { archiveCursor, archiveOperation, archiveStatus, deferArchive, nextArchiveAlarm, nextArchiveOperation, runArchive, stagedArchiveActivity, stagedUndo, type ArchiveCommand } from "./archive-operations";
 export type { ArchiveCommand } from "./archive-operations";
 import { PROFILE_MIGRATIONS } from "./schema";
+import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
+import { noteRecall, recallStrength } from "./recall-stats";
+import { listSessions, sessionDetail } from "./sessions";
+import { activitySummary, listProjects, projectProfile } from "./insights";
+import { leaseFacts } from "../health";
+import { profilePart } from "../viewer/snapshot";
+import { changesSince } from "../viewer/events";
+import type { ActivitySummaryQuery, EvalCandidateQuery, EvalCandidateStatus, OwnerQueue, RecallOptions, SessionQuery } from "../viewer/types";
 import { runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
@@ -45,6 +55,13 @@ export interface WorkBatch { repo: string | null; commits: UploadArgs[]; prs?: U
 /** A PR or ticket item also names its updated_at. `flagged`: held, but its protected node was flagged for the owner instead of changed. */
 export type WorkItemResult = { key: string; status: "stored" | "replayed" | "stale" | "flagged" | "refused"; updated_at?: string; reason?: string };
 export type MarkerResult = ReturnType<typeof putMarker>;
+/** v2 owner and Worker reads (X0): each maps to one wave-1 module function; owner routes and the snapshot use them. */
+export type V2Read =
+	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string }
+	| { kind: "viewer_part"; day: string } | { kind: "changes"; after: number; limit: number }
+	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string }
+	| { kind: "eval_candidates"; q: EvalCandidateQuery } | { kind: "accepted_candidates"; cursor: string | null; limit: number }
+	| { kind: "lease_facts" } | { kind: "recall_strength"; ids: string[]; day: string };
 
 import { foldDue, foldStep } from "./compact";
 import { danglingPage, enqueueDangling } from "./dangling";
@@ -159,7 +176,7 @@ export class ProfileStore extends DurableObject<Env> {
 			const m = await readManifest(this.env, `profile-${who.profile}`, r.exportId, who.userId);
 			if (!m.ok) return m;
 			const manifest = m.value;
-			if (manifest.profile !== who.profile || manifest.schema_version !== PROFILE_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+			if (manifest.profile !== who.profile || !restorable("profile", manifest.schema_version, PROFILE_MIGRATIONS.length)) return fail("validation", "this export's profile or schema version does not match");
 			if (!meta("restore_id")) {
 				if (exportTables(sql, { control: PROFILE_CONTROL }).some((t) => t !== "profile_meta" && sql.exec(`SELECT 1 FROM "${t}" LIMIT 1`).toArray().length)) return fail("validation", "a restore needs a fresh generation");
 				sql.exec("INSERT INTO profile_meta (key, value) VALUES ('restore_id', ?), ('restore_next', '0')", r.id);
@@ -229,6 +246,57 @@ export class ProfileStore extends DurableObject<Env> {
 			open_transfers: sql.exec<{ n: number }>("SELECT count(*) AS n FROM transfers WHERE state NOT IN ('committed','aborted')").one().n,
 			open_transfer_ids: after.node === "" && after.request === "" ? sql.exec<{ id: string }>("SELECT id FROM transfers WHERE state NOT IN ('committed','aborted') ORDER BY id LIMIT 50").toArray().map((t) => t.id) : [],
 		});
+	}
+
+	/**
+	 * Internal RPC from openRestore (export restore and point-in-time), before the generation opens: restores the account's
+	 * permanent wipe identities here as local fences, and removes the v2 side rows they name. A candidate is removed in every
+	 * status when its expected ids or node evidence name a wiped id, even if this profile never held that node (the me overlay).
+	 * Bounded: done is false while rows remain for these ids, and the account calls again with the same page.
+	 */
+	async fenceWiped(who: Who, ids: { id: string; mark: string }[]): Promise<Outcome<{ done: boolean }>> {
+		const sql = this.ctx.storage.sql;
+		if (!this.who()) return ok({ done: true });
+		const has = (k: string) => sql.exec("SELECT 1 FROM profile_meta WHERE key = ?", k).toArray().length > 0;
+		if (!this.same(who) || (has("restore_id") && !has("restore_done"))) return fail("validation", "this generation holds no finished restore");
+		const list = JSON.stringify(ids.map((i) => i.id));
+		return ok(this.ctx.storage.transactionSync(() => {
+			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+			for (const i of ids) tx.run("INSERT OR IGNORE INTO profile_meta (key, value) VALUES (?, ?)", `wiped:${i.id}`, i.mark);
+			const pages = [
+				"DELETE FROM recall_daily WHERE (node_id, day) IN (SELECT node_id, day FROM recall_daily WHERE node_id IN (SELECT value FROM json_each(?1)) LIMIT 100)",
+				`DELETE FROM eval_candidates WHERE id IN (SELECT c.id FROM eval_candidates c WHERE EXISTS (SELECT 1 FROM json_each(c.expected_json) x WHERE x.value IN (SELECT value FROM json_each(?1)))
+					OR EXISTS (SELECT 1 FROM json_each(c.evidence_json) e WHERE json_extract(e.value, '$.kind') = 'node' AND json_extract(e.value, '$.ref') IN (SELECT value FROM json_each(?1))) LIMIT 40)`];
+			for (const q of pages) {
+				for (let before = -1; before !== tx.rows;) {
+					if (tx.spent(0.5)) return { done: false };
+					before = tx.rows;
+					tx.run(q, list);
+				}
+			}
+			return { done: true };
+		}));
+	}
+
+	/** Owner queue (TG4, TG5): enqueues through the existing fingerprinted queue, so a repeat queues nothing. Subjects must be this profile's. */
+	async queueOwner(who: Who, q: OwnerQueue): Promise<Outcome<{ queued: number }>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql;
+			const ids = q.kind === "unlinked" ? q.ids : [q.session];
+			const held = sql.exec<{ id: string }>(q.kind === "unlinked"
+				? "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND memory_type IS NOT NULL"
+				: "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND kind = 'session'", JSON.stringify(ids)).toArray().map((r) => r.id);
+			if (held.length !== new Set(ids).size) return fail("not_found", q.kind === "unlinked" ? "every id must be an active memory in this profile" : "no such session");
+			return ok(this.ctx.storage.transactionSync(() => {
+				let tx: BudgetTx | undefined;
+				return { queued: enqueueIn(sql, () => (tx ??= new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString())), held.map((id) => ({ kind: q.kind, subjects: [id] }))) };
+			}));
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
 	}
 
 	/** Internal RPC from an aborted restore, after the account retired this generation: clears what the restore wrote. */
@@ -682,7 +750,60 @@ export class ProfileStore extends DurableObject<Env> {
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
 	}
 
-	async read(who: Who, q: ReadQuery): Promise<Outcome<unknown>> {
+	/** Recall hit counts (R1): one transaction at one sequence; only recall_daily and recall_totals change. */
+	async noteRecall(who: Who, ids: string[], tokens: number): Promise<Outcome<null>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql, day = new Date().toISOString().slice(0, 10);
+			this.ctx.storage.transactionSync(() => noteRecall(sql, nextSeq(sql, "profile_meta"), day, ids, tokens));
+			return ok(null);
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** The owner accepts or dismisses one eval candidate (R1). */
+	async decideEvalCandidate(who: Who, id: string, status: Exclude<EvalCandidateStatus, "pending">): Promise<Outcome<unknown>> {
+		try {
+			await this.access(who);
+			this.bind(who);
+			const sql = this.ctx.storage.sql;
+			const c = this.ctx.storage.transactionSync(() => decideCandidate(sql, nextSeq(sql, "profile_meta"), id, status));
+			return c ? ok(c) : fail("not_found", "no such eval candidate");
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	/** v2 reads; an object never bound answers from its empty tables without binding. */
+	async readV2(who: Who, q: V2Read): Promise<Outcome<unknown>> {
+		try {
+			await this.access(who);
+			this.bind(who, true);
+			const sql = this.ctx.storage.sql, now = new Date().toISOString();
+			switch (q.kind) {
+				case "sessions": return ok(listSessions(sql, q.q));
+				case "session": { const d = sessionDetail(sql, q.id); return d ? ok(d) : fail("not_found", "no such session"); }
+				case "viewer_part": return ok(profilePart(sql, who.profile, q.day, sql.databaseSize));
+				case "changes": return ok(changesSince(sql, who.profile, q.after, q.limit));
+				case "activity_summary": return ok(activitySummary(sql, q.q));
+				case "projects": return ok(listProjects(sql));
+				case "project_profile": { const p = projectProfile(sql, q.key, now); return p ? ok(p) : fail("not_found", "no such project"); }
+				case "eval_candidates": return ok(listCandidates(sql, q.q));
+				case "accepted_candidates": return ok(acceptedCandidates(sql, q.cursor, q.limit));
+				case "lease_facts": return ok(leaseFacts(sql, now));
+				case "recall_strength": return ok(recallStrength(sql, q.ids, q.day));
+			}
+		} catch (e) {
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
+	async read(who: Who, q: ReadQuery, opts?: RecallOptions): Promise<Outcome<unknown>> {
 		try {
 			await this.access(who);
 			this.bind(who, ["import_audit", "batch_status", "owner_model", "board", "entity", "journals", "journal", "map", "graph", "page_timeline", "activity", "shown", "archive", "markers", "wipe_preview"].includes(q.kind));
@@ -698,7 +819,7 @@ export class ProfileStore extends DurableObject<Env> {
 					// Ownership probe: a record still landing or a tombstone left behind never claims the id.
 					return ok(sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status IN ('active','retired','superseded','moving','candidate','dismissed')", q.id).toArray().length > 0);
 				case "recall":
-					return ok(await this.recall(who, q));
+					return ok(await this.recall(who, q, opts?.channels));
 				case "import_audit":
 					return ok(audit(sql, q));
 				case "explore":
@@ -748,11 +869,11 @@ export class ProfileStore extends DurableObject<Env> {
 	 * the lexical channels run while it is in flight, and the Vectorize query follows the embedding. Whatever has not
 	 * answered by the deadline is left out; the lexical results return, and diagnostics name the stage that missed.
 	 */
-	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>): Promise<RecallPage> {
+	private async recall(who: Who, q: Extract<ReadQuery, { kind: "recall" }>, want: RecallOptions["channels"] = ["lexical", "vector"]): Promise<RecallPage> {
 		const diagnostics: Record<string, string> = {};
 		let stage: "embedding" | "vector" = "embedding";
 		// Vectors hold only current cards, so a read at as_of is lexical over the text stored by then.
-		const semantic = q.semantic && !q.asOf && this.env.AI && this.env.VECTORS ? (async () => {
+		const semantic = q.semantic && want.includes("vector") && !q.asOf && this.env.AI && this.env.VECTORS ? (async () => {
 			const out = (await this.env.AI!.run(EMBED_MODEL, { text: [q.keyword] })) as { data?: number[][] };
 			const vector = out.data?.[0];
 			if (!vector?.length) throw new Error("empty embedding");
@@ -763,10 +884,11 @@ export class ProfileStore extends DurableObject<Env> {
 		})() : undefined;
 		// An answer or failure that arrives after the deadline is dropped, never left unhandled.
 		semantic?.catch(() => undefined);
-		const channels = lexicalChannels(this.ctx.storage.sql, q, diagnostics);
+		// channels: ["vector"] leaves the exact, literal and full-text channels out (v2 eval and Memories search by meaning).
+		const channels = want.includes("lexical") ? lexicalChannels(this.ctx.storage.sql, q, diagnostics) : {};
 		let vectorUsed = false;
 		if (!semantic) {
-			diagnostics.embedding = q.asOf ? "off:as_of" : q.semantic ? "unavailable" : "off";
+			diagnostics.embedding = q.asOf ? "off:as_of" : !want.includes("vector") ? "off:channels" : q.semantic ? "unavailable" : "off";
 			diagnostics.vector = "off";
 		} else {
 			const timeout = Symbol("timeout");

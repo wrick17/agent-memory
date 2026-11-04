@@ -4,6 +4,11 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { canonicalJson, randomBase32, sha256 } from "../domain/ids";
 import { Fail, fail, ok, PROFILE_NAME, PROFILES, SCOPES, type Caller, type Outcome, type ProfileRef, type RoutingRule, type Scope } from "../domain/types";
 import { migrate, nextSeq } from "../storage";
+import { restorable } from "../compat";
+import { healthSweep, readHealth } from "../health";
+import { listClientStatus, storeClientStatus } from "../client-status";
+import { insertEvalRun, listEvalRuns } from "../eval";
+import type { ClientStatusBody, ClientStatusRow, EvalRunInput, HealthCheck, LeaseFacts } from "../viewer/types";
 import { ACCOUNT_MIGRATIONS } from "./schema";
 import * as refresh from "./refresh";
 import { accountTransfer, type AccountTransfer, type TransferCommand } from "./transfers";
@@ -79,7 +84,15 @@ export type AccountCommand =
 	| { op: "reviewOffer"; items: ReviewOffer[]; origin?: { profile: string; generation: string } }
 	| { op: "reviewList"; kind?: ReviewKind; state?: ReviewState; exportSha?: string; after?: string; limit: number }
 	| { op: "reviewAssign"; id: string; profile: "work" | "personal" }
-	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" };
+	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" }
+	// v2 (X0): the cron health sweep and the content-free client status and eval scores. The Worker sets deviceId from the token.
+	| { op: "health_sweep" }
+	| { op: "accountHealth" }
+	| { op: "reportStatus"; deviceId: string; body: ClientStatusBody }
+	| { op: "recordEvalRun"; deviceId: string; run: EvalRunInput }
+	| { op: "listEvalRuns"; profile?: string; limit: number };
+/** The account's share of GET /api/health; the Worker adds each profile's lease facts and search counts. */
+export interface AccountHealth { checks: HealthCheck[]; devices: ClientStatusRow[]; last_export_at: string | null; exports: string[] }
 
 export type ReviewKind = "migration" | "collision";
 export type ReviewState = "open" | "assigned" | "resolved" | "wiped";
@@ -94,7 +107,9 @@ const reviewOut = (r: ReviewRow) => ({ ...r, payload: JSON.parse(r.payload) as R
 export interface Recovery extends Choices {
 	id: string; profile: string; export: string; from: string; to?: string; at: string; export_at: string; export_seq: number;
 	state: "restoring" | "settling" | "checking" | "ready" | "unresolved" | "opening" | PitrState;
-	after?: { node: string; request: string }; mark?: number; phase?: "precheck" | "deferred" | "index" | "sweep" | "switch";
+	after?: { node: string; request: string }; mark?: number; phase?: "precheck" | "deferred" | "index" | "sweep" | "fence" | "switch";
+	/** The last account `wiped:` key whose fence the restored generation holds (phase "fence", v2). */
+	fence_after?: string;
 	restored?: { nodes: number; requests: number }; unresolved: { kind: string; id: string }[]; unresolved_count: number;
 	/** Absent for a restore from an export into a new generation. A point-in-time restore keeps `to` = `from`; a corpus restore owns no records. */
 	kind?: "pitr" | "corpus";
@@ -170,7 +185,8 @@ const boundOp = (q: RestoredPage["requests"][number]) => q.legacy_hash ? (q.lega
 const keptMeta = (key: string) => ["user_id", "write_seq", "schema_version", "recovery_state"].includes(key) || key.startsWith("restore:") || key.startsWith("wiped:") || key.startsWith("drill");
 const KEPT_META_SQL = "key NOT IN ('user_id', 'write_seq', 'schema_version', 'recovery_state') AND key NOT LIKE 'restore:%' AND key NOT LIKE 'wiped:%' AND key NOT LIKE 'drill%'";
 /** Merged, never cleared: today's counters stay, and the permanent refresh ledger and the sensitive terms only grow. */
-const MERGED = ["counters", "refresh_days", "sensitive_terms"];
+// eval_runs only grows: a restore keeps runs recorded after the export (MG0). client_status and health are derived and replace.
+const MERGED = ["counters", "refresh_days", "sensitive_terms", "eval_runs"];
 const ADMIN_WHILE_RESTORING = ["drillStatus", "listExports", "restoreStatus", "restoreRecord", "recoveryConflicts", "recoveryRequest", "recheckRequests", "resolveConflict", "restoreStep", "openRestore", "abortRestore", "listProfiles", "listDevices"];
 /** recoveryRequest's content-free placement of one request id. */
 interface Placement {
@@ -592,7 +608,7 @@ export class AccountStore extends DurableObject<Env> {
 	}
 	private profileAt(ref: ProfileRef) {
 		return this.env.PROFILE.get(this.env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
-			Pick<ProfileStore, "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
+			Pick<ProfileStore, "readV2" | "fenceWiped" | "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
 	}
 	private corpusAt(ref: ProfileRef) {
 		return this.env.CORPUS_STORE!.get(this.env.CORPUS_STORE!.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
@@ -690,7 +706,7 @@ export class AccountStore extends DurableObject<Env> {
 			let chosen: Manifest | undefined;
 			for (const id of (await listExports(this.env, `profile-${cmd.profile}`)).reverse()) {
 				const m = await readManifest(this.env, `profile-${cmd.profile}`, id, userId);
-				if (!m.ok || m.value.profile !== cmd.profile || m.value.schema_version !== PROFILE_MIGRATIONS.length) continue;
+				if (!m.ok || m.value.profile !== cmd.profile || !restorable("profile", m.value.schema_version, PROFILE_MIGRATIONS.length)) continue;
 				if (this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ?", m.value.generation ?? "").toArray()[0]?.state === "wiped") continue;
 				chosen = m.value;
 				break;
@@ -699,7 +715,7 @@ export class AccountStore extends DurableObject<Env> {
 			let account: string | null = null;
 			for (const id of (await listExports(this.env, "account")).reverse()) {
 				const m = await readManifest(this.env, "account", id, userId);
-				if (m.ok && m.value.schema_version === ACCOUNT_MIGRATIONS.length) { account = m.value.id; break; }
+				if (m.ok && restorable("account", m.value.schema_version, ACCOUNT_MIGRATIONS.length)) { account = m.value.id; break; }
 			}
 			// Rechecked after the awaits: the gate below is the only one, and it lands before anything else.
 			const late = refuse();
@@ -925,7 +941,7 @@ export class AccountStore extends DurableObject<Env> {
 				if (this.wiping()) return fail("busy", "finish the unfinished profile wipe before a restore");
 				const m = await readManifest(this.env, "account", cmd.export, userId);
 				if (!m.ok) return m;
-				if (m.value.schema_version !== ACCOUNT_MIGRATIONS.length) return fail("validation", "this export's schema version does not match");
+				if (!restorable("account", m.value.schema_version, ACCOUNT_MIGRATIONS.length)) return fail("validation", "this export's schema version does not match");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
 				// Rechecked after the manifest read, in the same turn as the write below: a drill begun meanwhile keeps the account to itself.
 				if (this.drillOpen()) return fail("busy", "finish or clean up the restore drill first", { reason: "drill_open" });
@@ -1085,7 +1101,7 @@ export class AccountStore extends DurableObject<Env> {
 				if (p.status !== "active") return fail("profile_wiped", "only an active profile can be restored");
 				const m = await readManifest(this.env, `profile-${cmd.profile}`, cmd.export, userId);
 				if (!m.ok) return m;
-				if (m.value.profile !== cmd.profile || m.value.schema_version !== PROFILE_MIGRATIONS.length) return fail("validation", "this export's profile or schema version does not match");
+				if (m.value.profile !== cmd.profile || !restorable("profile", m.value.schema_version, PROFILE_MIGRATIONS.length)) return fail("validation", "this export's profile or schema version does not match");
 				const gen = this.sql.exec<{ state: string }>("SELECT state FROM generations WHERE id = ? AND profile = ?", m.value.generation ?? "", cmd.profile).toArray()[0];
 				if (gen?.state === "wiped") return fail("profile_wiped", "this export belongs to a wiped generation");
 				if (this.meta("recovery_state")) return fail("busy", "a recovery is already open");
@@ -1213,8 +1229,18 @@ export class AccountStore extends DurableObject<Env> {
 							if (!tx.spent(0.5)) tx.run("DELETE FROM request_index WHERE request_id IN (SELECT request_id FROM request_index WHERE profile = ? AND op <> 'wiped' AND seq <= ? LIMIT 25)", r.profile, r.mark!);
 							left = tx.rows > before;
 						}
-						if (!left) { r.phase = "switch"; tx.run("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('recovery_state', ?)", JSON.stringify(r)); }
+						if (!left) { r.phase = "fence"; tx.run("INSERT OR REPLACE INTO account_meta (key, value) VALUES ('recovery_state', ?)", JSON.stringify(r)); }
 					});
+				}
+				// v2: every permanent wipe identity becomes a local fence in the restored generation, and the eval candidates and
+				// recall counts naming one go, before it opens. The generation may predate the wipe and never have held the node.
+				while (r.phase === "fence" && Date.now() - started < 20_000) {
+					const page = this.sql.exec<{ key: string; value: string }>("SELECT key, value FROM account_meta WHERE key LIKE 'wiped:%' AND key > ? ORDER BY key LIMIT 50", r.fence_after ?? "").toArray();
+					if (!page.length) { this.advance(r, () => Object.assign(r, { phase: "switch" })); break; }
+					const f = await stub.fenceWiped(who, page.map((k) => ({ id: k.key.slice("wiped:".length), mark: k.value })));
+					if (!f.ok) return f;
+					if (this.recovery()?.id !== r.id) return fail("busy", "the recovery changed; read its status");
+					if (f.value.done) this.advance(r, () => Object.assign(r, { fence_after: page.at(-1)!.key }));
 				}
 				if (r.phase !== "switch") return ok(r);
 				// A point-in-time restore stays on its own generation; its record keeps the undo bookmark for a reversal.
@@ -2093,6 +2119,35 @@ export class AccountStore extends DurableObject<Env> {
 				}
 				return wipeProfile(this.env, { ...wipePorts(this.env, this.ctx.storage), backups: (p) => this.replaceExports(p) }, { userId, kind: "owner", scopes: ["read", "write"], profiles: "*" }, cmd.profile, cmd.typed);
 			}
+			case "health_sweep": {
+				// Deterministic: reads state and replaces health rows; never a model call, never a record change.
+				const userId = this.meta("user_id");
+				if (!userId) return fail("unavailable", "the account is not set up");
+				const refs = this.sql.exec<{ name: string; generation: string }>("SELECT name, generation FROM profiles WHERE status = 'active' ORDER BY name").toArray();
+				const profiles = await Promise.all(refs.map(async (r) => {
+					const ref = { userId, profile: r.name, generation: r.generation };
+					const f = await this.profileAt(ref).readV2(ref, { kind: "lease_facts" }).catch(() => null);
+					return f?.ok ? { profile: r.name, facts: f.value as LeaseFacts } : null;
+				}));
+				const devices = this.sql.exec<{ id: string; revoked: number }>("SELECT id, (revoked_at IS NOT NULL OR enabled = 0) AS revoked FROM devices").toArray().map((d) => ({ id: d.id, revoked: d.revoked === 1 }));
+				const last = JSON.parse(this.meta("last_export") ?? "null") as { at?: string } | null;
+				const input = { now: new Date().toISOString(), profiles: profiles.filter((p) => p !== null), devices, last_export_at: last?.at ?? null };
+				return ok(this.write(() => healthSweep(this.sql, input)));
+			}
+			case "accountHealth": {
+				const last = JSON.parse(this.meta("last_export") ?? "null") as { at?: string } | null;
+				return ok({ checks: readHealth(this.sql), devices: listClientStatus(this.sql), last_export_at: last?.at ?? null, exports: await listExports(this.env, "account") } satisfies AccountHealth);
+			}
+			case "reportStatus":
+				this.write(() => storeClientStatus(this.sql, cmd.deviceId, new Date().toISOString(), cmd.body));
+				return ok(null);
+			case "recordEvalRun": {
+				const run = { ...cmd.run, id: crypto.randomUUID(), device_id: cmd.deviceId };
+				this.write(() => insertEvalRun(this.sql, run));
+				return ok({ id: run.id });
+			}
+			case "listEvalRuns":
+				return ok(listEvalRuns(this.sql, { ...(cmd.profile ? { profile: cmd.profile } : {}), limit: cmd.limit }));
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
 			case "reviewOffer": {

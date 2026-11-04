@@ -1,0 +1,117 @@
+{
+	"id": "00000000-0000-5000-8000-0000000000a1",
+	"client": "claude-code",
+	"session": "fixture-session-1",
+	"device": "dev_fixture_mac",
+	"project": "00000000-0000-5000-8000-0000000000b1",
+	"first_upload_at": "2026-11-02T08:41:00Z",
+	"last_upload_at": "2026-11-02T09:12:00Z",
+	"status": "active",
+	"first_ask": "Why does the nightly export skip the second profile?",
+	"counts": {
+		"asks": 3,
+		"decisions": 2,
+		"corrections": 1,
+		"outcomes": 2,
+		"parts": 4,
+		"files_changed": 5
+	},
+	"events": [
+		{
+			"i": 0,
+			"kind": "ask",
+			"label": "Why does the nightly export skip the second profile?",
+			"offset_ms": null,
+			"detail": {
+				"part": "1",
+				"pos": "1800"
+			}
+		},
+		{
+			"i": 1,
+			"kind": "decision",
+			"label": "Iterate profiles from the account list, not the cache",
+			"offset_ms": null,
+			"detail": {
+				"part": "1",
+				"pos": "3911"
+			}
+		},
+		{
+			"i": 2,
+			"kind": "ask",
+			"label": "Does the <script>alert(1)</script> label stay text?",
+			"offset_ms": null,
+			"detail": {
+				"part": "2",
+				"pos": "6333"
+			}
+		},
+		{
+			"i": 3,
+			"kind": "correction",
+			"label": "Keep the export order stable by profile name",
+			"offset_ms": null,
+			"detail": {
+				"part": "2",
+				"pos": "9066"
+			}
+		},
+		{
+			"i": 4,
+			"kind": "decision",
+			"label": "Add the missing profile to the export cursor",
+			"offset_ms": null,
+			"detail": {
+				"part": "3",
+				"pos": "12110"
+			}
+		},
+		{
+			"i": 5,
+			"kind": "outcome",
+			"label": "Export covers both profiles",
+			"offset_ms": null,
+			"detail": {
+				"part": "3",
+				"pos": "15465",
+				"outcome": "commit"
+			}
+		},
+		{
+			"i": 6,
+			"kind": "ask",
+			"label": "Run typecheck before the commit",
+			"offset_ms": null,
+			"detail": {
+				"part": "4",
+				"pos": "19131"
+			}
+		},
+		{
+			"i": 7,
+			"kind": "outcome",
+			"label": "Typecheck passes",
+			"offset_ms": null,
+			"detail": {
+				"part": "4",
+				"pos": "23108",
+				"outcome": "test"
+			}
+		}
+	],
+	"produced": [
+		{
+			"id": "00000000-0000-5000-8000-0000000000c1",
+			"kind": "memory",
+			"title": "Nightly export iterates the account profile list",
+			"via": "evidence"
+		},
+		{
+			"id": "00000000-0000-5000-8000-0000000000c2",
+			"kind": "preference",
+			"title": "Keep export order stable by profile name",
+			"via": "inferred_preference"
+		}
+	]
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Agent Memory local CLI (section 10): `hook <client>`, `run`, `install`. Node 24, no dependencies.
+// Agent Memory local CLI (section 10): `hook <client>`, `run [--scheduled]`, `install`, `eval`, `replay`, `backfill`, `doctor` and
+// `corpus-upload`. Node 24, no dependencies.
 // Reads transcripts completely on this machine and uploads only bounded, redacted digests.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -25,8 +26,8 @@ export function writePrivate(file, data, mode = 0o600) {
 	fs.writeFileSync(tmp, data, { mode });
 	fs.renameSync(tmp, file);
 }
-const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
-const safeName = (s) => s.replace(/[^A-Za-z0-9._-]/g, "_");
+export const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
+export const safeName = (s) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 
 // Same patterns as the server's src/domain/redact.ts (port of BothQ memory_privacy.py).
 const REDACTED = "[REDACTED]";
@@ -59,7 +60,9 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	if (!CLIENTS.has(client)) return;
 	let h;
 	try { h = JSON.parse(input); } catch { return; }
-	const session = typeof h.session_id === "string" ? h.session_id : null;
+	// A prompt hook is the opt-in injection path (inject.mjs, dispatched by the CLI). It never queues a capture run.
+	if (h?.hook_event_name === "UserPromptSubmit") return;
+	const session = typeof h?.session_id === "string" ? h.session_id : null;
 	if (!session || !/^[A-Za-z0-9._:-]{1,128}$/.test(session)) return;
 	const name = `${client}-${safeName(session)}.json`;
 	const file = path.join(home(), "queue", name);
@@ -197,7 +200,7 @@ export function readLines(file, from) {
 }
 
 const INJECTED = /^\s*(<environment_context>|<user_instructions>|<INSTRUCTIONS>|# AGENTS\.md instructions|<command-name>|<local-command-stdout>|Caveat: The messages below)/;
-const stripReminders = (s) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+export const stripReminders = (s) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
 
 /** Owner and assistant text only. Tool calls and output, thinking, and injected system or hook text are skipped. */
 export function extract(client, lines) {
@@ -506,6 +509,14 @@ export function httpServer(config) {
 			return res.json();
 		},
 		ingest: (batch) => post("/v1/ingest", batch).then((r) => r.results),
+		/** v2, job token: the per-device capture report (status.mjs) and eval scores and counts only (eval.mjs). */
+		status: (body) => post("/v1/status", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		evalRun: (body) => post("/v1/eval/runs", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		whoami: async () => {
+			const res = await fetch(new URL("/v1/whoami", config.server), { headers: { authorization: `Bearer ${token()}` }, redirect: "error", signal: AbortSignal.timeout(10_000) });
+			if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+			return res.json();
+		},
 		work: (batch) => post("/v1/ingest", batch, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		state: (ids, repo) => post("/v1/capture", { range_ids: ids, ...(repo ? { repo } : {}) }).then((r) => r.ranges),
 	};
@@ -537,9 +548,51 @@ async function replaySpool(server) {
 	}
 }
 
+/**
+ * The read-scoped device token for injection and eval (config read_token_file), or null. It must be a regular file owned by
+ * this user with no group or other access, as the job token is kept. The job token is never read here.
+ */
+export function readToken(config = loadConfig()) {
+	const file = expandHome(config.read_token_file);
+	if (!file) return null;
+	try {
+		const st = fs.lstatSync(file);
+		if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) return null;
+		const t = fs.readFileSync(file, "utf8").trim();
+		return t && !/\s/.test(t) ? t : null;
+	} catch { return null; }
+}
+
+/**
+ * POST /v1/recall and GET /v1/eval/candidates, with the read token only. Each request names the profile the caller chose (inject.profile, eval --profile):
+ * the service validates that target and the token's read scope and never infers work or personal from the text.
+ */
+export function readServer(config = loadConfig()) {
+	const send = async (url, { body, timeoutMs = 30_000 } = {}) => {
+		const token = readToken(config);
+		if (!token) throw Object.assign(new Error("read_token_missing"), { code: "read_token_missing" });
+		const res = await fetch(url, { method: body === undefined ? "GET" : "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+			...(body === undefined ? {} : { body: JSON.stringify(body) }), redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+		if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+		return res.json();
+	};
+	return {
+		recall: (body, { timeoutMs = 30_000 } = {}) => send(new URL("/v1/recall", config.server), { body, timeoutMs }),
+		/** GET /v1/eval/candidates: one page of the explicit profile's accepted candidates, oldest first. → { rows, next_cursor } */
+		acceptedCandidates: ({ profile, cursor, limit } = {}) => {
+			if (typeof profile !== "string" || !profile) throw Object.assign(new Error("profile_required"), { code: "profile_required" });
+			const url = new URL("/v1/eval/candidates", config.server);
+			url.searchParams.set("profile", profile);
+			if (cursor) url.searchParams.set("cursor", cursor);
+			if (limit !== undefined) url.searchParams.set("limit", String(limit));
+			return send(url);
+		},
+	};
+}
+
 // ---------- run ----------
 
-const statePath = (c, s) => path.join(home(), "state", c, `${safeName(s)}.json`);
+export const statePath = (c, s) => path.join(home(), "state", c, `${safeName(s)}.json`);
 
 /** The repo identity the server routes by: the origin remote from local git, and the session's working directory. */
 export function repoOf(cwd) {
@@ -645,8 +698,29 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	return { status: missing || "done", digested_to: st.digested_to, consolidated_to: st.consolidated_to, outcomes };
 }
 
+/** `~` or `~/…` to the user's home; other values unchanged; non-strings to null. */
+export const expandHome = (p) => (typeof p !== "string" || !p ? null : p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p);
+
+/**
+ * v2 keys, applied when config.json leaves them out, so a v1 config keeps working unchanged. Injection stays off unless the owner
+ * sets inject.enabled to true and names inject.profile, the profile the prompt hook reads; nothing picks one for them.
+ */
+export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, max_tokens: 600, timeout_ms: 1500, profile: null } });
+const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
+
+/** The raw config with the v2 defaults filled in. Every v1 key is returned as written. */
+export function withDefaults(raw) {
+	const c = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}, d = configDefaults();
+	const i = c.inject && typeof c.inject === "object" && !Array.isArray(c.inject) ? c.inject : {};
+	return { ...c,
+		batch_hour: Number.isInteger(c.batch_hour) && c.batch_hour >= 0 && c.batch_hour <= 23 ? c.batch_hour : d.batch_hour,
+		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
+		inject: { enabled: i.enabled === true, max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000),
+			profile: typeof i.profile === "string" && /^[a-z][a-z0-9-]{0,31}$/.test(i.profile) ? i.profile : null } };
+}
+
 export function loadConfig() {
-	return readJson(path.join(home(), "config.json"), {});
+	return withDefaults(readJson(path.join(home(), "config.json"), {}));
 }
 
 const claimDir = () => path.join(home(), "claimed");
@@ -696,7 +770,7 @@ function sweep(now, debounceMs) {
  * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
  * trigger written meanwhile lands in a new queue file and is handled after it.
  */
-async function drain({ server, runner, clock, sleep, debounceMs }, results) {
+async function drain({ server, runner, clock, sleep, debounceMs, trigger }, results) {
 	const config = loadConfig();
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
@@ -742,7 +816,7 @@ async function drain({ server, runner, clock, sleep, debounceMs }, results) {
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
-			results.batch = await batch({ runner, config, clock });
+			results.batch = await batch({ runner, config, clock, trigger });
 		}
 	} finally {
 		runner?.cleanup?.();
@@ -769,18 +843,21 @@ async function corpusAfterSessions(config, cwds, runner) {
 	return out;
 }
 
-/** The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. */
-export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS } = {}) {
+/**
+ * The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. trigger is "hook"
+ * (a client hook started it) or "scheduled" (`run --scheduled` from launchd); C1 makes a scheduled run exit at once when nothing is due.
+ */
+export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
 	const results = {};
 	let last = null;
 	while (takeLock()) {
-		try { last = await drain({ server, runner, clock, sleep, debounceMs }, results); } finally { dropLock(); }
+		try { last = await drain({ server, runner, clock, sleep, debounceMs, trigger }, results); } finally { dropLock(); }
 		// A trigger written after the last scan saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");
 		if (!starts(qdir).length && !queued(qdir).some((f) => { const t = readJson(path.join(qdir, f), null); return t && last.handled.get(f) !== genOf(t); })) break;
 	}
 	if (!last) return { status: "locked" };
-	return { status: "ran", results, runtime: last.runtime, reason: last.reason };
+	return { status: "ran", trigger, results, runtime: last.runtime, reason: last.reason };
 }
 
 // ---------- confined runtime (section 12) ----------
@@ -1145,6 +1222,8 @@ export function parseEvents(stdout) {
 // corpus-upload's import closure in the source layout: its modules beside this CLI, and their domain imports at ../src/domain.
 const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
 const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
+// v2 modules the CLI dispatches to, copied beside it. They import only ./agent-memory.mjs and each other.
+export const V2_LOCAL = ["eval.mjs", "eval-score.mjs", "replay.mjs", "transcript-full.mjs", "replay-player.js", "backfill.mjs", "status.mjs", "doctor.mjs", "launchd.mjs", "inject.mjs"];
 
 export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1156,7 +1235,7 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 		fs.chmodSync(dir, 0o700);
 	}
 	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
-	for (const f of CORPUS_LOCAL) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+	for (const f of [...CORPUS_LOCAL, ...V2_LOCAL]) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
 	for (const f of CORPUS_DOMAIN) writePrivate(path.join(home(), "src", "domain", f), fs.readFileSync(new URL(`../src/domain/${f}`, import.meta.url)));
 	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -1171,20 +1250,49 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 
 // ---------- CLI ----------
 
+export const USAGE = "usage: agent-memory hook <claude-code|codex> | run [--scheduled] | install | eval [export-candidates] … | replay [--list] [--session ID] [--port N]"
+	+ " | backfill [--client claude-code|codex] [--since 30d] | doctor | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory <command> --help` for its options\n";
+
+/** v2 commands: each module's main(argv, prog) resolves to the exit code. */
+const COMMANDS = { eval: "./eval.mjs", replay: "./replay.mjs", backfill: "./backfill.mjs", doctor: "./doctor.mjs" };
+
+/**
+ * UserPromptSubmit: the only hook that may wait on the network. Off unless inject.enabled; prints at most the client's
+ * context output, and on any failure, a missing read token or the timeout prints nothing and exits 0.
+ */
+function promptHook(client, input) {
+	const config = loadConfig();
+	if (!config.inject.enabled) process.exit(0);
+	setTimeout(() => process.exit(0), config.inject.timeout_ms + 250);
+	import("./inject.mjs").then((m) => m.inject(client, input, { config })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
+
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
 	const [cmd, arg] = process.argv.slice(2);
 	if (cmd === "hook") {
 		let input = "";
-		process.stdin.on("data", (d) => { input += d; }).on("end", () => { try { hook(arg, input); } catch { /* never block the client */ } process.exit(0); });
+		process.stdin.on("data", (d) => { input += d; }).on("end", () => {
+			let event = null;
+			try { event = JSON.parse(input)?.hook_event_name ?? null; } catch { /* hook() ignores bad input */ }
+			if (event === "UserPromptSubmit" && CLIENTS.has(arg)) { try { promptHook(arg, input); } catch { process.exit(0); } return; }
+			try { hook(arg, input); } catch { /* never block the client */ }
+			process.exit(0);
+		});
 	} else if (cmd === "run") {
-		run().then((r) => { writePrivate(path.join(home(), "last-run.json"), JSON.stringify({ at: new Date().toISOString(), status: r.status, runtime: r.runtime ?? null })); }, () => process.exit(1));
+		const trigger = process.argv.slice(3).includes("--scheduled") ? "scheduled" : "hook";
+		run({ trigger }).then((r) => { writePrivate(path.join(home(), "last-run.json"), JSON.stringify({ at: new Date().toISOString(), status: r.status, runtime: r.runtime ?? null, ...(trigger === "scheduled" ? { trigger } : {}) })); }, () => process.exit(1));
 	} else if (cmd === "install") {
 		const r = install();
 		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\nClaude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
 	} else if (cmd === "corpus-upload") {
 		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
+	} else if (Object.hasOwn(COMMANDS, cmd)) {
+		import(COMMANDS[cmd]).then((m) => m.main(process.argv.slice(3), `agent-memory ${cmd}`)).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else {
-		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
+		process.stderr.write(USAGE);
 		process.exit(2);
 	}
 }

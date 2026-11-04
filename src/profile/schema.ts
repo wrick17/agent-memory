@@ -42,6 +42,23 @@ const COUNT_SEAL = `
 		AND json_extract(c.value,'$.id') IN (json_extract(OLD.commit_meta,'$.person'),json_extract(OLD.commit_meta,'$.project'));
 `;
 
+// The maintenance queue's DDL, shared by v2 and v9's rebuild so the columns, indexes and tombstones stay identical.
+const MAINTENANCE_V2_KINDS = ["near_duplicate", "possible_contradiction", "unlinked", "unprocessed_capture", "preference_signal", "stale_journal", "weekly_review", "dangling_link"] as const;
+/** v9 adds stale_memory: a deterministic review item, never an automatic deletion. */
+export const MAINTENANCE_KINDS = [...MAINTENANCE_V2_KINDS, "stale_memory"] as const;
+const maintenanceTable = (name: string, kinds: readonly string[]) => `CREATE TABLE ${name} (
+		id INTEGER PRIMARY KEY,
+		kind TEXT NOT NULL CHECK (kind IN (${list(kinds)})),
+		subjects TEXT NOT NULL CHECK (json_valid(subjects)),
+		fingerprint TEXT NOT NULL UNIQUE,
+		state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','leased','done','dismissed','stuck')),
+		lease_id TEXT, lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL, done_at TEXT, outcome TEXT, seq INTEGER NOT NULL
+	)`;
+const MAINTENANCE_COLUMNS = "id, kind, subjects, fingerprint, state, lease_id, lease_until, attempts, created_at, done_at, outcome, seq";
+const MAINTENANCE_INDEXES = ["CREATE INDEX maintenance_open ON maintenance (state, kind, created_at)", "CREATE INDEX maintenance_seq ON maintenance (seq, id)"];
+const MAINTENANCE_TOMBS = tombstoneTriggers("profile_meta", "maintenance", (r) => `CAST(${r}.id AS TEXT)`);
+
 export const PROFILE_MIGRATIONS: Migration[] = [[
 	`CREATE TABLE nodes (
 		id TEXT PRIMARY KEY,
@@ -173,23 +190,15 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	`CREATE TRIGGER texts_cap_au_in AFTER UPDATE OF live, lane ON texts WHEN NEW.live = 1 AND NEW.lane = 'capture' AND NOT (OLD.live = 1 AND OLD.lane = 'capture') BEGIN
 		INSERT INTO captures_fts (rowid, body) VALUES (NEW.rowid, NEW.body); END`,
 	"CREATE TABLE markers (repo TEXT PRIMARY KEY, head TEXT, uploaded_at TEXT, analyzed_at TEXT, analysis_head TEXT, seq INTEGER NOT NULL) WITHOUT ROWID",
-	`CREATE TABLE maintenance (
-		id INTEGER PRIMARY KEY,
-		kind TEXT NOT NULL CHECK (kind IN ('near_duplicate','possible_contradiction','unlinked','unprocessed_capture','preference_signal','stale_journal','weekly_review','dangling_link')),
-		subjects TEXT NOT NULL CHECK (json_valid(subjects)),
-		fingerprint TEXT NOT NULL UNIQUE,
-		state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','leased','done','dismissed','stuck')),
-		lease_id TEXT, lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-		created_at TEXT NOT NULL, done_at TEXT, outcome TEXT, seq INTEGER NOT NULL
-	)`,
+	maintenanceTable("maintenance", MAINTENANCE_V2_KINDS),
 	// The me guard's work terms, kept in the me profile itself so its write transaction reads them atomically (section 5).
 	"CREATE TABLE guard_terms (term TEXT PRIMARY KEY, source TEXT NOT NULL, added_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID",
 	"CREATE INDEX guard_terms_seq ON guard_terms (seq, term)",
-	"CREATE INDEX maintenance_open ON maintenance (state, kind, created_at)",
+	MAINTENANCE_INDEXES[0]!,
 	"CREATE INDEX markers_seq ON markers (seq, repo)",
-	"CREATE INDEX maintenance_seq ON maintenance (seq, id)",
+	MAINTENANCE_INDEXES[1]!,
 	...tombstoneTriggers("profile_meta", "markers", (r) => `${r}.repo`),
-	...tombstoneTriggers("profile_meta", "maintenance", (r) => `CAST(${r}.id AS TEXT)`),
+	...MAINTENANCE_TOMBS,
 	...tombstoneTriggers("profile_meta", "guard_terms", (r) => `${r}.term`),
 ], [
 	// v3: the staged import (section 16). Revisions are rebuilt to take BothQ's own operations and keep each revision's
@@ -332,4 +341,29 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 		UPDATE requests SET commit_meta=NULL,seq=(SELECT CAST(value AS INTEGER) FROM profile_meta WHERE key='write_seq') WHERE request_id=json_extract(OLD.undo,'$.commitReceipt.request')
 		AND json_extract(commit_meta,'$.owner.id')=OLD.id AND json_extract(commit_meta,'$.owner.at')=OLD.at AND json_extract(commit_meta,'$.owner.seq')=json_extract(OLD.undo,'$.seq');
 	END`,
+], [
+	// v9 (v2 plan, MG0): recall measurement, eval candidates and the stale_memory maintenance kind. New tables follow the seq
+	// index and tombstone convention, so exports, restores and the change feed carry them like every other profile table.
+	// One row per node per UTC day; nodes rows never change on recall, so their seq and protected records stay untouched.
+	"CREATE TABLE recall_daily (node_id TEXT NOT NULL, day TEXT NOT NULL, hits INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (node_id, day)) WITHOUT ROWID",
+	"CREATE TABLE recall_totals (day TEXT PRIMARY KEY, recalls INTEGER NOT NULL, tokens INTEGER NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID",
+	`CREATE TABLE eval_candidates (id TEXT PRIMARY KEY, query TEXT NOT NULL, expected_json TEXT NOT NULL CHECK (json_valid(expected_json)),
+		evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),
+		status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed')), created_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID`,
+	"CREATE INDEX recall_daily_seq ON recall_daily (seq, node_id, day)",
+	"CREATE INDEX recall_daily_day ON recall_daily (day)",
+	"CREATE INDEX recall_totals_seq ON recall_totals (seq, day)",
+	"CREATE INDEX eval_candidates_seq ON eval_candidates (seq, id)",
+	"CREATE INDEX eval_candidates_status ON eval_candidates (status, created_at)",
+	...tombstoneTriggers("profile_meta", "recall_daily", (r) => `json_array(${r}.node_id, ${r}.day)`),
+	...tombstoneTriggers("profile_meta", "recall_totals", (r) => `${r}.day`),
+	...tombstoneTriggers("profile_meta", "eval_candidates", (r) => `${r}.id`),
+	// SQLite cannot widen a CHECK in place: copy every row, id and seq unchanged, then restore v2's indexes and tombstones.
+	// DROP TABLE fires no delete trigger, so no tombstone is written for a copied row.
+	maintenanceTable("maintenance_v9", MAINTENANCE_KINDS),
+	`INSERT INTO maintenance_v9 (${MAINTENANCE_COLUMNS}) SELECT ${MAINTENANCE_COLUMNS} FROM maintenance`,
+	"DROP TABLE maintenance",
+	"ALTER TABLE maintenance_v9 RENAME TO maintenance",
+	...MAINTENANCE_INDEXES,
+	...MAINTENANCE_TOMBS,
 ]];

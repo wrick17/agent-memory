@@ -42,12 +42,13 @@ export type MaintenanceOp =
 	| { op: "dismiss" }
 	| { op: "infer_preference"; name: string; description: string; why?: string; how_to_apply?: string; scope?: string; evidence: Evidence[] }
 	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true }
-	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] };
+	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] }
+	| { op: "suggest_eval_case"; query: string; expected: string[]; evidence: Evidence[] };
 /** A review's link to one board item it discusses (relates_to), cited by node pointers to the item's subjects. */
 export type ReviewLink = { to: string; reason: string; evidence: { kind: "node"; ref: string; note?: string }[] };
 export const REVIEW_LINKS = 20;
 export type MaintenanceCmd =
-	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number }
+	| { op: "next"; kinds?: string[]; limit?: number; lease_seconds?: number; request_id?: string }
 	| { op: "complete"; lease_id: string; results: { item_id: number; ops: MaintenanceOp[] }[] }
 	| { op: "complete"; lease_id: string; status: "batch_skipped" | "stuck"; reason: string }
 	| { op: "complete"; status: "batch_skipped"; reason: string };
@@ -356,6 +357,7 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 	// A shared-writer refusal keeps its content-free reason code (details.reason), never its message.
 	const failed = (e: Fail) => { const r = e.failure.details?.reason; return done({ status: "rejected", code: e.failure.code, ...(typeof r === "string" && CODE.test(r) ? { reason: r } : {}) }); };
 	if (op.op === "dismiss") return done({ status: "applied" });
+	if (op.op === "suggest_eval_case") return refuse("not_implemented"); // stub: M1 stores it through insertCandidate (R1), wiped ids refused
 	let touched: string[], local = true;
 	if (op.op === "end_link") {
 		const e = sql.exec<{ src: string; dst: string; dst_profile: string }>("SELECT src, dst, dst_profile FROM edges WHERE id = ? AND ended_at IS NULL", op.edge).toArray()[0];

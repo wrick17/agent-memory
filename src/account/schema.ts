@@ -58,4 +58,14 @@ export const ACCOUNT_MIGRATIONS: Migration[] = [[
 		created_at TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID`,
 	"CREATE INDEX review_items_seq ON review_items (seq, id)",
 	...tombstoneTriggers("account_meta", "review_items", pk("id")),
+], [
+	// v7 (v2 plan, MG0): content-free scores and status. eval_runs is one eval run's scores; client_status is each device's latest
+	// capture report; health is the cron sweep's latest state per check and subject. None holds memory content or a query.
+	// Export and checkpoint carry them as ordinary tables. Restore: see account/store.ts MERGED (eval_runs only grows).
+	`CREATE TABLE eval_runs (id TEXT PRIMARY KEY, profile TEXT NOT NULL, at TEXT NOT NULL, channels TEXT NOT NULL, k INTEGER NOT NULL,
+		cases INTEGER NOT NULL, recall_all_at_k REAL NOT NULL, any_hit_at_k REAL NOT NULL, mrr REAL NOT NULL, device_id TEXT NOT NULL) WITHOUT ROWID`,
+	"CREATE INDEX eval_runs_at ON eval_runs (profile, at)",
+	"CREATE TABLE client_status (device_id TEXT PRIMARY KEY, reported_at TEXT NOT NULL, body TEXT NOT NULL CHECK (json_valid(body))) WITHOUT ROWID",
+	`CREATE TABLE health (check_id TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('ok','warn','fail')),
+		detail TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (check_id, subject)) WITHOUT ROWID`,
 ]];
