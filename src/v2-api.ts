@@ -1,14 +1,17 @@
 // v2 routes (X spine wiring). Each block authenticates, validates and calls the module that owns the logic. Device routes run
 // before api.ts's owner check; owner routes only after it, so /api/* stays owner-only and device tokens never reach them.
-import type { AccountContext, AccountStore, Principal } from "./account/store";
+import type { AccountContext, AccountHealth, AccountStore, Principal } from "./account/store";
 import { authenticate } from "./auth";
 import { z } from "zod";
 import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
+import { embeddingsOn, type SearchCounts } from "./profile/store";
+import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
+import { healthReport } from "./health";
 import { mayUse } from "./routing";
 import { parseEvalRun } from "./eval";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
-import type { Page, SessionRow } from "./viewer/types";
+import type { LeaseFacts, Page, SessionRow } from "./viewer/types";
 
 export const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const STATUS: Record<string, number> = { not_found: 404, forbidden: 403, unavailable: 503, busy: 409, revision_conflict: 409, profile_wiped: 410 };
@@ -75,6 +78,18 @@ export async function deviceV2(request: Request, env: Env, url: URL, waitUntil: 
 		if (!ref) return forbidden(`this token cannot use profile '${q.data.profile}'`);
 		return reply(await profileStub(env, ref).readV2(ref, { kind: "accepted_candidates", cursor: q.data.cursor ?? null, limit: q.data.limit ?? 100 }));
 	}
+	// #11 the job device's capture report: allowlisted counts and times only; its device is the token's.
+	if (path === "/v1/status" && method === "POST") {
+		const c = await deviceCaller(request, env);
+		if (c instanceof Response) return c;
+		if (!isJob(c)) return forbidden("send this with the job token");
+		const body = await boundedJson(request, STATUS_MAX_BYTES);
+		if (body instanceof Response) return body;
+		const s = parseClientStatus(body.value, c.caller.deviceId!);
+		if (!s.ok) return reply(s);
+		const r = await accountStub(env, env.OWNER_USER_ID!).admin({ op: "reportStatus", deviceId: c.caller.deviceId!, body: s.value });
+		return r.ok ? json({ reported_at: new Date().toISOString() }) : reply(r);
+	}
 	// #9 eval scores and counts from the job token, for an explicit profile it may use.
 	if (path === "/v1/eval/runs" && method === "POST") {
 		const c = await deviceCaller(request, env);
@@ -100,6 +115,22 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 	const notActive = () => json({ error: { code: "not_found", message: `profile '${p![1]}' is not active` } }, 404);
 	const today = () => new Date().toISOString().slice(0, 10);
 
+	// #11 health: the sweep on demand, and the report. Every active profile gets one slot; a failed read stays a null slot, so the
+	// lexical count reads as unknown instead of a subtotal.
+	if (path === "/api/health/sweep" && method === "POST") {
+		const r = await account.admin({ op: "health_sweep" });
+		return r.ok ? json({ checks: r.value }) : reply(r);
+	}
+	if (path === "/api/health" && method === "GET") {
+		const a = await account.admin({ op: "accountHealth" });
+		if (!a.ok) return reply(a);
+		const per = await Promise.all(ctx.profiles.map(async (r) => {
+			const [lease, counts] = await Promise.all([profileStub(env, r).readV2(r, { kind: "lease_facts" }).catch(() => null), profileStub(env, r).readV2(r, { kind: "search_counts" }).catch(() => null)]);
+			return { profile: r.profile, lease: lease?.ok ? lease.value as LeaseFacts : null, counts: counts?.ok ? counts.value as SearchCounts : null };
+		}));
+		return json(healthReport(a.value as AccountHealth, per.flatMap((x) => (x.lease ? [{ profile: x.profile, facts: x.lease }] : [])),
+			per.map((x) => (x.counts ? { usage: x.counts } : null)), embeddingsOn(env)));
+	}
 	// #9 eval runs, candidates and recall strength.
 	if (path === "/api/eval/runs" && method === "GET") {
 		const q = z.object({ profile: profileName.optional(), limit: z.coerce.number().int().min(1).max(500).optional() }).strict().safeParse(params);

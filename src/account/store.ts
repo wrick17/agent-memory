@@ -17,7 +17,9 @@ import { scrubReview, wipePorts, wipeProfile, wipeRefs, wipeTerms } from "../wip
 import { CORPUS_MIGRATIONS, type CorpusStore } from "../corpus/store";
 import { settleRule, type Identity, type RecoveryCopy, type SettleAction, type SettleFacts } from "../profile/store";
 import { insertEvalRun, listEvalRuns } from "../eval";
-import type { EvalRunInput } from "../viewer/types";
+import type { ClientStatusBody, ClientStatusRow, EvalRunInput, HealthCheck, LeaseFacts } from "../viewer/types";
+import { healthSweep, readHealth } from "../health";
+import { listClientStatus, storeClientStatus } from "../client-status";
 
 export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
@@ -85,7 +87,13 @@ export type AccountCommand =
 	| { op: "reviewResolve"; id: string; choice: "renamed" | "merged" | "kept" | "moved" }
 	// v2 eval scores (#9): content-free; the Worker sets deviceId from the job token and checks the profile with mayUse.
 	| { op: "recordEvalRun"; deviceId: string; run: EvalRunInput }
-	| { op: "listEvalRuns"; profile?: string; limit: number };
+	| { op: "listEvalRuns"; profile?: string; limit: number }
+	// v2 health (#11): the cron's deterministic sweep, its read, and each job device's latest capture report.
+	| { op: "health_sweep" }
+	| { op: "accountHealth" }
+	| { op: "reportStatus"; deviceId: string; body: ClientStatusBody };
+/** The account's share of GET /api/health; the Worker adds each profile's lease facts and search counts. */
+export interface AccountHealth { checks: HealthCheck[]; devices: ClientStatusRow[]; last_export_at: string | null; exports: string[] }
 
 export type ReviewKind = "migration" | "collision";
 export type ReviewState = "open" | "assigned" | "resolved" | "wiped";
@@ -600,7 +608,7 @@ export class AccountStore extends DurableObject<Env> {
 	}
 	private profileAt(ref: ProfileRef) {
 		return this.env.PROFILE.get(this.env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
-			Pick<ProfileStore, "fenceWiped" | "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
+			Pick<ProfileStore, "readV2" | "fenceWiped" | "exportNow" | "restoreStep" | "restoredPage" | "discardRestore" | "settleScan" | "settleFacts" | "settleTransfer" | "pitrArm" | "pitrCheck" | "recoveryCopy" | "undoPreflight" | "nodeRequests" | "drillEmbed" | "drillDiscard">;
 	}
 	private corpusAt(ref: ProfileRef) {
 		return this.env.CORPUS_STORE!.get(this.env.CORPUS_STORE!.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as
@@ -609,6 +617,11 @@ export class AccountStore extends DurableObject<Env> {
 
 	private wiping(): boolean {
 		return this.sql.exec("SELECT 1 FROM wipes WHERE json_extract(report, '$.state') <> 'done' LIMIT 1").toArray().length > 0;
+	}
+	/** When the last full successful export ran. Before last_full_export existed, last_export counts only if it was such a run. */
+	private lastFullExportAt(): string | null {
+		const r = JSON.parse(this.meta("last_full_export") ?? this.meta("last_export") ?? "null") as { at?: string; results?: Record<string, unknown> } | null;
+		return r?.results && "account" in r.results ? r.at ?? null : null;
 	}
 	private exportAccount(userId: string, preserve?: true) {
 		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: [], ...(preserve ? { preserve } : {}) }));
@@ -997,7 +1010,12 @@ export class AccountStore extends DurableObject<Env> {
 					mark(`corpus-${p.name}`, p.generation, c, { due });
 				}
 				const failed = Object.values(results).some((v) => typeof v === "object" && v !== null && "error" in v);
-				this.write(() => this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", JSON.stringify({ at: now(), trigger, results, stores })));
+				const record = JSON.stringify({ at: now(), trigger, results, stores });
+				this.write(() => {
+					this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", failed ? "last_export_failed" : "last_export", record);
+					// Backup health counts only a run that exported the account and every profile without a failure.
+					if (!failed && !cmd.profile) this.sql.exec("INSERT OR REPLACE INTO account_meta (key, value) VALUES (?, ?)", "last_full_export", record);
+				});
 				return failed ? fail("unavailable", "an export failed", { results }) : ok(results);
 			}
 			case "listExports":
@@ -2120,6 +2138,26 @@ export class AccountStore extends DurableObject<Env> {
 			}
 			case "listEvalRuns":
 				return ok(listEvalRuns(this.sql, { ...(cmd.profile ? { profile: cmd.profile } : {}), limit: cmd.limit }));
+			case "health_sweep": {
+				// Deterministic: reads state and replaces health rows; no model call, no record change. A profile whose lease facts
+				// cannot be read is left out of the input, and healthSweep keeps its earlier rows.
+				const userId = this.meta("user_id");
+				if (!userId) return fail("unavailable", "the account is not set up");
+				const refs = this.sql.exec<{ name: string; generation: string }>("SELECT name, generation FROM profiles WHERE status = 'active' ORDER BY name").toArray();
+				const profiles = await Promise.all(refs.map(async (r) => {
+					const ref = { userId, profile: r.name, generation: r.generation };
+					const f = await this.profileAt(ref).readV2(ref, { kind: "lease_facts" }).catch(() => null);
+					return f?.ok ? { profile: r.name, facts: f.value as LeaseFacts } : null;
+				}));
+				const devices = this.sql.exec<{ id: string; revoked: number }>("SELECT id, (revoked_at IS NOT NULL OR enabled = 0) AS revoked FROM devices").toArray().map((d) => ({ id: d.id, revoked: d.revoked === 1 }));
+				const input = { now: new Date().toISOString(), profiles: profiles.filter((p) => p !== null), devices, last_export_at: this.lastFullExportAt() };
+				return ok(this.write(() => healthSweep(this.sql, input)));
+			}
+			case "accountHealth":
+				return ok({ checks: readHealth(this.sql), devices: listClientStatus(this.sql), last_export_at: this.lastFullExportAt(), exports: await listExports(this.env, "account") } satisfies AccountHealth);
+			case "reportStatus":
+				this.write(() => storeClientStatus(this.sql, cmd.deviceId, new Date().toISOString(), cmd.body));
+				return ok(null);
 			case "listProfiles":
 				return ok(this.sql.exec("SELECT name, generation, status, created_at FROM profiles ORDER BY name").toArray());
 			case "reviewOffer": {

@@ -40,8 +40,12 @@ export default {
 		return new Response("not found", { status: 404 });
 	},
 	// The nightly export of every active profile and the account (section 18); a failure is kept as last_export_failed. The
-	// platform's own scheduledTime and cron travel as internal trigger metadata, which no public route can set.
+	// platform's own scheduledTime and cron travel as internal trigger metadata, which no public route can set. The deterministic
+	// health sweep (#11) runs after the export, whatever its outcome, so backup_overdue reads this night's result.
 	async scheduled(event, env, ctx): Promise<void> {
-		if (env.OWNER_USER_ID) ctx.waitUntil(accountStub(env, env.OWNER_USER_ID).admin({ op: "export", trigger: { scheduled_time: event.scheduledTime, cron: event.cron } }));
+		if (!env.OWNER_USER_ID) return;
+		const account = accountStub(env, env.OWNER_USER_ID);
+		ctx.waitUntil(account.admin({ op: "export", trigger: { scheduled_time: event.scheduledTime, cron: event.cron } })
+			.catch(() => undefined).then(() => account.admin({ op: "health_sweep" })));
 	},
 } satisfies ExportedHandler<Env>;
