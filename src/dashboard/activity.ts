@@ -460,6 +460,14 @@ export function activityTab(am: Am): void {
 			clearTimeout(timer);
 			timer = setTimeout(() => { if (version === am.pageVersion) void refresh(true); }, 1500);
 		});
+		// A capture upload stores digest parts without an activity row, so no live event marks it. While this tab is open and the
+		// stream is up, the summaries are read again every POLL_MS; leaving the tab ends the chain.
+		const POLL_MS = 60_000;
+		const poll = () => am.win.setTimeout(async () => {
+			if (version !== am.pageVersion) return;
+			if (!paused && year) await refresh(true);
+			if (version === am.pageVersion) poll();
+		}, POLL_MS);
 
 		// eachProfile turns every failed read into its own result, so these loads never throw for a profile's error.
 		void (async () => {
@@ -467,6 +475,7 @@ export function activityTab(am: Am): void {
 			if (version !== am.pageVersion) return;
 			year = y;
 			await repaint();
+			poll();
 		})();
 		return h;
 	} });
