@@ -7,7 +7,7 @@ import { call, contextFor, deviceToken } from "./helpers";
 
 type El = { tag: string; tagName: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
 	on: Record<string, (event?: { preventDefault(): void }) => unknown>; appendChild(c: El): void; replaceChildren(): void; setAttribute(k: string, v: string): void; focus(): void;
-	addEventListener(type: string, f: () => unknown): void; getAttribute(k: string): string | null; querySelector(sel: string): El | null };
+	addEventListener(type: string, f: () => unknown): void; getAttribute(k: string): string | null; querySelector(sel: string): El | null; parent?: El; remove(): void; removeAttribute(k: string): void };
 let active: El | undefined; // the stand-in document.activeElement
 // A 2D context that draws nothing and records text: its font, place and width (7 px a character, as measureText reports here).
 type Ctx = Record<string, unknown> & { arcs: number; fills: number; images: number; font: string; fillStyle: string; fillStyles: string[];
@@ -24,7 +24,8 @@ const context = (): Ctx => {
 };
 const make = (tag: string, hidden = false): El => {
 	const e: El = { tag, tagName: tag.toUpperCase(), textContent: "", value: "", hidden, disabled: false, checked: false, children: [], attrs: {}, on: {},
-		appendChild(c) { e.children.push(c); }, replaceChildren() { e.children = []; }, setAttribute(k, v) { e.attrs[k] = v; },
+		appendChild(c) { c.parent = e; e.children.push(c); }, remove() { if (e.parent) e.parent.children = e.parent.children.filter((x) => x !== e); },
+		removeAttribute(k) { delete e.attrs[k]; }, replaceChildren() { e.children = []; }, setAttribute(k, v) { e.attrs[k] = v; },
 		focus() { e.focused = true; active = e; }, addEventListener(type, f) { e.on[type] = f; }, getAttribute(k) { return e.attrs[k] ?? null; },
 		// Only the selector shapes the shell uses: tag, [attr] and [attr="value"], or a tag with one of those.
 		querySelector(sel) {
@@ -74,6 +75,8 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag),
 			documentElement: html, addEventListener(type: string, f: (event?: unknown) => void) { listeners[`doc:${type}`] = f; } },
 		location: { hash: o.hash ?? "", origin: "https://memory.example" },
+		// As in a browser, replaceState changes the address without a hashchange event.
+		history: { replaceState: (_s: unknown, _t: string, url: string) => { win.location.hash = url.startsWith("#") ? url : ""; } },
 		localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => { storage.set(k, v); } },
 		setTimeout: (_f: () => void, ms: number) => timers.push(ms), clearTimeout() {},
 		addEventListener(type: string, f: () => void) { listeners[type] = f; },
@@ -141,7 +144,8 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
-const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #/memories"]], ["System", ["Audit #/activity"]],
+// The registered Memories tab takes the built-in Memories entry's place.
+const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories"]], ["System", ["Audit #/activity"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -257,14 +261,15 @@ describe("dashboard shell", () => {
 		expect(text(b.els.nav!)).not.toMatch(/Overview|Lessons|Crystals|Sessions|Actions|Replay|Health|Live|features/i);
 		b.go("#memories/r1?profile=personal");
 		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memory");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: personal"); // the Memories tab: the list with r1's detail panel
 		expect(b.seen.fetched).toContain("/api/profiles/personal/nodes/r1");
 		expect(current()).toEqual(["Memories"]);
 		b.go("#audit");
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Activity: work");
 		expect(current()).toEqual(["Audit"]);
 		b.go("#memories?profile=nobody");
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("No active profile named nobody");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: no active profile named nobody"); // the shell refuses it before the tab reads
+		expect(text(b.view())).toContain("Nothing was read.");
 		b.go("#/backups");
 		expect(current()).toEqual(["Backups and recovery"]);
 		expect(b.els.nav!.children.at(-1)!.attrs.class).toBe("navgroup current");
@@ -296,7 +301,7 @@ describe("dashboard shell", () => {
 		expect(b.key("?", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(false);
 		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("g Graph, m Memories, u Audit");
+		expect(text(b.els.gloss!)).toContain("g Graph, u Audit, m Memories");
 		expect(b.key("Escape", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(true);
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
@@ -375,12 +380,12 @@ describe("dashboard live chrome", () => {
 		click(features);
 		expect(text(b.els.features!)).toContain("Prompt injection");
 		expect(text(b.els.features!)).toContain("To turn it on: Run agent-memory install --inject.");
-		expect(text(b.els.features!)).toContain("Affects: memories.");
-		// A tab registered with a count shows the snapshot's number; today's built-in pages show none.
+		expect(text(b.els.features!)).toContain("Affects: Memories.");
+		// A tab registered with a count shows the snapshot's number, labelled as covering every profile; built-in pages show none.
 		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
 		am.tab({ id: "lessons", group: "memory", label: "Lessons", key: "l", count: (s: typeof SNAPSHOT) => s.counts.lessons, render: (root: El) => am.el("h2", root, "Lessons") });
 		am.render(false);
-		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories", "Lessons 7 across all profiles", "Audit"]));
+		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories 12 across all profiles", "Lessons 7 across all profiles", "Audit"]));
 		b.listeners.pagehide!(); // the client lets go of its connection before the test closes the stream
 		stream.close();
 	});
@@ -1979,6 +1984,7 @@ describe("dashboard profile choice", () => {
 		expect([h2(), seen.at(-1)!.query.profile]).toEqual(["Solo", "work"]);
 
 		// The picker rewrites only the profile query. Without history.replaceState it sets the hash, whose change renders once.
+		Reflect.deleteProperty(b.win, "history");
 		pick.value = "personal";
 		pick.on.change!();
 		expect(b.win.location.hash).toBe("#solo/r1?q=x&profile=personal");
@@ -2003,5 +2009,206 @@ describe("dashboard profile choice", () => {
 		const unknown = await am.eachProfile("nope", read) as { profile: string; ok: false; error: Error & { code?: string } }[];
 		expect([unknown.length, unknown[0]!.profile, unknown[0]!.ok, unknown[0]!.error.code]).toEqual([1, "nope", false, "unknown_profile"]);
 		expect(calls).toEqual(["personal", "work", "work"]);
+	});
+});
+
+describe("dashboard Memories tab", () => {
+	// From the Memories tab author's smoke: the list, server strength, the record link, and Forget with Undo.
+	const row = (id: string, name: string) => ({ memory_id: id, profile: "work", name, type: "feedback", scope: "repo:x", status: "active", revision: 3, passage: `${name} passage`,
+		provenance: { source_platform: "claude-code" }, freshness: { updated_at: "2026-11-03T10:00:00Z" }, score: 1 });
+	const record = { id: "m1", node: { id: "m1", kind: "rule", memory_type: "feedback", scope: "repo:x", name: HOSTILE, status: "active", origin: "agent", pinned: false, flagged: null,
+		revision: 3, created_at: "2026-11-01T10:00:00.000Z", updated_at: "2026-11-03T10:00:00.000Z", source_platform: "claude-code", updated_source_platform: null,
+		description: "Prefer small diffs", truncated: [] }, content: { text: "Keep the diff small.", chars: 20, complete: true }, evidence: { items: [], truncated: false }, links: [],
+		history: { items: [{ revision: 3, op: "created", at: "2026-11-01T10:00:00.000Z", actor: "agent", device_id: null }], next_before: null } };
+
+	it("lists records as text with the server's strength, opens one keeping ?profile, and forgets only after a second click, with Undo", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", HOSTILE), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+			if (path.startsWith("/api/profiles/work/recall-strength?")) {
+				const ids = new URL(`http://x${path}`).searchParams.get("ids")!.split(",");
+				return Response.json({ strength: Object.fromEntries(ids.map((id) => [id, { hits_90d: 14, strength: 10, last_recalled: "2026-11-02" }])) });
+			}
+			if (path === "/api/profiles/work/nodes/m1") return Response.json(record);
+			if (path === "/api/profiles/work/nodes/m1/forget") return Response.json({ ok: true, action: "forgotten", activity_id: 41 });
+			if (path === "/api/profiles/work/activity/41/undo") return Response.json({ ok: true });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain(HOSTILE);
+		expect(find(b.view(), "script")).toEqual([]);
+		expect(text(b.view())).toContain("10/10");
+		expect(find(b.view(), "tbody")[0]!.attrs["data-list"]).toBe("");
+		find(b.view(), "a").find((a) => a.attrs.href === "#memories/m1?profile=work")!.on.click!({ preventDefault() {} });
+		await settle();
+		expect(b.win.location.hash).toBe("#memories/m1?profile=work");
+		const panel = find(b.view(), "aside")[0]!;
+		expect(find(panel, "button").some((x) => "data-close" in x.attrs)).toBe(true);
+		click(button(panel, "Forget…"));
+		expect(b.seen.posted.filter((x) => x.endsWith("/forget"))).toEqual([]); // asks first
+		click(button(panel, "Forget it"));
+		await settle();
+		expect(b.seen.posted).toContain("/api/profiles/work/nodes/m1/forget");
+		click(button(b.view(), "Undo"));
+		await settle();
+		expect(b.seen.posted).toContain("/api/profiles/work/activity/41/undo"); // then the list reads again
+	});
+
+	it("shows each profile's own records only: a me overlay hit in a profile's recall is neither relabelled nor listed twice", async () => {
+		const mine = (id: string, profile: string) => ({ ...row(id, `${profile} ${id}`), profile });
+		const b = browser({ signedIn: true, hash: "#memories", api: (path) => {
+			// Owner recall for a named profile also returns the authorized me overlay; each hit names its own profile.
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [mine("w1", "work"), mine("me1", "me")], next_cursor: "more-is-me", truncated: false, lexical_only: true });
+			if (path === "/api/profiles/personal/recall") return Response.json({ results: [mine("p1", "personal"), mine("me1", "me")], next_cursor: null, truncated: false, lexical_only: true });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
+		expect(hrefs.sort()).toEqual(["#memories/p1?profile=personal", "#memories/w1?profile=work"]);
+		expect(text(b.view())).not.toContain("me me1");
+		expect(b.seen.fetched.filter((x) => x.includes("recall-strength")).sort()).toEqual(["/api/profiles/personal/recall-strength?ids=p1", "/api/profiles/work/recall-strength?ids=w1"]);
+		expect(text(b.view())).not.toContain("more are available"); // past its own records the cursor only walks me
+	});
+
+	it("searches a profile with the plain payload and lists all 25 of its matches, as the owner recall route returns them", async () => {
+		// The owner route reads only the named profile before its cap (mcp-auth: "keeps 25 inferred Work matches under the cap"),
+		// so 25 inferred Work matches come back even when 25 stated me preferences match too. The tab adds no field for that.
+		const bodies: unknown[] = [];
+		const pref = (i: number) => ({ ...row(`w${i}`, `crowded ${i}`), kind: "preference", type: "user", origin: "inferred" });
+		const b = browser({ signedIn: true, hash: "#memories?profile=work&q=crowded", api: (path, _m, body) => {
+			if (path !== "/api/profiles/work/recall") return undefined;
+			bodies.push(body);
+			return Response.json({ read_set: ["work"], results: Array.from({ length: 25 }, (_, i) => pref(i)), next_cursor: null, truncated: true, lexical_only: true });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(bodies).toEqual([{ limit: 25, count_hits: false, keyword: "crowded" }]); // only the fields the route admits
+		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
+		expect(hrefs).toEqual(Array.from({ length: 25 }, (_, i) => `#memories/w${i}?profile=work`));
+		expect(text(b.view())).toContain("Showing 25 records");
+	});
+
+	it("drops the selection and an open bulk confirmation when a new search replaces the list", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = () => find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box().checked = true;
+		box().on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined(); // the confirmation names its one target
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the same search again: the rows are rebuilt unchecked
+		for (let i = 0; i < 2; i++) await settle();
+		expect(box().checked).toBe(false);
+		expect(text(b.view())).toContain("0 selected.");
+		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
+		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+	});
+
+	// A record longer than one entity read: the first 4,000 characters, then "Load the full content" pages the rest.
+	const FULL = `${"a".repeat(4000)}${"b".repeat(1000)}`;
+	const longApi = (saved: unknown[] = []): Api => (path, _m, body) => {
+		if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "Long")], next_cursor: null, truncated: false, lexical_only: false });
+		if (path === "/api/profiles/work/nodes/m1") return Response.json({ ...record, content: { text: FULL.slice(0, 4000), chars: FULL.length, complete: false } });
+		if (path === "/api/profiles/work/nodes/m1?content=all") return Response.json({ content: { content: FULL, cursor: null } });
+		if (path === "/api/profiles/work/save") { saved.push(body); return Response.json({ name: HOSTILE, revision: 4 }); }
+	};
+
+	it("enables Edit once the full content has loaded, and edits the whole text", async () => {
+		const saved: unknown[] = [];
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi(saved) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		expect(button(panel(), "Edit").disabled).toBe(true); // only the first 4,000 characters are shown
+		click(button(panel(), "Load the full content"));
+		await settle();
+		expect(button(panel(), "Edit").disabled).toBe(false);
+		expect(button(panel(), "Edit").getAttribute("title")).toBeNull();
+		click(button(panel(), "Edit"));
+		const content = find(panel(), "textarea").find((x) => x.attrs.id === "mem-edit-content")!;
+		expect(content.value).toBe(FULL);
+		find(panel(), "form").find((x) => x.attrs["aria-label"]?.startsWith("Edit "))!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(saved).toMatchObject([{ memory_id: "m1", expected_revision: 3, content: FULL }]);
+	});
+
+	it("exports the loaded text with its completeness: the shown part before Load the full content, all of it after", async () => {
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi() });
+		const files: { record: { id: string; node: { id: string }; content: { text: string; chars: number; complete: boolean } } }[] = [];
+		const doc = b.win.document as unknown as { createElement(t: string): El }, make = doc.createElement;
+		doc.createElement = (t: string) => Object.assign(make(t), { click() {} }); // a download link's click saves nothing here
+		Object.assign(b.win, { Blob: class { constructor(readonly parts: string[]) {} },
+			URL: { createObjectURL: (x: { parts: string[] }) => { files.push(JSON.parse(x.parts[0]!)); return "blob:x"; }, revokeObjectURL() {} } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		click(button(panel(), "Export JSON"));
+		click(button(panel(), "Load the full content"));
+		await settle();
+		click(button(panel(), "Export JSON"));
+		expect(files.map((f) => [f.record.content.text.length, f.record.content.chars, f.record.content.complete])).toEqual([[4000, 5000, false], [5000, 5000, true]]);
+		expect([files[1]!.record.id, files[1]!.record.node.id]).toEqual(["m1", "m1"]); // the rest of the record is as read
+	});
+
+	it("closes an open bulk confirmation when the selection changes, so an unchecked record is never forgotten", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box.checked = true;
+		box.on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined();
+		box.checked = false; // the owner changes their mind
+		box.on.change!();
+		expect(text(b.view())).toContain("0 selected.");
+		const stale = button(b.view(), "Forget 1");
+		if (stale) click(stale); // a confirmation left open would forget the unchecked record
+		await settle();
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+		expect(stale).toBeUndefined();
+	});
+
+	it("clears the selection, its checkboxes and an open confirmation when the Agent filter changes", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), { ...row("m2", "Second"), provenance: { source_platform: "codex" } }], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box.checked = true;
+		box.on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined();
+		const agent = find(b.view(), "select").find((x) => x.attrs.id === "mem-agent")!;
+		agent.value = "codex"; // First, a claude-code record, is now hidden
+		agent.on.change!();
+		expect([box.checked, text(b.view()).includes("0 selected.")]).toEqual([false, true]);
+		const stale = button(b.view(), "Forget 1");
+		if (stale) click(stale); // a confirmation left open would forget the hidden record
+		await settle();
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+		expect(stale).toBeUndefined();
+	});
+
+	it("keeps the search when the header picker changes profile", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) =>
+			path.endsWith("/recall") ? Response.json({ results: [], next_cursor: null, truncated: false, lexical_only: false }) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value = "diffs";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the tab writes ?q= into the address without a render
+		await settle();
+		expect(b.win.location.hash).toBe("#memories?profile=work&q=diffs");
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#memories?profile=personal&q=diffs"); // the tab's own address after it reads personal
+		expect(find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value).toBe("diffs");
 	});
 });

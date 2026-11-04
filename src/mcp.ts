@@ -23,8 +23,12 @@ import type { RecallOptions, RecallRequest } from "./viewer/types";
  * MCP calls write as agent and move from wherever the record is. `moveFrom` is the source profile and generation a dashboard move
  * showed: the durable transfer intent binds them, so the account refuses the move if the record left that source meanwhile.
  */
-/** waitUntil: the request's ExecutionContext.waitUntil, for work after the reply such as recall hit counts (absent in internal calls). */
-export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner">; moveFrom?: { profile: string; generation: string }; waitUntil?: (p: Promise<unknown>) => void }
+/**
+ * waitUntil: the request's ExecutionContext.waitUntil, for work after the reply such as recall hit counts (absent in internal calls).
+ * withoutMe: set only by the owner dashboard's per-profile recall route, never from request input: recall reads just the named
+ * profile, so the me overlay cannot take that profile's places under the limit. Agents and devices keep the overlay.
+ */
+export interface ToolContext { env: Env; caller: Caller; account: AccountContext; platform: string; actor?: Extract<WriteContext["actor"], "agent" | "owner">; moveFrom?: { profile: string; generation: string }; waitUntil?: (p: Promise<unknown>) => void; withoutMe?: true }
 
 const RRF_K = 60;
 
@@ -368,7 +372,7 @@ export async function recall(c: ToolContext, a: RecallInput, opts: RecallOptions
 	if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
 	const rs = readSet(c.caller, c.account.rules, c.account.known, { ...(a.profile !== undefined ? { profile: a.profile } : {}), ...(a.repo ? { repo: a.repo } : {}) });
 	if (!rs.ok) return rs;
-	const names = [rs.value.primary, ...(rs.value.withMe ? ["me"] : [])];
+	const names = [rs.value.primary, ...(rs.value.withMe && !c.withoutMe ? ["me"] : [])];
 	const refs = names.map((n) => refOf(c, n)!);
 	const keyword = (a.keyword ?? "").trim();
 	const limit = a.limit ?? 15;

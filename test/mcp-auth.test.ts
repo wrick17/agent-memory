@@ -1457,12 +1457,67 @@ describe("v2 viewer routes", () => {
 	});
 });
 
+describe("v2 dashboard recall reads only the named profile (#38 P2)", () => {
+	it("keeps 25 inferred Work matches under the cap when 25 stated Me matches overlay, while MCP and device routes keep their me overlay", async () => {
+		serveJwks();
+		const origin = new URL(env.RESOURCE_URL).origin;
+		const post = (path: string, token: string, body: unknown) => exports.default.fetch(new Request(`${origin}${path}`, { method: "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) })).then(async (r) => ({ status: r.status, body: await r.json() as Record<string, unknown> }));
+		type Hit = { profile: string; memory_id: string };
+		const c = await contextFor(), word = `wren${crypto.randomUUID().slice(0, 8)}`, work: string[] = [];
+		for (let i = 0; i < 25; i++) {
+			work.push((await call(c, "save_memory", { name: `Work pref ${word} ${i}`, type: "user", description: word, content: `${word} work ${i}`, profile: "work" })).memory_id as string);
+			await call(c, "save_memory", { name: `Me pref ${word} ${i}`, type: "user", description: word, content: `${word} me ${i}`, profile: "me", company_free: true });
+		}
+		// The Work preferences are inferred, as a batch would write them; stated Me preferences then outrank them in a shared cap.
+		const ref = c.account.profiles.find((p) => p.profile === "work")!;
+		await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:work:${ref.generation}`)), (_i, s) => {
+			s.storage.sql.exec("UPDATE nodes SET origin = 'inferred' WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(work));
+		});
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const dash = await post("/api/profiles/work/recall", session, { keyword: word, limit: 25, count_hits: false });
+		expect(dash.status).toBe(200);
+		expect(dash.body.read_set).toEqual(["work"]);
+		expect((dash.body.results as Hit[]).map((h) => h.memory_id).sort()).toEqual([...work].sort());
+		// Agents keep the additive me overlay: the same query through recall_memories reads work and me under one cap.
+		const mcp = await call<{ read_set: string[]; results: Hit[] }>(c, "recall_memories", { keyword: word, profile: "work", limit: 25 });
+		expect(mcp.read_set).toEqual(["work", "me"]);
+		expect(mcp.results.some((h) => h.profile === "me")).toBe(true);
+		const reader = await deviceToken(`p2-reader-${Date.now()}`, ["read"], ["work", "me"], "work");
+		const device = await post("/v1/recall", reader.token, { keyword: word, profile: "work", limit: 25 });
+		expect(device.status).toBe(200);
+		expect(device.body.read_set).toEqual(["work", "me"]);
+		// The owner route stays owner-only.
+		expect((await post("/api/profiles/work/recall", reader.token, { keyword: word })).status).toBe(403);
+	});
+});
+
 describe("v2 health vector count (#11)", () => {
 	it("does not count an uploaded session or a bare entity as a vector", async () => {
 		serveJwks();
 		const origin = new URL(env.RESOURCE_URL).origin, session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
 		const vectors = async () => ((await (await exports.default.fetch(new Request(`${origin}/api/health`, { headers: { authorization: `Bearer ${session}` } }))).json()) as { search: { vectors: number } }).search.vectors;
 		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
+		// The total covers every profile of the account, and earlier cases leave memories waiting to embed. An alarm firing inside
+		// the comparison (this case's own writes arm the test profile's) would embed them and move the total. Every due alarm runs
+		// to completion first, until the stores are quiet, so only the two writes below are compared; the comparison stays exact.
+		// An alarm the runtime has already started holds no stored alarm, so each profile is first evicted, which waits for its
+		// in-flight work to drain, before its stored alarm is read.
+		const stubs = c.account.profiles.map((r) => env.PROFILE.get(env.PROFILE.idFromName(`${r.userId}:${r.profile}:${r.generation}`)));
+		const quiet = async () => {
+			for (let pass = 0; pass < 10; pass++) {
+				let ran = false;
+				for (const stub of stubs) for (let i = 0; i < 20; i++) {
+					if (i === 0) await evictDurableObject(stub).catch(() => undefined); // rejects only when the object is not running
+					const at = await runInDurableObject(stub, (_i, st) => st.storage.getAlarm());
+					if (at === null || at > Date.now() + 30_000) break;
+					ran = (await runDurableObjectAlarm(stub)) || ran;
+				}
+				if (!ran) return;
+			}
+			throw new Error("the stores did not quiesce");
+		};
+		await quiet();
 		const before = await vectors();
 		// Both are written with embed_hash equal to card_hash so the embed stage skips them; neither has a vector.
 		const { ingest } = await import("../src/profile/capture"), { sha256 } = await import("../src/domain/ids");
@@ -1471,6 +1526,7 @@ describe("v2 health vector count (#11)", () => {
 			ingest(st.storage, ref, { session: { client: "codex", id: `vec-${tag}` }, manifests: [], digests: [{ range_id: `codex:vec-${tag}:0a1b2c3d:0-10`, capture_status: "heuristic", part_id: "-", sha256: sha256(b), body: b }] });
 		});
 		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "component", name: `Bare ${tag}` }] });
+		await quiet();
 		expect(await vectors()).toBe(before);
 	});
 });
