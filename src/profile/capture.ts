@@ -95,6 +95,14 @@ const stored = (sql: SqlStorage, rangeId: string, status: string, part: string) 
 	sql.exec<{ rowid: number; sha256: string; body: string; live: number }>(
 		"SELECT rowid, sha256, body, live FROM texts WHERE range_id = ? AND capture_status = ? AND capture_part = ? AND chunk = 0", rangeId, status, part).toArray()[0];
 
+/**
+ * SQL over a texts row `t`: its position in its range's accepted manifest, matched by part id and hash in the form ingest's
+ * canonical body writes each entry; 0 when the manifest leaves it out, NULL when the range has no manifest yet. Every reader of a
+ * range's consolidated parts keeps only the listed ones once a manifest is accepted.
+ */
+export const manifestListed = `instr((SELECT string_agg(m.body, '' ORDER BY m.chunk) FROM texts m WHERE m.range_id = t.range_id
+	AND m.capture_status = 'consolidated' AND m.capture_part = 'manifest'), json_object('part_id', t.capture_part, 'sha256', t.sha256))`;
+
 /** A stored manifest's full body, rebuilt from its chunks. */
 export const manifestBody = (sql: SqlStorage, rangeId: string): string | null => {
 	const rows = sql.exec<{ body: string }>("SELECT body FROM texts WHERE range_id = ? AND capture_status = 'consolidated' AND capture_part = 'manifest' ORDER BY chunk", rangeId).toArray();
