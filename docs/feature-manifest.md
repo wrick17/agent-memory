@@ -93,3 +93,14 @@ Parent-accepted client SOURCE CLEAR, its durability amendment and the accepted d
 ### AM-12 selected-observation acquisition source adoption, 2026-10-31
 
 The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTION of the exact six reviewed acquisition/storage-export/uploader paths on current f094. This is selected-observation extraction and durable local source acknowledgement, UNWIRED. [Source closure](/private/tmp/am-acquisition-recheck-sol-mq7xo33_/REVIEW.md) and [actual adoption maps and preservation](/private/tmp/am-acquisition-root-adoption-sol-7qcksstj/capsule/HANDOFF.md). No real default inventory/account/auth/EOF/reader, post-claim production caller, installation or automatic activation is provided. Historical e876 seals and expectations remain immutable and are not upgraded. Existing client/server/graph/weekly/import facts retain their own scope. Real default-provider design, counterv8 and nativef302 remain unadopted. Local tests and synthetic Worker interoperability passed at their [documented scope and limits](combined-verification-2026-10-30.md#selected-observation-acquisition-local-verification-2026-10-31). AM-12 availability and completion remain open. Six Responses STOPPED, no seventh, pending ONE question unanswered, capture OFF, BothQ live/readable.
+
+
+### Session replay player (#21), 2026-11-04
+
+`local/replay-player.js` holds the shared v2 replay player. It is implemented, but nothing loads it yet. The dashboard Replay tab and `agent-memory replay` will each load it in their own changes.
+
+- Contract: `globalThis.amReplayPlayer.mount(root, events, options)` returns `play`, `pause`, `step`, `seek`, `setSpeed` and `destroy`. `options` takes `speeds` (default 0.5, 1, 2 and 4) and `onEvent`.
+- Draws start, previous, play/pause and next controls, speed buttons, "event i of n · t of total", the event list and the event detail. Every value is set as text.
+- Events without offsets (hosted digests) advance one per second at 1x. The position line says "order only" instead of a time. Events with transcript offsets wait for the real gap divided by the speed, with no compression.
+- Keys, while mounted and visible: Space plays or pauses; Left and Right step; in the list, Up, Down, Home and End move. Fields and the rest of the page keep their own keys. `destroy()` removes the view, the key listener and the timer, and may run twice.
+- Evidence: `local/replay-player.test.mjs`, in `test:local`.
