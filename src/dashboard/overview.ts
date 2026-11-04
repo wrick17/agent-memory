@@ -4,7 +4,7 @@
 // reads "Not reported", never 0. Change events make the counts stale; the tab says so and asks for one fresh snapshot.
 // Browser code, serialized into /app.js: it may use only `am` and browser globals (type imports are erased).
 import type { FeedItem, HealthCheck, LayerState, ProfileSessionRow, Snapshot } from "../viewer/types";
-import type { Am, Node, Route } from "./am";
+import type { Am, Batch, Node, Route } from "./am";
 
 export function overviewTab(am: Am): void {
 	const { el, enc, empty, help, intro, loading, note, win } = am;
@@ -54,6 +54,13 @@ export function overviewTab(am: Am): void {
 	let mounted: { version: number; paint: () => void } | null = null;
 	let extra: FeedItem[] = [], checks: HealthCheck[] | null = null, since = 0, timer: unknown = null, failed = "";
 	const onScreen = () => { if (mounted && mounted.version !== am.pageVersion) mounted = null; return mounted; };
+	let batchRead = 0;
+	/** Sign-in reads each profile's batch status once; Overview reads it again on each visit and with each fresh snapshot. */
+	const reloadBatches = () => {
+		const req = ++batchRead;
+		void Promise.all(am.active().map(async (p) => [p.name, await am.call(`/api/profiles/${enc(p.name)}/batch`).catch((err: Error) => err)] as [string, Batch | Error]))
+			.then((got) => { if (req !== batchRead) return; for (const [n, b] of got) am.batches.set(n, b); onScreen()?.paint(); });
+	};
 	/** One snapshot reload for a burst of changes, and only while the Overview is on screen; the data client shares a request in flight. */
 	const refresh = () => {
 		if (timer !== null || !onScreen()) return;
@@ -64,7 +71,7 @@ export function overviewTab(am: Am): void {
 		}, REFRESH_MS);
 	};
 	am.api.subscribe((e) => {
-		if (e.type === "snapshot") { extra = []; checks = null; since = 0; failed = ""; }
+		if (e.type === "snapshot") { extra = []; checks = null; since = 0; failed = ""; if (onScreen()) reloadBatches(); }
 		else if (e.type === "change") { extra = [e.item, ...extra].slice(0, FEED_MAX); since++; refresh(); }
 		else if (e.type === "health") checks = e.checks;
 		else return;
@@ -246,6 +253,7 @@ export function overviewTab(am: Am): void {
 		};
 		mounted = { version: am.pageVersion, paint };
 		paint();
+		if (am.snapshot) reloadBatches(); // a first visit gets its read with the first snapshot
 		if (since) refresh();
 		return h;
 	} });

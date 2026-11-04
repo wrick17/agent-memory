@@ -2295,3 +2295,39 @@ describe("dashboard tabs on the shared profile choice", () => {
 		}
 	});
 });
+
+describe("dashboard Overview and Health tabs", () => {
+	it("updates Health's viewer-feed line when the stream connects after the page has drawn", async () => {
+		const open = gate();
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const b = browser({ signedIn: true, hash: "#health", api: async (path) => {
+			if (path === "/api/health") return Response.json({ error: { code: "unavailable", message: "down" } }, { status: 503 });
+			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [] });
+			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
+			if (path.startsWith("/api/viewer/events?")) { await open.wait; return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } }); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("Not connected yet");
+		open.open();
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toMatch(/Viewer feed Live since/);
+		expect(text(b.view())).not.toContain("Not connected yet");
+		b.listeners.pagehide!();
+		stream.close();
+	});
+
+	it("reads the batch status again with a fresh snapshot instead of keeping the sign-in copy", async () => {
+		const stuck = { last_lease_at: null, last_status: { status: "stuck", reason: "lease_lost", items: 0, at: "2026-11-04T09:00:00Z" } };
+		let batch: unknown = stuck;
+		const b = browser({ signedIn: true, hash: "#overview?profile=work", api: (path) => path === "/api/profiles/work/batch" ? Response.json(batch) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("work: parked");
+		batch = { ...stuck, last_lease_at: "2026-11-04T10:00:00Z" }; // a later batch ran
+		await (b.win as unknown as { __am: { api: { snapshot(): Promise<unknown> } } }).__am.api.snapshot();
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("work: leased");
+		expect(text(b.view())).not.toContain("work: parked");
+	});
+});

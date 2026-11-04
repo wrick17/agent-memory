@@ -45,13 +45,14 @@ export function healthTab(am: Am): void {
 	// One subscription for the life of the page (dataClient runs before this part): the stream state for "Viewer feed", and the
 	// health rows from `event: health`, which repaint the checks only while this tab is on screen.
 	let stream: { state: "unknown" | "live" | "paused"; at: string | null } = { state: "unknown", at: null };
-	let mounted: { version: number; paint: (rows: HealthCheck[]) => void } | null = null;
+	let mounted: { version: number; paint: (rows: HealthCheck[]) => void; feed?: () => void } | null = null;
 	am.api.subscribe((e) => {
 		if (e.type === "live") stream = { state: "live", at: e.since };
 		else if (e.type === "paused") stream = { state: "paused", at: e.as_of };
 		else if (e.type !== "health") return;
 		if (mounted && mounted.version !== am.pageVersion) mounted = null; // Health left the screen
 		if (e.type === "health") mounted?.paint(e.checks);
+		else mounted?.feed?.(); // live or paused: the Viewer feed line is drawn from `stream`
 	});
 
 	/** The verdict line and the read-only list of checks. `names` maps a device id to its name. */
@@ -88,15 +89,17 @@ export function healthTab(am: Am): void {
 		const s = am.snapshot, names = am.active().map((p) => p.name);
 		const answering = report instanceof Error ? [] : report.consolidation.map((c) => c.profile);
 		const silent = names.filter((n) => !answering.includes(n));
-		const mcp = `${win.location.origin}/mcp`;
-		facts(sec, [
+		const mcp = `${win.location.origin}/mcp`, box = el("div", sec);
+		const draw = () => { box.replaceChildren(); facts(box, [
 			["Worker version", s ? `${s.version || "Not reported"}, deployed ${utc(s.deployed_at, "at an unreported time")}` : "Waiting for the first full sync", !s],
 			["Account store", report instanceof Error ? `Could not read: ${why(report)}` : "Answering", report instanceof Error],
 			["Profile stores", report instanceof Error ? "Unknown: the account read failed" : `${answering.length} of ${names.length} active answering${silent.length ? `; no answer from ${silent.join(", ")}` : ""}`, report instanceof Error || silent.length > 0],
 			["Viewer feed", stream.state === "live" ? `Live since ${utc(stream.at)}` : stream.state === "paused" ? `Paused; numbers as of ${utc(stream.at)}` : "Not connected yet", stream.state !== "live"],
 			["MCP URL", mcp],
-		]);
+		]); };
+		draw();
 		copy(sec, "Copy MCP URL", () => mcp);
+		return draw;
 	};
 
 	const search = (root: Node, report: HealthReport) => {
@@ -324,8 +327,7 @@ export function healthTab(am: Am): void {
 				for (const d of report.devices) if (d.device_name) names.set(d.device_id, d.device_name);
 				checksView(checksBox, report.checks, names);
 			} else if (!s) { checksBox.replaceChildren(); note(checksBox, `Could not read the health checks: ${why(report)}`); }
-			mounted = { version, paint: (rows) => checksView(checksBox, rows, names) };
-			engine(rest, report);
+			mounted = { version, paint: (rows) => checksView(checksBox, rows, names), feed: engine(rest, report) };
 			if (!(report instanceof Error)) {
 				search(rest, report);
 				capture(rest, report);
