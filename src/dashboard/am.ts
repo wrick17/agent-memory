@@ -3,6 +3,17 @@
 // shell's boot() signs in and renders. Parts may use only `am`, their own locals and browser globals; anything they
 // import must be a type. Every value from the API or the URL reaches the page as text (textContent), never as markup.
 // Types only: this file emits no code.
+//
+// Keys the shell handles for every page, through markup alone:
+// - "/" focuses the first [data-search] element in the view, else its first input[type=search].
+// - g then a letter opens a nav entry: g Graph, m Memories, u Activity, or a registered tab's key.
+// - Up, Down, Home and End move focus between the visible [data-item] entries of the [data-list] that holds the focus.
+//   Each [data-item] must be focusable (a button, a link, or tabindex).
+// - Space, Left and Right click the visible button marked data-key="Space", "ArrowLeft" or "ArrowRight". Space on a
+//   focused button or link activates that control instead.
+// - Esc closes a glossary tip, the glossary panel, the narrow menu or the Admin list; with none open, it clicks the visible
+//   [data-close] button in the view (a detail panel).
+// The shell ignores keys typed into inputs, selects and text areas, except Esc.
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- JSON from the owner API and browser globals; this Worker project has no DOM types
 export type J = any;
@@ -86,6 +97,19 @@ export type Am = {
 	textBlock: (parent: Node, t: string) => void;
 	note: (parent: Node, t: string, cls?: string) => void;
 	outcomes: Map<string, { text: string; undo?: string }>; // route -> last write outcome there
+
+	// Shared pieces for pages and tabs (style classes are listed in style.ts).
+	glossary: Record<string, { term: string; text: string }>; // glossary.ts fills it
+	help: (parent: Node, term: string) => void; // a ? that explains a glossary term; an unknown term adds nothing
+	intro: (root: Node, label: string, term: string, text: string) => void; // "**Label** ? text", the one-sentence page intro
+	copy: (parent: Node, label: string, text: () => string) => Node; // a copy button; the text is built on click
+	/** A curl command with the token left as a variable, never a real one: $AGENT_MEMORY_OWNER_TOKEN for owner-only /api/* paths
+	 * (device tokens get 403 there), $AGENT_MEMORY_TOKEN (a device token with the route's scope) for /v1 and /mcp. */
+	curl: (method: string, path: string, body?: unknown) => string;
+	mcpCall: (tool: string, args: Record<string, unknown>) => string; // { "name": tool, "arguments": args } as JSON
+	mcpCurl: (tool: string, args: Record<string, unknown>) => string; // the same tools/call over HTTP to /mcp, with $AGENT_MEMORY_TOKEN
+	empty: (root: Node, text: string, command?: string) => void; // what fills this page and the command that does it
+	loading: (root: Node, rows?: number) => Node; // skeleton rows; replaceChildren() on it when data arrives
 
 	// Registry and routing.
 	tabs: TabDef[];

@@ -2,11 +2,11 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { DASHBOARD_HTML, DASHBOARD_JS, dashboardMain } from "../src/dashboard";
-import { call, contextFor } from "./helpers";
+import { call, contextFor, deviceToken } from "./helpers";
 
-type El = { tag: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
+type El = { tag: string; tagName: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
 	on: Record<string, (event?: { preventDefault(): void }) => unknown>; appendChild(c: El): void; replaceChildren(): void; setAttribute(k: string, v: string): void; focus(): void;
-	addEventListener(type: string, f: () => unknown): void };
+	addEventListener(type: string, f: () => unknown): void; getAttribute(k: string): string | null; querySelector(sel: string): El | null };
 let active: El | undefined; // the stand-in document.activeElement
 // A 2D context that draws nothing and records text: its font, place and width (7 px a character, as measureText reports here).
 type Ctx = Record<string, unknown> & { arcs: number; fills: number; images: number; font: string; fillStyle: string; fillStyles: string[];
@@ -22,9 +22,16 @@ const context = (): Ctx => {
 	return c;
 };
 const make = (tag: string, hidden = false): El => {
-	const e: El = { tag, textContent: "", value: "", hidden, disabled: false, checked: false, children: [], attrs: {}, on: {},
+	const e: El = { tag, tagName: tag.toUpperCase(), textContent: "", value: "", hidden, disabled: false, checked: false, children: [], attrs: {}, on: {},
 		appendChild(c) { e.children.push(c); }, replaceChildren() { e.children = []; }, setAttribute(k, v) { e.attrs[k] = v; },
-		focus() { e.focused = true; active = e; }, addEventListener(type, f) { e.on[type] = f; } };
+		focus() { e.focused = true; active = e; }, addEventListener(type, f) { e.on[type] = f; }, getAttribute(k) { return e.attrs[k] ?? null; },
+		// Only the selector shapes the shell uses: tag, [attr] and [attr="value"], or a tag with one of those.
+		querySelector(sel) {
+			const [, tag, attr, value] = /^([a-z]*)(?:\[([a-z-]+)(?:="([^"]*)")?\])?$/.exec(sel) ?? [];
+			const hit = (x: El) => (!tag || x.tag === tag) && (!attr || (attr in x.attrs && (value === undefined || x.attrs[attr] === value)));
+			const walk = (x: El): El | null => { for (const c of x.children) { if (hit(c)) return c; const d = walk(c); if (d) return d; } return null; };
+			return walk(e);
+		} };
 	if (tag === "canvas") Object.assign(e, { clientWidth: 800, clientHeight: 560, ctx: context(), getContext(this: { ctx: Ctx }) { return this.ctx; } });
 	return e;
 };
@@ -40,9 +47,10 @@ const DEVICES = [
 const BATCH = { last_lease_at: null, last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0, at: "2026-10-29T07:00:00Z" } };
 
 type Api = (path: string, method: string, body?: unknown) => Response | undefined | Promise<Response | undefined>;
-function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles?: unknown[]; api?: Api } = {}) {
+function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles?: unknown[]; api?: Api; storage?: Map<string, string> } = {}) {
 	const els: Record<string, El> = {};
-	const listeners: Record<string, () => void> = {};
+	const listeners: Record<string, (event?: unknown) => void> = {};
+	const html = make("html"), storage = o.storage ?? new Map<string, string>();
 	const seen: { fetched: string[]; auth: string[]; posted: string[]; bodies: unknown[]; mounted?: unknown } = { fetched: [], auth: [], posted: [], bodies: [] };
 	const clerk = {
 		user: o.signedIn ? { id: env.OWNER_USER_ID } : null,
@@ -51,8 +59,10 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 		mountSignIn(target: unknown) { seen.mounted = target; },
 	};
 	const win = {
-		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag) },
-		location: { hash: o.hash ?? "" },
+		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag),
+			documentElement: html, addEventListener(type: string, f: (event?: unknown) => void) { listeners[`doc:${type}`] = f; } },
+		location: { hash: o.hash ?? "", origin: "https://memory.example" },
+		localStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => { storage.set(k, v); } },
 		addEventListener(type: string, f: () => void) { listeners[type] = f; },
 		fetch: async (path: string, init: { method?: string; headers: Record<string, string>; body?: string }) => {
 			seen.fetched.push(path);
@@ -71,7 +81,9 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 		__internal_ClerkUICtor: function ClerkUI() {},
 	};
 	const go = (hash: string) => { win.location.hash = hash; listeners.hashchange!(); };
-	return { win, els, seen, listeners, go, view: () => els.view! };
+	// A key pressed with focus on `target` (default: the focused stand-in element); returns whether the shell took it.
+	const key = (k: string, target: El | null = active ?? null) => { let taken = false; listeners["doc:keydown"]!({ key: k, target, preventDefault() { taken = true; } }); return taken; };
+	return { win, els, seen, listeners, go, key, html, storage, view: () => els.view! };
 }
 
 // About you fixtures: owner-model items as the server sends them, and a gate to answer a request later.
@@ -108,8 +120,14 @@ const ROUTES: [string, string][] = [
 	["#/path/work", "Path finder: work"], ["#/review/work", "Review: work"], ["#/move/work/r1", "Move a record"], ["#/copy/work/r1", "Save a copy"],
 	["#/backups", "Backups and recovery"], ["#/routing", "Routing"], ["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"],
 	["#/graph/nobody", "No active profile named nobody"]];
+// The shell's nav: each group's label and its links. Only pages that exist today; Admin holds the rest, as the static nav did.
+const navOf = (b: ReturnType<typeof browser>) => b.els.nav!.children.map((g) => [g.tag === "details" ? find(g, "summary")[0]!.textContent : find(g, "span")[0]!.textContent,
+	find(g, "a").map((a) => `${a.textContent} ${a.attrs.href}`)]);
 const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/activity", "Timeline #/timeline", "Journals #/journals", "Paths #/path", "Work #/work",
 	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
+
+const GROUPED_NAV = [["Memory", ["Graph #/", "Memories #/memories"]], ["System", ["Activity #/activity"]],
+	["Admin", NAV.filter((l) => !["Graph #/", "Memories #/memories", "Activity #/activity"].includes(l))]];
 
 describe("dashboard", () => {
 	it("mounts sign-in and fetches nothing until the owner signs in", async () => {
@@ -194,7 +212,7 @@ describe("dashboard", () => {
 		const seen: [string, string][] = [];
 		for (const [hash] of ROUTES) { b.go(hash); await settle(); seen.push([hash, find(b.view(), "h2")[0]?.textContent ?? ""]); }
 		expect(seen).toEqual(ROUTES);
-		expect(b.els.nav).toBeUndefined(); // no tab registers yet, so the shell adds nothing to the static nav
+		expect(navOf(b)).toEqual(GROUPED_NAV); // the shell replaces the static nav with the same pages, grouped
 	});
 
 	it("reports an API refusal instead of showing an empty dashboard", async () => {
@@ -202,6 +220,96 @@ describe("dashboard", () => {
 		await dashboardMain(b.win);
 		expect(b.els.status!.textContent).toBe("Could not load the dashboard: forbidden");
 		expect(b.els.view).toBeUndefined(); // never looked up, so never shown
+	});
+});
+
+describe("dashboard shell", () => {
+	it("groups only today's pages, marks the current one, and opens the newer deep links on today's pages", async () => {
+		const b = browser({ signedIn: true, hash: "#/memory/work/r1" });
+		await dashboardMain(b.win);
+		expect(navOf(b)).toEqual(GROUPED_NAV);
+		const current = () => find(b.els.nav!, "a").filter((a) => a.attrs["aria-current"] === "page").map((a) => a.textContent);
+		expect(current()).toEqual(["Memories"]);
+		expect(text(b.els.nav!)).not.toMatch(/Overview|Lessons|Crystals|Sessions|Actions|Replay|Health|Live|features/i);
+		b.go("#memories/r1?profile=personal");
+		await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memory");
+		expect(b.seen.fetched).toContain("/api/profiles/personal/nodes/r1");
+		expect(current()).toEqual(["Memories"]);
+		b.go("#audit");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Activity: work");
+		expect(current()).toEqual(["Activity"]);
+		b.go("#memories?profile=nobody");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("No active profile named nobody");
+		b.go("#/backups");
+		expect(current()).toEqual(["Backups"]);
+		expect(b.els.nav!.children.at(-1)!.attrs.class).toBe("navgroup current");
+		b.go("");
+		expect(current()).toEqual(["Graph"]);
+	});
+
+	it("takes g then a letter, / for search, ? for the glossary and Esc, but not while typing", async () => {
+		const b = browser({ signedIn: true, hash: "#/memories" });
+		await dashboardMain(b.win);
+		const search = find(b.view(), "input").find((i) => i.attrs.type === "search")!;
+		expect(b.key("/", null)).toBe(true);
+		expect(active).toBe(search);
+		expect(b.key("g", search)).toBe(false); // typing in the search box
+		expect(b.key("u", search)).toBe(false);
+		expect(b.win.location.hash).toBe("#/memories");
+		b.key("g", null);
+		expect(b.key("u", null)).toBe(true);
+		expect(b.win.location.hash).toBe("#/activity");
+		expect(b.key("?", null)).toBe(true);
+		expect(b.els.gloss!.hidden).toBe(false);
+		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Activity", "Undo", "g, then a letter"]));
+		expect(text(b.els.gloss!)).toContain("g Graph, m Memories, u Activity");
+		expect(b.key("Escape", null)).toBe(true);
+		expect(b.els.gloss!.hidden).toBe(true);
+		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
+		am.help(box, "undo");
+		const tip = find(box, "span")[1]!, q = find(box, "button")[0]!;
+		click(q);
+		expect([tip.hidden, q.attrs["aria-expanded"]]).toEqual([false, "true"]);
+		expect(b.key("Escape", search)).toBe(true); // Esc works even while typing
+		expect([tip.hidden, q.attrs["aria-expanded"]]).toEqual([true, "false"]);
+		am.help(box, "no-such-term");
+		expect(find(box, "button")).toHaveLength(1);
+	});
+
+	it("follows the system theme until the owner picks one, and keeps the pick", async () => {
+		const plain = browser({ signedIn: true });
+		await dashboardMain(plain.win);
+		expect(plain.html.attrs["data-theme"]).toBeUndefined();
+		const b = browser({ signedIn: true, storage: new Map([["am.theme", "dark"]]) });
+		await dashboardMain(b.win);
+		expect(b.html.attrs["data-theme"]).toBe("dark");
+		const toggle = find(b.els.tools!, "button").find((x) => x.attrs["aria-label"]?.startsWith("Use the"))!;
+		expect([toggle.textContent, toggle.attrs["aria-label"]]).toEqual(["Light", "Use the light theme"]);
+		click(toggle);
+		expect([b.html.attrs["data-theme"], b.storage.get("am.theme"), toggle.textContent]).toEqual(["light", "light", "Dark"]);
+		expect(text(b.els.tools!)).not.toMatch(/live|features|version|all profiles/i);
+	});
+
+	it("copies commands with the token as a variable: the owner's for /api, a device token for /mcp, and the MCP form the Worker serves", async () => {
+		const b = browser({ signedIn: true });
+		await dashboardMain(b.win);
+		const am = (b.win as unknown as { __am: { curl(m: string, p: string, body?: unknown): string; mcpCurl(t: string, a: Record<string, unknown>): string } }).__am;
+		const owner = am.curl("GET", "/api/profiles/work/nodes/r1"), device = am.curl("POST", "/v1/recall", { keyword: "it's" });
+		expect(owner).toContain(`-H "Authorization: Bearer $AGENT_MEMORY_OWNER_TOKEN"`);
+		expect(device).toContain(`-H "Authorization: Bearer $AGENT_MEMORY_TOKEN"`);
+		expect(device).toContain(`--data '{"keyword":"it'\\''s"}'`);
+		const mcp = am.mcpCurl("recall_memories", { keyword: "split", profile: "work" });
+		for (const cmd of [owner, device, mcp]) expect(cmd).not.toContain("session-token");
+		// Run the copied MCP command against the Worker with a real read token in place of the variable.
+		const { token } = await deviceToken(`copy-${Date.now()}`, ["read"], ["work"], "work");
+		const quoted = [...mcp.matchAll(/'((?:[^']|'\\'')*)'|"([^"]*)"/g)].map((m) => (m[1] ?? m[2]!).replaceAll("'\\''", "'"));
+		const url = quoted[0]!, headers = new Headers(quoted.filter((q) => /^[a-z-]+: /i.test(q)).map((h) => h.split(/: (.*)/s).slice(0, 2) as [string, string]));
+		headers.set("authorization", headers.get("authorization")!.replace("$AGENT_MEMORY_TOKEN", token));
+		const res = await exports.default.fetch(new Request(url.replace("https://memory.example", new URL(env.RESOURCE_URL).origin), { method: "POST", headers, body: quoted.find((q) => q.startsWith("{"))! }));
+		const body = await res.text(), data = JSON.parse(body.startsWith("{") ? body : body.split("\n").find((l) => l.startsWith("data: "))!.slice(6));
+		expect(res.status).toBe(200);
+		expect(data.result.isError).toBeFalsy();
 	});
 });
 
