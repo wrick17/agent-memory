@@ -2095,6 +2095,32 @@ describe("dashboard Sessions and Replay tabs", () => {
 		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Session B");
 		expect(find(b.view(), "h3").map((x) => x.textContent)).not.toContain("Session A");
 	});
+
+	it("keeps the open session when the header picker changes profile, in Sessions and in Replay", async () => {
+		const rows = [session("a", "work", "Session A"), session("b", "work", "Session B")];
+		const b = browser({ signedIn: true, hash: "#sessions", api: (path) => {
+			if (path.startsWith("/api/sessions?") || path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows, next_cursor: null });
+			const m = /^\/api\/profiles\/(\w+)\/sessions\/(a|b)$/.exec(path);
+			if (m) return Response.json(session(m[2]!, m[1]!, `Session ${m[2]!.toUpperCase()}`));
+		} });
+		Object.assign(b.win, { amReplayPlayer: { mount: () => ({ destroy() {} }) } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
+		find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes("Session B"))!.on.click!();
+		await settle();
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#sessions/b?profile=personal"); // B stays open, now asked of personal
+		b.go("#replay?profile=work");
+		for (let i = 0; i < 3; i++) await settle();
+		find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!.value = "1";
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
+		await settle();
+		pick.value = "personal";
+		pick.on.change!();
+		expect(b.win.location.hash).toBe("#replay/b?profile=personal");
+	});
 });
 
 describe("dashboard Memories tab", () => {
