@@ -131,15 +131,26 @@ export function readFull(client, file) {
 		const say = (l) => { for (const m of extract(client, [l])) push(m.role === "owner" ? "prompt" : "response", m.text, offset, { role: m.role }); };
 		if (client === "claude-code") {
 			if ((o.type !== "user" && o.type !== "assistant") || o.isMeta || o.isSidechain || !Array.isArray(o.message?.content)) { say(line); continue; }
-			// Blocks in source order, each text block through extract alone. A record whose joined text opens as injected (a
-			// command envelope) stays out whole; extract sees it as one string, so a per-block extract cannot keep its later blocks.
-			const joined = o.message.content.filter((b) => b?.type === "text").map((b) => String(b.text ?? "")).join("\n");
-			const keep = extract(client, [{ ...line, obj: { ...o, message: { ...o.message, content: joined } } }]).length > 0;
+			// A record the hook drops as a whole (a command record) stays dropped. Owner text after injected context in one record
+			// survives only where extract keeps it.
+			const whole = extract(client, [line]);
+			// Each text block goes through extract alone, for the hook's per-block filters. The text between two tool blocks is one
+			// event, redacted joined, so a secret split across text blocks is caught as the hook's whole-message redaction catches it.
+			const runs = [[]];
 			for (const b of o.message.content) {
-				if (b?.type === "text") { if (keep) say({ ...line, obj: { ...o, message: { ...o.message, content: [b] } } }); }
-				else if (b?.type === "tool_use") call(offset, b.id, String(b.name ?? "tool"), b.input);
-				else if (b?.type === "tool_result") result(offset, b.tool_use_id, b.content, b.is_error === true);
+				if (b?.type === "text") { const m = whole.length ? extract(client, [{ ...line, obj: { ...o, message: { ...o.message, content: [b] } } }])[0] : null; if (m) runs.at(-1).push(m.text); }
+				else if (b?.type === "tool_use" || b?.type === "tool_result") runs.push([]);
 			}
+			const texts = runs.map((r) => redact(r.join("\n"))), all = texts.filter(Boolean).join("\n");
+			// redact is idempotent, so a change here is a secret split across a tool block: show the record's text once, before it.
+			if (redact(all) !== all) { const i = texts.findIndex(Boolean); texts.fill(""); texts[i] = redact(all); }
+			let r = 0;
+			const flush = () => { const t = texts[r++]; if (t) push(whole[0].role === "owner" ? "prompt" : "response", t, offset, { role: whole[0].role }); };
+			for (const b of o.message.content) {
+				if (b?.type === "tool_use") { flush(); call(offset, b.id, String(b.name ?? "tool"), b.input); }
+				else if (b?.type === "tool_result") { flush(); result(offset, b.tool_use_id, b.content, b.is_error === true); }
+			}
+			flush();
 			continue;
 		}
 		say(line); // a Codex record is either a message or a tool item, never both
