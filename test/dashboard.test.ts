@@ -1646,6 +1646,24 @@ describe("dashboard knowledge graph", () => {
 		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
 		expect(panel).not.toContain("No linked memories");
 	});
+
+	it("queues only memories with no link when a link to another profile arrives before its record", async () => {
+		const nodesHeld = gate();
+		const mem = (id: string) => ({ id, kind: "document", type: "feedback", name: `Memory ${id}`, status: "active" });
+		const b = browser({ signedIn: true, hash: "#/graph", api: async (path) => {
+			if (path.startsWith("/api/profiles/work/graph?part=edges")) return pageOf("edges", [{ id: 1, rel: "relates_to", ...at("m1", "far", false) }], path);
+			if (path.startsWith("/api/profiles/work/graph?part=nodes")) { await nodesHeld.wait; return pageOf("nodes", [mem("m1"), mem("m2")], path); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle(); // the edges page lands first; m1 is not loaded yet
+		nodesHeld.open();
+		await loaded(b);
+		click(button(b.view(), "Queue link maintenance"));
+		expect(text(b.view())).toContain("Queue 1 unlinked active memory for link maintenance?");
+		click(button(b.view(), "Queue 1")); // only m2: m1's one link goes to a record in another profile
+		await settle();
+		expect(b.seen.bodies.at(-1)).toEqual({ kind: "unlinked", ids: ["m2"] });
+	});
 });
 
 describe("dashboard review", () => {
@@ -2207,5 +2225,51 @@ describe("dashboard Memories tab", () => {
 		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
 		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
 		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+	});
+
+	// A record longer than one entity read: the first 4,000 characters, then "Load the full content" pages the rest.
+	const FULL = `${"a".repeat(4000)}${"b".repeat(1000)}`;
+	const longApi = (saved: unknown[] = []): Api => (path, _m, body) => {
+		if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "Long")], next_cursor: null, truncated: false, lexical_only: false });
+		if (path === "/api/profiles/work/nodes/m1") return Response.json({ ...record, content: { text: FULL.slice(0, 4000), chars: FULL.length, complete: false } });
+		if (path === "/api/profiles/work/nodes/m1?content=all") return Response.json({ content: { content: FULL, cursor: null } });
+		if (path === "/api/profiles/work/save") { saved.push(body); return Response.json({ name: HOSTILE, revision: 4 }); }
+	};
+
+	it("enables Edit once the full content has loaded, and edits the whole text", async () => {
+		const saved: unknown[] = [];
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi(saved) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		expect(button(panel(), "Edit").disabled).toBe(true); // only the first 4,000 characters are shown
+		click(button(panel(), "Load the full content"));
+		await settle();
+		expect(button(panel(), "Edit").disabled).toBe(false);
+		expect(button(panel(), "Edit").getAttribute("title")).toBeNull();
+		click(button(panel(), "Edit"));
+		const content = find(panel(), "textarea").find((x) => x.attrs.id === "mem-edit-content")!;
+		expect(content.value).toBe(FULL);
+		find(panel(), "form").find((x) => x.attrs["aria-label"]?.startsWith("Edit "))!.on.submit!({ preventDefault() {} });
+		await settle();
+		expect(saved).toMatchObject([{ memory_id: "m1", expected_revision: 3, content: FULL }]);
+	});
+
+	it("exports the loaded text with its completeness: the shown part before Load the full content, all of it after", async () => {
+		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi() });
+		const files: { record: { id: string; node: { id: string }; content: { text: string; chars: number; complete: boolean } } }[] = [];
+		const doc = b.win.document as unknown as { createElement(t: string): El }, make = doc.createElement;
+		doc.createElement = (t: string) => Object.assign(make(t), { click() {} }); // a download link's click saves nothing here
+		Object.assign(b.win, { Blob: class { constructor(readonly parts: string[]) {} },
+			URL: { createObjectURL: (x: { parts: string[] }) => { files.push(JSON.parse(x.parts[0]!)); return "blob:x"; }, revokeObjectURL() {} } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const panel = () => find(b.view(), "aside")[0]!;
+		click(button(panel(), "Export JSON"));
+		click(button(panel(), "Load the full content"));
+		await settle();
+		click(button(panel(), "Export JSON"));
+		expect(files.map((f) => [f.record.content.text.length, f.record.content.chars, f.record.content.complete])).toEqual([[4000, 5000, false], [5000, 5000, true]]);
+		expect([files[1]!.record.id, files[1]!.record.node.id]).toEqual(["m1", "m1"]); // the rest of the record is as read
 	});
 });
