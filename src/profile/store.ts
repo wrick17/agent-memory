@@ -26,7 +26,7 @@ import { archiveCursor, archiveOperation, archiveStatus, deferArchive, nextArchi
 export type { ArchiveCommand } from "./archive-operations";
 import { PROFILE_MIGRATIONS } from "./schema";
 import { restorable } from "../compat";
-import { runWrite, writeIds, type Who } from "./write";
+import { HAS_VECTOR, runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
 import { commitKey, naturalRequest, putMarker, uploadKey } from "./work-upload";
@@ -794,7 +794,7 @@ export class ProfileStore extends DurableObject<Env> {
 				case "lease_facts": return ok(leaseFacts(sql, new Date().toISOString()));
 				case "search_counts": return ok({
 					lexical_documents: sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE live = 1 AND lane = 'recall'").one().n,
-					vectors: sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE status = 'active' AND embed_hash = card_hash").one().n,
+					vectors: sql.exec<{ n: number }>(`SELECT count(*) AS n FROM nodes WHERE ${HAS_VECTOR}`).one().n,
 				} satisfies SearchCounts);
 			}
 		} catch (e) {
