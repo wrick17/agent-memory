@@ -1,0 +1,11 @@
+{
+  "profile": "personal",
+  "at": "2026-11-04T13:31:46.529Z",
+  "channels": "vector",
+  "k": 5,
+  "cases": 22,
+  "recall_all_at_k": 0.6818181818181818,
+  "any_hit_at_k": 0.7272727272727273,
+  "mrr": 0.7272727272727273,
+  "source": "synthetic fixture test/fixtures/eval/synthetic-cases.json with the fake embeddings of test/fakes.js; not a live provider or semantic-quality result"
+}

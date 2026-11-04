@@ -19,5 +19,6 @@ export default defineConfig({
 		}),
 	],
 	// local/ holds the Node-only capture client; node --test runs it (npm run test:local).
-	test: { testTimeout: 30_000, include: ["test/**/*.test.ts"] },
+	// eval-baseline-setup.ts hands the synthetic recall baselines to test/eval-synthetic.test.ts (issue #20).
+	test: { testTimeout: 30_000, include: ["test/**/*.test.ts"], globalSetup: ["./test/eval-baseline-setup.ts"] },
 });

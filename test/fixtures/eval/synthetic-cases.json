@@ -1,0 +1,327 @@
+{
+	"schema_version": 1,
+	"classification": "synthetic-eval-fixture",
+	"note": "Invented records and queries for the issue #20 CI recall gate (test/eval-synthetic.test.ts). No real memory. Each expected entry names a record in memories; the gate seeds them and replaces each name with the seeded record's id. The two golden-form cases set a type filter that POST /v1/recall does not take, so they run unfiltered and stay listed as unsupported_filters until a filter contract exists.",
+	"memories": [
+		{
+			"name": "Larkspur sourdough starter feeding",
+			"type": "reference",
+			"description": "How the rye starter is fed",
+			"content": "Feed the rye starter twice a day at one part starter, one part flour and one part water by weight, and keep it at 24 C."
+		},
+		{
+			"name": "Larkspur sourdough hydration",
+			"type": "reference",
+			"description": "Dough ratios for the country loaf",
+			"content": "The country loaf dough runs at 78 percent hydration with 2 percent salt."
+		},
+		{
+			"name": "Copperfield bike chain wax",
+			"type": "reference",
+			"description": "Chain care for the touring bike",
+			"content": "Strip the chain with mineral spirits, then dip it in hot paraffin wax every 800 km."
+		},
+		{
+			"name": "Copperfield tyre pressure",
+			"type": "reference",
+			"description": "Tyre setup for the gravel bike",
+			"content": "Run the 32 mm gravel tyres at 38 psi front and 42 psi rear."
+		},
+		{
+			"name": "Tidewater kayak launch",
+			"type": "reference",
+			"description": "Where and when to launch the kayak",
+			"content": "Launch from the north slipway two hours before high tide to avoid the mudflats."
+		},
+		{
+			"name": "Tidewater paddle float rescue",
+			"type": "reference",
+			"description": "Self rescue steps for the sea kayak",
+			"content": "Inflate the paddle float, lock it on the blade, and re-enter over the rear deck."
+		},
+		{
+			"name": "Prefers metric units",
+			"type": "user",
+			"description": "Units to use in answers",
+			"content": "Use kilograms, kilometres and Celsius in every answer."
+		},
+		{
+			"name": "Prefers short answers",
+			"type": "feedback",
+			"description": "Answer length preference",
+			"content": "Lead with the answer in one sentence before any detail."
+		},
+		{
+			"name": "Orchard pruning calendar",
+			"type": "project",
+			"description": "When the fruit trees are pruned",
+			"content": "Prune the apple trees in late winter while dormant, and summer prune the plums after harvest."
+		},
+		{
+			"name": "Orchard codling moth traps",
+			"type": "project",
+			"description": "Pest monitoring in the orchard",
+			"content": "Hang pheromone traps in May and count the codling moths weekly until August."
+		},
+		{
+			"name": "Harbourline chess opening repertoire",
+			"type": "project",
+			"description": "Openings for club games",
+			"content": "Play the Caro-Kann against e4 and the Queen's Gambit Declined against d4."
+		},
+		{
+			"name": "Harbourline chess endgame drills",
+			"type": "reference",
+			"description": "Weekly endgame practice",
+			"content": "Drill king and pawn opposition and the Lucena position each Sunday."
+		},
+		{
+			"name": "Moonbeam telescope collimation",
+			"type": "reference",
+			"description": "Optics alignment before observing",
+			"content": "Collimate the Newtonian with a laser before every session and adjust the primary mirror screws last."
+		},
+		{
+			"name": "Moonbeam dark sky site",
+			"type": "reference",
+			"description": "Observing location",
+			"content": "The Bortle 3 site is the reservoir car park, forty minutes east."
+		},
+		{
+			"name": "Juniper home network VLANs",
+			"type": "reference",
+			"description": "Home network segments",
+			"content": "IoT devices sit on VLAN 30 with no route to the workstation VLAN 10."
+		},
+		{
+			"name": "Juniper backup rotation",
+			"type": "reference",
+			"description": "How home backups rotate",
+			"content": "Keep three backup copies on two kinds of media with one copy off site, rotated monthly."
+		},
+		{
+			"name": "Saffron risotto method",
+			"type": "reference",
+			"description": "Risotto cooking steps",
+			"content": "Toast the arborio, add warm stock a ladle at a time, and finish with butter and parmesan."
+		},
+		{
+			"name": "Saffron pantry substitutions",
+			"type": "reference",
+			"description": "Spice substitutions",
+			"content": "Turmeric gives colour only and does not replace the saffron aroma."
+		},
+		{
+			"name": "Quill fountain pen inks",
+			"type": "reference",
+			"description": "Fountain pen ink care",
+			"content": "Iron gall ink needs a pen flush every two weeks to avoid corrosion."
+		},
+		{
+			"name": "Marathon taper plan",
+			"type": "project",
+			"description": "Race build-up",
+			"content": "Cut weekly distance by a third three weeks out and keep one tempo run each week."
+		},
+		{
+			"name": "Marathon fuelling",
+			"type": "feedback",
+			"description": "Race nutrition note",
+			"content": "Take a gel every 40 minutes from kilometre ten and practise it on long runs."
+		},
+		{
+			"name": "Beekeeping hive inspection",
+			"type": "reference",
+			"description": "Hive inspection routine",
+			"content": "Inspect the brood frames every nine days in swarm season and look for queen cells."
+		},
+		{
+			"name": "Beekeeping varroa treatment",
+			"type": "project",
+			"description": "Mite treatment plan",
+			"content": "Treat the colony with oxalic acid in midwinter when it is broodless."
+		},
+		{
+			"name": "Ceramics glaze firing",
+			"type": "reference",
+			"description": "Kiln settings for stoneware",
+			"content": "Fire the celadon glaze to cone 10 in reduction."
+		}
+	],
+	"cases": [
+		{
+			"id": "syn-01",
+			"query": "Larkspur sourdough starter feeding",
+			"expected": [
+				"Larkspur sourdough starter feeding"
+			]
+		},
+		{
+			"id": "syn-02",
+			"query": "chain wax",
+			"expected": [
+				"Copperfield bike chain wax"
+			]
+		},
+		{
+			"id": "syn-03",
+			"query": "Tidewater kayak",
+			"expected": [
+				"Tidewater kayak launch",
+				"Tidewater paddle float rescue"
+			]
+		},
+		{
+			"id": "syn-04",
+			"query": "metric units",
+			"expected": [
+				"Prefers metric units"
+			]
+		},
+		{
+			"id": "syn-05",
+			"query": "codling moth",
+			"expected": [
+				"Orchard codling moth traps"
+			]
+		},
+		{
+			"id": "syn-06",
+			"query": "Orchard",
+			"expected": [
+				"Orchard pruning calendar",
+				"Orchard codling moth traps"
+			]
+		},
+		{
+			"id": "syn-07",
+			"query": "Caro-Kann",
+			"expected": [
+				"Harbourline chess opening repertoire"
+			]
+		},
+		{
+			"id": "syn-08",
+			"query": "collimation",
+			"expected": [
+				"Moonbeam telescope collimation"
+			]
+		},
+		{
+			"id": "syn-09",
+			"query": "Moonbeam",
+			"expected": [
+				"Moonbeam telescope collimation",
+				"Moonbeam dark sky site"
+			]
+		},
+		{
+			"id": "syn-10",
+			"query": "VLAN",
+			"expected": [
+				"Juniper home network VLANs"
+			]
+		},
+		{
+			"id": "syn-11",
+			"query": "backup copies off site",
+			"expected": [
+				"Juniper backup rotation"
+			]
+		},
+		{
+			"id": "syn-12",
+			"query": "arborio stock",
+			"expected": [
+				"Saffron risotto method"
+			]
+		},
+		{
+			"id": "syn-13",
+			"query": "iron gall ink",
+			"expected": [
+				"Quill fountain pen inks"
+			]
+		},
+		{
+			"id": "syn-14",
+			"query": "marathon",
+			"expected": [
+				"Marathon taper plan",
+				"Marathon fuelling"
+			]
+		},
+		{
+			"id": "syn-15",
+			"query": "queen cells",
+			"expected": [
+				"Beekeeping hive inspection"
+			]
+		},
+		{
+			"id": "syn-16",
+			"query": "oxalic acid",
+			"expected": [
+				"Beekeeping varroa treatment"
+			]
+		},
+		{
+			"id": "syn-17",
+			"query": "how do I get back into my boat after capsizing",
+			"expected": [
+				"Tidewater paddle float rescue"
+			]
+		},
+		{
+			"id": "syn-18",
+			"query": "gravel tyre psi",
+			"expected": [
+				"Copperfield tyre pressure"
+			]
+		},
+		{
+			"id": "syn-19",
+			"query": "sourdough hydration salt",
+			"expected": [
+				"Larkspur sourdough hydration"
+			]
+		},
+		{
+			"id": "syn-20",
+			"query": "glaze kiln temperature",
+			"expected": [
+				"Ceramics glaze firing"
+			]
+		},
+		{
+			"id": "syn-golden-21",
+			"hosted_call": {
+				"tool": "recall_memories",
+				"arguments": {
+					"keyword": "short answers",
+					"type": "feedback"
+				}
+			},
+			"expected": {
+				"source_top1": {
+					"hosted_memory_id": "Prefers short answers"
+				}
+			}
+		},
+		{
+			"id": "syn-golden-22",
+			"hosted_call": {
+				"tool": "recall_memories",
+				"arguments": {
+					"keyword": "pruning apple trees",
+					"type": "project"
+				}
+			},
+			"expected": {
+				"source_top1": {
+					"hosted_memory_id": "Orchard pruning calendar"
+				}
+			}
+		}
+	]
+}
