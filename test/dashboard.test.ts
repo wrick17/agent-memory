@@ -2086,4 +2086,24 @@ describe("dashboard Memories tab", () => {
 		expect(hrefs).toEqual(Array.from({ length: 25 }, (_, i) => `#memories/w${i}?profile=work`));
 		expect(text(b.view())).toContain("Showing 25 records");
 	});
+
+	it("drops the selection and an open bulk confirmation when a new search replaces the list", async () => {
+		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const box = () => find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
+		box().checked = true;
+		box().on.change!();
+		click(button(b.view(), "Forget selected…"));
+		expect(button(b.view(), "Forget 1")).toBeDefined(); // the confirmation names its one target
+		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the same search again: the rows are rebuilt unchecked
+		for (let i = 0; i < 2; i++) await settle();
+		expect(box().checked).toBe(false);
+		expect(text(b.view())).toContain("0 selected.");
+		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
+		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
+		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
+	});
 });

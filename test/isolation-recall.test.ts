@@ -20,6 +20,18 @@ const profileStub = (c: Awaited<ReturnType<typeof contextFor>>, name: string) =>
 	const ref = c.account.profiles.find((p) => p.profile === name)!;
 	return env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`));
 };
+/**
+ * A write arms the embed alarm for now, and it may already be running, so run it only if still pending. Then wait until each
+ * card is embedded and fail here if it never is: recall counts a vector only once its embedding is recorded.
+ */
+const embedded = async (c: Awaited<ReturnType<typeof contextFor>>, ...ids: unknown[]) => {
+	await runDurableObjectAlarm(profileStub(c, "test"));
+	for (const id of ids) {
+		let status: unknown;
+		for (let i = 0; i < 200 && (status = (await call(c, "get_memory", { memory_id: id })).embedding_status) !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		expect(status, `embedding_status of ${String(id)}`).toBe("embedded");
+	}
+};
 
 describe("G4 isolation", () => {
 	it("keeps a personal device token out of work", async () => {
@@ -247,8 +259,7 @@ describe("recall channels and the vector fallback", () => {
 		const exact = await call<{ results: { memory_id: string; matched_by: string[] }[] }>(c, "recall_memories", { keyword: "token refresh client", profile: "test" });
 		expect(exact.results[0]!.matched_by).toContain("exact");
 		// The write armed the alarm for now; it may already have run. Run it if it is still pending, then wait for the card.
-		await runDurableObjectAlarm(profileStub(c, "test"));
-		for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: saved.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		await embedded(c, saved.memory_id);
 		const semantic = await call<{ results: { memory_id: string; matched_by: string[] }[]; lexical_only: boolean }>(c, "recall_memories", { keyword: "shared client retried", profile: "test" });
 		expect(semantic.lexical_only).toBe(false);
 		expect(semantic.results.find((r) => r.memory_id === saved.memory_id)?.matched_by).toContain("vector");
@@ -263,8 +274,7 @@ describe("recall channels and the vector fallback", () => {
 		const c = await contextFor();
 		const j = await call(c, "save_memory", { name: "codex: semantic journal", type: "project", kind: "journal", description: "journal", profile: "test" });
 		const settle = async () => {
-			await runDurableObjectAlarm(profileStub(c, "test"));
-			for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: j.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+			await embedded(c, j.memory_id);
 		};
 		const hash = async () => runInDurableObject(profileStub(c, "test"), (_i, s) => s.storage.sql.exec<{ card_hash: string; embed_hash: string | null }>(
 			"SELECT card_hash, embed_hash FROM nodes WHERE id = ?", j.memory_id).one());
@@ -291,8 +301,7 @@ describe("recall channels and the vector fallback", () => {
 	const fake = () => (env as unknown as { AI: { _pending(): Promise<number>; _calls(): Promise<number> } }).AI;
 	const probe = async (c: Awaited<ReturnType<typeof contextFor>>, name: string) => {
 		const saved = await call(c, "save_memory", { name, type: "reference", description: "deadline", content: "deadline probe body", profile: "test" });
-		await runDurableObjectAlarm(profileStub(c, "test"));
-		for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: saved.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		await embedded(c, saved.memory_id);
 		return saved.memory_id as string;
 	};
 	const timed = async (c: Awaited<ReturnType<typeof contextFor>>, keyword: string) => {
@@ -439,8 +448,7 @@ describe("v2 R1: recall channels, hit counts and eval records", () => {
 		const ids: string[] = [];
 		for (const n of [1, 2, 3]) ids.push((await call(c, "save_memory", { name: `R1 count ${word} ${n}`, type: "project", description: word, content: `${word} body ${n}`, profile: "test" })).memory_id as string);
 		// The store's own embedding alarm updates these rows after a save; let it finish so only recall could change them.
-		await runDurableObjectAlarm(profileStub(c, "test"));
-		for (const id of ids) for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		await embedded(c, ...ids);
 		const before = await state(c, ids);
 		const first = await recallOf(c, { keyword: word, profile: "test", limit: 2 });
 		const shown = first.results.filter((h) => h.profile === "test").map((h) => h.memory_id);
@@ -468,8 +476,7 @@ describe("v2 R1: recall channels, hit counts and eval records", () => {
 		const c = await contextFor();
 		const word = `osprey${crypto.randomUUID().slice(0, 8)}`;
 		const saved = await call(c, "save_memory", { name: `R1 channel ${word}`, type: "reference", description: "channel probe", content: `${word} nesting platform`, profile: "test" });
-		await runDurableObjectAlarm(profileStub(c, "test"));
-		for (let i = 0; i < 40 && (await call(c, "get_memory", { memory_id: saved.memory_id })).embedding_status !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
+		await embedded(c, saved.memory_id);
 		const LEXICAL = ["exact", "literal", "fulltext"];
 		const both = await recallOf(c, { keyword: word, profile: "test" });
 		expect(both.results.find((h) => h.memory_id === saved.memory_id)?.matched_by).toEqual(expect.arrayContaining(["fulltext", "vector"]));

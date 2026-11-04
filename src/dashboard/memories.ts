@@ -364,7 +364,8 @@ export function memoriesTab(am: Am): void {
 
 		const load = async (next = false) => {
 			const id = ++request, keyword = q.value.trim();
-			if (!next) { tbody.replaceChildren(); rows.clear(); cursors.clear(); failures.clear(); am.win.history.replaceState(null, "", addr(keyword)); }
+			// New rows are built unchecked, so a replacement drops the old selection and any open confirmation of it.
+			if (!next) { tbody.replaceChildren(); rows.clear(); selected.clear(); confirmBox.replaceChildren(); cursors.clear(); failures.clear(); refreshBulk(); am.win.history.replaceState(null, "", addr(keyword)); }
 			more.hidden = true;
 			say(keyword ? "Searching…" : "Loading memories…");
 			const skeleton = next ? null : am.loading(listBox, 5);
