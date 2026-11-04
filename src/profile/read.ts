@@ -6,7 +6,7 @@ import { importDelivery, policyOf, currentImportFields, POLICY_ATTRS_SQL } from 
 import { normalizeName, normalizeScope, sha256 } from "../domain/ids";
 import { Fail, type MemoryKind, type MemoryType, type RecallHit, type Step } from "../domain/types";
 import { captureText, findNode, readContent, relationships, type NodeRow, type Who } from "./write";
-import { captureState, parseRange, sessionKey } from "./capture";
+import { captureState, manifestListed, parseRange, sessionKey } from "./capture";
 import { BATCH_GAP_MS, batchStatus } from "./maintenance";
 import { projectKey } from "./work-upload";
 
@@ -301,15 +301,21 @@ export function filters(q: Filter): { where: string; params: SqlStorageValue[] }
 
 const isCapture = (n: NodeRow & { other_label?: string }) => n.kind === "session" || (n.kind === "other" && n.other_label === "capture");
 
-/** Only stored capture text, never manifests. A superseded heuristic is visible before its manifest was stored. */
+/**
+ * Only stored capture text, never manifests. A superseded heuristic is visible before its manifest was stored; once a manifest is
+ * stored, only the consolidated parts it lists (manifestListed), as of `at` when given.
+ */
 function captureVisible(at?: string): { where: string; params: SqlStorageValue[] } {
 	return at ? { where: `t.part = 'capture' AND t.lane = 'capture' AND t.capture_part IS NOT 'manifest'
 		AND coalesce(julianday(t.created_at) <= julianday(?), 0)
 		AND (t.live = 1 OR (t.capture_status = 'heuristic' AND EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id
 			AND m.capture_part = 'manifest' AND julianday(m.created_at) > julianday(?))))
 		AND (t.capture_status IS NOT 'heuristic' OR NOT EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id
-			AND m.capture_part = 'manifest' AND coalesce(julianday(m.created_at) <= julianday(?), 0)))`, params: [at, at, at] }
-		: { where: "t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.capture_part IS NOT 'manifest'", params: [] };
+			AND m.capture_part = 'manifest' AND coalesce(julianday(m.created_at) <= julianday(?), 0)))
+		AND (t.capture_status IS NOT 'consolidated' OR NOT EXISTS (SELECT 1 FROM texts m WHERE m.range_id = t.range_id
+			AND m.capture_part = 'manifest' AND coalesce(julianday(m.created_at) <= julianday(?), 0)) OR ${manifestListed} > 0)`, params: [at, at, at, at] }
+		: { where: `t.part = 'capture' AND t.lane = 'capture' AND t.live = 1 AND t.capture_part IS NOT 'manifest'
+			AND (t.capture_status IS NOT 'consolidated' OR coalesce(${manifestListed}, 1) > 0)`, params: [] };
 }
 
 function captureFilter(q: Filter): { where: string; params: SqlStorageValue[] } | null {
