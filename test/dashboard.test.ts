@@ -2029,6 +2029,56 @@ describe("dashboard profile choice", () => {
 	});
 });
 
+describe("dashboard Sessions and Replay tabs", () => {
+	const session = (id: string, profile: string, ask: string) => ({ id, profile, session: `${id}-${profile}`, client: "codex", status: "complete", first_ask: ask,
+		events: [{ kind: "ask", text: ask, at: "2026-11-04T10:00:00Z" }], counts: {}, first_upload_at: "2026-11-04T10:00:00Z", last_upload_at: "2026-11-04T10:00:00Z" });
+
+	it("keeps the newest selection when two profiles' reads of the same session id answer out of order", async () => {
+		const g = { personal: gate(), work: gate() } as Record<string, ReturnType<typeof gate>>;
+		const b = browser({ signedIn: true, hash: "#sessions", api: async (path) => {
+			if (path.startsWith("/api/sessions?")) return Response.json({ rows: [session("s1", "personal", "Personal ask"), session("s1", "work", "Work ask")], next_cursor: null });
+			const m = /^\/api\/profiles\/(\w+)\/sessions\/s1$/.exec(path);
+			if (m) { await g[m[1]!]!.wait; return Response.json(session("s1", m[1]!, m[1] === "work" ? "Work ask" : "Personal ask")); }
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const rowOf = (pf: string) => find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes(` ${pf} · `))!;
+		rowOf("personal").on.click!();
+		rowOf("work").on.click!();
+		g.work!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g.personal!.open(); // the older selection answers last
+		for (let i = 0; i < 2; i++) await settle();
+		const panel = find(b.view(), "section").find((x) => x.attrs["aria-label"] === "Session detail")!;
+		expect(find(panel, "h3")[0]!.textContent).toBe("Work ask");
+		expect(text(panel)).toContain(" work · ");
+	});
+
+	it("plays only the session opened last when an earlier one answers late, and leaves no player running", async () => {
+		const g = { a: gate(), b: gate() } as Record<string, ReturnType<typeof gate>>;
+		const b = browser({ signedIn: true, hash: "#replay?profile=work", api: async (path) => {
+			if (path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows: [session("a", "work", "Session A"), session("b", "work", "Session B")], next_cursor: null });
+			const m = /^\/api\/profiles\/work\/sessions\/(a|b)$/.exec(path);
+			if (m) { await g[m[1]!]!.wait; return Response.json(session(m[1]!, "work", `Session ${m[1]!.toUpperCase()}`)); }
+		} });
+		const mounted: string[] = [], destroyed: string[] = [];
+		Object.assign(b.win, { amReplayPlayer: { mount: (_box: El, events: { text: string }[]) => { const t = events[0]!.text; mounted.push(t); return { destroy: () => { destroyed.push(t); } }; } } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const pick = find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!, form = find(b.view(), "form")[0]!;
+		pick.value = "0"; form.on.submit!({ preventDefault() {} });
+		pick.value = "1"; form.on.submit!({ preventDefault() {} });
+		g.b!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g.a!.open(); // A answers after B
+		for (let i = 0; i < 2; i++) await settle();
+		expect(mounted).toEqual(["Session B"]);
+		expect(destroyed).toEqual([]);
+		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Session B");
+		expect(find(b.view(), "h3").map((x) => x.textContent)).not.toContain("Session A");
+	});
+});
+
 describe("dashboard Memories tab", () => {
 	// From the Memories tab author's smoke: the list, server strength, the record link, and Forget with Undo.
 	const row = (id: string, name: string) => ({ memory_id: id, profile: "work", name, type: "feedback", scope: "repo:x", status: "active", revision: 3, passage: `${name} passage`,

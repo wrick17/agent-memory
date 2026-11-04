@@ -97,7 +97,7 @@ The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTIO
 
 ### Session replay player (#21), 2026-11-04
 
-`local/replay-player.js` holds the shared v2 replay player. `agent-memory replay` (#22) loads it, and `/app.js` embeds its exact bytes (#23, #24). The dashboard Replay tab mounts it in its own change (#29).
+`local/replay-player.js` holds the shared v2 replay player. `agent-memory replay` (#22) loads it, `/app.js` embeds its exact bytes (#23, #24), and the dashboard Replay tab mounts it (#29).
 
 - Contract: `globalThis.amReplayPlayer.mount(root, events, options)` returns `play`, `pause`, `step`, `seek`, `setSpeed` and `destroy`. `options` takes `speeds` (default 0.5, 1, 2 and 4) and `onEvent`.
 - Draws start, previous, play/pause and next controls, speed buttons, "event i of n · t of total", the event list and the event detail. Every value is set as text.
@@ -248,7 +248,7 @@ Server source ready, not deployed. The Lessons, Crystals and Actions tabs that r
 
 ### v2 replay player text import (#29), 2026-11-04
 
-Build rule ready, not deployed; the Sessions and Replay tabs land separately.
+Build rule ready, not deployed. The Sessions and Replay tabs are listed under AM-13 v2 dashboard tabs below.
 
 - `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
 - `/app.js` now embeds the player's exact bytes (#23, #24), so the Worker bundle includes it.
@@ -307,3 +307,4 @@ Source in review; not deployed. Each change carries its own dashboard tests. Eac
 - Memories (#26): keyword and channel search; type, project and agent filters; server recall strength; versions, a word diff and provenance; edit, copy, Forget with Undo, bulk forget and JSON export. A new search or filter clears the selection and any open bulk confirmation before the rows are rebuilt. Memories lists each profile's own records. The owner's per-profile search reads only that profile, so `me` cannot take its places, and the tab reads `me` as its own profile. A `me` overlay hit in a profile's recall is neither relabelled nor listed twice. Evidence: `test/dashboard.test.ts` 57 of 57, and the owner-route cases in `test/mcp-auth.test.ts`.
 - Lessons, Crystals and Actions (#27): Lessons lists preferences and rules from each profile's owner model, with 90-day uses and pin, unpin, unflag and forget, each with Undo. Crystals summarizes finished work from compacted journals and completed sessions. Actions lists uploaded PR and Jira items by board score and is read-only. A deep link to one lesson or action needs `?profile`. Evidence: `test/dashboard.test.ts` 57 of 57.
 - Graph (#28): a shape per kind, a toolbar, zoom buttons named Zoom in and Zoom out, a node detail panel and "Queue link maintenance". Each relation shows a direction arrow with a hidden Outgoing or Incoming label. Canvas labels pass text contrast in both themes. A record selected before the graph has loaded is drawn again once the nodes and links are complete, so a deep link shows its real connections. Graph stays a page with its path profile (`#/graph/NAME`) and no header profile picker. Evidence: `test/dashboard.test.ts` 58 of 58.
+- Sessions and Replay (#29): Sessions lists every active profile through `/api/sessions`, or one profile's own list, and shows a failed read as an error, never an empty list. Queueing consolidation writes only to the session's own profile, after confirmation. Replay needs one profile, mounts the shared replay player and cleans it up on leaving. Only the most recent open can draw a session's detail or mount the replay player; a late answer for an earlier open is dropped. Evidence: `test/dashboard.test.ts` 60 of 60.
