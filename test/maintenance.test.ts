@@ -33,6 +33,7 @@ import { wipeAccount, wipeProfile } from "../src/wipe";
 import { danglingPage, enqueueDangling } from "../src/profile/dangling";
 import { flushRows, pendingRows, ROW_PAUSE } from "../src/profile/meter";
 import { noteRecall } from "../src/profile/recall-stats";
+import { ingest } from "../src/profile/capture";
 
 it("embedding failures keep housekeeping running and retain the embedding retry", async () => {
 	const who = (await contextFor()).account.profiles.find((p) => p.profile === "personal")!;
@@ -2446,6 +2447,13 @@ describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall 
 			const plain = id("Plain old"), stated = id("Stated old", { origin: "stated" }), pinned = id("Pinned old"), pref = id("Preference old"), fresh = id("Fresh");
 			const recalled = id("Recalled old"), longAgo = id("Recalled long ago"), toPin = id("Pinned after queueing");
 			const journal = String(wired(storage, who, save({ name: "Journal old", type: "project", kind: "journal", content: "" })).memory_id);
+			// Graph nodes without a memory type (an uploaded session, a component) cannot take the retire-only save: never stale_memory.
+			const digest = JSON.stringify({ asks: [{ text: "old ask", pos: 1 }], decisions: [], corrections: [], outcomes: {}, entities: [], dropped: { asks: 0, decisions: 0, corrections: 0 } });
+			expect(ingest(storage, who, { session: { client: "codex", id: "stale-session" }, manifests: [],
+				digests: [{ range_id: "codex:stale-session:0a1b2c3d:0-10", capture_status: "heuristic", part_id: "-", sha256: sha256(digest), body: digest }] }).map((r) => r.status)).toEqual(["stored"]);
+			wired(storage, who, { op: "knowledge", args: { nodes: [{ kind: "component", name: "Stale component", description: "a component" }] } });
+			const graphOnly = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE memory_type IS NULL AND kind IN ('session', 'component') AND status = 'active'").toArray().map((r) => r.id);
+			expect(graphOnly).toHaveLength(2);
 			sql.exec("UPDATE nodes SET pinned = 1 WHERE id = ?", pinned);
 			sql.exec("UPDATE nodes SET kind = 'preference' WHERE id = ?", pref);
 			sql.exec("UPDATE nodes SET updated_at = ? WHERE id <> ?", old, fresh);
@@ -2453,7 +2461,7 @@ describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall 
 			noteRecall(sql, nextSeq(sql, "profile_meta"), new Date(Date.now() - 120 * DAY).toISOString().slice(0, 10), [longAgo], 10);
 			only(storage, who, "queue");
 			expect(queued(sql, "stale_memory").sort()).toEqual([plain, longAgo, toPin].sort());
-			expect([stated, pinned, pref, fresh, recalled, journal].some((n) => queued(sql, "stale_memory").includes(n))).toBe(false);
+			expect([stated, pinned, pref, fresh, recalled, journal, ...graphOnly].some((n) => queued(sql, "stale_memory").includes(n))).toBe(false);
 
 			const lease = next(storage, { kinds: ["stale_memory"] });
 			expect(lease.items.every((i) => JSON.stringify(i.allowed_ops) === JSON.stringify(["save", "flag", "dismiss"]))).toBe(true);
