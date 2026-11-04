@@ -421,7 +421,8 @@ export function memoriesTab(am: Am): void {
 		form.addEventListener("submit", (e) => { e.preventDefault(); load(); });
 		for (const s of [type, project]) s.addEventListener("change", () => load());
 		mode.addEventListener("change", () => { if (q.value.trim()) load(); });
-		agent.addEventListener("change", applyAgent);
+		// The filter can hide selected rows, so it starts over like a new search: nothing selected or checked, no open confirmation.
+		agent.addEventListener("change", () => { for (const r of rows.values()) r.box.checked = false; selected.clear(); confirmBox.replaceChildren(); applyAgent(); });
 		all.addEventListener("change", () => { for (const r of shown()) { r.box.checked = all.checked; if (all.checked) selected.add(r.key); else selected.delete(r.key); } reselect(); });
 
 		// ---- Writes: forget (single and bulk), with Undo through each removal's activity row ----
