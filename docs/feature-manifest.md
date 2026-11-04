@@ -104,3 +104,14 @@ The parent accepted the normalized-hash P2 closure and authorized SOURCE ADOPTIO
 - Events without offsets (hosted digests) advance one per second at 1x. The position line says "order only" instead of a time. Events with transcript offsets wait for the real gap divided by the speed, with no compression.
 - Keys, while mounted and visible: Space plays or pauses; Left and Right step; in the list, Up, Down, Home and End move. Fields and the rest of the page keep their own keys. `destroy()` removes the view, the key listener and the timer, and may run twice.
 - Evidence: `local/replay-player.test.mjs`, in `test:local`.
+
+### v2 response contracts (part of #4), 2026-11-04
+
+`src/viewer/types.ts` declares the v2 request and response shapes: recall options, eval, client status and health, sessions and replay, viewer snapshot and events, insights, and the route and auth table. It is types only. No route, RPC method or dashboard tab uses it yet; each route lands with the service that implements it.
+
+- Profile choice follows #3. An explicit profile must be known and allowed and is never rerouted. An omitted profile uses the routing rules, then the device default, then `me`. Every new request field is optional, so v1 callers keep today's behavior.
+- `/api/*` stays owner-only. `POST /v1/recall` takes the owner or a read-scoped device; job tokens get 403.
+- `FeedItem.id` is the activity id, and `target` is the activity's first target node id when it names one.
+- `HealthReport.search.lexical_documents` is null when any profile's count could not be read, never a guessed 0.
+- `ProjectProfile.budget`, when present, is the graph reads' `Budget`; `exhausted` means the graph-derived lists are partial.
+- Evidence: `npm run typecheck` and `npm run lint`.
