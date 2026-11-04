@@ -221,3 +221,11 @@ Server source ready, not deployed; the Lessons, Crystals and Actions tabs land s
 - `GET /api/profiles/:p/board` takes `state=open|closed|all`. Omitted or `open`, it is the scored board `work_board` reads; `closed` and `all` list those items with the same fields and terms. Each item carries its uploaded state and a Jira ticket's own status text. Merged GitHub PRs arrive as `closed`, so a merge is never reported.
 - Reads only; no issue state is written and no feed or polling is added.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 replay player text import (#29), 2026-11-04
+
+Build rule ready, not deployed; the Sessions and Replay tabs land separately.
+
+- `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
+- Nothing imports the player yet, so the Worker bundle is unchanged until the dashboard tabs land.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`.

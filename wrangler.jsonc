@@ -6,6 +6,8 @@
 	"workers_dev": false,
 	"preview_urls": false,
 	"main": "src/worker.ts",
+	// #29: the dashboard embeds the shared replay player's exact bytes as text; globs are relative to main's directory.
+	"rules": [{ "type": "Text", "globs": ["../local/*-player.js"], "fallthrough": true }],
 	"compatibility_date": "2026-10-20",
 	// global_fetch_strictly_public: the Clerk Frontend API (clerk.memory.wrick17.com) is a DNS-only CNAME in this Worker's own
 	// zone, served by Clerk's Worker. Cloudflare documents that without the flag same-zone fetches go to the zone's origin and
