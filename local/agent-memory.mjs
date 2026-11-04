@@ -1145,6 +1145,8 @@ export function parseEvents(stdout) {
 // corpus-upload's import closure in the source layout: its modules beside this CLI, and their domain imports at ../src/domain.
 const CORPUS_LOCAL = ["corpus-cli.mjs", "corpus-git.mjs", "corpus-judgment.mjs", "corpus-refresh.mjs", "corpus-scan.mjs", "corpus-upload.mjs"];
 const CORPUS_DOMAIN = ["personal.ts", "redact.ts"];
+// replay's import closure: replay.mjs imports transcript-full.mjs, which imports ./agent-memory.mjs; the player is read as bytes.
+const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 
 export function install({ server = "https://memory.wrick17.com" } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1156,7 +1158,7 @@ export function install({ server = "https://memory.wrick17.com" } = {}) {
 		fs.chmodSync(dir, 0o700);
 	}
 	writePrivate(path.join(path.dirname(bin), "batch.mjs"), fs.readFileSync(new URL("./batch.mjs", import.meta.url)));
-	for (const f of CORPUS_LOCAL) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
+	for (const f of [...CORPUS_LOCAL, ...REPLAY_LOCAL]) writePrivate(path.join(path.dirname(bin), f), fs.readFileSync(new URL(`./${f}`, import.meta.url)));
 	for (const f of CORPUS_DOMAIN) writePrivate(path.join(home(), "src", "domain", f), fs.readFileSync(new URL(`../src/domain/${f}`, import.meta.url)));
 	writePrivate(`${bin}.mjs`, fs.readFileSync(fileURLToPath(import.meta.url)), 0o700);
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -1183,8 +1185,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\nClaude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
 	} else if (cmd === "corpus-upload") {
 		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
+	} else if (cmd === "replay") {
+		import("./replay.mjs").then((m) => m.main(process.argv.slice(3))).then((code) => process.exit(code), () => { process.stderr.write("agent-memory replay: failed\n"); process.exit(1); });
 	} else {
-		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
+		process.stderr.write("usage: agent-memory hook <claude-code|codex> | run | install | replay [--list] [--session ID] [--port N] | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory corpus-upload` for its options\n");
 		process.exit(2);
 	}
 }

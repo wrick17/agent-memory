@@ -214,3 +214,14 @@ Build rule ready, not deployed; the Sessions and Replay tabs land separately.
 - `wrangler.jsonc` imports `local/*-player.js` as Text, so the Worker can embed the shared replay player's exact bytes. `vitest.config.ts` gives tests the same import, and `worker-configuration.d.ts` declares it as a string module.
 - Nothing imports the player yet, so the Worker bundle is unchanged until the dashboard tabs land.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`.
+### Local full-transcript replay (#22), 2026-11-04
+
+`agent-memory replay` serves full local Claude Code and Codex transcripts to a browser on the recording machine. It loads the shared player above, byte for byte. Nothing it reads is uploaded or stored in a hosted system.
+
+- Commands: `--list` prints local sessions, newest first. `--session ID` opens one session, `--port N` picks the port (default 0, a random free port), and `--help` prints usage. Bad arguments exit 2; an unknown session or a failed start exits 1.
+- Sources: `projects/<project>/<session>.jsonl` under the Claude Code home and `sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl` under the Codex home. Listed files must be regular files owned by the current user, and symlinks are not followed. Session ids are validated. Each read opens with `O_NOFOLLOW` and checks `fstat`.
+- Events: owner and assistant text comes from the hook's `extract()`, so thinking, system, meta, sidechain and injected context stay out. A Claude record whose joined text opens as injected, such as a `<command-name>` envelope, stays out whole. Tool calls and results are kept for both formats. A lone string argument shows as its bare value only when redaction would leave its JSON form unchanged; otherwise the key stays, so key-based redaction applies. Every label and detail is redacted, and each tool input and output is cut at 8 KB after redaction (`truncated: "true"`).
+- Server: binds 127.0.0.1 only. A random 32-byte token is the first URL path segment and is compared in constant time. Host must be exactly `127.0.0.1:<port>`, and Origin, when sent, must be the same origin. These checks run before routing or file access. Only GET and HEAD are allowed. Responses set a self-only CSP with no inline script or style, plus `no-store`, `nosniff`, `no-referrer` and frame denial. There are no redirects. Errors carry no paths or transcript text.
+- Install: `agent-memory install` also copies `replay.mjs`, `transcript-full.mjs` and `replay-player.js` beside the CLI.
+- Evidence: `local/replay.test.mjs`, in `test:local`, against synthetic scratch stores. It covers token, Host, Origin, method and path refusals, redaction across the 8 KB cut, lone sensitive tool arguments in Claude and Codex calls, the `lsof` loopback bind, and the installed command mounting the real player.
+
