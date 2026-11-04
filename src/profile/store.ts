@@ -20,6 +20,7 @@ import { listSessions, sessionDetail } from "./sessions";
 import { enqueueIn } from "./maintenance";
 import { leaseFacts } from "../health";
 import { activitySummary, listProjects, projectProfile } from "./insights";
+import { changesSince } from "../viewer/events";
 import { activity, entity, graph, journal, journals, map, pageTimeline, shownIds, wipePreview } from "./pages";
 import { BudgetTx } from "./archive";
 import { archivedNodeIds, archivePage } from "./archive";
@@ -61,7 +62,8 @@ export type V2Read =
 	| { kind: "recall_strength"; ids: string[]; day: string }
 	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string }
 	| { kind: "lease_facts" } | { kind: "search_counts" }
-	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string };
+	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string }
+	| { kind: "changes"; after: number; limit: number };
 /** #11: one profile's search index counts for GET /api/health: live recall texts, and nodes whose current card is embedded. */
 export interface SearchCounts { lexical_documents: number; vectors: number }
 
@@ -796,6 +798,8 @@ export class ProfileStore extends DurableObject<Env> {
 				case "session": { const d = sessionDetail(sql, q.id); return d ? ok(d) : fail("not_found", "no such session"); }
 				case "lease_facts": return ok(leaseFacts(sql, new Date().toISOString()));
 				case "activity_summary": return ok(activitySummary(sql, q.q));
+				// #14: one synchronous read, so the feed and its seq come from one state of the store.
+				case "changes": return ok(changesSince(sql, who.profile, q.after, q.limit));
 				case "projects": return ok(listProjects(sql));
 				case "project_profile": { const p = projectProfile(sql, q.key, new Date().toISOString()); return p ? ok(p) : fail("not_found", "no such project"); }
 				case "search_counts": return ok({

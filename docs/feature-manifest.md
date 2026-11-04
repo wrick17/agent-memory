@@ -177,3 +177,13 @@ Source ready, not deployed. Depends on #12 above for session and project semanti
 - File lists (`top_files`, `files`) come only from the profile's Corpus when it is on; `me` has none. A failed Corpus read fails the request instead of showing no files, and with the Corpus off the lists are empty.
 - Data stays in the explicitly selected, authorized profile and project; no profile is inferred from content.
 - Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. Tests run in the combined phase.
+
+### v2 live viewer events (#14), 2026-11-04
+
+Source ready, not deployed. Depends on the v2 request plumbing and #11 above for account health.
+
+- `GET /api/viewer/events?cursor=` is a `text/event-stream` for the owner only; every device token gets 403 from the existing owner check.
+- Every three seconds it reads each active profile's activity after the cursor and the account health checks, and sends change and health events in the typed contracts, health first.
+- The cursor holds each profile's activity sequence, so a reconnect resumes without losing intervening activity; an invalid cursor is refused. A failed profile read ends the stream instead of skipping that profile.
+- The stream ends at the authenticating token's `exp` or after five minutes, whichever is earlier, and a cancelled request stops polling.
+- Evidence: `npm run typecheck`, `npm run lint` and `wrangler deploy --dry-run`. The preserved stream tests run in the combined phase.
