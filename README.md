@@ -4,21 +4,7 @@ A shared memory for your coding agents. Claude Code and Codex save decisions, ru
 
 It runs on your own Cloudflare account, with sign-in through your own Clerk application. Each deployment serves one owner; it is not a shared service.
 
-## Status
-
-The owner's everyday service runs version 1 and has replaced BothQ for daily use. BothQ stays running and readable as a fallback. Version 2 is built and reviewed in source, but it isn't released on the everyday service yet.
-
-- [x] Version 1 on the everyday service: imported and audited records, save, journal, recall and history, backup and restore, and the owner's clients connected.
-- [x] Version 2 built and reviewed in source: recall evaluation, scheduled consolidation, richer capture, session replay and the new dashboard.
-- [ ] Release the keep-all manual export, and use it before the version 2 upgrade.
-- [ ] Version 2 checked on the hosted test deployment (#39).
-- [ ] Version 2 released to the everyday service (#40).
-
-Details and evidence: [feature manifest](docs/feature-manifest.md) and [verification records](docs/import-verification.md).
-
 ## Features
-
-This list describes the source. The status above says what is released.
 
 - **One memory for all your agents.** Claude Code and Codex connect over MCP. Desktop clients sign in through Clerk, and headless machines use a revocable device token.
 - **Separate profiles.** `work`, `personal` and `me` keep their memories apart. The agent picks the profile; storage never guesses from the content. Recall reads the chosen profile plus `me`. An owner-only wipe can remove `work` on its own.
@@ -48,7 +34,7 @@ The full design is in [architecture](docs/architecture.md).
 
 ## Deploy your own
 
-There's no one-click "Deploy to Cloudflare" button yet. Cloudflare's button needs a public repository and deploys the repository's own Wrangler config, which here holds the owner's production settings. It also can't set up the Clerk application. Use the self-host package instead. It has been checked on an isolated test deployment in the owner's account, but not yet end to end on anyone else's.
+Deploy your own copy with the self-host package.
 
 **You need:**
 - Node 24.
