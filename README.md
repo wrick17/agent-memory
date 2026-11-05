@@ -1,56 +1,124 @@
 # Agent Memory
 
-Give your coding agents a shared place to remember what matters. Agent Memory is being built to help Claude Code and Codex pick up decisions, notes, and context across sessions and machines, so you do not have to explain the same things again.
+A shared memory for your coding agents. Claude Code and Codex save decisions, rules and context here, and recall them later in any session, on any machine. You stop explaining the same things twice.
 
-## Where it stands
+It runs on your own Cloudflare account, with sign-in through your own Clerk application. Each deployment serves one owner; it is not a shared service.
 
-Agent Memory is being prepared to replace BothQ for everyday use. The approved migration contains 1,374 Work records, 5,699 revisions, 4,173 requests and 5,291 audited texts with zero semantic mismatches or drift. Another 119 records remain held and excluded. These are selected sources, not complete chat histories. [Migration evidence](docs/import-verification.md#core-v1-source-and-runtime-checkpoint-2026-11-02).
+## Status
 
-- [x] Import and audit the approved records, history and request receipts at the recorded scope.
-- [x] Exercise core save, journal, recall and history operations in the owner trial.
-- [x] Restore full-size Account and Corpus data, verify Account checkpoint rollback, and reconcile the retained records, history, replay and corpus at the recorded scope.
-- [x] Release the earlier reviewed recovery and capture privacy fixes to the everyday canonical service.
-- [x] Verify authenticated read, write, journal and capture flows in the actual Claude, Codex and T3 clients and machines at the recorded scope.
-- [x] Verify automatic preference learning from captured evidence, including owner controls, and enable the intended capture-to-learning path.
-- [x] Switch the agreed everyday callers and competing native-memory writes using retained rollback snapshots.
-- [ ] Release the keep-all manual export, then use it before the v2 fixture upgrade and the canonical migration.
-- [x] Build v2 in source (recall evaluation, scheduled consolidation, richer capture, session replay and the new dashboard) and pass its combined local tests. The earlier full run passed 645 server and 137 local tests before the later fix waves, which have scoped checks only. [Evidence](docs/import-verification.md#v2-combined-local-verification-2026-11-04).
-- [ ] Check v2 on the hosted test deployment and a populated copy, then release it to the everyday service one change at a time, with prompt recall off.
-- [ ] Self-host setup for the dashboard's replay player (#39): `npm run setup` writes the Text loader rule for `local/*-player.js`, and the self-host package includes `local/replay-player.js`. The source is merged, and the scoped setup tests (5/5) and dry-run builds pass. Hosted acceptance is pending.
+The owner's everyday service runs version 1 and has replaced BothQ for daily use. BothQ stays running and readable as a fallback. Version 2 is built and reviewed in source, but it isn't released on the everyday service yet.
 
-Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Account restore, preservation checks and checkpoint rollback passed in the isolated fixture. The later Account reconciliation and learning changes are deployed to canonical. Actual Claude, Codex and T3 client checks and ordinary cutover passed at their recorded scopes. Main's normal Work learning is enabled and has processed a batch. Native Claude refresh has not been observed. Thirty-two preserved capture entries predate activation and currently have missing sources; their disappearance time is unknown. [Current evidence](docs/import-verification.md#account-recovery-and-learning-preview-2026-11-02).
+- [x] Version 1 on the everyday service: imported and audited records, save, journal, recall and history, backup and restore, and the owner's clients connected.
+- [x] Version 2 built and reviewed in source: recall evaluation, scheduled consolidation, richer capture, session replay and the new dashboard.
+- [ ] Release the keep-all manual export, and use it before the version 2 upgrade.
+- [ ] Version 2 checked on the hosted test deployment (#39).
+- [ ] Version 2 released to the everyday service (#40).
 
-The reviewed profile-selection change is deployed to canonical and passed bounded checks on all four profiles. It lets agents choose an authorized profile without storage classifying memory content; legacy omitted-profile routing remains compatible. [Verification](docs/import-verification.md#profile-selection-local-verification-2026-11-04).
+Details and evidence: [feature manifest](docs/feature-manifest.md) and [verification records](docs/import-verification.md).
 
-v2 is built and reviewed in source, but it is not deployed or active on the everyday canonical service. Checks on the isolated hosted fixture are partial: the narrow-screen Memories layout now passes there, and other items remain open. Its changes go into the repository one issue at a time. The everyday service upgrades only after a fresh Work backup and the hosted checks. [Design and status](docs/architecture.md#v2-summary-2026-11-04).
+## Features
 
-Project and strategic reviews, the broader dashboard and reader trial, full-size Work-wipe expansion, cosmetic polish and exhaustive test matrices are follow-up work. Proactive PR and Jira feeds remain excluded. BothQ stays running and readable as a legacy fallback; there are no ordinary dual writes. The [feature manifest](docs/feature-manifest.md) retains the broader historical commitments and their evidence.
+This list describes the source. The status above says what is released.
+
+- **One memory for all your agents.** Claude Code and Codex connect over MCP. Desktop clients sign in through Clerk, and headless machines use a revocable device token.
+- **Separate profiles.** `work`, `personal` and `me` keep their memories apart. The agent picks the profile; storage never guesses from the content. Recall reads the chosen profile plus `me`. An owner-only wipe can remove `work` on its own.
+- **Linked knowledge.** Decisions carry their reasons and evidence, and records link to projects, people and work items. Agents can ask why something was decided, follow a path between records or read a timeline.
+- **Search that works without AI.** Recall uses exact names and full-text search. Semantic search with Workers AI is optional.
+- **Private capture.** The local client turns sessions into short, redacted digests on your machine. Full transcripts stay on that machine, and you can replay them there.
+- **A dashboard.** Browse memories, the graph, sessions, activity and health at `/app`, and manage devices and routing at `/settings`.
+- **Backups and recovery.** Nightly encrypted exports go to your own R2 bucket, and the two newest are kept. Profiles and account state can be restored.
+- **Careful cleanup.** Housekeeping is rule-based, with no model on the server. Stated rules, pinned records and `me` are never changed by the background batch, and changes can be undone.
+
+## How it works
+
+```mermaid
+flowchart LR
+	A["Claude Code / Codex"] -->|MCP| W["Cloudflare Worker"]
+	C["Local capture client"] -->|digests only| W
+	W --> P["One SQLite store per profile"]
+	W --> S["Account store: devices, routing, profiles"]
+	W --> R["R2: encrypted backups"]
+	W -.optional.-> V["Workers AI + Vectorize"]
+	W -->|verifies sign-in| K["Your Clerk app"]
+```
+
+One Worker serves the MCP endpoint, the dashboard and the API. Each profile lives in its own SQLite Durable Object, so profiles never share a database. An account store holds devices, routing rules and the profile list. The Worker checks Clerk's sign-in tokens with Clerk's public keys and needs no Clerk secret.
+
+The full design is in [architecture](docs/architecture.md).
+
+## Deploy your own
+
+There's no one-click "Deploy to Cloudflare" button yet. Cloudflare's button needs a public repository and deploys the repository's own Wrangler config, which here holds the owner's production settings. It also can't set up the Clerk application. Use the self-host package instead. It has been checked on an isolated test deployment in the owner's account, but not yet end to end on anyone else's.
+
+**You need:**
+- Node 24.
+- A Cloudflare account, ideally on Workers Paid. Use your own domain's zone, or the account's workers.dev subdomain.
+- A Wrangler login for that account (`npx wrangler login`, or `CLOUDFLARE_API_TOKEN`). Setup never logs in for you.
+- A Clerk production instance on your domain, with sign-ups closed, OAuth (CIMD and PKCE) turned on, and the `memory` scope. The [self-host guide](docs/self-host.md#create-the-clerk-application) lists every setting.
+
+**Steps:**
+
+1. Build the self-host package from this repository. The command prints the archive path.
+
+	```sh
+	npm ci
+	npm run pack:self-host -- /absolute/existing/output-directory
+	```
+
+2. Unpack it into a new directory, outside this repository, and install:
+
+	```sh
+	mkdir my-agent-memory
+	tar -xzf /path/to/agent-memory-0.0.0.tgz -C my-agent-memory
+	cd my-agent-memory/package
+	npm ci --include=dev
+	```
+
+3. Write `agent-memory.setup.json` with your account id, Worker name, URL, Clerk issuer and publishable key, and routing rules. See [the settings](docs/self-host.md#write-the-settings).
+4. Preview the plan, then apply it. Apply asks for your Clerk user id and stores it only as a Worker secret.
+
+	```sh
+	npm run setup
+	npm run setup -- --apply
+	```
+
+5. Deploy, then check the public metadata:
+
+	```sh
+	npx wrangler deploy
+	curl <your-url>/.well-known/oauth-protected-resource/mcp
+	```
+
+Setup creates only what it plans: the Worker config, an R2 bucket and, with semantic search on, a Vectorize index. It refuses rather than overwrite an existing deployment. Backups stay off until you set a backup key; see [backups and restore](docs/self-host.md#profile-backups-and-restore).
 
 ## Connect a client
 
-You need access to your own deployed server and its MCP URL before starting. The current hosted instance is private and owner-only; it is not a public service or open for registration. Replace `https://YOUR-DEPLOYMENT.example/mcp` below with your own URL.
+Use your own deployment's URL in place of `https://YOUR-DEPLOYMENT.example/mcp`.
 
-For Claude Code, add the server, then use `/mcp` in Claude Code to sign in:
+For Claude Code, add the server, then run `/mcp` in Claude Code to sign in:
 
 ```sh
 claude mcp add --transport http memory https://YOUR-DEPLOYMENT.example/mcp
 ```
 
-For Codex, add the server and follow the sign-in prompts:
+For Codex:
 
 ```sh
 codex mcp add memory --url https://YOUR-DEPLOYMENT.example/mcp
 codex mcp login memory
 ```
 
-Codex may open a browser during setup. Sign-in uses Clerk; scoped device access is available for supported headless use. These commands connect to an existing deployment and do not provision one.
+For a machine without a browser, see [headless machines](docs/self-host.md#headless-machines).
 
-## Privacy and capture
+## Privacy
 
-The planned capture client builds bounded digests locally. Local raw transcript files are not uploaded, though a digest can include short excerpts. Personal capture hooks are enabled; bounded Main and T3 capture passed, while MacBook capture and full parity remain pending. The separate own-app model path remains blocked after eight diagnostic requests.
+- Automatic capture uploads only short, redacted digests of each session, never the full transcript. A digest can contain short excerpts. What an agent saves or imports on purpose is stored as written.
+- Full sessions stay on the machine that recorded them. `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
+- The server never calls GitHub or Jira, and holds no credentials for them.
 
-To review a full session on the machine that recorded it, run `agent-memory replay --list`, then `agent-memory replay --session ID`. The viewer listens on 127.0.0.1 only, behind a private URL token, and uploads nothing.
+## Learn more
 
-## Explore the project
-
-The [feature manifest](docs/feature-manifest.md) tracks what is implemented, tested, and still planned. The [architecture](docs/architecture.md) explains the design and its checks. For local development, install dependencies with `npm ci` and run `npm run check` to run the repository checks.
+- [Self-host guide](docs/self-host.md): every setup step, setting and option.
+- [Architecture](docs/architecture.md): the design and its decisions.
+- [Feature manifest](docs/feature-manifest.md): what is built, tested and released.
+- Development: run `npm ci`, then `npm run check`.
