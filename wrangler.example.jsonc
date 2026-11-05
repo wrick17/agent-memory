@@ -5,6 +5,15 @@
 	"name": "agent-memory",
 	"account_id": "0123456789abcdef0123456789abcdef",
 	"main": "src/worker.ts",
+	"rules": [
+		{
+			"type": "Text",
+			"globs": [
+				"../local/*-player.js"
+			],
+			"fallthrough": true
+		}
+	],
 	"compatibility_date": "2026-10-20",
 	"compatibility_flags": [
 		"nodejs_compat",
