@@ -4,6 +4,10 @@ Before changing product behavior, interfaces, or decisions, read [the feature ma
 
 When user-visible features, setup, or project status change, update [README.md](README.md); keep it short, align its checklist with the feature manifest, and check only completed milestones.
 
+## Clerk sign-in
+
+Do Clerk authentication yourself in the owner's existing Chrome through DevTools MCP, using its current session; don't ask the owner to sign in for you. Involve the owner only for a step only they can complete, such as a passkey, a second factor or a CAPTCHA, or when a DevTools tool fails. Manage tabs under the `browser-work` skill, and never copy cookies, tokens or callback URLs into chat or memory.
+
 ## Completion-first policy
 
 Finish the agreed features and usable end-to-end flows before edge-case handling, extra hardening, optimization or polish. Defer that follow-up work until the owner asks for it or says "go hard on testing".

@@ -1132,3 +1132,44 @@ The local Claude runner accepts the exact `system:thinking_tokens` telemetry fra
 The reviewed result parser accepts pure JSON or extracts one top-level JSON object with the permitted single JSON fence or surrounding text. The existing full output-schema validation still applies. A parse failure retains a redacted final-frame diagnostic in a private local file and discards the result; it does not upload the diagnostic. Offline replay, caller cases, syntax and lint passed, and the combined patch received independent source clearance. The failed batch's actual non-JSON format was not retained and is unknown.
 
 The affected recovery and maintenance tests and independent source review cover these changes; [runtime and verification scope](import-verification.md#account-recovery-and-learning-preview-2026-11-02) is recorded separately. A pre-existing single-profile restore can sweep the index of an absent archived node and report a dangling link; archive content and receipts remain, and explicit archive restore registers the node again. In inconsistent recovery history, different archived nodes with the same request ID can produce order-dependent binding. Ordinary writes and imports enforce account-wide request uniqueness, and recheck refuses a multi-node case; this is not a claim that every inconsistent history is resolved safely.
+
+## v2 module ownership and merge order, 2026-11-04
+
+This section gives each v2 file one writer, so every issue lands in its own PR. [Architecture](architecture.md#v2-summary-2026-11-04) holds the behaviour, rules and status. The integrated tree for #37 holds all of it in source; nothing is deployed.
+
+| Issue | Files the issue owns | Shared files it extends |
+|---|---|---|
+| #9 | `src/eval.ts`, `src/profile/recall-stats.ts`, `src/profile/eval-candidates.ts` | `src/v2-api.ts`, `src/profile/store.ts`, `src/profile/wipe.ts`, `src/account/store.ts`, `src/api.ts`, `src/mcp.ts` |
+| #12 | `src/sessions.ts`, `src/profile/sessions.ts`, `src/profile/capture.ts` | `src/v2-api.ts`, `src/profile/store.ts`, `src/api.ts` |
+| #10 | `src/profile/maintenance.ts`, `src/profile/housekeeping.ts`, `src/maintenance-tools.ts` | `src/v2-api.ts`, `src/profile/store.ts`, `src/mcp.ts` |
+| #11 | `src/health.ts`, `src/client-status.ts` | `src/v2-api.ts`, `src/profile/store.ts`, `src/account/store.ts`, `src/worker.ts` |
+| #15 | `src/profile/insights.ts` | `src/v2-api.ts`, `src/profile/store.ts` |
+| #14 | `src/viewer/events.ts` | `src/v2-api.ts`, `src/profile/store.ts` |
+| #13 | `src/viewer/snapshot.ts` | `src/v2-api.ts`, `src/profile/store.ts`, `wrangler.jsonc`, `worker-configuration.d.ts` |
+| #27 (server) | `src/profile/board.ts`, `src/profile/owner-model.ts` | `src/api.ts`, `src/domain/types.ts` |
+| #29 (build rule) | none | `wrangler.jsonc`, `vitest.config.ts`, `worker-configuration.d.ts` |
+| #23 to #31 (tabs) | One `src/dashboard/<tab>.ts` each; `data.ts` for #24 | `src/dashboard/shell.ts`, `am.ts`, `glossary.ts`, `style.ts`, `test/dashboard.test.ts` |
+| #6, #16 | `local/agent-memory.mjs` dispatch, hooks and install | `local/agent-memory.test.mjs` |
+| #17 | `local/batch.mjs` | none |
+| #18 | `local/launchd.mjs`, `local/status.mjs`, `local/doctor.mjs`, `local/backfill.mjs` | none |
+| #19 | `local/inject.mjs` | none |
+| #20 | `local/eval.mjs`, `local/eval-score.mjs`, `test/eval-synthetic.test.ts`, `test/eval-baseline-setup.ts`, `test/fixtures/eval/` | `package.json`, `vitest.config.ts` |
+| #22 | `local/replay.mjs`, `local/transcript-full.mjs`, `local/replay.test.mjs` | `package.json` |
+| #32 | `docs/architecture.md`, `docs/module-contracts.md` and the AM-19 to AM-23 manifest rows | `docs/feature-manifest.md` |
+
+Merge order is one chain of 29 PRs, each built on the one before:
+
+1. Temp-directory support for tests (#39).
+2. Server, one PR each: #9, #12, #10, #11, #15, #14, #13, #27, #29. Each extends the `V2Read` union in `src/profile/store.ts` and the route list in `src/v2-api.ts`. #9 carries the wipe and restore fences, so no telemetry or candidate route ships without them.
+3. The #22 replay baseline with its privacy fix, then the CLI foundation (#6).
+4. #17, #19, #18 and the #20 source, then capture and scheduled runs (#16), whose installer copies those modules.
+5. The final #22 replay fix through PR51, which needs #16's text extraction; then the #18 `doctor` and `backfill` tests and the #20 eval gate.
+6. #24 and #23 together: the data client and the shell share one contract, so their eight files ship as one change.
+7. Tabs: #26, #27, #28, #29, #30, #31, then #25 with the shared tab tests.
+8. #32, these docs and the manifest rows, last.
+
+Status on 2026-11-04: #55 and #56 are merged, and #4 stays open. #17 (PR57) is held until #10 merges, because #10 must accept `request_id` before #17 sends it. #58, the first PR in the chain, also carries the CI corrections: the stale-vector recall fix in `src/profile/store.ts` and two `test/work-upload.test.ts` timing fixes. Both passed independent review and the corrected Worker run. There is no combined v2 PR. Feature IDs AM-19 to AM-23 follow the v2 plan's five outcomes in order; the [architecture](architecture.md#v2-summary-2026-11-04) records that allocation.
+
+Each issue PR adds its own dated section to `docs/feature-manifest.md`. README and `docs/import-verification.md` stay with the delivery owner.
+
+Original module tests for #9, #10, #11 and #15 were not preserved, and author-reported results on other trees are not reused as evidence. The combined phase added the coverage they lacked: channel and filter ranks, count rows, eval auth and fences (#9); lease replay, expiry, the stale queue and the purge pages (#10); health thresholds with a fake clock and status-body refusals (#11); and summary values, budget cuts and Corpus on, off and failing (#15). It passed in the combined local run ([evidence](import-verification.md#v2-combined-local-verification-2026-11-04)).

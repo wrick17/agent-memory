@@ -509,3 +509,63 @@ The canonical semantic audit accepted 1,374 approved Work records, 5,699 revisio
 Seven affected source paths are independently CLEAR and adopted in the root working tree at the [exact before/after map](/private/tmp/am-v1-capture-root-adopt-yju_qu6s/receipt.json). Recovery captures the cancellation counter before the authority await and checks it across awaited operations; Corpus FTS restore is bounded to 250 batches of 200 documents per step, with chunk application, FTS and final counts separated. Capture checks literal coverage and redacts before prompts and in legacy pending content; client and server handle escaped quoted values consistently for storage and request-hash replay. Pattern coverage has limits and does not guarantee detection of every secret.
 
 Fresh scoped backup checks passed 30 cases with typecheck and lint; author evidence records 205 local and 179 server cases. The combined affected phase passed 284 Worker tests, typecheck and lint. The normal offline package contains 76 files and 387 checked imports, SHA-256 `9083918ad5513ea0c917ea936be301ce8d28b59fbc7dd16afe0c2a1eded4a343`. The isolated fixture deployed version `e08cbff9-c12a-4fc7-8fd6-e89716661638`, bundle SHA-256 `4a7bca398415aa8a07feb1138413a3ea4c190a043d30fd2f2ff09d5554e622f0`. No full-suite or full recovery acceptance follows from these checks. The owner waived the maintenance cooldown only during implementation/testing until v1 freeze; the accepted private fixture-only `BATCH_GAP_MS` zero overlay is separate from root and production, whose frozen 20-hour rule remains unchanged. One additional Sonnet batch is approved under its existing data, authorization and recovery conditions; no cursor or clock reset is authorized. Actual learning and default capture-to-learning activation remain open.
+
+## v2 combined local verification, 2026-11-04
+
+**Combined local tests passed on the integrated v2 source. Hosted, populated-fixture and canonical acceptance are still open.**
+
+| Run | Result | Log SHA-256 |
+|---|---|---|
+| Worker tests, `vitest run`, 24 files | 628 of 628 passed, exit 0, 74.98 s | `8bd071b5e17014bf6a42e25b675cf2c8fbf7813a45ccb2838a1f760ac75a085c` |
+| Local CLI tests, `node --test` on the agent-memory, batch, replay and replay-player suites | 120 of 120 passed, exit 0, 60.45 s | `aab9e04be70d1a843dd227353ff878a15c99244c8a5215d2c6431d6ea561fecb` |
+
+- Source: 264 files on master `ba5bc2c`, manifest SHA-256 `d8e99dd94bd1e4b123255eb61b0fd38750694639de95198e187ac5c3c5ed01b6`, tree `1e304f36`. The tested tree matches it except four docs that no test reads: README, architecture, feature manifest and module contracts. [Receipt](/Users/pratyush.poddar/.local/share/agent-memory-preservation/v2-source-2026-11-04/author-final-V39-b6dca2vk/receipt.json).
+- Isolation: both runs used `env -i` with synthetic `HOME`, `TMPDIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `AGENT_MEMORY_HOME`, and no links to real credentials. The local run intercepted `launchctl`, and its marker file stayed absent.
+- Excluded: the one case that runs the real macOS sandbox probe was filtered by name. Neither run called a model or provider. `EVAL_WRITE_BASELINE` was unset, so no baseline changed.
+- Reviews: the replay fix for owner text and the Memories per-profile search fix passed independent review. The owner's search now narrows to the chosen profile before ranking and the limit; agents and read devices keep the `me` overlay.
+
+**Earlier incident**
+- Before these runs, a prohibited unfiltered local run executed the native sandbox and control probes on this Mac and overwrote `~/.agent-memory/probe/canary`. The file's earlier content is unknown. Those processes have stopped.
+- During review, one ordinary memory lookup returned embedding diagnostics. The no-provider statement covers the verified runs in this section, not the whole session.
+
+### Worker rerun after CI corrections
+
+**After the fixes for two CI failures, the Worker suite passed again: 628 of 628 tests in 24 files, exit 0, 85.50 s.**
+
+- The first Worker run above passed, but it missed timing-dependent failures that CI hit later on #58 and #60.
+- One was a product bug. After a replace or compaction, recall could match a record through a vector built from its old text. Recall now counts a vector hit only when the record's `embed_hash` equals its `card_hash`; the AM-01 row records the rule.
+- Two were test bugs in `test/work-upload.test.ts`. The test now reads a second-precision timestamp once, and its account SQL check leaves out meter writes from other profiles' alarms. No assertion was weakened.
+- Changed files: `src/profile/store.ts`, `test/work-upload.test.ts` and `docs/feature-manifest.md`. Every other file matches the I38 source. The local CLI inputs did not change, so the 120 of 120 local result above still applies.
+- Both fixes passed a fresh independent review.
+- Isolation was the same as above: `env -i`, synthetic homes, no provider or model calls and no native sandbox probe.
+- The log shows synthetic interruption errors and a Vitest RPC disposal warning. Vitest reported no failed test and no unhandled-error summary.
+- Log SHA-256 `10d13972ed59e74230902b34dd044edafe3829c11997e71eedfca04d05e25ef5`. [Receipt](/Users/pratyush.poddar/.local/share/agent-memory-preservation/v2-source-2026-11-04/author-final-V39-CI-corrections-drecx2lj/receipt.json), SHA-256 `2f581d2fa16e42f45d7880520e6c5cd2cee8d4691cad7991617a0f9e08762e86`.
+
+**Checkout incident**
+- While preparing this run, a shell kept going after a failed `cd` into an expired temp folder and applied two patches to the default checkout.
+- Both patches were reversed at once, and `git status` showed the checkout clean. No tests or external actions ran there.
+- Commands now run with an absolute working directory and stop when it is missing.
+
+### Final combined run, 2026-11-04
+
+**On the integrated v2 source at the I39 receipt, before the later #69, #76, #78 and #80 fixes, 645 of 645 Worker tests and 137 of 137 local CLI tests passed.**
+
+| Run | Result | Log SHA-256 |
+|---|---|---|
+| Worker tests, `vitest run`, 24 files | 645 of 645 passed, exit 0, 69.06 s | `4fecdd8167d94ff15f54921b043bae234a9fe22cfced3565e6ee0fdf551183b7` |
+| Local CLI tests, native sandbox case filtered | 137 of 137 passed, exit 0 | `0a77334921602924b31a54e5f5e3b1ef5cc3850adbd4d951647fdb027bacde65` |
+
+- Source manifest SHA-256 `8847e384c1203fa3284ca3057da99429ce066b2f725a614969625c18f45432df`; runtime manifest `0328c7e6ed043030eef1a69e0152c697682c621b8a4a17778563328156e673b0`. [Receipt](/Users/pratyush.poddar/.local/share/agent-memory-preservation/v2-source-2026-11-04/author-final-V39-I39-fixturefix-ukmxbtcu/receipt.json), SHA-256 `eab4b0aae5470fdbdfbf5d01daee441a2ea6638f8bf028123b597e132bcc2fbc`.
+- An earlier run of the same source failed 2 of 645 Worker tests in two test fixtures. Only `test/isolation-recall.test.ts` and `test/work-upload.test.ts` changed: their guards and expectations now match the real paused gate. Product code is unchanged, and an independent review cleared it, 33 of 33.
+- The local result stands on its own run of 137 tests. The two changed Worker test files are not read by the local suite.
+- Same isolation as above: `env -i`, synthetic homes, no provider or model calls, no native sandbox probe, and the `launchctl` marker stayed absent. Type check and eslint on the changed test files passed.
+- The Worker log shows three Vitest RPC disposal warnings. Vitest reported no failed test and no unhandled-error summary.
+- Earlier results are historical: 628 and 120 on the I38 source, 628 after the CI corrections, and 643 of 645 before the fixture fixes.
+- The no-provider statement covers these verified runs only, not the whole session, as noted above.
+- Still open: hosted and populated-fixture acceptance (#39), the fresh canonical Work backup (#50) and canonical delivery (#40). The #50 cleanup scope of 120 is approved, but no cleanup has run.
+
+**Still open**
+- Hosted checks on the isolated fixture Worker: route auth, the event stream, the viewer and health.
+- A populated-fixture schema upgrade, v1 and v2 export restore, rollback, and old-Worker reads and writes.
+- The test launchd job on this Mac, a real install, and native Codex prompt recall.
+- A fresh canonical Work backup (#50), then canonical delivery (#40), with prompt recall off.
