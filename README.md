@@ -35,6 +35,7 @@ Agent Memory is being prepared to replace BothQ for everyday use. The approved m
 - [ ] Sessions and Replay tabs (#29): source in review; not deployed.
 - [ ] Activity and Project profile tabs (#30): source in review; not deployed.
 - [ ] Audit across profiles and restyled Admin pages (#31): source in review; not deployed.
+- [ ] Overview and Health tabs (#25): source in review; not deployed.
 - [ ] Add the source-only batch transport for issue #17, with retries, stable request IDs and lease handling, before runtime lease acceptance (#10) and trigger forwarding (#16).
 - [ ] Local full-transcript replay, `agent-memory replay` (#22): source in review. `agent-memory install` copies it beside the CLI, but it is not installed on any machine.
 - [ ] Self-host setup for the dashboard's replay player (#39): `npm run setup` writes the Text loader rule for `local/*-player.js`, and the self-host package includes `local/replay-player.js`. Source in review; scoped setup tests (5/5) and dry-run builds pass, and no deployment has used it yet.
