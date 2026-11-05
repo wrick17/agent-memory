@@ -3,13 +3,15 @@
 import type { Am, J, Node, Profile } from "../am";
 
 export function timelinePages(am: Am): void {
-	const { btn, call, el, enc, input, link, note, pageStatus, recorded, switcher, why } = am;
+	const { btn, call, el, enc, input, intro, link, note, pageStatus, recorded, switcher, why } = am;
 
 	// Timeline, journals and the path finder (section 15): read-only views over the owner page reads, nothing written.
 	const DAY_MS = 86_400_000, TIMELINE_DAYS = 90;
 	/** One timeline event as text: its date, what happened, and a link to the record when the server named it. */
 	const eventItem = (parent: Node, p: Profile, e: J) => {
 		const li = el("li", parent), kind = String(e.event ?? ""), [cls, op] = kind.split(":");
+		li.setAttribute("data-item", "");
+		li.setAttribute("tabindex", "-1");
 		el("strong", li, recorded(e.at));
 		el("span", li, ` · ${cls === "activity" ? `Change: ${op} by ${recorded(e.actor)}` : cls === "revision" ? `Revision ${recorded(e.revision)}: ${op} by ${recorded(e.actor)}`
 			: kind === "entry" ? `Journal entry ${recorded(e.entry_seq)} by ${recorded(e.actor)}` : kind === "link_recorded" || kind === "link_ended"
@@ -25,6 +27,7 @@ export function timelinePages(am: Am): void {
 	// cursor: a cut window says so, and only a narrower window or the 500-event limit shows more.
 	const timelinePage = (view: Node, p: Profile, nodeId?: string) => {
 		const version = am.pageVersion, h = el("h2", view, `Timeline: ${p.name}`);
+		intro(view, "Timeline", "timeline", "Changes, revisions, journal entries and links in one window of time, oldest first.");
 		switcher(view, "timeline", p.name);
 		if (nodeId) {
 			el("p", view, "Showing one record's revisions, entries and links.");
@@ -33,6 +36,7 @@ export function timelinePages(am: Am): void {
 		}
 		note(view, `A window of at most ${TIMELINE_DAYS} days, ISO dates with Z or an offset; a date alone means midnight UTC. To is not included.`);
 		const form = el("form", view), now = Date.now();
+		form.setAttribute("class", "toolbar");
 		const from = input(form, "tl-from", "From");
 		from.value = new Date(now - 7 * DAY_MS).toISOString();
 		const to = input(form, "tl-to", "To");
@@ -66,6 +70,7 @@ export function timelinePages(am: Am): void {
 			if (!r.events.length) note(out, "No events in this window.");
 			const list = el("ol", out);
 			list.setAttribute("class", "prefs");
+			list.setAttribute("data-list", "");
 			for (const e of r.events) eventItem(list, p, e);
 			more.hidden = r.truncated !== true || limit === 500;
 			if (moveFocus) msg.focus();

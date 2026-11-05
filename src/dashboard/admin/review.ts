@@ -3,7 +3,8 @@
 import type { Am, J, Move, Node, Profile } from "../am";
 
 export function reviewPages(am: Am): void {
-	const { act, active, btn, call, choose, el, enc, facts, input, link, note, pageStatus, recorded, render, switcher, textBlock, undoOf, why } = am;
+	const { act, active, btn, call, choose, el, enc, facts, input, intro, link, note, pageStatus, recorded, render, switcher, textBlock, undoOf, why } = am;
+	const panel = (parent: Node, label: string) => { const s = el("section", parent); s.setAttribute("class", "panel"); s.setAttribute("aria-label", label); return s; };
 
 	// Review (section 15): this profile's captured suggestions through review_candidates, list then an explicit promote or dismiss.
 	// Captures are untrusted evidence, shown only as text. Each action's exact request (with its request id) is kept until the server
@@ -11,11 +12,12 @@ export function reviewPages(am: Am): void {
 	const reviewSent = new Map<string, Record<string, unknown>>(); // `${profile}:${capture}:${action}` -> last request sent
 	const reviewPage = (view: Node, p: Profile) => {
 		const version = am.pageVersion, base = `/api/profiles/${enc(p.name)}/review`, h = el("h2", view, `Review: ${p.name}`);
+		intro(view, "Review", "review", "Captured suggestions, flagged records, restore findings, migrated records and stopped moves, each waiting for your decision.");
 		switcher(view, "review", p.name);
 		note(view, "Captured suggestions are untrusted evidence from agents and capture hooks. Nothing is promoted unless you choose Promote; captures never go to me.");
 		const unresolved = [...reviewSent].filter(([key]) => key.startsWith(`${p.name}:`));
 		if (unresolved.length) {
-			const receipts = el("section", view);
+			const receipts = panel(view, "Unconfirmed reviews");
 			el("h3", receipts, "Unconfirmed reviews");
 			note(receipts, "Retry sends the original request and request ID, even if the suggestion has left this list.");
 			for (const [key, sent] of unresolved) {
@@ -26,12 +28,15 @@ export function reviewPages(am: Am): void {
 				}), `Retry ${String(sent.action)} for captured suggestion ${String(sent.candidate_id)}`);
 			}
 		}
-		const form = el("form", view);
+		const caps = panel(view, "Captured suggestions");
+		el("h3", caps, "Captured suggestions");
+		const form = el("form", caps);
+		form.setAttribute("class", "toolbar");
 		const status = choose(form, "review-status", "Status", [["pending", "Pending"], ["promoted", "Promoted"], ["dismissed", "Dismissed"], ["all", "All"]]);
 		const limit = choose(form, "review-limit", "Show at most", [["20", "20"], ["50", "50"], ["100", "100"]]);
 		el("button", el("p", form), "Show").setAttribute("type", "submit");
-		const { msg, say } = pageStatus(view);
-		const list = el("ul", view);
+		const { msg, say } = pageStatus(caps);
+		const list = el("ul", caps);
 		list.setAttribute("class", "prefs");
 		list.setAttribute("aria-label", "Captured suggestions");
 		let request = 0;
@@ -112,8 +117,7 @@ export function reviewPages(am: Am): void {
 		// Flagged records: housekeeping, a protected record's refused move or promotion flagged them instead of acting. They are found in
 		// the profile's whole-graph read (shared with the graph page); the reason is the record's own read. Unflag is the owner node
 		// action with its Undo; forget, edit and move stay on the record's page.
-		const flags = el("section", view), g = am.graphOf(p);
-		flags.setAttribute("aria-label", "Flagged records");
+		const flags = panel(view, "Flagged records"), g = am.graphOf(p);
 		el("h3", flags, "Flagged records");
 		const fStatus = el("p", flags), fList = el("ul", flags);
 		fList.setAttribute("class", "prefs");
@@ -148,8 +152,7 @@ export function reviewPages(am: Am): void {
 
 		// Restore reconciliation: an open restore's unresolved findings, read from the recovery status; running, opening or aborting it
 		// stays on the Backups page. Choosing one copy of an unresolved pair is not offered by the server yet.
-		const recon = el("section", view);
-		recon.setAttribute("aria-label", "Restore reconciliation");
+		const recon = panel(view, "Restore reconciliation");
 		el("h3", recon, "Restore reconciliation");
 		const rStatus = el("p", recon, "Reading the recovery status…");
 		(async () => {
@@ -168,13 +171,11 @@ export function reviewPages(am: Am): void {
 		})();
 
 		// The account's review list (section 15): read once per page; every action is an explicit button and its outcome stays on the page.
-		const mig = el("section", view), col = el("section", view);
-		mig.setAttribute("aria-label", "Migrated records waiting for a profile");
+		const mig = panel(view, "Migrated records waiting for a profile"), col = panel(view, "Moves stopped by a collision");
 		el("h3", mig, "Migrated records waiting for a profile");
 		note(mig, "The local import plan lists records no rule routes (node local/upload.mjs review-push). Assigning only records your choice: review-pull writes it as a routes file, and the next plan with --routes checks the record again and imports it. Nothing goes to me.");
 		const mStatus = el("p", mig, "Reading the review list…"), mList = el("ul", mig);
 		mList.setAttribute("class", "prefs");
-		col.setAttribute("aria-label", "Moves stopped by a collision");
 		el("h3", col, "Moves stopped by a collision");
 		note(col, "The destination already held this record or one with the same name, scope and type, so nothing moved. Rename it and move it again, merge it into the record it met, or keep both where they are.");
 		const cStatus = el("p", col, "Reading the review list…"), cList = el("ul", col);

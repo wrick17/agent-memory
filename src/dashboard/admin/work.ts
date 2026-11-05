@@ -3,7 +3,7 @@
 import type { Am, Failure, Node, Profile } from "../am";
 
 export function workPages(am: Am): void {
-	const { active, call, el, facts, recorded } = am;
+	const { active, call, el, facts, intro, recorded } = am;
 	type BoardRef = { id: string; readable?: false; kind?: string; name?: string };
 	type Board = { as_of: string; items: { kind: string; name: string; key: string | null; priority: string | null; due: string | null;
 		score: number; reasons: { term: string; points: number; text: string }[]; stale: boolean; last_activity_at: string;
@@ -18,8 +18,10 @@ export function workPages(am: Am): void {
 			a.setAttribute("href", `#/work/${encodeURIComponent(q.name)}`);
 			if (q.name === p.name) a.setAttribute("aria-current", "page");
 		}
-		el("p", view, "Covers only what the owner's machines have uploaded. Item fields are their latest upload; as_of dates links, due dates and activity. This is not a historical snapshot of item fields.");
-		const form = el("form", view), label = el("label", form, "As of (ISO date and time with Z for UTC or an explicit offset; blank uses server time)");
+		intro(view, "Work", "work", "Covers only what the owner's machines have uploaded. Item fields are their latest upload; as_of dates links, due dates and activity. This is not a historical snapshot of item fields.");
+		const form = el("form", view);
+		form.setAttribute("class", "toolbar");
+		const label = el("label", form, "As of (ISO date and time with Z for UTC or an explicit offset; blank uses server time)");
 		label.setAttribute("for", "work-as-of");
 		const date = el("input", form);
 		date.setAttribute("id", "work-as-of");
@@ -33,11 +35,13 @@ export function workPages(am: Am): void {
 		msg.setAttribute("tabindex", "-1");
 		const result = el("section", view);
 		result.setAttribute("aria-label", "Work board result");
+		result.setAttribute("class", "panel");
+		result.hidden = true;
 		const more = el("button", view, "Show up to 200 items");
 		more.setAttribute("type", "button");
 		more.hidden = true;
 		let request = 0, returnedDate = "";
-		const invalidate = () => { request++; result.replaceChildren(); more.hidden = true; };
+		const invalidate = () => { request++; result.replaceChildren(); result.hidden = true; more.hidden = true; };
 		date.addEventListener("input", () => { invalidate(); msg.textContent = "Date changed. Choose Show board to load it."; });
 		const load = async (asOf: string, limit = 50, moveFocus = false) => {
 			invalidate();
@@ -63,6 +67,7 @@ export function workPages(am: Am): void {
 			}
 			if (!current()) return;
 			returnedDate = board.as_of;
+			result.hidden = false;
 			el("h3", result, `As of ${returnedDate}`);
 			const limited = board.truncated === true, partial = board.budget?.exhausted === true;
 			msg.textContent = `Showing ${board.items.length} ranked open items${typeof board.total === "number" ? ` of ${board.total} evaluated` : "; evaluated count unavailable"}.`;

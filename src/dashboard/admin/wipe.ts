@@ -3,7 +3,7 @@
 import type { Am, Failure, J, Node } from "../am";
 
 export function wipePages(am: Am): void {
-	const { act, btn, call, el, enc, facts, input, link, live, note, pageStatus, recorded, render, why, win } = am;
+	const { act, btn, call, el, enc, facts, input, intro, link, live, note, pageStatus, recorded, render, why, win } = am;
 
 	// The wipe preview (section 9) for an active profile: every other profile the wipe reads, both parts, page by page from the
 	// server's read-only preview, before the confirmation is offered. A failed page stops the walk; reading again is explicit and
@@ -12,6 +12,7 @@ export function wipePages(am: Am): void {
 	const wipePreviewView = (parent: Node, name: string, version: number, done: () => void) => {
 		const sec = el("section", parent);
 		sec.setAttribute("aria-label", "Preview of the wipe outside this profile");
+		sec.setAttribute("class", "panel");
 		el("h3", sec, `Before you confirm: what happens outside ${name}`);
 		note(sec, "Read now, page by page; it is not a snapshot. Records written, moved or archived after this preview are decided by the same rules when the wipe runs.");
 		note(sec, "A preference that survives in me is one you accepted as free of company details. One marked as decided when the wipe runs has archived history the wipe checks only then. Records that stay but mention this profile's terms are listed for you to review; the wipe does not change them.");
@@ -76,12 +77,13 @@ export function wipePages(am: Am): void {
 		const version = am.pageVersion;
 		if (name === undefined) {
 			const h = el("h2", view, "Wipe a profile");
-			el("p", view, "Choose the profile to wipe. Nothing happens until you confirm on its page.");
+			intro(view, "Wipe", "wipe", "Choose the profile to wipe. Nothing happens until you confirm on its page.");
 			const ul = el("ul", view);
 			for (const q of am.profiles) link(el("li", ul), `#/wipe/${enc(q.name)}`, `${q.name} (${q.status})`);
 			return h;
 		}
 		const base = `/api/profiles/${enc(name)}/wipe`, h = el("h2", view, `Wipe profile: ${name}`);
+		intro(view, "Wipe", "wipe", "Removes everything this profile holds, everywhere, after a full preview and the typed name. It cannot be undone.");
 		link(el("p", view), "#/wipe", "Choose another profile");
 		const { msg, say } = pageStatus(view);
 		const body = el("div", view);
@@ -122,6 +124,7 @@ export function wipePages(am: Am): void {
 			let previewed = unfinished;
 			if (!unfinished) wipePreviewView(body, name, version, () => { previewed = true; gate(); });
 			const form = el("form", body);
+			form.setAttribute("class", "panel");
 			const typed = input(form, "wipe-typed", `Type ${name} to confirm`);
 			typed.setAttribute("autocomplete", "off");
 			typed.setAttribute("spellcheck", "false");

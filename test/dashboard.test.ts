@@ -133,7 +133,7 @@ const ROUTES: [string, string][] = [
 	["#/about", "About you: personal"], ["#/about/work", "About you: work"], ["#/memories", "Memories: work"],
 	["#/memories/personal", "Memories: personal"], ["#/memory/work/r1", "Memory"], ["#/graph/work", "Knowledge graph: work"],
 	["#/graph/work/r1", "Knowledge graph: work"], ["#/map/work", "Map: work"], ["#/draft", "Write: work"], ["#/draft/work", "Write: work"],
-	["#/activity/work", "Activity: work"], ["#/timeline/work", "Timeline: work"], ["#/journals/work", "Journals: work"],
+	["#/activity/work", "Audit: work"], ["#/timeline/work", "Timeline: work"], ["#/journals/work", "Journals: work"],
 	["#/path/work", "Path finder: work"], ["#/review/work", "Review: work"], ["#/move/work/r1", "Move a record"], ["#/copy/work/r1", "Save a copy"],
 	["#/backups", "Backups and recovery"], ["#/routing", "Routing"], ["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"],
 	["#/graph/nobody", "No active profile named nobody"]];
@@ -146,7 +146,7 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
 // The registered Memories tab takes the built-in Memories entry's place.
 const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
-	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Audit #/activity"]],
+	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Audit #audit"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -266,7 +266,7 @@ describe("dashboard shell", () => {
 		expect(b.seen.fetched).toContain("/api/profiles/personal/nodes/r1");
 		expect(current()).toEqual(["Memories"]);
 		b.go("#audit");
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Activity: work");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Audit"); // the Audit tab
 		expect(current()).toEqual(["Audit"]);
 		b.go("#memories?profile=nobody");
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: no active profile named nobody"); // the shell refuses it before the tab reads
@@ -298,11 +298,11 @@ describe("dashboard shell", () => {
 		expect(b.win.location.hash).toBe("#/memories");
 		b.key("g", null);
 		expect(b.key("u", null)).toBe(true);
-		expect(b.win.location.hash).toBe("#/activity");
+		expect(b.win.location.hash).toBe("#audit"); // the Audit tab's own link
 		expect(b.key("?", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(false);
 		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("g Graph, u Audit, m Memories");
+		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, m Memories, l Lessons, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, u Audit.");
 		expect(b.key("Escape", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(true);
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
@@ -2445,5 +2445,74 @@ describe("dashboard Memories tab", () => {
 		pick.on.change!();
 		expect(b.win.location.hash).toBe("#memories?profile=personal&q=diffs"); // the tab's own address after it reads personal
 		expect(find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value).toBe("diffs");
+	});
+});
+
+describe("dashboard Audit tab and Admin pages", () => {
+	// From the Audit and Admin author's smoke: undo conflicts, filters from the link, token-safe copy, and every Admin page's intro.
+	const act = (id: number, at: string, p: string, extra: Record<string, unknown> = {}) => ({ id, at, actor: "agent", device_id: null, op: "save", summary: `${p} change ${id} <b>x</b>`,
+		targets: [`${p}-n${id}`], undone_by: null, undo_of: null, undo: "available", ...extra });
+	const ROWS: Record<string, ReturnType<typeof act>[]> = { work: [act(9, "2026-11-03T10:00:00.000Z", "work"), act(7, "2026-11-02T10:00:00.000Z", "work", { actor: "owner" })],
+		personal: [act(5, "2026-11-02T12:00:00.000Z", "personal", { actor: "migration", op: "import", undo: "none" })] };
+	const api: Api = (path, method) => {
+		const u = new URL(path, "https://x"), seg = u.pathname.split("/"), json = (v: unknown, status = 200) => Response.json(v, { status });
+		if (method === "GET" && /\/activity$/.test(u.pathname)) {
+			const actor = u.searchParams.get("actor"), rows = (ROWS[seg[3]!] ?? []).filter((r) => !actor || r.actor === actor);
+			return json({ items: rows, next_before: null });
+		}
+		if (method === "POST" && /activity\/9\/undo$/.test(u.pathname)) return json({ error: { code: "revision_conflict", message: "changed since; review by hand" } }, 409);
+		if (/\/archive$/.test(u.pathname)) return json({ items: [], next_after: null });
+		if (path === "/api/rules") return json({ rules: [], profiles: ["work", "personal"] });
+		if (path === "/api/recovery") return json({ recovery: null, last_export: null });
+		if (path === "/api/backups/drill") return json({ drill: null, last: null });
+		if (/\/wipe$/.test(u.pathname)) return json({ status: "active", generation: "b", wipe: null });
+		if (/\/wipe\/preview/.test(u.pathname)) return json(u.searchParams.get("target") ? { items: [], next: null } : { targets: [] });
+		if (method === "POST" && /\/review$/.test(u.pathname)) return json({ candidates: [] });
+		if (/\/owner-model|\/journals|\/review$/.test(u.pathname) || path.startsWith("/api/review")) return json({ items: [], next_after: null });
+		if (/\/board/.test(u.pathname)) return json({ as_of: "2026-11-04T00:00:00Z", items: [], total: 0, truncated: false, without_state: 0, review: null, budget: { exhausted: false, skipped: 0 } });
+		if (/\/map$/.test(u.pathname)) return json({ nodes: [], links: [], starts: [] });
+		if (/\/timeline$/.test(u.pathname)) return json({ events: [], truncated: false });
+		if (/\/graph$/.test(u.pathname)) return json({ items: [], next_after: null, total: 0 });
+		if (/\/nodes\//.test(u.pathname)) return json({ error: { code: "not_found", message: "no node" } }, 404);
+	};
+
+	it("asks for review by hand on an undo conflict, reads filters from the link, and copies curl with the owner token variable", async () => {
+		const copied: string[] = [];
+		const b = browser({ signedIn: true, hash: "#audit", api });
+		Object.assign(b.win, { navigator: { clipboard: { writeText: async (t: string) => { copied.push(t); } } } });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("work change 9 <b>x</b>"); // summaries stay text
+		expect(find(b.view(), "b")).toEqual([]);
+		find(b.view(), "button").find((x) => /^Undo work change 9/.test(x.attrs["aria-label"] ?? ""))!.on.click!();
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain("Changed since. Review by hand");
+		expect(b.seen.posted.at(-1)).toBe("/api/profiles/work/activity/9/undo");
+		b.go("#audit?profile=work&actor=owner");
+		for (let i = 0; i < 2; i++) await settle();
+		const sel = (id: string) => find(b.view(), "select").find((x) => x.attrs.id === id)?.value;
+		expect([find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!.value, sel("audit-actor")]).toEqual(["work", "owner"]); // the header picker
+		expect(text(b.view())).toContain("work change 7");
+		expect(text(b.view())).not.toContain("personal change");
+		click(button(b.view(), "Copy curl"));
+		await settle();
+		expect(copied.at(-1)).toContain("/api/profiles/work/activity?limit=50&actor=owner");
+		expect(copied.at(-1)).toContain("$AGENT_MEMORY_OWNER_TOKEN");
+		expect(copied.join()).not.toContain("session-token");
+	});
+
+	it("opens every Admin page with its intro and no load failure", async () => {
+		const b = browser({ signedIn: true, hash: "#/profiles", api });
+		await dashboardMain(b.win);
+		await settle();
+		const bad: string[] = [];
+		for (const h of ["#/profiles", "#/draft/work", "#/path/work", "#/map/work", "#/timeline/work", "#/journals/work", "#/review/work", "#/backups", "#/routing", "#/move",
+			"#/copy/work", "#/wipe", "#/wipe/work", "#/work/work", "#/about/work"]) {
+			b.go(h);
+			for (let i = 0; i < 2; i++) await settle();
+			const t = text(b.view());
+			if (!find(b.view(), "p").some((x) => x.attrs.class === "intro") || /No page|Could not/.test(t)) bad.push(`${h}: ${t.slice(0, 160)}`);
+		}
+		expect(bad).toEqual([]);
 	});
 });
