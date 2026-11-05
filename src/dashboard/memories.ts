@@ -268,7 +268,9 @@ export function memoriesTab(am: Am): void {
 		panel.setAttribute("aria-label", "Memory detail");
 		panel.hidden = true;
 
-		const table = el("table", listBox);
+		const tableBox = el("div", listBox); // nine columns: below that width the table scrolls in its box, not the page
+		tableBox.setAttribute("class", "tablewrap");
+		const table = el("table", tableBox);
 		el("caption", table, "Memories").setAttribute("class", "vh");
 		const head = el("tr", el("thead", table));
 		const all = el("input", el("th", head));
@@ -341,6 +343,7 @@ export function memoriesTab(am: Am): void {
 			box.setAttribute("aria-label", `Select ${name}`);
 			box.addEventListener("change", () => { if (box.checked) selected.add(key); else selected.delete(key); reselect(); });
 			const t = el("td", tr), title = el("a", t, name);
+			t.setAttribute("class", "mem-title");
 			title.setAttribute("href", memoryHash(p, id));
 			title.setAttribute("data-item", "");
 			title.addEventListener("click", (e: J) => { if (e.ctrlKey || e.metaKey || e.shiftKey) return; e.preventDefault(); open(p, id); });

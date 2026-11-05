@@ -4,7 +4,7 @@
 // (4.5:1) on both --bg and --panel in its theme, and --line (control borders) passes 3:1.
 //
 // Classes the tabs can use (one look per role; the names after a slash are the same rule under a tab's own name):
-// - Boxes: .panel / .mem-detail / .agentbox / .player / .replay-detail (a ruled box). .split / .mem-split / .replay-body (list
+// - Boxes: .panel / .mem-detail / .agentbox / .player / .replay-detail (a ruled box). .tablewrap scrolls a wide table in place. .split / .mem-split / .replay-body (list
 //   and detail side by side). .cards with .card.
 // - Rows of controls: .toolbar / .bulk / .actions / .replay-controls. .linklike is a button drawn as a link.
 // - Numbers: .stats with .stat > .num (or strong) and .lbl (or .label).
@@ -78,7 +78,7 @@ main{flex:1;width:100%;max-width:1320px;margin:0 auto;padding:.5rem 1.25rem 2rem
 .panel,.mem-detail,.agentbox,.player,.replay-detail,.card,.empty{background:var(--panel);border:1px solid var(--rule);padding:.8rem 1rem;margin:0 0 1rem}
 .cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}.card{padding:0 1rem}
 .agentbox h3{margin-top:0}.mem-detail,.replay-detail{position:sticky;top:.5rem;max-height:calc(100vh - 1rem);overflow:auto}
-.split,.mem-split,.replay-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:1rem;align-items:start}@media (max-width:900px){.split,.mem-split,.replay-body{grid-template-columns:1fr}.mem-detail,.replay-detail{position:static;max-height:none}}
+.split,.mem-split,.replay-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:1rem;align-items:start}@media (max-width:900px){.split,.mem-split,.replay-body{grid-template-columns:minmax(0,1fr)}.mem-detail,.replay-detail{position:static;max-height:none}}
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));border-top:1px solid var(--rule);border-left:1px solid var(--rule);margin:0 0 1rem}
 .stat{border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:.7rem .85rem;background:var(--panel)}
 .stat .num,.stat strong{display:block;font:600 1.9rem/1.1 var(--serif)}.stat .lbl,.stat .label{display:block;font:10px var(--mono);text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-top:.3rem}
@@ -97,7 +97,7 @@ meter::-webkit-meter-optimum-value,meter::-webkit-meter-suboptimum-value,meter::
 meter::-moz-meter-bar{background:var(--ink)}
 .excerpt{color:var(--muted);font-size:.9em;margin-top:.15rem}
 .diff ins{text-decoration:underline;color:var(--ok)}.diff del{text-decoration:line-through;color:var(--accent)}
-table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--rule);padding:.45rem .5rem;text-align:left;vertical-align:top}
+table{border-collapse:collapse;width:100%}.tablewrap{overflow-x:auto;max-width:100%}td.mem-title{min-width:12rem}td .chip{white-space:normal}td,th{border-bottom:1px solid var(--rule);padding:.45rem .5rem;text-align:left;vertical-align:top}
 th{font:10px var(--mono);text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:400}
 tr[aria-current=true],tr[aria-selected=true],[data-item][aria-selected=true],.selected,button.row[aria-current=true],.replay-event[aria-selected=true]{background:var(--sel);box-shadow:inset 3px 0 0 var(--accent)}
 .list{list-style:none;padding:0;margin:0;max-height:70vh;overflow:auto;border:1px solid var(--rule);background:var(--panel)}

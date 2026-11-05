@@ -22,7 +22,7 @@ Full-size Test Corpus restore opened with all 7,549 chunks and no findings. Acco
 
 The reviewed profile-selection change is deployed to canonical and passed bounded checks on all four profiles. It lets agents choose an authorized profile without storage classifying memory content; legacy omitted-profile routing remains compatible. [Verification](docs/import-verification.md#profile-selection-local-verification-2026-11-04).
 
-v2 is built and reviewed in source, but it is not deployed or active on the everyday canonical service. Checks on the isolated hosted fixture are partial. Its changes go into the repository one issue at a time. The everyday service upgrades only after a fresh Work backup and the hosted checks. [Design and status](docs/architecture.md#v2-summary-2026-11-04).
+v2 is built and reviewed in source, but it is not deployed or active on the everyday canonical service. Checks on the isolated hosted fixture are partial: the narrow-screen Memories layout now passes there, and other items remain open. Its changes go into the repository one issue at a time. The everyday service upgrades only after a fresh Work backup and the hosted checks. [Design and status](docs/architecture.md#v2-summary-2026-11-04).
 
 Project and strategic reviews, the broader dashboard and reader trial, full-size Work-wipe expansion, cosmetic polish and exhaustive test matrices are follow-up work. Proactive PR and Jira feeds remain excluded. BothQ stays running and readable as a legacy fallback; there are no ordinary dual writes. The [feature manifest](docs/feature-manifest.md) retains the broader historical commitments and their evidence.
 
