@@ -569,3 +569,21 @@ Fresh scoped backup checks passed 30 cases with typecheck and lint; author evide
 - A populated-fixture schema upgrade, v1 and v2 export restore, rollback, and old-Worker reads and writes.
 - The test launchd job on this Mac, a real install, and native Codex prompt recall.
 - A fresh canonical Work backup (#50), then canonical delivery (#40), with prompt recall off.
+
+## v2 canonical release, 2026-11-05
+
+**v2 is released on the everyday canonical service as version `2d86c5b7-b5af-462a-9f97-5a47a0e9b222` from `782f9b9634ded253d413d6d577bd835219dae395`.** Prompt recall stays off, and BothQ and other machines are unchanged.
+
+| Step | Result |
+|---|---|
+| Rollback point, before the upgrade | Encrypted exports of every profile and the account: me `20261105T071338133Z-61cf8d5e`, personal `20261105T071340596Z-1eea8391`, test `20261105T071347715Z-ed8a4766`, work `20261105T071350019Z-2ce533c7`, account `20261105T071407087Z-62c6f0cb`, Work Corpus `20261105T071413425Z-940d8054`; Personal and Test Corpus stores were empty. Schema: Profile 8, Account 6, Work Corpus 6, read from authenticated manifests. Existing exports were kept; the nightly job still keeps the newest two. |
+| Controls | all 18 existing bindings and resource identities, variables, custom domain, 03:17 UTC cron, disabled workers.dev and previews preserved; the source-required version metadata binding was added |
+| Canonical upgrade | Version `2d86c5b7-b5af-462a-9f97-5a47a0e9b222`, deployed only after the rollback point was verified. |
+| Smoke | `test` first, then `work`, `personal` and `me`, with MCP read and write and matching audit counts: each profile passed synthetic create, read, update and two-revision history; each had the matching save and update activity rows |
+| This Mac | The runner was updated, keeping the Work and Personal configuration, hooks and a rollback copy: 20 runtime files matched source, with prior files and the entry symlink recorded for rollback; configuration and hooks were unchanged. Prompt recall is off. No LaunchAgent, and no new persistent credentials. |
+| Schedule | The T3 Code task at 11:00 Monday to Friday, Asia/Kolkata, is enabled. Next run: 6 November 2026, 11:00 Asia/Kolkata. It was not run now. |
+| CI | [source PR #85 CI](https://github.com/wrick17/agent-memory/actions/runs/41971829565/job/127061629921) |
+
+**Known limits**
+- Same-tab live-update reconnect is not proven (#39). The owner accepted manual Refresh.
+- Rolling back the Worker code doesn't roll back the data. Restoring data uses the fresh exports above.
