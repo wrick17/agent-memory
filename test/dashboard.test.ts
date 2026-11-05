@@ -145,7 +145,8 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
 // The registered Memories tab takes the built-in Memories entry's place.
-const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]], ["System", ["Audit #/activity"]],
+const GROUPED_NAV = [["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
+	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Audit #/activity"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -2120,6 +2121,129 @@ describe("dashboard Sessions and Replay tabs", () => {
 		pick.value = "personal";
 		pick.on.change!();
 		expect(b.win.location.hash).toBe("#replay/b?profile=personal");
+	});
+});
+
+describe("dashboard Activity tab", () => {
+	it("shows the day picked last when an earlier day's read answers late, and keeps each day's own answer", async () => {
+		const iso = (t: number) => new Date(t).toISOString().slice(0, 10), dayB = iso(Date.now()), dayA = iso(Date.now() - 86_400_000);
+		const g: Record<string, ReturnType<typeof gate>> = { [dayA]: gate(), [dayB]: gate() };
+		const summary = (from: string, to: string, note: string) => ({ from, to, active_days: 2, sessions: 1, observations: 2, busiest_day: dayB,
+			days: [{ day: dayA, count: 1 }, { day: dayB, count: 1 }], kinds: { asks: 2, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [],
+			busiest_sessions: [], latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] });
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: async (path) => {
+			const u = new URL(path, "https://x");
+			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+			const from = u.searchParams.get("from")!, to = u.searchParams.get("to")!;
+			if (from !== to) return Response.json(summary(from, to, "the whole year"));
+			await g[from]!.wait;
+			return Response.json(summary(from, to, `asked on ${from}`));
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const day = (d: string) => find(b.view(), "button").find((x) => x.attrs["data-day"] === d)!;
+		day(dayA).on.click!();
+		day(dayB).on.click!();
+		g[dayB]!.open();
+		for (let i = 0; i < 2; i++) await settle();
+		g[dayA]!.open(); // the older pick answers last
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`What agents did on ${dayB}`);
+		expect(text(b.view())).toContain(`asked on ${dayB}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayA}`);
+		day(dayA).on.click!(); // A's own answer was kept for A
+		for (let i = 0; i < 2; i++) await settle();
+		expect(text(b.view())).toContain(`asked on ${dayA}`);
+		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
+	});
+
+	// One profile's year as the activity-summary route answers it; `extra` replaces fields.
+	const year = (from: string, to: string, extra: Record<string, unknown> = {}) => ({ from, to, active_days: 0, sessions: 0, observations: 0, busiest_day: null, days: [],
+		kinds: { asks: 0, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [], busiest_sessions: [], latest: [], ...extra });
+	const yearApi: (extra?: Record<string, unknown>) => Api = (extra) => (path) => {
+		const u = new URL(path, "https://x");
+		if (u.pathname === "/api/profiles/work/activity-summary") return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, extra));
+	};
+
+	it("moves through the heatmap by date: Up and Down a day, Left and Right a week, Home and End to the first and last day", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ observations: 1, sessions: 1, active_days: 1 }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		const cells = find(b.view(), "button").filter((x) => x.attrs["data-day"]), days = cells.map((x) => x.attrs["data-day"]!).sort();
+		const cell = (d: string) => cells.find((x) => x.attrs["data-day"] === d)!, table = find(b.view(), "table")[0]!;
+		const press = (key: string, from: string) => { table.on.keydown!({ key, target: cell(from), preventDefault() {} } as never); return active?.attrs["data-day"]; };
+		const last = days.at(-1)!, back = (n: number) => days[days.length - 1 - n];
+		let at = last; // the roving stop: today
+		const seen = ["ArrowUp", "ArrowLeft", "ArrowRight", "ArrowDown", "Home", "End"].map((k) => (at = press(k, at)!));
+		expect(seen).toEqual([back(1), back(8), back(1), last, days[0], last]);
+		expect(cells.filter((x) => x.attrs.tabindex === "0").map((x) => x.attrs["data-day"])).toEqual([last]); // still one roving stop
+	});
+
+	it("lists the corpus's most touched files when a year has no observations, and keeps them selectable", async () => {
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ top_files: [{ path: "src/a.ts", count: 3 }] }) });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("No observations in work in the last 12 months.");
+		const file = () => find(b.view(), "button").find((x) => x.attrs["data-f"] === "file:src/a.ts")!;
+		expect(file()).toBeDefined(); // a selectable file filter
+		expect(file().attrs["aria-pressed"]).toBe("false");
+		file().on.click!();
+		await settle();
+		expect(file().attrs["aria-pressed"]).toBe("true");
+		expect(b.win.location.hash).toBe("#activity?profile=work&file=src%2Fa.ts");
+	});
+
+	it("reads the summaries again while it is open, so a capture upload shows without Refresh, and stops after leaving the tab", async () => {
+		let note = "asked before the capture";
+		const reads: string[] = [];
+		let stream!: ReadableStreamDefaultController<Uint8Array>;
+		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
+			// The live stream stays up, as it does while a capture uploads: nothing pauses it.
+			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
+			const u = new URL(path, "https://x");
+			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+			reads.push(path);
+			const to = u.searchParams.get("to")!;
+			return Response.json(year(u.searchParams.get("from")!, to, { observations: 1, sessions: 1, active_days: 1, latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] }));
+		} });
+		// A capture adds digest parts but no activity row, so no live event comes; the page's own timer is held here and run by hand.
+		const later: [() => unknown, number][] = [];
+		Object.assign(b.win, { setTimeout: (f: () => unknown, ms: number) => later.push([f, ms]), clearTimeout() {} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 3; i++) await settle();
+		expect(text(b.view())).toContain("asked before the capture");
+		note = "asked after the capture";
+		const tick = async () => { const i = later.findIndex(([, ms]) => ms === 60_000); expect(i).toBeGreaterThanOrEqual(0); const [due] = later.splice(i, 1); await due![0](); for (let j = 0; j < 2; j++) await settle(); };
+		await tick();
+		expect(text(b.view())).toContain("asked after the capture");
+		b.go("#/memories");
+		const before = reads.length;
+		await tick();
+		expect(reads.length).toBe(before); // no read once Activity is gone
+		expect(later.some(([, ms]) => ms === 60_000)).toBe(false); // and no further reload is scheduled
+		b.listeners.pagehide!();
+		stream.close();
+	});
+
+	it("moves its rolling year forward on Refresh after UTC midnight, with today's cell", async () => {
+		const reads: string[] = [], realNow = Date.now;
+		Date.now = () => Date.parse("2026-11-04T23:59:30Z");
+		try {
+			const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
+				const u = new URL(path, "https://x");
+				if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
+				reads.push(u.searchParams.get("to")!);
+				return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, { observations: 1, sessions: 1, active_days: 1 }));
+			} });
+			await dashboardMain(b.win);
+			for (let i = 0; i < 3; i++) await settle();
+			const day = (d: string) => find(b.view(), "button").some((x) => x.attrs["data-day"] === d);
+			expect([reads.at(-1), day("2026-11-04"), day("2026-11-05")]).toEqual(["2026-11-04", true, false]);
+			Date.now = () => Date.parse("2026-11-05T00:00:30Z"); // the tab stays open past midnight
+			click(button(b.view(), "Refresh")); // the minute poll runs the same refresh
+			for (let i = 0; i < 3; i++) await settle();
+			expect([reads.at(-1), day("2026-11-05")]).toEqual(["2026-11-05", true]);
+		} finally { Date.now = realNow; }
 	});
 });
 
