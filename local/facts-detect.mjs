@@ -70,7 +70,7 @@ function step(seg, inherited = { unset: [], set: [] }) {
 	}
 	const prog = w[i] ? path.basename(w[i]).toLowerCase() : null;
 	const head = [prog, ...w.slice(i + 1).filter((x, k, a) => a.slice(0, k + 1).every((y) => WORD.test(y))).slice(0, 2)].filter(Boolean).join(" ");
-	return { env, prog: prog && /^[\w.+-]{1,40}$/.test(prog) ? prog : null, head, text: seg };
+	return { env, prog: prog && /^[\w.+-]{1,40}$/.test(prog) ? prog : null, head, text: seg, args: w.slice(i + 1) };
 }
 
 /** Environment changes a whole step makes for later steps: `unset A B`, `export A=…`. */
@@ -188,6 +188,38 @@ function confirmations(cmds) {
 	return found;
 }
 
+// Network operations whose target is an argument: a URL (curl, wget, http, git remote commands) or a host or user@host (ssh, ping, nc).
+const URL_CLIENTS = new Set(["curl", "wget", "http", "https"]), HOST_CLIENTS = new Set(["ssh", "ping", "nc"]);
+const GIT_REMOTE = new Set(["clone", "fetch", "pull", "push", "ls-remote"]);
+// shortcut: only simple destination forms are attributed; extend explicit option handling when a verified command needs it.
+const DEST_FLAGS = {
+	curl: /^-[fsSLIkv46]+$/, wget: /^-[qSv46]+$/, ssh: /^-[TtNnqv46]+$/, ping: /^-[nqv]+$/, nc: /^-[vz46]+$/,
+	git: /^(?:-q|--(?:quiet|heads|tags|refs|symref|exit-code))$/,
+};
+/** Whether a proven step is a recognized network operation aimed at host itself. Anything else (search text, headers, echo) is not. */
+function reaches(s, host) {
+	const args = s.args.map((w) => w.replace(/^['"]|['"]$/g, "").toLowerCase());
+	if (s.prog === "git" && !GIT_REMOTE.has(args.shift())) return false;
+	while (args[0]?.startsWith("-")) {
+		const flag = args.shift();
+		if (flag === "--") break;
+		if (s.prog === "curl" && flag === "--url" && args.length === 1) break;
+		if (!DEST_FLAGS[s.prog]?.test(flag)) return false;
+	}
+	const target = args[0];
+	if (!target || target.startsWith("-")) return false;
+	const url = (w) => {
+		try {
+			const value = /^(?:https?|ssh|git|ftps?):\/\//.test(w) ? w : /^[^/\s]+@[^/\s]+:/.test(w) ? `ssh://${w.replace(/^([^/:@]+@[^/:]+):/, "$1/")}` : "";
+			return new URL(value).hostname === host;
+		} catch { return false; }
+	};
+	if (URL_CLIENTS.has(s.prog)) return args.length === 1 && url(target);
+	if (s.prog === "git") return !args.slice(1).some((w) => w.startsWith("-")) && url(target);
+	if (HOST_CLIENTS.has(s.prog)) return (s.prog === "ssh" || args.slice(1).every((w) => /^\d+(?:-\d+)?$/.test(w))) && (target === host || target.endsWith(`@${host}`));
+	return false;
+}
+
 /** Whether a session contradicts a known fact: a proven success of exactly what the fact says fails. Env facts are never contradicted. */
 function contradicts(cmds, { detector, literal }) {
 	const ok = cmds.flatMap(provenOk);
@@ -198,7 +230,7 @@ function contradicts(cmds, { detector, literal }) {
 		const head = literal.split(" needs ")[0];
 		return ok.some((s) => (literal.includes(" needs ") ? s.head === head : s.prog === literal));
 	}
-	if (detector === "network") return ok.some((s) => s.text.toLowerCase().includes(literal));
+	if (detector === "network") return ok.some((s) => reaches(s, literal));
 	if (detector === "empty_vcs") return ok.some((s) => s.head === literal);
 	return false;
 }
@@ -207,13 +239,17 @@ function contradicts(cmds, { detector, literal }) {
 function labelsOf(cmds) {
 	const out = new Set();
 	for (const c of cmds.filter(ran)) {
-		for (const s of stepsOf(c.cmd)) {
+		const steps = stepsOf(c.cmd);
+		for (const s of steps) {
 			if (s.prog) out.add(`prog:${s.prog}`);
 			const w = s.head.split(" ");
 			for (let k = 2; k <= w.length; k++) out.add(`head:${w.slice(0, k).join(" ")}`);
 		}
 		for (const m of c.cmd.matchAll(/\b(?:import|from) ([A-Za-z_]\w*)/g)) out.add(`pymod:${m[1].toLowerCase()}`);
-		for (const m of c.cmd.matchAll(/\b(?:https?:\/\/|git@)([a-z0-9][\w.-]*\.[a-z]{2,})/gi)) out.add(`host:${m[1].toLowerCase()}`);
+		for (const m of c.cmd.matchAll(/\b(?:https?:\/\/|git@)([a-z0-9][\w.-]*\.[a-z]{2,})/gi)) {
+			const host = m[1].toLowerCase();
+			if (steps.some((s) => reaches(s, host))) out.add(`host:${host}`);
+		}
 	}
 	return out;
 }

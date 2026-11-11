@@ -68,8 +68,8 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 				cur.pending[n.id]={n:0,at:now+SETTLE_MS,card:n.card};return;
 			}
 			delete cur.pending[n.id];
-			// Only neighbours that are still active nodes of this profile.
-			const live = new Set(hits.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active'",
+			// Only neighbours that are still active nodes of this profile, never a repo fact (it may hold a vector after a re-embed).
+			const live = new Set(hits.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND scope <> 'repo-fact'",
 				JSON.stringify(hits.map((h) => h.id))).toArray().map((r) => r.id) : []);
 			const keep = hits.filter((h) => live.has(h.id) && h.score >= MIN_SCORE);
 			sql.exec(`UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE src = ? AND basis = 'similarity' AND ended_at IS NULL AND dst NOT IN (SELECT value FROM json_each(?))`,
@@ -105,7 +105,7 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 		if (!source) return;
 		const items: { kind: string; subjects: string[] }[] = [];
 		for (const hit of near[i] ?? []) {
-			const target = sql.exec<{ kind: string; scope: string }>("SELECT kind, scope FROM nodes WHERE id = ? AND status = 'active'", hit.id).toArray()[0];
+			const target = sql.exec<{ kind: string; scope: string }>("SELECT kind, scope FROM nodes WHERE id = ? AND status = 'active' AND scope <> 'repo-fact'", hit.id).toArray()[0];
 			if (!target) continue;
 			if (source.kind === target.kind && hit.score >= 0.92) items.push({ kind: "near_duplicate", subjects: [n.id, hit.id] });
 			else if (hit.score < 0.92 && [source.kind, target.kind].every((kind) => ["rule", "preference", "decision"].includes(kind))) {

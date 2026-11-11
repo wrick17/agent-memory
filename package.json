@@ -24,7 +24,7 @@
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run test && npm run test:local",
     "eval:baseline": "EVAL_WRITE_BASELINE=1 vitest run test/eval-synthetic.test.ts",
-    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/corpus-upload.test.mjs local/migrate.test.mjs local/upload.test.mjs local/setup.test.mjs local/pr-upload.test.mjs local/jira-upload.test.mjs local/replay-player.test.mjs local/replay.test.mjs",
+    "test:local": "node --test local/agent-memory.test.mjs local/batch.test.mjs local/corpus-upload.test.mjs local/migrate.test.mjs local/upload.test.mjs local/setup.test.mjs local/pr-upload.test.mjs local/jira-upload.test.mjs local/replay-player.test.mjs local/replay.test.mjs local/facts.test.mjs local/facts-synth.test.mjs local/loop-guard.test.mjs",
     "pack:self-host": "node local/package.mjs",
     "prepack": "node local/package.mjs --source-pack"
   },

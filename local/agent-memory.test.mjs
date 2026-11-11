@@ -998,7 +998,8 @@ describe("general confined executor", () => {
 					stderr: mode.startsWith("unsupported") ? "WARN codex_core::tools::router: unsupported call: exec_command\n" : "Reading prompt from stdin...\n" };
 			} });
 		const args = { prompt: "private input", schema: OPS_SCHEMA, model: "fake-model", effort: "high" };
-		assert.deepEqual(await execute(args), { kind: "ok", part: { results: [] } });
+		// usage is null when the event stream carries no turn.completed token counts (unknown, never zero).
+		assert.deepEqual(await execute(args), { kind: "ok", part: { results: [] }, usage: null });
 		mode = "tool"; assert.equal((await execute(args)).kind, "tool_event");
 		mode = "notice"; assert.equal((await execute(args)).kind, "runtime_warning");
 		mode = "unsupported"; assert.equal((await execute(args)).kind, "tool_event");
@@ -1539,5 +1540,64 @@ describe("doctor and backfill (#18)", () => {
 		assert.deepEqual([...new Set(server.log.map((b) => b.session.id))].sort(), [id, "bf-claude"].sort());
 		const again = backfill({ env });
 		assert.deepEqual([again.queued, again.current], [0, 2]);
+	});
+});
+
+describe("repo facts integration", () => {
+	it("keeps turn.completed token usage from the exec stream, and none when the stream has none", () => {
+		const ev = (...items) => items.map((i) => JSON.stringify(i)).join("\n");
+		const msg = { type: "item.completed", item: { type: "agent_message", text: "{\"facts\":[]}" } };
+		assert.deepEqual(am.parseEvents(ev(msg, { type: "turn.completed", usage: { input_tokens: 9, cached_input_tokens: 4, output_tokens: 2 } })).usage, { input_tokens: 9, cached_input_tokens: 4, output_tokens: 2 });
+		assert.equal(am.parseEvents(ev(msg, { type: "turn.completed" })).usage, null);
+	});
+
+	it("leaves fact injection and synthesis off by default, never routes facts to `me`, and takes rates only when all three are numbers", () => {
+		assert.deepEqual(am.withDefaults({}).facts, { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null });
+		const c = am.withDefaults({ facts: { inject: "true", synthesis: 1, profile: "me", synthesis_rates: { input: 1, output: 2 } } }).facts;
+		assert.deepEqual([c.inject, c.synthesis, c.profile, c.synthesis_rates], [false, false, null, null]);
+		assert.equal(am.withDefaults({ facts: { profile: "work" } }).facts.profile, "work");
+	});
+
+	it("installs every repo-fact module, and with injection on gives SessionStart a bounded timeout in both clients", () => {
+		const fakeHome = fs.mkdtempSync(path.join(tmp, "user-home-")), saved = process.env.HOME;
+		process.env.HOME = fakeHome;
+		try {
+			for (const f of ["facts.mjs", "facts-detect.mjs", "facts-client.mjs", "facts-inject.mjs", "facts-synth.mjs"]) assert.ok(am.V2_LOCAL.includes(f), f);
+			const off = am.install({ platform: "linux" });
+			assert.deepEqual(off.claude.hooks.SessionStart[0].hooks[0], { type: "command", command: `${off.bin} hook claude-code` });
+			am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ facts: { inject: true } }));
+			const on = am.install({ platform: "linux" });
+			assert.equal(on.claude.hooks.SessionStart[0].hooks[0].timeout, 3);
+			assert.match(on.codex, /\[\[hooks\.SessionStart\.hooks\]\]\ntype = "command"\ncommand = ".*hook codex"\ntimeout = 3/);
+			for (const f of am.V2_LOCAL) assert.ok(fs.existsSync(path.join(path.dirname(on.bin), f)), f);
+		} finally { process.env.HOME = saved; }
+	});
+
+	it("run --scheduled retries a pending fact report with synthesis off, and stays idle when only refused or sent reports remain", async () => {
+		const sessions = path.join(am.home(), "facts", "sessions"), bytes = JSON.stringify({ repo: { remote: "github.com/o/r" }, facts: { session: "codex:000000000001", families: [], fired: [], observations: [] } });
+		const write = (name, status) => am.writePrivate(path.join(sessions, name), JSON.stringify({ v: 1, repo_key: "github.com/o/r", digest: { session: "codex:000000000001" }, report: { bytes, status, pending: {} } }));
+		const sent = [], server = { ...fakeServer(), status: async () => {}, facts: async (b) => { sent.push(b); return { profile: "personal", report: { action: "stored", facts: [] } }; } };
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [] }));
+		write("codex-refused.json", "refused");
+		assert.equal((await am.run({ server, runner: { available: false }, trigger: "scheduled" })).status, "idle", "a refused report is final");
+		write("codex-pending.json", "pending");
+		const ran = await am.run({ server, runner: { available: false }, trigger: "scheduled" });
+		assert.equal(ran.status, "ran");
+		assert.deepEqual([ran.results.facts.sent, sent], [1, [bytes]]);
+		assert.equal((await am.run({ server, runner: { available: false }, trigger: "scheduled" })).status, "idle");
+	});
+
+	it("run --scheduled counts a waiting completion when synthesis is on, and stays idle and untouched when it is off", async () => {
+		const sy = await import("./facts-synth.mjs"), server = { ...fakeServer(), status: async () => {} }, runner = { available: false };
+		const marker = () => sy.markCompleted(am.withDefaults({ facts: { synthesis: true } }), "github.com/o/r", "codex:000000000001");
+		marker();
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [] }));
+		assert.equal((await am.run({ server, runner, trigger: "scheduled" })).status, "idle", "off: the marker waits");
+		assert.ok(fs.existsSync(path.join(sy.dueDir(), "codex_000000000001.json")));
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [], facts: { synthesis: true } }));
+		const ran = await am.run({ server, runner, trigger: "scheduled" });
+		assert.equal(ran.status, "ran");
+		assert.equal(ran.results.synthesis.counted, 1);
+		assert.deepEqual(fs.readdirSync(sy.dueDir()), []);
 	});
 });

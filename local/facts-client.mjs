@@ -186,6 +186,13 @@ export async function observeSession(t, src, repo, { server, ended, config } = {
 	return { repo_key: key, session: state.digest.session, completed: true, status: await send(file, state, server) };
 }
 
+/** Whether any saved report is still pending (sent, refused and 400-final reports are not), for the scheduled run's idle check. */
+export function hasPending() {
+	const d = dir("sessions");
+	if (!fs.existsSync(d)) return false;
+	return fs.readdirSync(d).some((f) => f.endsWith(".json") && readJson(path.join(d, f), null)?.report?.status === "pending");
+}
+
 /** Sends every saved report still pending (after a network failure or a crash between saving and sending). */
 export async function flushPending(server) {
 	const d = dir("sessions");

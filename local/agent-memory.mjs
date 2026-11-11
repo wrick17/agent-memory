@@ -1131,7 +1131,9 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 				// Under the lock every entry in claimed/ is a dead run's; drain returns it to the queue first.
 				const retained = fs.existsSync(claimDir()) && fs.readdirSync(claimDir()).length > 0;
 				const synth = await import("./facts-synth.mjs").then((m) => m.synthDue(config, clock()), () => false);
-				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock()) && !synth) {
+				// A fact report saved but not yet accepted is retried by any run, whatever the synthesis switch says.
+				const reports = await import("./facts-client.mjs").then((m) => m.hasPending(), () => false);
+				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock()) && !synth && !reports) {
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
