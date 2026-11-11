@@ -1350,7 +1350,7 @@ The loop guard (#102) adds one fixed note to a turn that is stuck. It is off unl
 - **State.** Each session's state file holds hashes and counts only, never tool input, output or the hook payload. It is written under a lock with a 2 s deadline and pruned after 7 idle days.
 - **Note.** Fixed text with the counts and a sanitized tool name, labelled as a local rule, not the user. No tool text reaches the agent through it.
 
-A Codex-backed check (#103) is design only. It would run locally, make one call per stuck turn only after the rules fire, and act only at confidence 0.7 or higher. It is built only if the six P3 paired tasks (#101) show that the rules miss real loops.
+A Codex-backed check (#103) is design only. It would run locally, make one call per stuck turn only after the rules fire, and act only at confidence 0.7 or higher. It is built only if the six P3 paired tasks (#101) show that the rules miss real loops. Decision, 2026-11-11: it stays design only, with no provider judge. The P3 traces had no repeated failed commands, and the guard's coverage of Codex shell runs is not established. Revisit only when a concrete missed loop appears ([P3 results](repo-facts-verification.md#p3-paired-evaluation-2026-11-11)).
 
 ### Other upload items, each with its own id
 

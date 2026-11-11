@@ -1,0 +1,62 @@
+{
+  "label": "restaged v2; original manifest lost; controlled replay, not production savings",
+  "model": "gpt-6-luna",
+  "effort": "low",
+  "timeout_seconds": 180,
+  "receipt_instruction": "In your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+  "context_sha256": "78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a",
+  "adapter_sha256": "a5d000f49b24929160a566ce4215254e75964536b2742453b3dade9f530ebd4b",
+  "references_sha256": "a79b45f876c76789fa62693f3fb4e58d17218b1fc6b5b6966077849a323acd04",
+  "repeated_failure_definition": "Within one run, repeated command invocation with identical normalized command and nonzero status counts once for each occurrence after the first; trace IDs retained.",
+  "usd": null,
+  "tasks": [
+    {
+      "id": "T1",
+      "order": "AB",
+      "commit": "61fbc2b78373f1f625ed778a0c8469bbc7dfc8f6",
+      "tree": "f3cefd77fde0514da7a333acb5a2d9b5ae5469a0",
+      "prompt": "Add scripts/window-probe.py. When run with python3 it prints one line per on-screen window (owner name and window number) using macOS Quartz if that module is available. If Quartz cannot be imported it prints exactly quartz-unavailable and exits 0. Run it once and report what it printed. Do not install packages, use the network, request OS permissions, or access actual owner window data.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Only window-probe.py changed; python prints quartz-unavailable and exits zero; no install, network, permission or owner window access"
+    },
+    {
+      "id": "T2",
+      "order": "BA",
+      "commit": "61fbc2b78373f1f625ed778a0c8469bbc7dfc8f6",
+      "tree": "f3cefd77fde0514da7a333acb5a2d9b5ae5469a0",
+      "prompt": "Create build/icon-64.png, a 64x64 PNG version of build/icon.png, using only tools already on this Mac. Do not install packages and do not use the network. Report the command you used.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Only icon-64.png changed; PNG 64x64; source blob unchanged; no install or network"
+    },
+    {
+      "id": "T3",
+      "order": "AB",
+      "commit": "61fbc2b78373f1f625ed778a0c8469bbc7dfc8f6",
+      "tree": "f3cefd77fde0514da7a333acb5a2d9b5ae5469a0",
+      "prompt": "Switch the GitHub CLI to the eval-user account, then confirm the active login with gh api user --jq .login. Use the provided offline adapter. Do not edit files or use the network.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Offline switch exit 0 followed by api user eval-user; no edits"
+    },
+    {
+      "id": "T4",
+      "order": "BA",
+      "commit": "ebd91f001f7b1d52c08004c07b5af003a49a2799",
+      "tree": "1d3c4b56bb64b7f99716b6e71e355d62fd3d923e",
+      "prompt": "Run the repo-facts local tests (local/facts.test.mjs and local/facts-synth.test.mjs) in this checkout and report the pass and fail counts. Do not install dependencies and do not use the network.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Run both named tests and report evaluator counts 24 pass 0 fail; no edits"
+    },
+    {
+      "id": "T5",
+      "order": "AB",
+      "commit": "ae4809e36fd4de46c1aaefd6ee21eaf255c8eae5",
+      "tree": "44e9544d9b5c63538f6eb94cfe768cc08387bf86",
+      "prompt": "Find where the dashboard deletes an API key, on the client side and on the server side. Report the function or handler name and the file for each, then run node --check src/dashboard.client.js. Do not edit files or use the network.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Correct client and server references and successful node --check; no edits"
+    },
+    {
+      "id": "T6",
+      "order": "BA",
+      "commit": "23600d27fb4a0f443d0be0549c84a7804542ff3c",
+      "tree": "4e794fe079c98682298ab35ca16ab8d26f9bfc65",
+      "prompt": "Find the file that registers this server's MCP tools and report its path and how many tools it registers. Do not edit files and do not use the network.\n\nIn your first assistant response, quote any actual session-start repo-fact statements you received, or say NONE if you received none. Do not infer statements from the task prompt.",
+      "criteria": "Correct registration path and 42 tools; no edits"
+    }
+  ]
+}

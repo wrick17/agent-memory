@@ -1,0 +1,11 @@
+{
+  "T5": {
+    "client": "loadKeys Delete handler, src/dashboard.client.js",
+    "server": "keysApi -> store.deleteKey, src/index.ts"
+  },
+  "T6": {
+    "inventory": "mcp-server/tools.js",
+    "registration": "mcp-server/index.js",
+    "count": 42
+  }
+}

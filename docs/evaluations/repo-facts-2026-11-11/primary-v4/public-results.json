@@ -1,0 +1,377 @@
+{
+  "method": "historical frozen project snapshot, not live adaptive retrieval; marker suffix instrumentation",
+  "manifest_sha256": "882a8566170c362d57410d96c023a182b7e4fcaf5166defc2889f11b558b0db4",
+  "ordinary_metadata_sha256": "36ca42427ed9d701880327664c521a069c08a1fe0bf68229f9243b635f0cfc93",
+  "reference_sha256": "a79b45f876c76789fa62693f3fb4e58d17218b1fc6b5b6966077849a323acd04",
+  "facts_core_sha256": "78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a",
+  "fact_payload_sha256": "f508128f89e8a16acf6d7385ef5d95692505720fd4c6b96edeb24258da760d39",
+  "prior_v3": "excluded after failed receipt; input 92968, cached 54912, output 700",
+  "runs": [
+    {
+      "run": "T1A",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "c74d78b37119bfad6428195a11e7c110b82c945f0fc5bfd9c253906bc2ca12ac",
+      "usage": {
+        "input": 74868,
+        "cached": 55040,
+        "uncached": 19828,
+        "output": 624,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 3,
+        "known": 0,
+        "unknown": 3,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T1B",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "15cf976db99fa176e7bb1b6a9e7e42d5a36c795c0b678d252d6667d16d328c1e",
+      "usage": {
+        "input": 76264,
+        "cached": 55808,
+        "uncached": 20456,
+        "output": 715,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 3,
+        "known": 0,
+        "unknown": 3,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T2A",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "75e3a5976afc041f4adfb66d0b103daa76ef83233cd04cb8f1e3af50b85f9e47",
+      "usage": {
+        "input": 36486,
+        "cached": 17920,
+        "uncached": 18566,
+        "output": 209,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 1,
+        "known": 0,
+        "unknown": 1,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T2B",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "3771ab928772aafc87ea6bb0ff90757bd9ec7392d536fd3c91d60412313f2e68",
+      "usage": {
+        "input": 55247,
+        "cached": 36224,
+        "uncached": 19023,
+        "output": 298,
+        "usd": null
+      },
+      "failed_commands": [
+        {
+          "id": "item_3",
+          "exit_code": 1,
+          "signature_sha256": "924cb1836651fd72af8d39d083f404c30805e16763644cd03410af4ba982cf6d"
+        }
+      ],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 2,
+        "known": 0,
+        "unknown": 2,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T3A",
+      "task_pass": false,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "47b0cfd65463e8be4f06a82f32e032f2f031b8b6dced27cca730c3b722a1db8e",
+      "usage": {
+        "input": 73407,
+        "cached": 54272,
+        "uncached": 19135,
+        "output": 347,
+        "usd": null
+      },
+      "failed_commands": [
+        {
+          "id": "item_3",
+          "exit_code": 2,
+          "signature_sha256": "1a975a7478d33d2261e50b1456b533a85582cff6b65e94491c2ee71e59a9fe1c"
+        },
+        {
+          "id": "item_4",
+          "exit_code": 1,
+          "signature_sha256": "06484688e0c2d808cc35a4071d4ce46916c946cf9de36d7ca97566995252f284"
+        }
+      ],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 2,
+        "known": 0,
+        "unknown": 2,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T3B",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "91d21159d067b716a401f485bb5b6455d3b9d463585d4bee93237023ffe44cc6",
+      "usage": {
+        "input": 93897,
+        "cached": 55040,
+        "uncached": 38857,
+        "output": 513,
+        "usd": null
+      },
+      "failed_commands": [
+        {
+          "id": "item_4",
+          "exit_code": 1,
+          "signature_sha256": "06484688e0c2d808cc35a4071d4ce46916c946cf9de36d7ca97566995252f284"
+        }
+      ],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 3,
+        "known": 0,
+        "unknown": 3,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T4A",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "b0b47de521046df0a75acb8512157e595a62aed5870e64538cbc92c6aac2cd5f",
+      "usage": {
+        "input": 77094,
+        "cached": 55936,
+        "uncached": 21158,
+        "output": 332,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 2,
+        "known": 0,
+        "unknown": 2,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T4B",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "e25c3fa8a5c558f1b793710aba9c49b4bfc63b30b6299716c6cd7b3e8e2096e8",
+      "usage": {
+        "input": 75829,
+        "cached": 54784,
+        "uncached": 21045,
+        "output": 284,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 3,
+        "known": 0,
+        "unknown": 3,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T5A",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "678b6c25c15ad45d5701783ca3b629904fb3702048a5634edb4a70684427ef8f",
+      "usage": {
+        "input": 62049,
+        "cached": 42880,
+        "uncached": 19169,
+        "output": 504,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 2,
+        "known": 0,
+        "unknown": 2,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T5B",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "ef807c300430a0f6e73b5dbea1875f69c8ad1f4df4262a3f06266849ea2689b7",
+      "usage": {
+        "input": 79173,
+        "cached": 36992,
+        "uncached": 42181,
+        "output": 640,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 3,
+        "known": 0,
+        "unknown": 3,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T6A",
+      "task_pass": true,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "52a167c8b094da4813baa843df4ffec6fb4fe979534e9b0afc37966a4bef05d9",
+      "usage": {
+        "input": 97752,
+        "cached": 75904,
+        "uncached": 21848,
+        "output": 633,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 4,
+        "known": 0,
+        "unknown": 4,
+        "nudges": 0
+      }
+    },
+    {
+      "run": "T6B",
+      "task_pass": false,
+      "receipt": {
+        "ordinary_marker": true,
+        "fact_marker": true,
+        "core_hash_match": true,
+        "payload_hash_match": true
+      },
+      "trace_sha256": "de74c486509fa640312d5014f6e7f316ed28c24b3bd1201abf6f19563fd7549e",
+      "usage": {
+        "input": 100386,
+        "cached": 77696,
+        "uncached": 22690,
+        "output": 682,
+        "usd": null
+      },
+      "failed_commands": [],
+      "repeated_failed_commands": 0,
+      "native_file_changes": [],
+      "forbidden_command_ids": [],
+      "guard": {
+        "calls": 4,
+        "known": 0,
+        "unknown": 4,
+        "nudges": 0
+      }
+    }
+  ],
+  "totals": {
+    "input": 902452,
+    "cached": 618496,
+    "uncached": 283956,
+    "output": 5781,
+    "usd": null
+  }
+}

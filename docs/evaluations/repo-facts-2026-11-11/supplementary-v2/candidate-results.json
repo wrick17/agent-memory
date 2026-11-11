@@ -1,0 +1,269 @@
+{
+  "label": "restaged controlled replay; T1 native patch tool failed despite shell patch preflight; comparability qualification required",
+  "manifest_sha256": "dafd85f4025a9c97c67def0630fa4a9591e21970eeb2472a68cfaa030c647478",
+  "references_sha256": "a79b45f876c76789fa62693f3fb4e58d17218b1fc6b5b6966077849a323acd04",
+  "runs": [
+    {
+      "run": "T1A",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "8631a97313637e3db1596525d6129bf948cd4945145788de36c20c81ad9fe563",
+      "usage": {
+        "input_tokens": 110506,
+        "cached_input_tokens": 90240,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1034,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 20266
+      },
+      "failed_commands": [],
+      "failed_file_changes": [
+        "item_6"
+      ],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T1B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a",
+      "trace_sha256": "ead23ef47322bf8f162e935bea791a8b049e36783c8a102634bca05b3073143f",
+      "usage": {
+        "input_tokens": 109375,
+        "cached_input_tokens": 89728,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 875,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 19647
+      },
+      "failed_commands": [],
+      "failed_file_changes": [
+        "item_6"
+      ],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T2A",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "719926a5b157e7195a0dd0eeb7b200fd7ae63e0f56015a86187c63666f7707bb",
+      "usage": {
+        "input_tokens": 52498,
+        "cached_input_tokens": 38272,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 352,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 14226
+      },
+      "failed_commands": [
+        {
+          "id": "item_3",
+          "exit_code": 1,
+          "command_sha256": "924cb1836651fd72af8d39d083f404c30805e16763644cd03410af4ba982cf6d"
+        }
+      ],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T2B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a",
+      "trace_sha256": "34bb929e636ebfd16e00177fc38b19dda164df916342c8c380592cc7435c777f",
+      "usage": {
+        "input_tokens": 52913,
+        "cached_input_tokens": 17152,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 443,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 35761
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T3A",
+      "task_pass": false,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "df02bdf9c84ac80fe7ea75d8d894b88488a8f3d03e5878f93838209cbb28171d",
+      "usage": {
+        "input_tokens": 73765,
+        "cached_input_tokens": 57472,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 302,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 16293
+      },
+      "failed_commands": [
+        {
+          "id": "item_4",
+          "exit_code": 1,
+          "command_sha256": "06484688e0c2d808cc35a4071d4ce46916c946cf9de36d7ca97566995252f284"
+        }
+      ],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T3B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a",
+      "trace_sha256": "b286f464688d9e20242d809c45caa9f57c436171f0541960e59135e9250a3932",
+      "usage": {
+        "input_tokens": 112559,
+        "cached_input_tokens": 91904,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 462,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 20655
+      },
+      "failed_commands": [
+        {
+          "id": "item_5",
+          "exit_code": 1,
+          "command_sha256": "9b80c93f69e822985b957f99bfe41cebd60f11f5fd92a430fff4ed749042da95"
+        }
+      ],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T4A",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "21f5d7e3911b96a092f28bdef3d2876eb768db8cf30d486768389ab9685f2a6d",
+      "usage": {
+        "input_tokens": 54752,
+        "cached_input_tokens": 41728,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 344,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 13024
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T4B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "6a2feb5b35c468865dc8b9391580bad65303060276fec7c062df5e4367f36d36",
+      "usage": {
+        "input_tokens": 93779,
+        "cached_input_tokens": 80256,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 513,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 13523
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T5A",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "b9f12db364a9f506ab8ed7f26e04d50bb045a31295fbdb511881da01e25a54ac",
+      "usage": {
+        "input_tokens": 56754,
+        "cached_input_tokens": 24448,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 493,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 32306
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T5B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "3727ac639c9e3dafbe5fec8f26743117f52a05c25025e87fa7c118061b372cfe",
+      "usage": {
+        "input_tokens": 105571,
+        "cached_input_tokens": 86016,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 693,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 19555
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T6A",
+      "task_pass": false,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "2dae948915da6b8e2d6324c1799e7e3c426b6909fe79c425fe2382959231663c",
+      "usage": {
+        "input_tokens": 74303,
+        "cached_input_tokens": 60928,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 353,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 13375
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    },
+    {
+      "run": "T6B",
+      "task_pass": true,
+      "receipt_pass": true,
+      "hook_emitted": "empty",
+      "trace_sha256": "f638eb2ee8ebf9357d5d9f7ede6761e190ad86d9b7441922a51218e9734a605b",
+      "usage": {
+        "input_tokens": 111624,
+        "cached_input_tokens": 66176,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 791,
+        "reasoning_output_tokens": 0,
+        "uncached_input_tokens": 45448
+      },
+      "failed_commands": [],
+      "failed_file_changes": [],
+      "repeated_failed_commands": 0,
+      "forbidden_command_ids": [],
+      "usd": null
+    }
+  ]
+}

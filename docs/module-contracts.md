@@ -1176,7 +1176,7 @@ Original module tests for #9, #10, #11 and #15 were not preserved, and author-re
 
 ## Repo facts and loop guard modules, 2026-11-11
 
-Source: commit `ebd91f0` in PR #110, where CI passed. Source and local verification passed; not merged, released, deployed or installed. Behaviour and rules are in [architecture, repo facts](architecture.md#repo-facts) and [loop guard](architecture.md#loop-guard). Gates and evidence are in [repo facts verification](repo-facts-verification.md).
+Source: merged to `master` in PR #110 as `a0478c5`, after source and local verification and passing CI. Not released, deployed or installed. Behaviour and rules are in [architecture, repo facts](architecture.md#repo-facts) and [loop guard](architecture.md#loop-guard). Gates and evidence are in [repo facts verification](repo-facts-verification.md).
 
 ### Modules
 

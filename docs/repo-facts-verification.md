@@ -2,7 +2,7 @@
 
 This page records the gates and evidence for repo facts (epic #105, issues #90 to #103) and the loop guard (#102, #103). It lists what the source does, which checks passed, and which gates are still open. Fill in an open line only from a result that actually exists.
 
-**Status, 2026-11-11:** source and local verification passed at commit `ebd91f0`, pushed for review in PR #110, where CI passed. The feature is not merged, not released, not deployed and not installed. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call; that call passed, and #100 is closed. Normal synthesis stays off; turning it on is a separate owner step. P3 (#101) is not complete: two setup experiments were invalid, and no paired comparison is established, so there is no benefit claim.
+**Status, 2026-11-11:** merged to `master` in PR #110 as `a0478c5`, after source and local verification and passing CI. The feature is not released, not deployed and not installed on any owner client. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call; that call passed, and #100 is closed. Normal synthesis stays off; turning it on is a separate owner step. The P3 paired evaluation (#101) ran in full and did not demonstrate efficiency savings ([results](#p3-paired-evaluation-2026-11-11)). The Codex-backed loop check (#103) stays design only.
 
 | Check | Result |
 |---|---|
@@ -13,6 +13,9 @@ This page records the gates and evidence for repo facts (epic #105, issues #90 t
 | Isolated Linux install | Passed: all six fact and loop guard modules match source by SHA-256, with every default off |
 | PR #110 CI at `ebd91f0` | All checks passed |
 | PR #110 CI at `1547235` | All checks passed |
+| PR #110 CI at `14c8024`, the merged head | All checks passed |
+| Merge | `master` at `a0478c5`, tree `ac1ef23` |
+| P3 primary run (v4) | 12 of 12 runs, all receipts matched; no efficiency savings demonstrated |
 | Isolated real synthesis call | Passed: one provider call, valid empty result ([details](#isolated-synthesis-call-2026-11-11)) |
 | Privacy and data-loss review | 5 of 5 findings closed |
 
@@ -50,8 +53,8 @@ The verified source is commit `ebd91f001f7b1d52c08004c07b5af003a49a2799`, tree `
 | Gate | Rule | State on 2026-11-11 |
 |---|---|---|
 | Synthesis enable (#100) | `facts.synthesis` stays `false` until the owner signs off a written privacy and data-loss review. Turning it on is a separate owner step after the sign-off. | Review clear: all 5 findings closed ([review](#privacy-and-data-loss-review-2026-11-11)). **Signed off by the owner on 2026-11-11** ("Approve review and isolated call"), for source `ebd91f0` and exactly one isolated real call. That call passed ([details](#isolated-synthesis-call-2026-11-11)), and #100 is closed. Normal synthesis is not enabled. |
-| P3 benefit (#101) | Six paired tasks, memory alone against memory plus facts: completion, repeated failures and cache-aware cost. | Twelve trials are planned: six controlled replays, each run with memory alone and with memory plus facts. Only 2 replays have a relevant eligible fact; the other 4 are controls. Two setup experiments were invalid, so no paired comparison is established. The first, a pilot of trial 1's memory-alone arm, had a wrong sandbox setup (an empty `TMPDIR`, a login shell and denied patches) and did not complete its task. It used 48,626 input tokens (28,544 cached) and 752 output tokens, counted separately from any result. The second ran all 12 trials, but its comparison is invalid: one arm reused the pilot's files, two tasks failed in both arms with a Node `EPERM` from `lstat` on `/private/tmp`, the memory-plus-facts hook output does not prove that the model received the facts, and the repeat and failure counts were not recorded. The loop guard was off, so the run gives no evidence for #103. The benchmark is now blocked: a further attempt stopped before any model call or preflight, because a metadata-only policy for the evaluation could not be verified. Research into the installed schema and its pinned primary source, with probes that call no provider, is under way. The isolated test Worker holds the two seeded facts: bettergit `import Quartz` (exercised 9, fired 8) and `import PIL` (exercised 8, fired 6), with a 232-character injected context (SHA-256 prefix `78715f28`); the other three replay repos have none. No benefit or missed-loop conclusion exists. |
-| Codex-backed loop check (#103) | Design only. It is built only if P3 shows that the rules miss real loops. | Design only; no code. |
+| P3 benefit (#101) | Six paired tasks, memory alone against memory plus facts: completion, repeated failures and cache-aware cost. | Done on 2026-11-11 with the primary run (v4): all 12 runs, with every delivery receipt matched. It did not demonstrate efficiency savings ([results](#p3-paired-evaluation-2026-11-11)). |
+| Codex-backed loop check (#103) | Design only. It is built only if P3 shows that the rules miss real loops. | Decision on 2026-11-11: stays design only ([decision](#decision-on-the-codex-backed-loop-check-103)). |
 | Injection on | `facts.inject` is an owner choice, like prompt recall. | Off. Not turned on anywhere. |
 | Loop guard on | `loop_guard.enabled` is an owner choice. | Off. Not turned on anywhere. |
 
@@ -96,8 +99,117 @@ The `whole_local_history` counts in each file come from every local session, bui
 ### Not run
 
 - [ ] A live Claude Code or Codex client with injection or the loop guard turned on.
-- [ ] Merge, packaging release and deployment.
-- [ ] P3 paired tasks (#101): two setup experiments invalid; no paired comparison established.
+- [ ] Packaging release, deployment and install on an owner client.
+
+Done since: merged in PR #110 as `a0478c5`, and the P3 primary run completed ([results](#p3-paired-evaluation-2026-11-11)).
+
+## P3 paired evaluation, 2026-11-11
+
+**Result: this limited replay did not demonstrate efficiency savings.** Both arms completed both tasks where a fact was relevant. On those tasks, the facts arm used 18.10% more input, 2.83% more uncached input and 21.61% more output. The sample is 6 pairs on a frozen project snapshot, with 2 relevant tasks and 4 controls, so it supports no causal or production claim.
+
+### Method (primary run, v4)
+
+- **Same tasks.** Six tasks with the same pinned commits, run order, model (`gpt-6-luna`) and effort (low) as the earlier runs, and a 180 s timeout. Each run started from a clean copy and passed a preflight check.
+- **Ordinary memory in both arms.** Both arms received the same frozen ordinary-memory snapshot through the real `UserPromptSubmit` hook, which replayed a cached reply. The snapshot is one Agent Memory recall per repo:
+  - a lexical query on the repo name
+  - personal profile only, with `me` excluded
+  - as of 2026-11-11 05:00 UTC
+  - the production scrub and the 600-token formatter
+
+  | Repo | Tasks | Records | Context characters | Context SHA-256 |
+  |---|---|---|---|---|
+  | `bettergit` | T1 to T3 | 2 | 1,525 | `57e5bbca004b28c8f24b0e80db8a7b5fd4be8672ac62863ffe3e51dc56177dc4` |
+  | `agent-memory` | T4 | 1 | 489 | `3b6cb96c9fc3d00acb5152fbcf279b2871c6b3171cca244513c434b9478d8a85` |
+  | `postplan` | T5 | 0 | 0 | empty |
+  | `browser-mcp` | T6 | 0 | 0 | empty |
+
+- **Facts in arm B only.** For T1 to T3, arm B also received the unchanged 232-byte facts context (SHA-256 `78715f28…`). Arm A never received it. T4 to T6 had no facts in either arm.
+- **Delivery marker.** This is experimental evaluation instrumentation, not shipped behaviour.
+  - The hook appended an unpredictable `EVAL_FACT_DELIVERY` value after the unchanged core. That value was never in the prompt or in any file the model could read.
+  - The prompt asked only that the first answer copy the ordinary-snapshot and fact-delivery markers actually present, or say `NONE`.
+  - The core and the full payload were checked locally by SHA-256, separately.
+- **Receipts.** The first pair passed its gate before the other five pairs ran. All 12 runs matched on all four checks: the ordinary marker, the fact-delivery marker, the core hash and the full payload hash.
+- **Isolation.** Codex's own memories were off, and no MCP servers were configured in either arm.
+- **Loop guard on in both arms.** It recorded metadata counters only.
+- **Shell-only file writes in both arms.** This was declared before the run, to avoid the native file-change failure seen earlier. It is not a product fix and was not tuned on outcomes. No run made a native file change or used a forbidden command.
+- **Scope.** A frozen, historical, per-project snapshot of ordinary memory, not live adaptive retrieval.
+
+### Results by task
+
+| Task | Repo | Ordinary records | Fact relevant? | A | B | Notes |
+|---|---|---|---|---|---|---|
+| T1: print windows with Quartz, or `quartz-unavailable` | `bettergit` | 2 | Yes (`import Quartz`) | Pass | Pass | |
+| T2: make a 64×64 PNG with tools already on the Mac | `bettergit` | 2 | Yes (`import PIL`) | Pass | Pass | B's one failed command has the same command hash as the harmless tool-presence check in the supplementary run. |
+| T3: switch `gh` to an offline test account | `bettergit` | 2 | No; B got unrelated repo facts | Fail | Pass | Control. A did not complete the account switch. |
+| T4: run the repo-facts tests and report counts | `agent-memory` | 1 | No facts | Pass | Pass | Control. |
+| T5: find the API-key delete handlers | `postplan` | 0 | No facts | Pass | Pass | Control. |
+| T6: count the registered MCP tools | `browser-mcp` | 0 | No facts | Pass | Fail | Control. B reported 38 tools; the answer is 42. |
+
+Completion: A 5 of 6, B 5 of 6. Relevant tasks: 2 of 2 in each arm. Controls: 3 of 4 in each arm.
+
+### Input tokens
+
+| Scope | Arm | Input | Cached | Uncached | Output |
+|---|---|---|---|---|---|
+| Relevant tasks (T1, T2) | A | 111,354 | 72,960 | 38,394 | 833 |
+| Relevant tasks (T1, T2) | B | 131,511 | 92,032 | 39,479 | 1,013 |
+| Controls (T3 to T6) | A | 310,302 | 228,992 | 81,310 | 1,816 |
+| Controls (T3 to T6) | B | 349,285 | 224,512 | 124,773 | 2,119 |
+| All 12 runs | A | 421,656 | 301,952 | 119,704 | 2,649 |
+| All 12 runs | B | 480,796 | 316,544 | 164,252 | 3,132 |
+| All 12 runs | Both | 902,452 | 618,496 | 283,956 | 5,781 |
+
+On the relevant tasks, B used 20,157 more input tokens (+18.10%), 1,085 more uncached (+2.83%) and 180 more output (+21.61%). No cost rates are set, so there is no dollar figure.
+
+### Failures and loops
+
+- Failed shell commands: 2 in each arm. Both of A's were in T3. B had one in T2 and one in T3.
+- Repeated identical failed shell commands: 0 in every run, under the definition in the manifest. No repeated loops were found in these traces.
+- The loop guard saw 32 hook events across both arms. All 32 had an unknown outcome, and it sent 0 nudges. It reads only Codex MCP results that carry an explicit `isError`, and these tasks used the shell. Its coverage and value remain unestablished.
+- This does not show that the rules are sufficient, or that no loop was missed.
+
+### What this does not cover
+
+- Only 6 pairs, of which 2 had a relevant fact.
+- A frozen historical snapshot of ordinary memory, not live adaptive retrieval or everyday use.
+- The shell-only write rule and the delivery marker differ from normal use.
+- No total cost of the whole evaluation effort: the excluded attempts below lack complete data.
+
+### Supplementary: empty-context run (v2)
+
+All 12 runs completed, with both arms on empty ordinary memory context. That makes it a transport check, not the primary result. It did not demonstrate a benefit:
+
+- Completion: A 4 of 6, B 6 of 6. Both gains were on controls.
+- Relevant-task uncached input: 34,492 for A and 55,408 for B (+60.64%).
+- In T1, the native file-change operation failed once in each arm, cause unknown.
+
+### Excluded attempts
+
+None of these count toward any result.
+
+| Attempt | What happened | Tokens |
+|---|---|---|
+| First pilot | Wrong sandbox setup: an empty `TMPDIR`, a login shell and denied patches. The task did not complete. | 48,626 input, 28,544 cached, 752 output |
+| Earlier 12-call run | Invalid: reused pilot files, a sandbox `EPERM` in both arms of two tasks, no proof that the model received the facts, and repeat counts not recorded. | Raw data no longer available |
+| v3 first pair (2 calls) | Stopped at the first-pair gate. Its receipt wording, which asked for "session-start statements", was ambiguous: B answered `NONE` for facts while the hook had sent the exact facts core. Not counted as a pass. | 92,968 input, 54,912 cached, 38,056 uncached, 700 output |
+
+### Data
+
+The public data is committed byte for byte in [`evaluations/repo-facts-2026-11-11/`](evaluations/repo-facts-2026-11-11/). It holds no raw traces and no ordinary-memory text.
+
+| File | SHA-256 |
+|---|---|
+| `primary-v4/public-results.json` | `1c9fe308b9b262dec572fa67247b0fb70d3c6dc1bb5b5a6741474eeff39f6304` |
+| `primary-v4/manifest-v4.json` | `882a8566170c362d57410d96c023a182b7e4fcaf5166defc2889f11b558b0db4` |
+| `primary-v4/metadata.json` (ordinary-memory snapshot metadata) | `36ca42427ed9d701880327664c521a069c08a1fe0bf68229f9243b635f0cfc93` |
+| `primary-v4/references.json` (also used by the v2 run) | `a79b45f876c76789fa62693f3fb4e58d17218b1fc6b5b6966077849a323acd04` |
+| `supplementary-v2/candidate-results.json` | `77e13e9013c14ac2f7e5947263dc3eb552c282401ff0a6227de332313cff3042` |
+| `supplementary-v2/manifest-v2.json` | `dafd85f4025a9c97c67def0630fa4a9591e21970eeb2472a68cfaa030c647478` |
+| Facts core / full v4 payload | `78715f2839098c1d26080f25c1fc7e7075246342e1c9e87f67bbeda974cb4e8a` / `f508128f89e8a16acf6d7385ef5d95692505720fd4c6b96edeb24258da760d39` |
+
+### Decision on the Codex-backed loop check (#103)
+
+#103 stays design only: no implementation and no provider judge call. The primary run found no repeated failed commands, so it shows no concrete missed loop that would justify a paid checker. The guard's coverage of Codex shell runs is not established, so this is not evidence that the rules are sufficient. Revisit only when a concrete missed loop appears.
 
 ## Isolated synthesis call, 2026-11-11
 
