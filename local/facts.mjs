@@ -105,10 +105,11 @@ export function familyOf(cmd) {
 
 /** At most errLines lines of a failure: error-like lines first, then the first other lines. */
 function errorLines(text) {
-	const lines = String(text).replace(ANSI, "").split("\n").map((l) => l.trim()).filter(Boolean);
+	// The whole output is scrubbed before it is split: a multi-line secret such as a private-key block is only recognized whole.
+	const lines = scrub(String(text).replace(ANSI, "")).split("\n").map((l) => l.trim()).filter(Boolean);
 	const picked = lines.filter((l) => ERRORISH.test(l)).slice(0, FACT_LIMITS.errLines);
 	for (const l of lines) { if (picked.length >= FACT_LIMITS.errLines) break; if (!picked.includes(l)) picked.push(l); }
-	return picked.map((l) => cut(scrub(l)));
+	return picked.map((l) => cut(l));
 }
 
 const idOf = (raw) => sha(String(raw)).slice(0, 12);
@@ -132,7 +133,8 @@ const resultText = (content) => (typeof content === "string" ? content : Array.i
 export function commandDigest(client, lines, { repoKey: key, session, cwd, root = cwd, prior = null } = {}) {
 	if (!key || typeof session !== "string" || !session) return null;
 	const earlier = new Set((prior?.commands ?? []).filter((c) => c.status === "pending").map((c) => c.id));
-	const patched = [];
+	// apply_patch headers inside a shell command, read from the original command text (before any newline compaction or cut).
+	const patched = [], patchHeaders = (cmd) => { if (cmd.includes("*** Begin Patch")) for (const h of cmd.matchAll(PATCH_HEADER)) patched.push(h[1].trim()); };
 	const byId = new Map(), order = [];
 	const put = (id, c) => { if (!byId.has(id)) order.push(id); byId.set(id, { ...byId.get(id), ...c }); };
 	let first = null, last = null;
@@ -143,9 +145,10 @@ export function commandDigest(client, lines, { repoKey: key, session, cwd, root 
 			const p = obj?.payload, it = p?.type === "item_completed" ? p.item : null;
 			if (obj?.type === "event_msg" && it?.type === "CommandExecution") {
 				const cmd = commandText(it.command);
-				if (cmd.includes("*** Begin Patch")) for (const h of cmd.matchAll(PATCH_HEADER)) patched.push(h[1].trim());
+				patchHeaders(cmd);
 				put(idOf(it.id ?? `${at}:${cmd}`), { at, cmd, exit: Number.isInteger(it.exit_code) ? it.exit_code : undefined, out: it.aggregated_output ?? "" });
 			} else if (obj?.type === "event_msg" && p?.type === "exec_command_end" && Number.isInteger(p.exit_code)) {
+				patchHeaders(commandText(p.command));
 				put(idOf(p.call_id ?? `${at}:${commandText(p.command)}`), { at, cmd: commandText(p.command), exit: p.exit_code, out: p.aggregated_output ?? `${p.stdout ?? ""}\n${p.stderr ?? ""}` });
 			}
 		} else if (obj?.type === "assistant" && Array.isArray(obj.message?.content)) {
