@@ -1,0 +1,116 @@
+{
+	"repo": "github.com/wrick17/agent-memory",
+	"provenance": {
+		"source": "recorded",
+		"sessions_in_local_history": 219,
+		"sample": "bounded sequence, not the whole history: counts, rates and injectability hold for these sessions only",
+		"sessions_in_fixture": 11,
+		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
+		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint"
+	},
+	"rules": {
+		"activation": "3 confirming sessions whose edited-file sets are disjoint from the union of earlier counted sets; an empty set is disjoint",
+		"retirement": "an active, unpinned fact retires after 2 consecutive contradicting sessions",
+		"exercised": "from the proposing session on, a session that ran the fact's program, ran its trigger, confirmed it or ran its fix",
+		"fired": "an exercised session that confirmed the fact or ran its fix with a recorded success",
+		"injectable": "active, at least 4 exercised sessions and a firing rate of at least 0.40"
+	},
+	"facts": [
+		{
+			"id": "gh-env-token",
+			"detector": "command_repair",
+			"statement": "Run `gh` as `env -u GITHUB_TOKEN -u GH_TOKEN gh ...`; with GITHUB_TOKEN set, `gh auth switch` fails.",
+			"literals": [
+				"env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch",
+				"The value of the GITHUB_TOKEN environment variable is being used for authentication."
+			],
+			"program": "gh",
+			"expected": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 8,
+				"fired": 5,
+				"rate": 0.625,
+				"confirming_counted": 3
+			},
+			"whole_local_history": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 20,
+				"fired": 16
+			},
+			"timeline": [
+				{
+					"session": "codex:e7c8e3947ee2",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:c78ca5880336",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:ec6518889fbf",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"activated": true,
+					"state_after": "active"
+				}
+			]
+		},
+		{
+			"id": "vitest-missing",
+			"detector": "unavailable_tool",
+			"statement": "In a fresh checkout run `npm ci` first; `npm test` fails with `vitest: command not found`.",
+			"literals": [
+				"npm ci",
+				"sh: vitest: command not found"
+			],
+			"program": "npm",
+			"expected": {
+				"state": "candidate",
+				"injectable": false,
+				"exercised": 1,
+				"fired": 1,
+				"rate": 1,
+				"confirming_counted": 1
+			},
+			"whole_local_history": {
+				"state": "candidate",
+				"injectable": false,
+				"exercised": 1,
+				"fired": 1
+			},
+			"timeline": [
+				{
+					"session": "codex:799b08423172",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				}
+			]
+		}
+	],
+	"must_not_produce": [
+		{
+			"signal": "empty_vcs",
+			"sessions": [
+				"codex:11ac58f7579c",
+				"codex:799b08423172"
+			],
+			"why": "`fatal: not a git repository` came from probes outside the checkout; the empty-repo detector fires only on `does not have any commits yet` or `ambiguous argument 'HEAD'`"
+		}
+	],
+	"quiet_sessions": [
+		"claude-code:a4cc33eb6826",
+		"codex:d7889a488cd9"
+	]
+}

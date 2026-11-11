@@ -1,0 +1,38 @@
+{
+	"repo": "github.com/agent360dk/browser-mcp",
+	"provenance": {
+		"source": "recorded",
+		"sessions_in_local_history": 7,
+		"sample": "bounded sequence, not the whole history: counts, rates and injectability hold for these sessions only",
+		"sessions_in_fixture": 7,
+		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
+		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint"
+	},
+	"rules": {
+		"activation": "3 confirming sessions whose edited-file sets are disjoint from the union of earlier counted sets; an empty set is disjoint",
+		"retirement": "an active, unpinned fact retires after 2 consecutive contradicting sessions",
+		"exercised": "from the proposing session on, a session that ran the fact's program, ran its trigger, confirmed it or ran its fix",
+		"fired": "an exercised session that confirmed the fact or ran its fix with a recorded success",
+		"injectable": "active, at least 4 exercised sessions and a firing rate of at least 0.40"
+	},
+	"facts": [],
+	"must_not_produce": [
+		{
+			"signal": "any",
+			"sessions": [
+				"codex:fa8251e609ed",
+				"codex:0cbc8782815c",
+				"codex:3a06c12616fd",
+				"codex:1758642408f4",
+				"codex:2b1ab94638e2",
+				"codex:587d8a0946ba",
+				"claude-code:c5792ce69049"
+			],
+			"why": "no failed command repeats in this repo; expect zero candidates"
+		}
+	],
+	"quiet_sessions": [
+		"codex:2b1ab94638e2"
+	]
+}

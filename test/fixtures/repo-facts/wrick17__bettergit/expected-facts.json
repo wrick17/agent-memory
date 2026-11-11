@@ -1,0 +1,131 @@
+{
+	"repo": "github.com/wrick17/bettergit",
+	"provenance": {
+		"source": "recorded",
+		"sessions_in_local_history": 639,
+		"sample": "bounded sequence, not the whole history: counts, rates and injectability hold for these sessions only",
+		"sessions_in_fixture": 13,
+		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
+		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint"
+	},
+	"rules": {
+		"activation": "3 confirming sessions whose edited-file sets are disjoint from the union of earlier counted sets; an empty set is disjoint",
+		"retirement": "an active, unpinned fact retires after 2 consecutive contradicting sessions",
+		"exercised": "from the proposing session on, a session that ran the fact's program, ran its trigger, confirmed it or ran its fix",
+		"fired": "an exercised session that confirmed the fact or ran its fix with a recorded success",
+		"injectable": "active, at least 4 exercised sessions and a firing rate of at least 0.40"
+	},
+	"facts": [
+		{
+			"id": "gh-env-token",
+			"detector": "command_repair",
+			"statement": "Run `gh` as `env -u GITHUB_TOKEN -u GH_TOKEN gh ...`; with GITHUB_TOKEN set, `gh auth switch` fails.",
+			"literals": [
+				"env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch",
+				"The value of the GITHUB_TOKEN environment variable is being used for authentication."
+			],
+			"program": "gh",
+			"expected": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 6,
+				"fired": 4,
+				"rate": 0.667,
+				"confirming_counted": 3
+			},
+			"whole_local_history": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 164,
+				"fired": 160
+			},
+			"timeline": [
+				{
+					"session": "codex:12922ee41daa",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:10b554723383",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:6b2f9e404367",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"activated": true,
+					"state_after": "active"
+				}
+			]
+		},
+		{
+			"id": "pyobjc-missing",
+			"detector": "unavailable_tool",
+			"statement": "In the recorded Python environments `import Quartz` fails (PyObjC is not installed), so read macOS window data another way.",
+			"literals": [
+				"import Quartz",
+				"ModuleNotFoundError: No module named 'Quartz'"
+			],
+			"program": "python3",
+			"expected": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 4,
+				"fired": 3,
+				"rate": 0.75,
+				"confirming_counted": 3
+			},
+			"whole_local_history": {
+				"state": "active",
+				"injectable": true,
+				"exercised": 9,
+				"fired": 8
+			},
+			"timeline": [
+				{
+					"session": "codex:121db817da54",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:7b57938b4f71",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"state_after": "candidate"
+				},
+				{
+					"session": "codex:2bfe6b4e2260",
+					"observation": "confirm",
+					"files": 0,
+					"disjoint": true,
+					"activated": true,
+					"state_after": "active"
+				}
+			]
+		}
+	],
+	"must_not_produce": [
+		{
+			"signal": "network",
+			"sessions": [
+				"codex:4182ada678c2",
+				"codex:2c95a1f0de5d"
+			],
+			"why": "`curl 127.0.0.1:<port>` was refused because the local dev app was not running; loopback is never a network boundary"
+		}
+	],
+	"quiet_sessions": [
+		"codex:69c663db7785",
+		"codex:421e78515668"
+	]
+}
