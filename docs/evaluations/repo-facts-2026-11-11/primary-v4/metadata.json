@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "as_of": "2026-11-11T05:00:00Z",
+  "source": "Agent Memory historical lexical recall, repo-name query",
+  "max_tokens": 600,
+  "repos": {
+    "bettergit": {
+      "query": "bettergit",
+      "profile": "personal",
+      "result_count": 2,
+      "context_sha256": "57e5bbca004b28c8f24b0e80db8a7b5fd4be8672ac62863ffe3e51dc56177dc4",
+      "context_characters": 1525
+    },
+    "agent-memory": {
+      "query": "agent-memory",
+      "profile": "personal",
+      "result_count": 1,
+      "context_sha256": "3b6cb96c9fc3d00acb5152fbcf279b2871c6b3171cca244513c434b9478d8a85",
+      "context_characters": 489
+    },
+    "postplan": {
+      "query": "postplan",
+      "profile": "personal",
+      "result_count": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "context_characters": 0
+    },
+    "browser-mcp": {
+      "query": "browser-mcp",
+      "profile": "personal",
+      "result_count": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "context_characters": 0
+    }
+  }
+}

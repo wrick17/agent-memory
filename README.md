@@ -17,7 +17,7 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 
 ### Source-verified, not released
 
-These pass source and local tests but are not released, and no live client has run them yet; see the [repo facts verification](docs/repo-facts-verification.md). Session-start facts, fact synthesis and the loop guard are off by default.
+These are merged and pass source and local tests, but they are not released or turned on in any owner client; see the [repo facts verification](docs/repo-facts-verification.md). Session-start facts, fact synthesis and the loop guard are off by default. This limited replay did not demonstrate efficiency savings from repo facts.
 
 - **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a variable unset. After 3 separate sessions confirm a fact, and it keeps proving useful, session start can add up to 4 of them. Turn it on with `facts.inject`.
 - **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`.
