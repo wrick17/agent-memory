@@ -39,7 +39,8 @@ describe("v2 storage compatibility (issue #5)", () => {
 		.filter((r) => !skip.includes(r.name))
 		.map(({ name }) => [name, sql.exec(`SELECT * FROM "${name}"`).toArray().filter((r) => !(name === meta && r.key === "schema_version")).map((r) => JSON.stringify(r)).sort()]));
 	const ddl = (sql: SqlStorage, name: string) => sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = ?", name).toArray()[0]?.sql;
-	const NEW_PROFILE = ["recall_daily", "recall_totals", "eval_candidates"], NEW_ACCOUNT = ["eval_runs", "client_status", "health"];
+	// v10 (repo facts v2, guidance receipts) tables go too: a v8 profile has neither.
+	const NEW_PROFILE = ["recall_daily", "recall_totals", "eval_candidates", "fact_reports", "fact_report_facts", "fact_days", "guidance_injections", "guidance_sessions", "correction_matches"], NEW_ACCOUNT = ["eval_runs", "client_status", "health"];
 	/** Puts a v9 profile back into the deployed v8 shape: no v2 tables, and maintenance under v2's DDL, indexes and triggers. */
 	const toV8 = (sql: SqlStorage) => {
 		for (const t of NEW_PROFILE) sql.exec(`DROP TABLE ${t}`);
@@ -86,7 +87,7 @@ describe("v2 storage compatibility (issue #5)", () => {
 		await profileAt((st) => {
 			const sql = st.sql, before = dump(sql, "profile_meta");
 			migrate(st, "profile_meta", PROFILE_MIGRATIONS);
-			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe("9");
+			expect(sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value).toBe(String(PROFILE_MIGRATIONS.length));
 			expect(dump(sql, "profile_meta", NEW_PROFILE)).toEqual(before);
 			expect(ddl(sql, "maintenance")).toContain("'stale_memory'");
 			expect(sql.exec("SELECT name FROM sqlite_master WHERE tbl_name = 'maintenance' AND type IN ('index', 'trigger') ORDER BY name").toArray().map((r) => r.name))
@@ -105,7 +106,7 @@ describe("v2 storage compatibility (issue #5)", () => {
 		// Replay after the upgrade returns the stored results.
 		expect(await call(c, "append_memory", { memory_id: j.memory_id, content: "v8 entry 2", request_id: "v8-app-2" })).toMatchObject({ revision: 3 });
 		const v9 = (await exportOf("personal")).personal!.id;
-		expect(await value<Manifest>(readManifest(env, "profile-personal", v9, OWNER))).toMatchObject({ schema_version: 9, counts: { recall_daily: 1, recall_totals: 1, eval_candidates: 1 } });
+		expect(await value<Manifest>(readManifest(env, "profile-personal", v9, OWNER))).toMatchObject({ schema_version: PROFILE_MIGRATIONS.length, counts: { recall_daily: 1, recall_totals: 1, eval_candidates: 1 } });
 
 		// v2 code restores the pre-v2 export: its rows land in v9 tables, and the v2 tables start empty.
 		await restoreProfile(v8);
@@ -115,7 +116,7 @@ describe("v2 storage compatibility (issue #5)", () => {
 			.toEqual(["saved", "appended", "appended"]);
 		expect(await call(after, "append_memory", { memory_id: j.memory_id, content: "v8 entry 1", request_id: "v8-app-1" })).toMatchObject({ revision: 2 });
 		expect(await profileSql((sql) => [sql.exec("SELECT value FROM profile_meta WHERE key = 'schema_version'").one().value, ...NEW_PROFILE.map((t) => sql.exec(`SELECT count(*) AS n FROM ${t}`).one().n),
-			sql.exec("SELECT kind, state, outcome FROM maintenance WHERE fingerprint = 'v8-item'").toArray()])).toEqual(["9", 0, 0, 0, [{ kind: "stale_journal", state: "done", outcome: "kept" }]]);
+			sql.exec("SELECT kind, state, outcome FROM maintenance WHERE fingerprint = 'v8-item'").toArray()])).toEqual([String(PROFILE_MIGRATIONS.length), ...NEW_PROFILE.map(() => 0), [{ kind: "stale_journal", state: "done", outcome: "kept" }]]);
 
 		// A v9 export restores with its v2 rows.
 		await restoreProfile(v9);
@@ -125,11 +126,11 @@ describe("v2 storage compatibility (issue #5)", () => {
 
 		// Below the floor or above this code's schema: refused before any recovery opens.
 		const refused: string[] = [];
-		for (const v of [7, 10]) {
+		for (const v of [7, PROFILE_MIGRATIONS.length + 1]) {
 			await profileSql((sql) => relabel(sql, "profile_meta", v));
 			refused.push((await exportOf("personal")).personal!.id);
 		}
-		await profileSql((sql) => relabel(sql, "profile_meta", 9));
+		await profileSql((sql) => relabel(sql, "profile_meta", PROFILE_MIGRATIONS.length));
 		for (const id of refused) expect(await admin({ op: "beginRestore", profile: "personal", export: id })).toMatchObject({ ok: false, error: { code: "validation", message: expect.stringContaining("not restorable") } });
 		expect(await value(admin({ op: "restoreStatus" }))).toMatchObject({ recovery: null });
 	});
@@ -182,9 +183,9 @@ describe("v2 storage compatibility (issue #5)", () => {
 		await profileSql((sql) => relabel(sql, "profile_meta", 8));
 		const p8 = (await exportOf("personal")).personal!.id;
 		await tick();
-		await profileSql((sql) => relabel(sql, "profile_meta", 10));
+		await profileSql((sql) => relabel(sql, "profile_meta", PROFILE_MIGRATIONS.length + 1));
 		await exportOf("personal");
-		await profileSql((sql) => relabel(sql, "profile_meta", 9));
+		await profileSql((sql) => relabel(sql, "profile_meta", PROFILE_MIGRATIONS.length));
 		const begun = await value<{ id: string; export: string; account_export: string | null }>(admin({ op: "beginDrill", profile: "personal", request_id: "drill-v8" }));
 		expect(begun).toMatchObject({ export: p8, account_export: a7 });
 		let d = await value<{ state: string; passed?: boolean }>(admin({ op: "drillStep", id: begun.id }));

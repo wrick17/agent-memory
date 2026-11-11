@@ -74,6 +74,13 @@ describe("save and update", () => {
 		expect((await call(c, "get_memory", { memory_id: saved.memory_id })).content).toBe(`Inspect the diagnostic sample.\n{"api_key":[REDACTED]} {'github_token':[REDACTED]}\n{"api_key":[REDACTED]}`);
 		expect(await call(c, "save_memory", json)).toMatchObject({ action: "replayed", memory_id: saved.memory_id });
 	});
+
+	it("redacts a secret carried by a shell expansion or substitution, and keeps plain references and file reads", async () => {
+		const c = await contextFor();
+		const content = "PASSWORD=$(printf synthetic-only-x) PASSWORD=${UNSET:-synthetic-only-y} TOKEN=$GH_TOKEN TOKEN=$(cat ~/.tok)";
+		const saved = await call(c, "save_memory", { ...note, name: "Has substituted secrets", content, request_id: "redact-subst-1" });
+		expect((await call(c, "get_memory", { memory_id: saved.memory_id })).content).toBe("PASSWORD=[REDACTED] PASSWORD=[REDACTED] TOKEN=$GH_TOKEN TOKEN=$(cat ~/.tok)");
+	});
 });
 
 describe("transaction bound", () => {
