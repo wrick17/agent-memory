@@ -8,7 +8,16 @@ import type { Am, J, Node, Profile, Route } from "./am";
 export function lessonsTab(am: Am): void {
 	const { act, active, btn, call, choose, copy, day, el, empty, enc, input, intro, link, loading, mcpCall, mcpCurl, note, pageStatus, recorded, undoOf, why, win } = am;
 	type Lesson = { profile: string; id: string; kind: string; name: string; description: string; origin: string; pinned: boolean; flagged: string | null;
-		updated_at: string; scope: string; projects: string[]; evidence: { kind: string; ref: string; note: string | null }[]; evidence_truncated: boolean; evidence_missing: boolean };
+		updated_at: string; scope: string; projects: string[]; evidence: { kind: string; ref: string; note: string | null }[]; evidence_truncated: boolean; evidence_missing: boolean;
+		guidance: Guidance | null };
+	type Guidance = { injected: number; processed: number; failed: number; followed: number; followed_rate: number | null };
+	const count = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null);
+	/** #127 guidance receipts: null when the lesson was never injected or the shape is not one this page can read. */
+	const guidanceOf = (v: unknown): Guidance | null => {
+		const g = v as J, n = { injected: count(g?.injected), processed: count(g?.processed), failed: count(g?.failed), followed: count(g?.followed) };
+		if (!g || Object.values(n).some((x) => x === null)) return null;
+		return { ...(n as Omit<Guidance, "followed_rate">), followed_rate: typeof g.followed_rate === "number" && Number.isFinite(g.followed_rate) ? g.followed_rate : null };
+	};
 	const SOURCES = 5; // an inferred lesson's bar: its evidence pointers, capped here
 	const KINDS = ["preference", "rule"];
 	const filters = { q: "", project: "", origin: "", kind: "" }; // kept across the re-render that follows each action
@@ -17,7 +26,7 @@ export function lessonsTab(am: Am): void {
 	const fromModel = (profile: string, it: J): Lesson => ({ profile, id: String(it.id), kind: str(it.kind) || "preference", name: str(it.name), description: str(it.description),
 		origin: str(it.origin), pinned: it.pinned === true, flagged: str(it.flagged) || null, updated_at: str(it.updated_at), scope: str(it.scope),
 		projects: Array.isArray(it.projects) ? it.projects.filter((p: unknown) => typeof p === "string" && p) : [],
-		evidence: evidenceOf(it.evidence), evidence_truncated: it.evidence_truncated === true, evidence_missing: it.evidence_missing === true });
+		evidence: evidenceOf(it.evidence), evidence_truncated: it.evidence_truncated === true, evidence_missing: it.evidence_missing === true, guidance: guidanceOf(it.guidance) });
 	// The entity read of one node, for a deep link to a lesson not on a loaded page. Projects are its current, readable project links.
 	const fromEntity = (profile: string, r: J): Lesson | null => {
 		const n = r?.node;
@@ -27,7 +36,7 @@ export function lessonsTab(am: Am): void {
 			&& !l.ended_at && l.direction === "out").map((l: J) => str(l.other.name)).filter(Boolean))].sort().slice(0, 3);
 		return { profile, id: String(n.id), kind: str(n.kind), name: str(n.name), description: str(n.description), origin: str(n.origin), pinned: n.pinned === true || n.pinned === 1,
 			flagged: str(n.flagged) || null, updated_at: str(n.updated_at), scope: str(n.scope), projects, evidence: ev, evidence_truncated: r.evidence?.truncated === true,
-			evidence_missing: str(n.origin) === "inferred" && ev.length === 0 };
+			evidence_missing: str(n.origin) === "inferred" && ev.length === 0, guidance: null };
 	};
 
 	am.tab({ id: "lessons", group: "memory", label: "Lessons", key: "l", profiles: "any", render: (root: Node, route: Route) => {
@@ -114,6 +123,13 @@ export function lessonsTab(am: Am): void {
 			const o = el("td", tr), stated = it.origin === "stated" || it.origin === "inferred";
 			el("span", o, it.origin ? it.origin.toUpperCase() : "NOT RECORDED").setAttribute("class", `chip chip-${stated ? it.origin : "other"}`);
 			if (it.pinned) el("span", o, "PINNED").setAttribute("class", "chip chip-pinned");
+			// Guidance receipts (#127): sessions that got this lesson and were processed, and how many did not repeat the mistake.
+			const g = it.guidance;
+			if (g) {
+				const c = el("span", o, g.processed ? `FOLLOWED ${g.followed}/${g.processed}` : `INJECTED ${g.injected}`);
+				c.setAttribute("class", `chip ${!g.processed ? "c-blue" : g.failed ? "c-warn" : "c-ok"}`);
+				c.setAttribute("title", `Injected in ${g.injected} session${g.injected === 1 ? "" : "s"}; ${g.processed} processed, ${g.failed} repeated the mistake.`);
+			}
 			confidence(el("td", tr), it);
 			const u = uses.get(`${it.profile}/${it.id}`);
 			el("td", tr, u === undefined || u === null ? "Not available" : String(u));

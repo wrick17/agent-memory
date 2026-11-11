@@ -2,6 +2,7 @@
 // stated first, then pinned, then newest, each with its open links and a bounded slice of its evidence. Read-only: it never
 // writes, binds, stamps a sequence number or resolves another profile; pin, unpin, forget and unflag stay the owner actions.
 import { Fail } from "../domain/types";
+import { guidanceStats, type GuidanceStats } from "./guidance";
 
 /**
  * The read-query shape; the integrator adds the same member to ReadQuery in domain/types.ts. `kinds` (v2 Lessons): which
@@ -30,6 +31,8 @@ export interface OwnerModelItem {
 	evidence_truncated: boolean;
 	/** An inferred preference with no evidence pointer at all. */
 	evidence_missing: boolean;
+	/** #127 guidance receipts: sessions it was injected in, processed and failed, and its followed rate; null when never injected. */
+	guidance: GuidanceStats | null;
 }
 export interface OwnerModelPage { items: OwnerModelItem[]; next_after: string | null }
 
@@ -70,12 +73,13 @@ export function ownerModel(sql: SqlStorage, q: OwnerModelQuery): OwnerModelPage 
 			(SELECT kind, ref, note FROM evidence WHERE owner = j.value ORDER BY kind, ref LIMIT ?)) AS items
 		FROM json_each(?) j`, OWNER_EVIDENCE_MAX + 1, JSON.stringify(page.map((r) => `n:${r.id}`))).toArray()
 		.map((r) => [r.owner, JSON.parse(r.items) as [string, string, string | null][]]));
+	const guidance = guidanceStats(sql, page.map((r) => r.id));
 	const items = page.map((r): OwnerModelItem => {
 		const ev = evidence.get(`n:${r.id}`) ?? [];
 		return { id: r.id, name: r.name, description: r.description, origin: r.origin, pinned: r.p === 1, flagged: r.flagged, revision: r.revision,
 			updated_at: r.updated_at, source_profile: r.source_profile, kind: r.kind, scope: r.scope, projects: JSON.parse(r.projects) as string[], links: r.links,
 			evidence: ev.slice(0, OWNER_EVIDENCE_MAX).map(([kind, ref, note]) => ({ kind, ref, note })),
-			evidence_truncated: ev.length > OWNER_EVIDENCE_MAX, evidence_missing: r.origin === "inferred" && ev.length === 0 };
+			evidence_truncated: ev.length > OWNER_EVIDENCE_MAX, evidence_missing: r.origin === "inferred" && ev.length === 0, guidance: guidance.get(r.id) ?? null };
 	});
 	const last = page.at(-1);
 	return { items, next_after: rows.length > limit && last ? JSON.stringify([last.s, last.p, last.updated_at, last.id]) : null };

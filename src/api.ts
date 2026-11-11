@@ -4,7 +4,7 @@ import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
 import { redactPayload, redactText } from "./domain/redact";
-import { FACT_DETECTORS, Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type FactArgs, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
+import { FACT_CLASSES, Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, REPO_FACT_DETECTORS, SCOPES, type FactReport, type FactReportObservation, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, callTool, ownerOf, profileStub } from "./mcp";
@@ -17,7 +17,7 @@ import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routi
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 import { deviceV2, factRepoSchema, ownerV2 } from "./v2-api";
-import { checkObservation, factRepoKey, SESSION_REF } from "./profile/store";
+import { factRoute, SESSION_REF } from "./profile/store";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
@@ -168,48 +168,95 @@ async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, ro
 }
 
 const hex16 = z.string().regex(/^[0-9a-f]{16}$/), sessionRef = z.string().regex(SESSION_REF);
-const factObservation = z.object({ fact_key: hex16, kind: z.enum(["confirm", "contradict", "propose"]), detector: z.enum(FACT_DETECTORS),
+/** The client's machine id: 32 lowercase hex characters, random and generated once per machine. It keys environment lanes. */
+export const MACHINE = z.string().regex(/^[0-9a-f]{32}$/);
+// v1 bodies (section 8): accepted for the transition, mapped to v2 with attribution legacy; statement, family and disjoint_from are ignored.
+const factObservationV1 = z.object({ fact_key: hex16, kind: z.enum(["confirm", "contradict", "propose"]), detector: z.enum(["command_repair", "unavailable_tool", "env_var", "network", "empty_vcs"]),
 	statement: z.string().min(1).max(200), literal: z.string().min(1).max(120), family: hex16,
 	disjoint_from: z.array(sessionRef).max(8).optional(), citations: z.array(sessionRef).min(1).max(8).optional() }).strict()
 	.refine((o) => (o.kind === "confirm" || !o.disjoint_from) && (o.kind === "propose") === !!o.citations, { message: "disjoint_from is for confirm, citations for propose only" });
+const factsV1 = z.object({ session: sessionRef.optional(), proposal: z.string().regex(/^[0-9a-f]{16,64}$/).optional(),
+	families: z.array(hex16).max(32).default([]), fired: z.array(hex16).max(32).default([]), observations: z.array(factObservationV1).max(32).default([]) }).strict()
+	.refine((f) => !f.session !== !f.proposal, { message: "name exactly one of session or proposal" })
+	.refine((f) => f.session ? f.observations.every((o) => o.kind !== "propose") : !f.families.length && !f.fired.length && f.observations.every((o) => o.kind === "propose"),
+		{ message: "a session reports confirm and contradict with families and fired; a proposal only proposes" });
+const signatureString = z.string().min(3).max(80);
+const factSignature = z.object({ head: z.string().min(1).max(120), scope: z.array(signatureString).min(1).max(3), confirm: z.array(signatureString).min(1).max(3),
+	contradict: z.array(signatureString).max(3), fix: z.string().min(2).max(120).optional() }).strict();
+const factObservationV2 = z.object({ fact_key: hex16, kind: z.enum(["confirm", "contradict", "propose"]), detector: z.enum(REPO_FACT_DETECTORS), literal: z.string().min(1).max(400),
+	signature: factSignature.optional(), class: z.enum(FACT_CLASSES).optional(), citations: z.array(sessionRef).min(1).max(8).optional(), high_stakes: z.boolean().optional() }).strict();
+const outcome = z.enum(["fired", "prevented", "unexercised"]), tokens = z.number().int().min(0).max(1e10);
+const factsV2 = z.object({
+	v: z.literal(2), session: sessionRef.optional(), proposal: z.string().regex(/^[0-9a-f]{16,64}$/).optional(), machine: MACHINE.optional(),
+	order: z.object({ ended_at: z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/), seq: z.number().int().min(0).max(2 ** 31 - 1) }).strict().optional(),
+	families: z.array(hex16).max(32).optional(), files: z.array(hex16).max(32).optional(), observations: z.array(factObservationV2).max(32).default([]),
+	injected: z.array(z.discriminatedUnion("kind", [z.object({ kind: z.literal("fact"), fact_key: hex16, outcome }).strict(),
+		z.object({ kind: z.literal("memory"), memory_id: z.string().min(1).max(128), outcome }).strict()])).max(16).optional(),
+	usage: z.object({ input: tokens, cached_input: tokens, output: tokens, cache_write: tokens.optional() }).strict().optional(),
+	commands: z.object({ total: tokens, failed: tokens, repeated_failures: tokens }).strict().optional(),
+}).strict()
+	.refine((f) => !f.session !== !f.proposal, { message: "name exactly one of session or proposal" })
+	.refine((f) => f.session ? !!f.order && f.observations.every((o) => o.kind !== "propose" && !o.signature && !o.class && !o.citations)
+		: !f.order && !f.families && !f.files && !f.injected && !f.usage && !f.commands && f.observations.length <= 8 && f.observations.every((o) => o.kind === "propose"),
+	{ message: "a session report has order and confirm or contradict observations; a proposal has only propose observations" });
 /**
- * A repo-facts report (#92): repo.remote is the only routing input and the source of repo_key, so a report can never route one repo's
- * facts through another's rule. Bounded refs and hashes only, plus a statement and literal the Worker checks and redacts; no digest,
- * path or output text has a field here.
+ * A repo-facts report (sections 1 and 2): the raw remote and checkout path route it through the shared router; repo_key is the
+ * client's canonical key, checked against the remote. Bounded refs and hashes only, plus literals the store checks; no digest,
+ * output text or statement has a field here.
  */
-const factsSchema = factRepoSchema.extend({
-	facts: z.object({ session: sessionRef.optional(), proposal: z.string().regex(/^[0-9a-f]{16,64}$/).optional(),
-		families: z.array(hex16).max(32).default([]), fired: z.array(hex16).max(32).default([]), observations: z.array(factObservation).max(32).default([]) }).strict()
-		.refine((f) => !f.session !== !f.proposal, { message: "name exactly one of session or proposal" })
-		.refine((f) => f.session ? f.observations.every((o) => o.kind !== "propose") : !f.families.length && !f.fired.length && f.observations.every((o) => o.kind === "propose"),
-			{ message: "a session reports confirm and contradict with families and fired; a proposal only proposes" }),
-}).strict();
+const factsBody = factRepoSchema.extend({ facts: z.unknown() }).strict();
 
-/** The fact report branch of /v1/ingest: the device token's own report, routed like an upload and never to me. */
+/** The fact report branch of /v1/ingest: the device token's own report, routed like capture and never to me. v1 bodies are never refused whole. */
 async function factsIngest(env: Env, account: AccountContext, raw: Record<string, unknown>): Promise<Response> {
 	const caller = account.caller;
+	const bad = (message: string, reason = "invalid_body") => json({ error: { code: "validation", message: message.slice(0, 500), details: { reason } } }, 400);
 	if (caller.kind !== "device" || !caller.deviceId) return json({ error: { code: "forbidden", message: "fact reports need a device token" } }, 403);
-	const parsed = factsSchema.safeParse(raw);
-	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
-	const input = parsed.data, key = factRepoKey(input.repo.remote, input.repo_key);
+	const outer = factsBody.safeParse(raw);
+	if (!outer.success) return bad(outer.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
+	const legacy = !(outer.data.facts && typeof outer.data.facts === "object" && (outer.data.facts as { v?: unknown }).v === 2);
+	const parsed = legacy ? factsV1.safeParse(outer.data.facts) : factsV2.safeParse(outer.data.facts);
+	if (!parsed.success) return bad(parsed.error.issues.map((i) => `facts.${i.path.join(".")}: ${i.message}`).join("; "));
+	const input = outer.data;
+	if (!legacy && !input.repo.path) return bad("repo.path is required", "invalid_body");
+	if (!legacy && input.repo_key === undefined) return bad("repo_key is required", "unsupported_remote");
+	const key = factRoute(input.repo.remote, input.repo_key);
 	if (!key.ok) return json({ error: key.error }, 400);
-	for (const o of input.facts.observations) {
-		const bad = checkObservation(o);
-		if (bad) return json({ error: { code: "validation", message: `observation ${o.fact_key}: ${bad}`, details: { reason: "invalid_observation" } } }, 400);
-	}
-	const route = routeWrite(caller, account.rules, account.known, { ...(input.profile ? { profile: input.profile } : {}), repo: { remote: key.value } });
+	const route = routeWrite(caller, account.rules, account.known, { ...(input.profile ? { profile: input.profile } : {}), repo: { remote: input.repo.remote, ...(input.repo.path ? { path: input.repo.path } : {}) } });
 	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
 	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "repo facts never go to me" } }, 403);
 	const ref = account.profiles.find((p) => p.profile === route.value.profile);
-	if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 400);
-	const f = input.facts, identity = f.session ? `s:${f.session}` : `p:${f.proposal}`;
-	const args: FactArgs = { repo_key: key.value, device: caller.deviceId, ...(f.session ? { session: f.session } : { proposal: f.proposal! }), families: f.families, fired: f.fired,
-		observations: f.observations.map((o) => ({ ...o, statement: redactText(o.statement) })), request_id: `facts:${sha256(`${key.value}\n${identity}`)}` };
-	const res = await profileStub(env, ref).facts(ref, args, { platform: "facts", routedBy: route.value.routedBy, userId: caller.userId, deviceId: caller.deviceId,
-		payloadHash: requestHash("fact", args as unknown as Record<string, unknown>) });
-	if (!res.ok) return json({ error: res.error }, res.error.code === "forbidden" ? 403 : res.error.code === "busy" || res.error.code === "unavailable" ? 503 : res.error.code === "profile_wiped" ? 410 : 400);
-	const { node_ids: _ids, profile: _p, routed_by: _r, ok: _ok, repo_key: _k, ...report } = res.value;
-	return json({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value, report });
+	if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 410);
+	let args: FactReport, payloadHash: string;
+	if (legacy) {
+		const f = parsed.data as z.infer<typeof factsV1>, identity = f.session ? `s:${f.session}` : `p:${f.proposal}`, request_id = `facts:${sha256(`${key.value}\n${identity}`)}`;
+		// The v1 payload hash, unchanged, so a v1 report committed before the upgrade still replays.
+		payloadHash = requestHash("fact", { repo_key: key.value, device: caller.deviceId, ...(f.session ? { session: f.session } : { proposal: f.proposal! }), families: f.families, fired: f.fired,
+			observations: f.observations.map((o) => ({ ...o, statement: redactText(o.statement) })), request_id });
+		const observations: FactReportObservation[] = f.observations.map((o) => ({ fact_key: o.fact_key, kind: o.kind, detector: o.detector, literal: o.literal, ...(o.citations ? { citations: o.citations } : {}) }));
+		args = f.session ? { type: "session", repo_key: key.value, device: caller.deviceId, request_id, session: f.session, order: { ended_at: new Date().toISOString(), seq: 0 }, attribution: "legacy",
+			families: f.families, injected: [], observations }
+			: { type: "proposal", repo_key: key.value, device: caller.deviceId, request_id, proposal: f.proposal!, observations, attribution: "legacy" };
+	} else {
+		const f = parsed.data as z.infer<typeof factsV2>;
+		if (f.order && Date.parse(f.order.ended_at) > Date.now() + 600_000) return bad("order.ended_at is in the future", "order_invalid");
+		const request_id = `facts2:${sha256(`${ref.profile}\n${key.value}\n${f.session ? `s:${f.session}` : `p:${f.proposal}`}`)}`;
+		const observations = f.observations.map((o) => ({ ...o })) as FactReportObservation[];
+		const machine = f.machine ? { machine: f.machine } : {};
+		args = f.session ? { type: "session", repo_key: key.value, device: caller.deviceId, ...machine, request_id, session: f.session, order: f.order!, attribution: "command", families: f.families ?? [],
+			...(f.files ? { files: f.files } : {}), injected: f.injected ?? [], observations, ...(f.usage ? { usage: f.usage } : {}), ...(f.commands ? { commands: f.commands } : {}) }
+			: { type: "proposal", repo_key: key.value, device: caller.deviceId, ...machine, request_id, proposal: f.proposal!, observations };
+		payloadHash = requestHash("fact", args as unknown as Record<string, unknown>);
+	}
+	const res = await profileStub(env, ref).facts(ref, args, { platform: "facts", routedBy: route.value.routedBy, userId: caller.userId, deviceId: caller.deviceId, payloadHash });
+	if (!res.ok) {
+		const code = res.error.code;
+		if (code === "idempotency_mismatch") return json({ error: { ...res.error, details: { ...(res.error.details ?? {}), reason: "report_conflict" } } }, 409);
+		return json({ error: res.error }, code === "forbidden" ? 403 : code === "busy" || code === "unavailable" ? 503 : code === "profile_wiped" ? 410 : code === "size_budget" ? 413 : 400);
+	}
+	const { node_ids: _ids, profile: _p, routed_by: _r, repo_key: _k, ...rest } = res.value;
+	// v1 clients read reply.report.facts; v2 clients get the flat contract shape.
+	return legacy ? json({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value, report: rest })
+		: json({ ...rest, profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value });
 }
 
 const markersQuery = z.object({ repo: z.string().min(1).max(512).optional(), path: z.string().min(1).max(1024).optional(), profile: z.string().regex(PROFILE_NAME).optional(),
@@ -825,13 +872,15 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 	}
 
 	// The owner's node actions and undo (section 15): ordinary writes as actor owner, each with its activity row and undo.
-	const node = /^\/api\/profiles\/([^/]+)\/nodes\/([^/]{1,128})\/(pin|unpin|forget|unflag)$/.exec(url.pathname);
+	const node = /^\/api\/profiles\/([^/]+)\/nodes\/([^/]{1,128})\/(pin|unpin|forget|unflag|retire)$/.exec(url.pathname);
 	const undo = /^\/api\/profiles\/([^/]+)\/activity\/(\d{1,15})\/undo$/.exec(url.pathname);
 	if ((node || undo) && request.method === "POST") {
 		const name = (node ?? undo)![1]!;
 		const ref = PROFILE_NAME.test(name) ? ctx.value.profiles.find((p) => p.profile === name) : undefined;
 		if (!ref) return json({ error: { code: "not_found", message: `profile '${name}' is not active` } }, 404);
-		const cmd: WriteCommand = node ? { op: "owner", args: { action: node[3] as OwnerArgs["action"], memory_id: decodeURIComponent(node[2]!) } }
+		// retire is the ordinary retire-only save (allowed on repo facts too), with its own activity row and undo.
+		const cmd: WriteCommand = node?.[3] === "retire" ? { op: "save", args: { memory_id: decodeURIComponent(node[2]!), retire: true, request_id: `dashboard:retire:${crypto.randomUUID()}` } }
+			: node ? { op: "owner", args: { action: node[3] as OwnerArgs["action"], memory_id: decodeURIComponent(node[2]!) } }
 			: { op: "undo", args: { activity_id: Number(undo![2]), request_id: `undo:${undo![2]}` } };
 		const r = await profileStub(env, ref).write(ref, cmd, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: auth.principal.userId,
 			payloadHash: requestHash(cmd.op, cmd.args as unknown as Record<string, unknown>),

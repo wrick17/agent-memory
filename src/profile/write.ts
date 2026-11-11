@@ -18,7 +18,7 @@ import { assertWritable } from "./transfer";
 import { beforeImages, recordUndo, restore, revert } from "./undo";
 import { assertNotWiped, assertOpen } from "./wipe";
 import { upload, uploadIds, uploadKey } from "./work-upload";
-import { applyFacts, assertFactReserved, assertNotFactEdge, factIds, markForgotten } from "./facts";
+import { applyFacts, applyFlag, assertFactReserved, assertNotFactEdge, factIds, markForgotten } from "./facts";
 
 export interface Who { userId: string; profile: string; generation: string }
 
@@ -90,6 +90,7 @@ export function writeIds(who: Who, cmd: WriteCommand): string[] {
 	if (cmd.op === "knowledge") return (cmd.args.nodes ?? []).map((n) => knowledgeId(who, n));
 	if (cmd.op === "upload") return uploadIds(who, cmd.args);
 	if (cmd.op === "fact") return factIds(who, cmd.args);
+	if (cmd.op === "fact_flag") return cmd.args.memory_id ? [cmd.args.memory_id] : [];
 	const a = cmd.args as SaveArgs;
 	return [...(a.memory_id ? [a.memory_id] : []), ...(a.name && a.type ? [newMemoryId(who.userId, who.profile, a.scope !== undefined ? scopeOf(a.scope) : "default", a.type, a.name)] : [])];
 }
@@ -829,7 +830,7 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 		const before = cmd.op === "undo" || refused.length ? undefined : beforeImages(sql, cmd);
 		const flags = refused.map((n) => flagProtected(tx, n.id, n.why, cmd.op, ctx.actor));
 		const out: WriteOutput = flags.length ? { result: { action: "flagged", memory_id: refused[0]!.id, activity_id: flags.at(-1) }, created: [], embedDue: false }
-			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : cmd.op === "fact" ? applyFacts(tx, who, cmd.args) : candidate(tx, who, cmd.args);
+			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : cmd.op === "fact" ? applyFacts(tx, who, cmd.args) : cmd.op === "fact_flag" ? applyFlag(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
 		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed, commitReceipt: tx.commitReceipt });
 		if (requestId) {

@@ -361,4 +361,40 @@ export const PROFILE_MIGRATIONS: Migration[] = [[
 	"CREATE INDEX maintenance_open ON maintenance (state, kind, created_at)",
 	"CREATE INDEX maintenance_seq ON maintenance (seq, id)",
 	...tombstoneTriggers("profile_meta", "maintenance", (r) => `CAST(${r}.id AS TEXT)`),
+], [
+	// v10 (repo facts v2, docs/repo-facts-v2-contract.md section 6): report receipts with the complete validated report (the replay
+	// input), their per-fact index (forget rewrites the receipts it names) and per repo per day efficiency rows. Older exports restore
+	// with these tables empty.
+	`CREATE TABLE fact_reports (repo_key TEXT NOT NULL, report_id TEXT NOT NULL, order_key TEXT NOT NULL, device TEXT NOT NULL, day TEXT NOT NULL,
+		received_at TEXT NOT NULL, body TEXT NOT NULL CHECK (json_valid(body)), seq INTEGER NOT NULL, PRIMARY KEY (repo_key, report_id)) WITHOUT ROWID`,
+	"CREATE INDEX fact_reports_order ON fact_reports (order_key, repo_key, report_id)",
+	`CREATE TABLE fact_report_facts (repo_key TEXT NOT NULL, fact_key TEXT NOT NULL, report_id TEXT NOT NULL, seq INTEGER NOT NULL,
+		PRIMARY KEY (repo_key, fact_key, report_id)) WITHOUT ROWID`,
+	`CREATE TABLE fact_days (repo_key TEXT NOT NULL, day TEXT NOT NULL, sessions INTEGER NOT NULL, usage_sessions INTEGER NOT NULL, input INTEGER NOT NULL,
+		cached_input INTEGER NOT NULL, output INTEGER NOT NULL, cache_write INTEGER NOT NULL, commands INTEGER NOT NULL, failed INTEGER NOT NULL,
+		repeated_failures INTEGER NOT NULL, injected INTEGER NOT NULL, prevented INTEGER NOT NULL, fired INTEGER NOT NULL, seq INTEGER NOT NULL,
+		PRIMARY KEY (repo_key, day)) WITHOUT ROWID`,
+	"CREATE INDEX fact_reports_seq ON fact_reports (seq, repo_key, report_id)",
+	"CREATE INDEX fact_report_facts_seq ON fact_report_facts (seq, repo_key, fact_key, report_id)",
+	"CREATE INDEX fact_days_seq ON fact_days (seq, repo_key, day)",
+	...tombstoneTriggers("profile_meta", "fact_reports", (r) => `json_array(${r}.repo_key, ${r}.report_id)`),
+	...tombstoneTriggers("profile_meta", "fact_report_facts", (r) => `json_array(${r}.repo_key, ${r}.fact_key, ${r}.report_id)`),
+	...tombstoneTriggers("profile_meta", "fact_days", (r) => `json_array(${r}.repo_key, ${r}.day)`),
+	// Guidance receipts (#127, src/profile/guidance.ts): one row per injected memory per session, pending until the batch has
+	// processed that session; processed sessions; and the correction matches the batch's record_lesson made.
+	`CREATE TABLE guidance_injections (session_ref TEXT NOT NULL, memory_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending','followed','failed')),
+		at TEXT NOT NULL, seq INTEGER NOT NULL, UNIQUE (session_ref, memory_id))`,
+	"CREATE INDEX guidance_injections_memory ON guidance_injections (memory_id, state)",
+	"CREATE INDEX guidance_injections_at ON guidance_injections (at)",
+	"CREATE TABLE guidance_sessions (session_ref TEXT PRIMARY KEY, session_id TEXT NOT NULL, processed_at TEXT NOT NULL, seq INTEGER NOT NULL) WITHOUT ROWID",
+	`CREATE TABLE correction_matches (session_ref TEXT NOT NULL, session_id TEXT NOT NULL, rule_id TEXT NOT NULL, correction_index INTEGER NOT NULL,
+		repeat INTEGER NOT NULL, at TEXT NOT NULL, seq INTEGER NOT NULL, UNIQUE (session_ref, rule_id, correction_index))`,
+	"CREATE INDEX correction_matches_session ON correction_matches (session_id)",
+	"CREATE INDEX correction_matches_at ON correction_matches (at)",
+	"CREATE INDEX guidance_injections_seq ON guidance_injections (seq)",
+	"CREATE INDEX guidance_sessions_seq ON guidance_sessions (seq, session_ref)",
+	"CREATE INDEX correction_matches_seq ON correction_matches (seq)",
+	...tombstoneTriggers("profile_meta", "guidance_injections", (r) => `json_array(${r}.session_ref, ${r}.memory_id)`),
+	...tombstoneTriggers("profile_meta", "guidance_sessions", (r) => `${r}.session_ref`),
+	...tombstoneTriggers("profile_meta", "correction_matches", (r) => `json_array(${r}.session_ref, ${r}.rule_id, ${r}.correction_index)`),
 ]];

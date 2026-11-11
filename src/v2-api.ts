@@ -3,7 +3,7 @@
 import type { AccountContext, AccountHealth, AccountStore, Principal } from "./account/store";
 import { authenticate } from "./auth";
 import { z } from "zod";
-import { PROFILE_NAME, type Outcome, type ProfileRef } from "./domain/types";
+import { PROFILE_NAME, type FactFlagArgs, type Outcome, type ProfileRef } from "./domain/types";
 import { accountStub, profileStub, recall, recallRequestSchema } from "./mcp";
 import { corpusFiles, corpusFilesSql, embeddingsOn, type SearchCounts } from "./profile/store";
 import { corpusOn, corpusStub } from "./corpus-tools";
@@ -12,8 +12,10 @@ import { eventStream, parseCursor, STREAM_MAX_MS } from "./viewer/events";
 import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
 import { healthReport } from "./health";
 import { mayUse, routeWrite } from "./routing";
-import { factRepoKey, REPO_KEY } from "./profile/store";
+import { factRoute, REPO_KEY } from "./profile/store";
+import { requestHash } from "./domain/ids";
 import { parseEvalRun } from "./eval";
+import { brief } from "./brief";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
 import type { ActivitySummary, FeedItem, LeaseFacts, Page, ProfileSnapshotPart, ProjectProfile, SessionRow, ViewerCursor } from "./viewer/types";
 
@@ -33,9 +35,16 @@ async function deviceCaller(request: Request, env: Env): Promise<Response | Acco
 	const ctx = await accountStub(env, env.OWNER_USER_ID!).context(auth.principal as Principal);
 	return ctx.ok ? ctx.value : json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 }
-/** Repo-fact routes (#93): repo.remote is the only routing input and the source of repo_key; a body repo_key must match it. */
-export const factRepoSchema = z.object({ repo: z.object({ remote: z.string().min(1).max(512) }).strict(), repo_key: z.string().max(160).optional(),
-	profile: profileName.optional() });
+/**
+ * Repo-fact routes (contract section 1): the raw remote and checkout path route through routeWrite; repo_key is the client's
+ * canonical key, checked against the remote by factRoute. v1 bodies carry no path and no repo_key.
+ */
+/** The owner's flag body (contract section 7): a non-empty reason is required. */
+export const flagSchema = z.object({ memory_id: z.string().min(1).max(128).optional(), repo_key: z.string().regex(/^github\.com\//).max(160).optional(), fact_key: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+	scope: z.enum(["repo", "user"]).default("repo"), reason: z.string().trim().min(1).max(200), request_id: z.string().min(1).max(256).optional() }).strict()
+	.refine((f) => !!f.memory_id || (!!f.fact_key && (f.scope === "user" || !!f.repo_key)), { message: "name memory_id, or fact_key with repo_key" });
+export const factRepoSchema = z.object({ repo: z.object({ remote: z.string().min(1).max(512), path: z.string().min(1).max(1024).optional() }).strict(),
+	repo_key: z.string().max(160).optional(), profile: profileName.optional() });
 
 /** The job token: a device holding ingest and maintenance. Its device id comes from the token, never from a body. */
 const isJob = (c: AccountContext) => c.caller.kind === "device" && !!c.caller.deviceId && c.caller.scopes.includes("ingest") && c.caller.scopes.includes("maintenance");
@@ -74,23 +83,29 @@ export async function deviceV2(request: Request, env: Env, url: URL, waitUntil: 
 		return reply(await recall({ env, caller: c.caller, account: c, platform: `${c.caller.kind}:${c.caller.deviceName ?? "unknown"}`, ...(waitUntil ? { waitUntil } : {}) },
 			a, { ...(channels ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) }));
 	}
-	// #94 repo-fact injection: the read scope; at most 4 eligible facts of the repo key, from the profile its remote routes to. Never me.
+	// B1 session-start brief: the read scope; routed like the fact routes, plus me's preferences and rules (src/brief.ts).
+	if (path === "/v1/brief" && method === "POST") {
+		const c = await deviceCaller(request, env);
+		return c instanceof Response ? c : brief(request, env, c);
+	}
+	// Repo-fact injection (contract section 6), kept for compatibility beside /v1/brief: the read scope, routed by raw remote and path.
+	// mode inject: the injectable facts for this token's device and the rendered block; mode held: every live and dormant fact.
 	if (path === "/v1/facts" && method === "POST") {
 		const c = await deviceCaller(request, env);
 		if (c instanceof Response) return c;
 		if (!c.caller.scopes.includes("read")) return forbidden("this token cannot read");
 		const body = await boundedJson(request, 4_000);
 		if (body instanceof Response) return body;
-		const p = factRepoSchema.strict().safeParse(body.value);
+		const p = factRepoSchema.extend({ mode: z.enum(["inject", "held"]).optional(), machine: z.string().regex(/^[0-9a-f]{32}$/).optional() }).strict().safeParse(body.value);
 		if (!p.success) return invalid(issues(p.error));
-		const key = factRepoKey(p.data.repo.remote, p.data.repo_key);
+		const key = factRoute(p.data.repo.remote, p.data.repo_key);
 		if (!key.ok) return reply(key);
-		const route = routeWrite(c.caller, c.rules, c.known, { ...(p.data.profile ? { profile: p.data.profile } : {}), repo: { remote: key.value } });
+		const route = routeWrite(c.caller, c.rules, c.known, { ...(p.data.profile ? { profile: p.data.profile } : {}), repo: p.data.repo });
 		if (!route.ok) return reply(route);
 		if (route.value.profile === "me") return forbidden("repo facts never come from me");
 		const ref = c.profiles.find((x) => x.profile === route.value.profile);
 		if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 410);
-		const r = await profileStub(env, ref).readV2(ref, { kind: "fact_inject", repo_key: key.value });
+		const r = await profileStub(env, ref).readV2(ref, p.data.mode === "held" ? { kind: "fact_held", repo_key: key.value } : { kind: "fact_inject", repo_key: key.value, device: p.data.machine ?? "" }); // no machine id: no environment lane
 		return r.ok ? json({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value, ...(r.value as object) }) : reply(r);
 	}
 	// #9 accepted candidates for `agent-memory eval export-candidates`: the read scope, an explicit profile the token may use.
@@ -152,11 +167,12 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		const a = await account.admin({ op: "accountHealth" });
 		if (!a.ok) return reply(a);
 		const per = await Promise.all(ctx.profiles.map(async (r) => {
-			const [lease, counts] = await Promise.all([profileStub(env, r).readV2(r, { kind: "lease_facts" }).catch(() => null), profileStub(env, r).readV2(r, { kind: "search_counts" }).catch(() => null)]);
-			return { profile: r.profile, lease: lease?.ok ? lease.value as LeaseFacts : null, counts: counts?.ok ? counts.value as SearchCounts : null };
+			const [lease, counts, facts] = await Promise.all([profileStub(env, r).readV2(r, { kind: "lease_facts" }).catch(() => null), profileStub(env, r).readV2(r, { kind: "search_counts" }).catch(() => null),
+				profileStub(env, r).readV2(r, { kind: "fact_health" }).catch(() => null)]);
+			return { profile: r.profile, lease: lease?.ok ? lease.value as LeaseFacts : null, counts: counts?.ok ? counts.value as SearchCounts : null, facts: facts?.ok ? facts.value : null };
 		}));
-		return json(healthReport(a.value as AccountHealth, per.flatMap((x) => (x.lease ? [{ profile: x.profile, facts: x.lease }] : [])),
-			per.map((x) => (x.counts ? { usage: x.counts } : null)), embeddingsOn(env)));
+		return json({ ...healthReport(a.value as AccountHealth, per.flatMap((x) => (x.lease ? [{ profile: x.profile, facts: x.lease }] : [])),
+			per.map((x) => (x.counts ? { usage: x.counts } : null)), embeddingsOn(env)) as object, facts: Object.fromEntries(per.map((x) => [x.profile, x.facts])) });
 	}
 	// #13 viewer snapshot: one part from every active profile; any failed profile read fails the request, never a smaller total.
 	if (path === "/api/viewer/snapshot" && method === "GET") {
@@ -283,13 +299,38 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		const pp = r.value as ProjectProfile, f = await files(ref, corpusFilesSql({ project: pp.key, now: new Date().toISOString() }));
 		return f.ok ? json({ ...pp, files: f.value }) : reply(f);
 	}
-	// #95 repo facts: every state with evidence and firing rate. Retire, pin, unpin and forget stay the existing memory actions.
+	// Repo facts (contract section 7): list with lanes and evidence, the owner's flag (terminal, undoable through its activity) and
+	// per repo per day efficiency rows. Retire, pin, unpin and forget stay the existing memory actions.
 	if (p && sub === "facts" && method === "GET") {
 		if (!ref) return notActive();
-		const q = z.object({ repo_key: z.string().regex(REPO_KEY).optional(), after: z.string().min(1).max(300).optional(),
-			limit: z.coerce.number().int().min(1).max(200).optional() }).strict().safeParse(params);
-		if (!q.success) return invalid("repo_key github.com/<owner>/<repo>, after, limit 1 to 200");
-		return reply(await profileStub(env, ref).readV2(ref, { kind: "facts", ...(q.data.repo_key ? { repo_key: q.data.repo_key } : {}), after: q.data.after ?? null, limit: q.data.limit ?? 100 }));
+		const q = z.object({ repo_key: z.string().regex(REPO_KEY).optional(), tier: z.enum(["repo", "user", "all"]).optional(), state: z.enum(["candidate", "active", "retired", "dormant", "all"]).optional(),
+			device: z.string().min(1).max(128).optional(), after: z.string().min(1).max(300).optional(), limit: z.coerce.number().int().min(1).max(200).optional() }).strict().safeParse(params);
+		if (!q.success) return invalid("repo_key github.com/<owner>/<repo>, tier, state, device, after, limit 1 to 200");
+		const { after, limit, ...rest } = q.data;
+		return reply(await profileStub(env, ref).readV2(ref, { kind: "facts", ...rest, after: after ?? null, limit: limit ?? 100 }));
+	}
+	// #130 goal metrics: per repo and per week, read-only.
+	if (p && sub === "goal-metrics" && method === "GET") {
+		if (!ref) return notActive();
+		const q = z.object({ weeks: z.coerce.number().int().min(1).max(26).optional(), repo_key: z.string().regex(REPO_KEY).optional() }).strict().safeParse(params);
+		if (!q.success) return invalid("weeks 1 to 26, repo_key github.com/<owner>/<repo>");
+		return reply(await profileStub(env, ref).readV2(ref, { kind: "goal_metrics", now: new Date().toISOString(), ...q.data }));
+	}
+	if (p && sub === "facts/flag" && method === "POST") {
+		if (!ref) return notActive();
+		const b = flagSchema.safeParse(await request.json().catch(() => null));
+		if (!b.success) return invalid(`send JSON with memory_id (or fact_key and repo_key), scope and a reason: ${issues(b.error)}`);
+		const args: FactFlagArgs = { ...b.data, request_id: b.data.request_id ?? `fact-flag:${crypto.randomUUID()}` };
+		const r = await profileStub(env, ref).write(ref, { op: "fact_flag", args }, { actor: "owner", platform: "dashboard", routedBy: "explicit", userId: ctx.caller.userId,
+			payloadHash: requestHash("fact_flag", args as unknown as Record<string, unknown>) });
+		return reply(r);
+	}
+	if (p && sub === "facts/efficiency" && method === "GET") {
+		if (!ref) return notActive();
+		const day = z.string().regex(/^\d{4}-\d\d-\d\d$/);
+		const q = z.object({ repo_key: z.string().regex(REPO_KEY).optional(), from: day, to: day }).strict().safeParse(params);
+		if (!q.success || q.data.from > q.data.to || Date.parse(q.data.to) - Date.parse(q.data.from) > 92 * 86_400_000) return invalid("repo_key, from and to (YYYY-MM-DD, at most 92 days apart)");
+		return reply(await profileStub(env, ref).readV2(ref, { kind: "fact_efficiency", ...q.data }));
 	}
 	if (p && sub === "recall-strength" && method === "GET") {
 		if (!ref) return notActive();

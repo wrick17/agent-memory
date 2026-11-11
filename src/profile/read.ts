@@ -9,12 +9,45 @@ import { captureText, findNode, readContent, relationships, type NodeRow, type W
 import { captureState, manifestListed, parseRange, sessionKey } from "./capture";
 import { BATCH_GAP_MS, batchStatus } from "./maintenance";
 import { projectKey } from "./work-upload";
+import { normalizeRemote } from "../routing";
+import { injectableFacts } from "./facts";
+import { failing, guidanceStats, type GuidanceStats } from "./guidance";
 
 export const PAGE = 100_000;
 const RRF_K = 60;
 const PASSAGE = 700;
 const TOKEN_RE = /[A-Za-z0-9_@./:#-]+/g;
 const ORIGIN_WEIGHT: Record<string, number> = { stated: 1, agent: 0.9, import: 0.9, upload: 0.8, index: 0.8, inferred: 0.7 };
+/**
+ * B5: a hit no exact or literal channel found must fuse to at least this. One channel alone passes to about rank 39 for a stated
+ * record, 29 for an agent one and 9 for an inferred one; any two channels near their top pass. Deep single-channel tails drop.
+ */
+export const MIN_FUSED_SCORE = 0.01;
+
+/** B5: the only `me` kinds merged into another profile's recall or brief; an explicit `profile: "me"` read is unaffected. */
+export const ME_MERGE_KINDS = ["preference", "rule"] as const;
+/** B5: `me` records about the owner's identity, household or private life never merge into another profile's reads. */
+const ME_PRIVATE_SCOPE = /(^|[/:._-])(personal|identity|household)([/:._-]|$)/;
+export const meMergeable = (h: { kind: string; scope: string | null }) =>
+	(ME_MERGE_KINDS as readonly string[]).includes(h.kind) && !ME_PRIVATE_SCOPE.test(h.scope ?? "");
+
+/**
+ * B5: the memory scopes that name a repo's project: the repo name, owner/repo, the GitHub repo key and the project node's key,
+ * all folded as stored scopes are. Empty for a remote that names no owner/repo.
+ */
+export function projectScopes(remote: string | undefined): string[] {
+	const parts = (remote ? normalizeRemote(remote) : "").split("/").filter(Boolean);
+	if (parts.length < 2) return [];
+	const repo = parts.at(-1)!, ns = parts.slice(-2).join("/");
+	return [...new Set([repo, ns, `github.com/${ns}`, projectKey(ns)].flatMap((s) => { try { return [normalizeScope(s)]; } catch { return []; } }))];
+}
+
+/** B5: rules scoped to the request's project move to the front, each group keeping its order. */
+export function scopedRulesFirst<T extends { kind: string; scope: string | null }>(ranked: T[], scopes: string[]): T[] {
+	if (!scopes.length) return ranked;
+	const mine = (h: T) => h.kind === "rule" && scopes.includes(h.scope ?? "");
+	return [...ranked.filter(mine), ...ranked.filter((h) => !mine(h))];
+}
 
 const b64 = (o: unknown) => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const unb64 = (s: string): unknown => JSON.parse(atob(s.replace(/-/g, "+").replace(/_/g, "/")));
@@ -452,6 +485,7 @@ export function fuse(sql: SqlStorage, who: Who, q: RecallQuery, all: Record<stri
 		let s = score.get(id)!;
 		if (matched.get(id)!.has("literal")) s += (past ? normalizeName(str(past.get(id)!.snap, "name") ?? "") : n.norm_name) === norm ? 2 : 1;
 		s *= ORIGIN_WEIGHT[n.origin] ?? 0.9;
+		if (s < MIN_FUSED_SCORE && !matched.get(id)!.has("exact") && !matched.get(id)!.has("literal")) return [];
 		return [{ n, s }];
 	}).sort((a, b) => b.s - a.s || a.n.name.toLowerCase().localeCompare(b.n.name.toLowerCase()) || a.n.id.localeCompare(b.n.id));
 	// With as_of a text match counts only if the record's text then holds the keyword or a token: current text may be newer.
@@ -589,6 +623,61 @@ export function candidates(sql: SqlStorage, q: { status: "pending" | "promoted" 
 		.filter(({ status }) => q.status === "all" || status === q.status).slice(0, q.limit)
 		.map(({ n, a, same, status }) => ({ capture_id: n.id, name: n.name, kind: a.capture_kind ?? "observation", status, source: a.source ?? {},
 			content: captureText(sql, n.id), created_at: n.created_at, ...(same && a.promoted_to ? { promoted_to: a.promoted_to } : {}), ...(same && a.reason ? { reason: a.reason } : {}) }));
+}
+
+/**
+ * B1 session-start brief, one synchronous read of one profile (src/profile/brief.ts renders it). `profile` reads the repo's
+ * injectable facts and its project's rules, preferences, newest decisions and newest matching journal; `me` reads only merged
+ * kinds outside private scopes. Exact SQL only: no text index, no vector, no graph walk.
+ */
+export interface BriefQuery {
+	kind: "brief"; part: "profile" | "me";
+	/** The canonical GitHub repo key for facts (the client's repo_key, checked against the remote), or null when there is none. */
+	repo_key: string | null;
+	/** The calling device: environment-class facts are injected per device lane (repo-facts contract section 6). */
+	device: string;
+	/** projectScopes() of the repo; a record in one of these scopes, or linked to its project node (the github: one), belongs to the project. */
+	scopes: string[];
+	/** Normalized names (repo name, checkout folder) a journal's name may contain to count as this checkout's. */
+	checkout: string[];
+}
+/** guidance (#127): this profile's receipts for the record, when it was ever injected; the brief shows its followed rate. */
+type BriefRow = { id: string; kind: string; name: string; scope: string; origin: string; description: string; pinned?: number };
+export type BriefItem = BriefRow & { guidance?: GuidanceStats };
+export const BRIEF_LIMITS = { rules: 4, me: 3, decisions: 3 } as const;
+
+export function briefRead(sql: SqlStorage, q: BriefQuery) {
+	const scopes = JSON.stringify(q.scopes);
+	const live = "n.status = 'active' AND n.memory_type IS NOT NULL AND n.scope <> 'repo-fact' AND n.flagged IS NULL";
+	const linked = `EXISTS (SELECT 1 FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = n.id AND e.ended_at IS NULL AND e.dst_profile = ''
+		AND p.kind = 'project' AND p.status = 'active' AND p.key = ?)`;
+	const ofProject = `(n.scope IN (SELECT value FROM json_each(?)) OR ${linked})`;
+	const lessons = "ORDER BY (n.origin = 'inferred'), (n.origin = 'stated') DESC, (n.pinned <> 0) DESC, n.updated_at DESC, n.id";
+	const cols = "n.id, n.kind, n.name, n.scope, n.origin, n.description";
+	if (q.part === "me") {
+		// Project-scoped ones first; private scopes are dropped after the read, so read a few spare rows.
+		const rows = sql.exec<BriefRow>(`SELECT ${cols} FROM nodes n WHERE n.kind IN ('preference','rule') AND ${live}
+			ORDER BY (n.scope IN (SELECT value FROM json_each(?))) DESC, ${lessons.slice("ORDER BY ".length)} LIMIT ?`, scopes, BRIEF_LIMITS.me * 8).toArray();
+		return { facts: [], rules: rows.filter(meMergeable).slice(0, BRIEF_LIMITS.me), decisions: [], journal: null };
+	}
+	const key = q.scopes.find((s) => s.startsWith("github:")) ?? "";
+	// #127: an inferred lesson that keeps failing leaves the brief; among equals (origin group, pinned) the better followed rate
+	// goes first, an unmeasured one counting as even. Stated rules are never dropped, only shown with their rate.
+	const read = q.scopes.length ? sql.exec<BriefRow>(`SELECT ${cols}, (n.pinned <> 0) AS pinned FROM nodes n WHERE n.kind IN ('rule','preference') AND ${live} AND ${ofProject}
+		${lessons} LIMIT ?`, scopes, key, BRIEF_LIMITS.rules * 4).toArray() : [];
+	const stats = guidanceStats(sql, read.map((r) => r.id));
+	const group = (r: BriefItem) => (r.origin === "inferred" ? 2 : r.origin === "stated" ? 0 : 1) * 2 + (r.pinned ? 0 : 1);
+	const rules = read.filter((r) => !failing(r.origin, stats.get(r.id))).map((r, i) => ({ r: { ...r, ...(stats.has(r.id) ? { guidance: stats.get(r.id)! } : {}) }, i }))
+		.sort((x, y) => group(x.r) - group(y.r) || (y.r.guidance?.followed_rate ?? 0.5) - (x.r.guidance?.followed_rate ?? 0.5) || x.i - y.i)
+		.slice(0, BRIEF_LIMITS.rules).map((x) => x.r);
+	const decisions = q.scopes.length ? sql.exec<BriefRow>(`SELECT ${cols} FROM nodes n WHERE n.kind = 'decision' AND ${live} AND ${ofProject}
+		ORDER BY n.updated_at DESC, n.id LIMIT ?`, scopes, key, BRIEF_LIMITS.decisions).toArray() : [];
+	const journal = q.scopes.length || q.checkout.length ? sql.exec<{ id: string; name: string; updated_at: string }>(`SELECT n.id, n.name, n.updated_at FROM nodes n
+		WHERE n.kind = 'journal' AND n.status = 'active' AND (n.scope IN (SELECT value FROM json_each(?))
+			OR EXISTS (SELECT 1 FROM json_each(?) t WHERE instr(n.norm_name, t.value) > 0))
+		ORDER BY n.updated_at DESC, n.id LIMIT 1`, scopes, JSON.stringify(q.checkout)).toArray()[0] ?? null : null;
+	// The facts contract's injection read (section 6): the same injectableFacts as /v1/facts, for this device's lanes. Never me.
+	return { facts: q.repo_key ? injectableFacts(sql, { profile: "", repo_key: q.repo_key, device: q.device }) : [], rules, decisions, journal };
 }
 
 const RANGES_MAX = 2_000;

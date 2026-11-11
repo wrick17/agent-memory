@@ -2,7 +2,7 @@ import { archiveNodeIds } from "./write";
 // The maintenance queue (sections 7 and 12): deterministic items leased to the confined daily batch, and their results applied
 // through the normal write path with actor maintenance. Each op stays inside its item's subjects, and any op that touches a
 // protected node (stated, pinned, or anything in me) becomes a flag on it instead.
-import { requestHash, sha256, uuid5 } from "../domain/ids";
+import { normalizeName, requestHash, sha256, uuid5 } from "../domain/ids";
 import { redactPayload } from "../domain/redact";
 import { Fail, type ErrorCode, type RELATIONS, type WriteCommand, type WriteContext } from "../domain/types";
 import { nextSeq } from "../storage";
@@ -17,6 +17,8 @@ import { reviewBoard } from "./board";
 import { insertCandidate } from "./eval-candidates";
 import { ACTIVITY_DAYS } from "./housekeeping";
 import { readableNodeIds } from "./graph";
+import { carriedEvidence, learningFor } from "./lessons";
+import { settleSessions } from "./guidance";
 
 export const MAX_ITEMS = 40;
 export const MAX_LEASE_S = 900;
@@ -33,7 +35,9 @@ export function opsFor(kind: string): string[] {
 	// A stale record may only be retired (a save with retire: true and nothing else), flagged for the owner, or kept. Never deleted.
 	if (kind === "stale_memory") return ["save", "flag", "dismiss"];
 	const infer = kind === "preference_signal" || kind === "unprocessed_capture";
-	return [...ALLOWED_OPS, ...(infer ? ["infer_preference", "suggest_eval_case"] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
+	// Lessons come from a session's corrections, decisions from its capture digest; each item kind learns only its own.
+	const learn = kind === "preference_signal" ? ["record_lesson"] : kind === "unprocessed_capture" ? ["record_decision"] : [];
+	return [...ALLOWED_OPS, ...(infer ? ["infer_preference", "suggest_eval_case", ...learn] : []), ...(infer || kind === "near_duplicate" || kind === "possible_contradiction" ? ["promote_to_me"] : [])];
 }
 
 type Evidence = { kind: "entry" | "commit" | "pr" | "ticket" | "session" | "file" | "node" | "url" | "corpus"; ref: string; note?: string };
@@ -48,7 +52,11 @@ export type MaintenanceOp =
 	| { op: "infer_preference"; name: string; description: string; why?: string; how_to_apply?: string; scope?: string; evidence: Evidence[] }
 	| { op: "promote_to_me"; memory_id?: string; from_op?: number; company_free: true }
 	| { op: "strategic_review"; summary: string; content: string; links: ReviewLink[] }
-	| { op: "suggest_eval_case"; query: string; expected: string[]; evidence: Evidence[] };
+	| { op: "suggest_eval_case"; query: string; expected: string[]; evidence: Evidence[] }
+	/** A lesson from a correction: a rule with why (the mistake) and how_to_apply (the correction). `matches`: a known lesson it repeats. */
+	| { op: "record_lesson"; name: string; description: string; why: string; how_to_apply: string; matches?: string; evidence: Evidence[] }
+	/** A decision from a capture digest. `supersedes`: a known older decision on the same subject. */
+	| { op: "record_decision"; name: string; description: string; why: string; supersedes?: string; evidence: Evidence[] };
 /** A review's link to one board item it discusses (relates_to), cited by node pointers to the item's subjects. */
 export type ReviewLink = { to: string; reason: string; evidence: { kind: "node"; ref: string; note?: string }[] };
 export const REVIEW_LINKS = 20;
@@ -154,7 +162,9 @@ type LeaseRow = { id: number; kind: string; subjects: string; created_at: string
 function leasedItem(sql: SqlStorage, i: LeaseRow) {
 	const subjects = JSON.parse(i.subjects) as string[];
 	return { item_id: i.id, kind: i.kind, subjects, context: context(sql, subjects, i.kind), allowed_ops: opsFor(i.kind),
-		...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, subjects) } : {}) };
+		...(i.kind === "weekly_review" ? { board: reviewBoard(sql, i.created_at, subjects) } : {}),
+		// The lessons and decisions a new one may repeat or supersede, by id; the server derives the project and scope, never the model.
+		...(i.kind === "preference_signal" || i.kind === "unprocessed_capture" ? (({ project, scope, known }) => ({ learning: { project, scope, known } }))(learningFor(sql, subjects)) : {}) };
 }
 
 /** The request's stored binding, or undefined when none or unreadable (a damaged value never replays). */
@@ -301,6 +311,14 @@ export function complete(storage: DurableObjectStorage, who: Who, raw: { lease_i
 			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 			tx.run("UPDATE maintenance SET state = ?, done_at = ?, outcome = ?, seq = ? WHERE id = ?", outcome.status, tx.now, JSON.stringify(outcome), tx.seq, item.id);
 			intend(tx);
+			// #127: a record_lesson that repeated a known lesson (not a new one) is a correction matching it; once the session has no
+			// open digest item left, its injected guidance settles as followed or failed.
+			if (item.kind === "preference_signal" || item.kind === "unprocessed_capture") {
+				settleSessions(tx, [...subjects], r.ops.flatMap((op, n) => {
+					const o = ops[n];
+					return op.op === "record_lesson" && o && (o.status === "applied" || o.status === "flagged") && o.memory_id && !o.created?.length ? [{ rule: o.memory_id, index: n }] : [];
+				}));
+			}
 		});
 		return { item_id: r.item_id, ...outcome };
 	});
@@ -407,8 +425,30 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 	if (op.op === "suggest_eval_case") return suggestEvalCase(storage, who, op, subjects, requestId, done, refuse, failed);
 	// A stale record's save only retires it: no rename or content change rides along. mayChange still decides below.
 	if (item.kind === "stale_memory" && op.op === "save" && (op.retire !== true || Object.keys(op).some((k) => !["op", "memory_id", "retire", "expected_revision"].includes(k)))) return refuse("retire_only");
-	let touched: string[], local = true;
-	if (op.op === "end_link") {
+	// A stored write under this request id replays as it was: a retry never re-decides a match against what the first run wrote.
+	const replay = (rid: string) => {
+		const prior = sql.exec<{ node_id: string; result: string }>("SELECT node_id, result FROM requests WHERE request_id = ? AND op = 'save'", rid).toArray()[0];
+		if (!prior) return undefined;
+		try { assertOpen(sql); assertNotWiped(sql, prior.node_id); } catch (e) {
+			if (e instanceof Fail) return failed(e);
+			throw e;
+		}
+		const result = JSON.parse(prior.result) as { action: string; activity_id?: number };
+		return done({ status: result.action === "flagged" ? "flagged" : "applied", reason: "already_written",
+			...(typeof result.activity_id === "number" ? { activity_id: result.activity_id } : {}), ...(op.op === "record_lesson" ? { memory_id: prior.node_id } : {}),
+			...(result.action === "created" ? { created: [prior.node_id] } : {}) });
+	};
+	let touched: string[], local = true, learned: { cmd: WriteCommand } | undefined;
+	if (op.op === "record_lesson" || op.op === "record_decision") {
+		const again = replay(requestId);
+		if (again) return again;
+		const r = recordCmd(sql, who, op, subjects, requestId);
+		if ("refuse" in r) return r.refuse === "forbidden" || r.refuse === "outside_subjects" ? done({ status: "rejected", code: r.refuse }) : refuse(r.refuse);
+		// A matched or superseded record is server-checked against the known list, not a subject: protection still decides below.
+		touched = r.touched;
+		local = false;
+		learned = { cmd: r.cmd };
+	} else if (op.op === "end_link") {
 		const e = sql.exec<{ src: string; dst: string; dst_profile: string }>("SELECT src, dst, dst_profile FROM edges WHERE id = ? AND ended_at IS NULL", op.edge).toArray()[0];
 		if (!e) return done({ status: "rejected", code: "not_found" });
 		// A foreign or absent target is opaque: the item must name it, and only the real local source is checked and changed.
@@ -450,6 +490,22 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		if (nodes[0]!.kind !== "preference" || nodes[0]!.status !== "active") return refuse("not_promotable");
 	}
 	const refused = nodes.map((n) => ({ id: n.id, why: mayChange(n, "maintenance", who.profile) })).filter((n) => n.why);
+	// #127: a correction that repeats a protected (stated or pinned) lesson leaves it unchanged and unflagged: only the session's
+	// evidence pointers join it, and the outcome names it so guidance receipts count the match. A flag would hide it from briefs.
+	if (op.op === "record_lesson" && touched.length === 1 && refused.some((n) => n.id === touched[0])) {
+		try {
+			storage.transactionSync(() => {
+				assertOpen(sql);
+				assertWritable(sql, touched[0]!);
+				const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
+				for (const e of op.evidence) tx.run("INSERT OR IGNORE INTO evidence (owner, kind, ref, note, seq) VALUES (?, ?, ?, ?, ?)", `n:${touched[0]}`, e.kind, e.ref, e.note ?? "correction", tx.seq);
+			});
+			return done({ status: "applied", reason: "protected_match", memory_id: touched[0]! });
+		} catch (e) {
+			if (e instanceof Fail) return failed(e);
+			throw e;
+		}
+	}
 	if (op.op === "flag" || refused.length) {
 		const flags = op.op === "flag" ? [{ id: op.node, why: op.reason }] : refused;
 		try {
@@ -460,7 +516,8 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 				const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 				return flags.map((f) => flagProtected(tx, f.id, f.why!, op.op, "maintenance"));
 			});
-			return done({ status: op.op === "flag" ? "applied" : "flagged", activity_id: ids[ids.length - 1]! });
+			// A record_lesson refused on a protected known lesson still matched it: memory_id names it for guidance receipts.
+			return done({ status: op.op === "flag" ? "applied" : "flagged", activity_id: ids[ids.length - 1]!, ...(op.op === "record_lesson" && touched.length ? { memory_id: touched[0]! } : {}) });
 		} catch (e) {
 			if (e instanceof Fail) return failed(e);
 			throw e;
@@ -472,17 +529,8 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 	const review = op.op === "strategic_review" ? { name: `Strategic review ${item.created_at.slice(0, 10)}`, as_of: item.created_at } : undefined;
 	if (review) {
 		requestId = `maint:review:${who.generation}:${item.id}`;
-		const prior = sql.exec<{ node_id: string; result: string }>("SELECT node_id, result FROM requests WHERE request_id = ? AND op = 'save'", requestId).toArray()[0];
-		if (prior) {
-			try { assertOpen(sql); assertNotWiped(sql, prior.node_id); } catch (e) {
-				if (e instanceof Fail) return failed(e);
-				throw e;
-			}
-			const result = JSON.parse(prior.result) as { action: string; activity_id?: number };
-			return done({ status: result.action === "flagged" ? "flagged" : "applied", reason: "already_written",
-				...(typeof result.activity_id === "number" ? { activity_id: result.activity_id } : {}),
-				...(result.action === "created" ? { created: [prior.node_id] } : {}) });
-		}
+		const again = replay(requestId);
+		if (again) return again;
 	}
 	const cmd: WriteCommand = op.op === "strategic_review" ? { op: "save", args: { name: review!.name, type: "reference", kind: "document", description: op.summary, content: op.content,
 			scope: "default", origin: "agent", review: { as_of: review!.as_of, item: item.id, coverage: reviewBoard(sql, review!.as_of, [...subjects]).coverage },
@@ -493,9 +541,11 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 			origin: "inferred", evidence: op.evidence, request_id: requestId } }
 		: op.op === "save" ? { op: "save", args: { ...withoutOp(op), request_id: requestId } }
 		: op.op === "compact" ? { op: "save", args: { memory_id: op.memory_id, compact: { through_seq: op.through_seq, summary: op.summary }, expected_revision: op.expected_revision, request_id: requestId } }
-		: op.op === "supersede" ? { op: "save", args: { memory_id: op.keep, supersedes: op.retire, request_id: requestId } }
+		// A merged near-duplicate hands its evidence to the record kept, so a repeated lesson strengthens one record.
+		: op.op === "supersede" ? { op: "save", args: { memory_id: op.keep, supersedes: op.retire, ...(item.kind === "near_duplicate" ? nonEmpty(carriedEvidence(sql, op.keep, op.retire)) : {}), request_id: requestId } }
 			: op.op === "link" ? { op: "knowledge", args: { edges: [{ from: { id: op.from }, to: { id: op.to }, rel: op.rel, ...(op.other_label ? { other_label: op.other_label } : {}), reason: op.reason, evidence: op.evidence }], request_id: requestId } }
-				: { op: "knowledge", args: { end: [{ edge: op.edge, valid_to: op.valid_to ?? new Date().toISOString(), reason: op.reason }], request_id: requestId } };
+				: op.op === "end_link" ? { op: "knowledge", args: { end: [{ edge: op.edge, valid_to: op.valid_to ?? new Date().toISOString(), reason: op.reason }], request_id: requestId } }
+					: learned!.cmd;
 	try {
 		const out = runWrite(storage, who, cmd, {
 			// wiring: WriteContext.actor gains "keep" | "index" | "maintenance".
@@ -505,7 +555,8 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 		// A replay reports what the first run did; only a created preference is registered and may be promoted.
 		const action = out.result.action === "replayed" ? (JSON.parse(sql.exec<{ result: string }>("SELECT result FROM requests WHERE request_id = ?", requestId).one().result) as { action: string }).action : out.result.action;
 		return done({ status: action === "flagged" ? "flagged" : "applied", ...(typeof out.result.activity_id === "number" ? { activity_id: out.result.activity_id } : {}),
-			...((op.op === "infer_preference" || op.op === "strategic_review") && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
+			...(op.op === "record_lesson" && typeof out.result.memory_id === "string" ? { memory_id: out.result.memory_id } : {}),
+			...(CREATES.has(op.op) && action === "created" ? { created: [String(out.result.memory_id)] } : {}) }, out.embedDue);
 	} catch (e) {
 		if (e instanceof Fail) return failed(e);
 		throw e;
@@ -513,6 +564,48 @@ function apply(storage: DurableObjectStorage, who: Who, op: MaintenanceOp, subje
 }
 
 const withoutOp = ({ op: _op, ...rest }: Extract<MaintenanceOp, { op: "save" }>) => rest;
+const nonEmpty = (evidence: Evidence[]) => (evidence.length ? { evidence } : {});
+/** Ops that may create a record: each created id is registered for this generation (store.ts arms its alarm for these). */
+export const CREATES = new Set(["infer_preference", "strategic_review", "record_lesson", "record_decision"]);
+const TEXT_MAX = 10_000;
+
+/**
+ * The save a record_lesson or record_decision makes, or why it is refused. Evidence is the item's own subjects as node pointers;
+ * the scope and project link come from the session (lessons.ts), never from the model. A lesson that repeats a known one, by the
+ * model's `matches` or by the same name in the scope, adds its evidence to it instead of creating a record. A decision with the
+ * name of an active decision in the scope updates it; `supersedes` retires a known older decision through save's supersede.
+ * Never in me: lessons and decisions are project knowledge, and nothing writes me in the background.
+ */
+function recordCmd(sql: SqlStorage, who: Who, op: Extract<MaintenanceOp, { op: "record_lesson" | "record_decision" }>, subjects: Set<string>, requestId: string):
+	{ refuse: string } | { cmd: WriteCommand; touched: string[] } {
+	if (who.profile === "me") return { refuse: "forbidden" };
+	const lesson = op.op === "record_lesson";
+	const texts = [op.name, op.description, op.why, ...(lesson ? [op.how_to_apply] : [])];
+	if (texts.some((t) => typeof t !== "string" || !t.trim() || t.length > TEXT_MAX) || op.name.length > 512) return { refuse: "missing_text" };
+	if (!Array.isArray(op.evidence) || op.evidence.length < 1 || op.evidence.length > 10) return { refuse: "bad_evidence" };
+	if (op.evidence.some((e) => e?.kind !== "node" || !subjects.has(e.ref))) return { refuse: "outside_subjects" };
+	const { project, scope, known } = learningFor(sql, [...subjects]);
+	const kind = lesson ? "rule" : "decision", type = lesson ? "feedback" : "project";
+	const named = lesson ? op.matches : op.supersedes;
+	if (named !== undefined && !known.some((k) => k.id === named && k.kind === kind)) return { refuse: "not_known" };
+	let same: string | undefined;
+	try {
+		same = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE scope = ? AND memory_type = ? AND kind = ? AND norm_name = ? AND status = 'active'",
+			scope, type, kind, normalizeName(op.name)).toArray()[0]?.id;
+	} catch { return { refuse: "missing_text" }; }
+	const base = { request_id: requestId, evidence: op.evidence };
+	if (lesson) {
+		const match = op.matches ?? same;
+		if (match) return { touched: [match], cmd: { op: "save", args: { memory_id: match, ...base } } };
+	}
+	const links = project ? { links: [{ rel: "relates_to" as const, to: { id: project.id }, reason: `${lesson ? "Lesson" : "Decision"} learned in a session of this project`, evidence: op.evidence }] } : {};
+	const old = !lesson && op.supersedes !== undefined && op.supersedes !== same ? [op.supersedes] : [];
+	const retire = old.length ? { supersedes: old } : {};
+	const touched = [...(same && !lesson ? [same] : []), ...old];
+	if (!lesson && same) return { touched, cmd: { op: "save", args: { memory_id: same, description: op.description, why: op.why, ...retire, ...base } } };
+	return { touched, cmd: { op: "save", args: { name: op.name, type, kind, description: op.description, why: op.why, ...(lesson ? { how_to_apply: op.how_to_apply } : {}),
+		scope, origin: "inferred", ...links, ...retire, ...base } } };
+}
 
 type Done = (outcome: Omit<OpOutcome, "op">, embedDue?: boolean) => { outcome: OpOutcome; embedDue: boolean };
 /**
