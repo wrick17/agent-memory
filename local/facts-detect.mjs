@@ -223,7 +223,7 @@ const ranFix = (cmds, { detector, literal }) => detector === "command_repair"
 	&& (() => { const f = step(literal); return cmds.flatMap(provenOk).some((s) => s.prog === f.prog && s.head === f.head && f.env.unset.every((v) => s.env.unset.includes(v)) && f.env.set.every((v) => s.env.set.includes(v))); })();
 
 /** A literal and statement the server accepts: bounded, single line, unchanged by redaction, no private absolute path. */
-const acceptable = (literal, statement) => literal.length <= DETECT_LIMITS.literal && statement.length <= DETECT_LIMITS.statement
+export const acceptable = (literal, statement) => literal.length <= DETECT_LIMITS.literal && statement.length <= DETECT_LIMITS.statement
 	&& redact(literal) === literal && redact(statement) === statement && !PRIVATE.test(literal) && !PRIVATE.test(statement) && !literal.includes("…") && !literal.includes("`");
 
 /**

@@ -156,7 +156,8 @@ const topLevel = (cwd) => {
  * One step of a session, called by processSession with the trigger, its found transcript and repoOf(cwd). Reads the transcript from
  * this module's own cursor, merges new commands by call id, and once the session has ended builds and saves its one report, then sends
  * it. Never throws to the caller's capture path; a repo without a GitHub origin is skipped.
- * @returns {Promise<{ repo_key: string, completed: boolean, status: string } | null>} completed is true only on the call that built the report
+ * @returns {Promise<{ repo_key: string, session?: string, completed: boolean, status: string } | null>} completed is true only on the call that
+ * built the report, which also names the session ref (synthesis cadence counts it)
  */
 export async function observeSession(t, src, repo, { server, ended, config } = {}) {
 	const key = repoKey(repo?.remote);
@@ -177,9 +178,12 @@ export async function observeSession(t, src, repo, { server, ended, config } = {
 	// Only a session the existing pipeline marks ended (SessionEnd, sticky) is complete; a Stop can still be followed by more commands.
 	if (!ended || !state.digest) { writePrivate(file, JSON.stringify(state)); return { repo_key: key, completed: false, status: "open" }; }
 	retain(key, state.digest);
+	// Synthesis cadence (facts-synth.mjs): the durable completion marker comes before the report is saved, so a crash between the two
+	// only writes the same marker again when the report is rebuilt. Off: no marker.
+	(await import("./facts-synth.mjs")).markCompleted(config, key, state.digest.session);
 	state.report = buildReport(state.digest, key, config);
 	writePrivate(file, JSON.stringify(state));
-	return { repo_key: key, completed: true, status: await send(file, state, server) };
+	return { repo_key: key, session: state.digest.session, completed: true, status: await send(file, state, server) };
 }
 
 /** Sends every saved report still pending (after a network failure or a crash between saving and sending). */

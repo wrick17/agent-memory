@@ -846,7 +846,11 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	// Repo facts (facts-client.mjs): this session's command digest, and its one report once the session has ended. It reads the transcript
 	// from its own cursor and never changes capture state; any failure leaves capture untouched and is retried on a later run.
 	if (src) {
-		try { await (await import("./facts-client.mjs")).observeSession(t, src, repo, { server, ended: st.ended === true, config: loadConfig() }); } catch { /* retried later */ }
+		try {
+			const config = loadConfig(), r = await (await import("./facts-client.mjs")).observeSession(t, src, repo, { server, ended: st.ended === true, config });
+			// Synthesis cadence (facts-synth.mjs, off unless facts.synthesis): count the completion marker now; a crash leaves it for the next run.
+			if (r?.completed) (await import("./facts-synth.mjs")).reconcileCompleted(config);
+		} catch { /* retried later */ }
 	}
 	// consolidated_to moves over contiguous consolidated ranges of the current epoch only.
 	const advance = () => {
@@ -917,7 +921,7 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
  * off unless loop_guard.enabled is true. Repo-fact injection at SessionStart is off unless facts.inject is true.
  */
 export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
-	loop_guard: { enabled: false }, facts: { inject: false, profile: null, timeout_ms: 1500 } });
+	loop_guard: { enabled: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -933,7 +937,11 @@ export function withDefaults(raw) {
 		loop_guard: { enabled: c.loop_guard?.enabled === true },
 		// Repo facts: injection off by default; profile is an optional explicit route (never `me`), else the server routes by the remote.
 		facts: { inject: c.facts?.inject === true, profile: typeof c.facts?.profile === "string" && PROFILE_RE.test(c.facts.profile) && c.facts.profile !== "me" ? c.facts.profile : null,
-			timeout_ms: posInt(c.facts?.timeout_ms, d.facts.timeout_ms, 10_000) } };
+			timeout_ms: posInt(c.facts?.timeout_ms, d.facts.timeout_ms, 10_000),
+			// Synthesis is off unless facts.synthesis is true; synthesis_rates (USD per million input, cached input and output tokens) only prices the cost log.
+			synthesis: c.facts?.synthesis === true,
+			synthesis_rates: ["input", "cached_input", "output"].every((k) => typeof c.facts?.synthesis_rates?.[k] === "number" && c.facts.synthesis_rates[k] >= 0)
+				? { input: c.facts.synthesis_rates.input, cached_input: c.facts.synthesis_rates.cached_input, output: c.facts.synthesis_rates.output } : null } };
 }
 
 export function loadConfig() {
@@ -1028,6 +1036,8 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 		}
 		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
 		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
+		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
+		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
@@ -1120,7 +1130,8 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 				const spooled = fs.existsSync(spoolDir) && fs.readdirSync(spoolDir).some((f) => f.endsWith(".json"));
 				// Under the lock every entry in claimed/ is a dead run's; drain returns it to the queue first.
 				const retained = fs.existsSync(claimDir()) && fs.readdirSync(claimDir()).length > 0;
-				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock())) {
+				const synth = await import("./facts-synth.mjs").then((m) => m.synthDue(config, clock()), () => false);
+				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock()) && !synth) {
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
@@ -1467,13 +1478,15 @@ const ENVELOPES = new Set(["thread.started", "turn.started", "turn.completed", "
  * range pending; unknown output fails closed.
  */
 export function parseEvents(stdout) {
-	let final = null;
+	// usage: turn.completed's token counts, kept for the repo-fact cost log; null when the stream has none.
+	let final = null, usage = null;
 	for (const line of stdout.split("\n")) {
 		if (!line.trim()) continue;
 		let e;
 		try { e = JSON.parse(line); } catch { return { kind: "bad_events" }; }
 		if (e.type === "error" || e.type === "turn.failed") return { kind: "runtime_error" };
 		if (!ENVELOPES.has(e.type)) return { kind: "runtime_warning" };
+		if (e.type === "turn.completed" && e.usage && typeof e.usage === "object") usage = e.usage;
 		if (!e.type.startsWith("item.")) continue;
 		const item = e.item;
 		if (!item || typeof item !== "object") return { kind: "bad_events" };
@@ -1483,8 +1496,8 @@ export function parseEvents(stdout) {
 		if (item.type === "agent_message") { if (e.type === "item.completed") final = item.text; continue; }
 		return { kind: "tool_event" };
 	}
-	if (typeof final !== "string") return { kind: "no_output" };
-	try { return { kind: "ok", part: JSON.parse(final) }; } catch { return { kind: "bad_output" }; }
+	if (typeof final !== "string") return { kind: "no_output", usage };
+	try { return { kind: "ok", part: JSON.parse(final), usage }; } catch { return { kind: "bad_output", usage }; }
 }
 
 // ---------- install ----------
@@ -1505,8 +1518,8 @@ const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 const LO_LOCAL = ["launchd.mjs", "status.mjs", "doctor.mjs", "backfill.mjs"];
 // The eval command and its scorer.
 const EVAL_LOCAL = ["eval.mjs", "eval-score.mjs"];
-// Repo facts: digest primitives, detectors, the per-session client (imported by run) and SessionStart injection.
-const FACTS_LOCAL = ["facts.mjs", "facts-detect.mjs", "facts-client.mjs", "facts-inject.mjs"];
+// Repo facts: digest primitives, detectors, the per-session client and synthesis (imported by run) and SessionStart injection.
+const FACTS_LOCAL = ["facts.mjs", "facts-detect.mjs", "facts-client.mjs", "facts-inject.mjs", "facts-synth.mjs"];
 // Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit and loop-guard.mjs for the tool-result hooks. They
 // import only ./agent-memory.mjs and each other.
 export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", "loop-guard.mjs", ...FACTS_LOCAL, ...EVAL_LOCAL];
