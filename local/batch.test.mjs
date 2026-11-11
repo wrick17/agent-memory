@@ -71,7 +71,7 @@ describe("job flow", () => {
 		assert.deepEqual([server.calls[0].args.limit, server.calls[0].args.lease_seconds], [40, 900]);
 		const receipt = (id, kind) => ({ item_id: id, kind, status: "done", sent: ["dismiss"], ops: [{ op: "dismiss", status: "applied" }] });
 		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, dropped_ops: 0, codes: { applied: 2 },
-			receipts: [receipt(1, "unlinked"), receipt(2, "near_duplicate")] });
+			receipts: [receipt(1, "unlinked"), receipt(2, "near_duplicate")], applied: {}, last_write_at: null, tracked_since: r.profiles.work.tracked_since });
 	});
 
 	it("sends only allowed ops on the item's own subjects, drops nulls and redacts model text", async () => {
@@ -156,7 +156,7 @@ describe("work is retained on every failure", () => {
 			const r = await batch({ runner, config, server });
 			assert.deepEqual(server.calls.map((c) => c.name), ["maintenance_next", "maintenance_complete"], "status only, no result completion or second lease");
 			assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: kind === "tool_event" ? "stuck" : "batch_skipped", reason: kind });
-			assert.deepEqual(r.profiles.work, { status: "discarded", reason: kind, items: 2, retained: 2, released: true });
+			assert.deepEqual(r.profiles.work, { status: "discarded", reason: kind, items: 2, retained: 2, released: true, applied: {}, last_write_at: null, tracked_since: r.profiles.work.tracked_since });
 			assert.equal(r.profiles.personal.status, "batch_skipped");
 		}
 	});

@@ -176,6 +176,9 @@ function purge(sql: SqlStorage, who: Who, w: OriginWipe): PurgeResult {
 			["DELETE FROM recall_daily WHERE (node_id, day) IN (SELECT node_id, day FROM recall_daily WHERE node_id = ? LIMIT 100)", [id]],
 			[`DELETE FROM eval_candidates WHERE id IN (SELECT c.id FROM eval_candidates c WHERE EXISTS (SELECT 1 FROM json_each(c.expected_json) WHERE value = ?1)
 				OR EXISTS (SELECT 1 FROM json_each(c.evidence_json) e WHERE json_extract(e.value, '$.kind') = 'node' AND json_extract(e.value, '$.ref') = ?1) LIMIT 40)`, [id]],
+			// #127 guidance receipts naming the purged record (ids only, kept tidy so no stat outlives it).
+			["DELETE FROM guidance_injections WHERE rowid IN (SELECT rowid FROM guidance_injections WHERE memory_id = ? LIMIT 100)", [id]],
+			["DELETE FROM correction_matches WHERE rowid IN (SELECT rowid FROM correction_matches WHERE rule_id = ?1 OR session_id = ?1 LIMIT 100)", [id]],
 			["DELETE FROM transfer_parts WHERE (transfer_id, n) IN (SELECT p.transfer_id, p.n FROM transfer_parts p JOIN transfers t ON t.id = p.transfer_id WHERE t.node_id = ? LIMIT 60)", [id]],
 			["DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE node_id = ? LIMIT 40)", [id]],
 		];

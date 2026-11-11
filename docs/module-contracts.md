@@ -1257,3 +1257,110 @@ The loop guard keeps `<home>/loop-guard/<scope hash>.json` and a `.lock` beside 
 | Attempts per job | 3 | `SYNTH_LIMITS.attempts` |
 | Loop guard | Same failure 3 times, or 8 failures in the last 10 results, once per turn | `LOOP_GUARD` |
 | Loop guard hook | 2 s lock deadline, 5 s client hook timeout | `LOOP_DEADLINE_MS`, `LOOP_TIMEOUT_S` |
+
+## Repo facts v2 and forever context modules, 2026-11-11
+
+Source: branch `fix/repo-facts-review` (epics #123 and #131), implemented and not yet tested, reviewed or deployed (#122). The binding facts contract is [repo facts v2 contract](repo-facts-v2-contract.md). Behaviour is in [architecture, repo facts](architecture.md#repo-facts), [loop guard](architecture.md#loop-guard), [session-start brief](architecture.md#session-start-brief-125), [lessons and decisions](architecture.md#lessons-and-decisions-from-digests-126) and [goal metrics](architecture.md#goal-metrics-130). The [earlier section](#repo-facts-and-loop-guard-modules-2026-11-11) records the merged v1 modules; where it differs, this section describes the branch.
+
+### Modules
+
+| File | Issues | Change on the branch |
+|---|---|---|
+| `local/facts.mjs` | #113 | Per-command attribution, partitions (`partitionId`), the route and directory caches, usage and edited-file hashes for v2 reports, and the saved injected items per session and partition |
+| `local/facts-detect.mjs` | #116 | Seven detectors with `form_repair` and `arg_repair`, same-operation proof, full dotted module names, contract family labels and learned-signature matching |
+| `local/facts-client.mjs` | #113, #118 | v2 reports per partition, settled replies (`stored`, `seen`, `stale`, `report_conflict`), v1 migration, and the `facts` status counts |
+| `local/facts-inject.mjs` | #113, #125 | `SessionStart` calls `/v1/brief`, falls back to `/v1/facts` on 404, prints the server's text unchanged and logs latency |
+| `local/facts-synth.mjs` | #117 | Crash-safe attempts with a reply file, learned signatures, revisions, held facts in the prompt, partitioned state |
+| `local/facts-replay.mjs` | #120 | New, offline replay of local history through the detectors and a parameterised lifecycle; prints counts only |
+| `local/loop-guard.mjs` | #115 | Codex shell exit codes from the rollout, the `variant` rule, the directory in the invocation key, shadow mode and the fire log |
+| `local/agent-memory.mjs` | #113, #128 | Shared secret rules kept identical to `src/domain/redact.ts`, `loop_guard.shadow` default, sub-agent capture and `source_missing` settling |
+| `local/batch.mjs` | #126 | `record_lesson` and `record_decision` in the batch prompt and schema, the `applied` counts and the learning clock in `batch/last.json` |
+| `local/doctor.mjs`, `local/status.mjs` | #118, #126, #128 | Checks and status fields listed below |
+| `src/profile/facts.ts` | #114 | v2 lifecycle: lanes, session-ordered recompute, dormant, user tier, receipts, watermark, daily rows, flag, `injectableFacts` and `renderFactBlock` |
+| `src/profile/schema.ts` | #114 | Profile schema v10: `fact_reports`, `fact_report_facts`, `fact_days` |
+| `src/api.ts` (`factsIngest`) | #114 | v2 and v1 report bodies; the owner's retire route for any node |
+| `src/v2-api.ts` | #114, #118, #125, #130 | `/v1/facts` modes, `/v1/brief`, the owner fact, flag, efficiency and goal-metrics routes, `facts` in health |
+| `src/brief.ts`, `src/profile/read.ts` (`briefRead`) | #125 | The session-start brief |
+| `src/mcp.ts` | #118, #129 | MCP `repo_facts`; recall relevance |
+| `src/profile/lessons.ts`, `src/profile/maintenance.ts`, `src/maintenance-tools.ts` | #126 | `record_lesson` and `record_decision` ops |
+| `src/profile/metrics.ts`, `src/dashboard/goals.ts` | #130 | Goal metrics and the Goals tab |
+| `src/dashboard/facts.ts` | #118 | The Facts tab |
+| `src/domain/redact.ts` | #113 | Wider secret rules, shared with the client |
+
+### Wire contracts
+
+| Route | Credential | Body or query | Reply |
+|---|---|---|---|
+| `POST /v1/ingest`, facts branch | Job token (device, `ingest`) | Contract section 2 (v2) or the v1 body | v2: `{ ok, action, profile, routed_by, repo_key, report, facts }`; v1: unchanged |
+| `POST /v1/facts` | Read token | `{ repo: { remote, path? }, repo_key?, profile?, mode?: "inject" \| "held" }`, at most 4,000 bytes | `inject`: `{ profile, routed_by, repo_key, facts, block }`; `held`: every live and dormant fact, at most 64 |
+| `POST /v1/brief` | Read token | `{ repo: { remote, path? }, repo_key?, client?, cwd? }`, at most 4,000 bytes | `{ origin, profile, routed_by, repo_key, text, estimated_tokens, max_tokens: 400, items, omitted, took_ms }` |
+| MCP `repo_facts` | Read; `flag` also needs write | Contract section 7 | `list`: `{ profile, routed_by, repo_key, facts, next_after }`; `flag`: the write result |
+| `GET /api/profiles/:p/facts` | Owner | `repo_key?`, `tier?`, `state?`, `device?`, `after?`, `limit` 1 to 200 (default 100) | `{ facts, next_after }` |
+| `POST /api/profiles/:p/facts/flag` | Owner | `{ memory_id \| fact_key and repo_key, scope: "repo" \| "user", reason (1 to 200) }` | The write result |
+| `GET /api/profiles/:p/facts/efficiency` | Owner | `repo_key?`, `from`, `to` (YYYY-MM-DD, at most 92 days apart) | `{ rows }` |
+| `POST /api/profiles/:p/nodes/:id/retire` | Owner | None | The retire-only save, with undo |
+| `GET /api/profiles/:p/goal-metrics` | Owner | `weeks` 1 to 26 (default 12), `repo_key?` | `{ from, to, weeks, targets, min_sample, repos, missing, truncated }` |
+| `GET /api/health` | Owner | None | The health report plus `facts`, keyed by profile |
+
+`maintenance_complete` accepts two more ops, each only where the item's `allowed_ops` lists it:
+
+- `record_lesson` on `preference_signal`: `{ name, description, why, how_to_apply, matches?, evidence[1..10] }`.
+- `record_decision` on `unprocessed_capture`: `{ name, description, why, supersedes?, evidence[1..10] }`.
+
+Evidence pointers are `{ kind: "node", ref }` to the item's subjects. `matches` must name a known rule and `supersedes` a known decision from the item's `learning.known`.
+
+### Local files
+
+New or changed under `<home>/facts/` (default `~/.agent-memory/facts/`), mode 600, never uploaded:
+
+| Path | Holds |
+|---|---|
+| `p/<partition>/` | One partition: `meta.json` (profile, repo key, remote, path), `seen/` (injected items per session), `digests/`, `queue/` (saved report bytes) |
+| `routes/<pair>.json` | The cached routed profile of a (remote, path) pair |
+| `dirs/<hash>.json` | The cached route of a working directory, for 7 days |
+| `unrouted/` | Reports waiting for their pair's first route |
+| `inject/<day>.jsonl` | One line per session start: time, milliseconds, outcome code |
+| `stats/unattributed-<day>.json` | The count of commands with no established repo |
+| `synth/attempts/` | Each open attempt's sent input, reply file and outcome |
+| `ledger/` | v1 only; deleted after the first v2 report the Worker accepts |
+
+The loop guard adds `<home>/loop-guard/fires.jsonl` and its rotated `fires.jsonl.1`. The batch's `batch/last.json` gains `applied`, `last_write_at` and `tracked_since` per profile.
+
+### Status and doctor
+
+| Surface | Fields or checks |
+|---|---|
+| `status --json`, `facts` | `inject`, `synthesis`, `partitions`, `pending_reports`, `pending_v1`, `oldest_pending_at`, `last_report_at`, `conflicts`, `inject_p95_ms`, `inject_timeouts_7d`, `unattributed_commands_7d`, `synth: { used_today, cap, queued, unknown_attempts }` |
+| `status --json`, `loop_guard` | `enabled`, `shadow`, `fires_7d`, `shadow_fires_7d`, `by_rule_7d`, `last_fire_at` |
+| `doctor` warnings | `facts_profile_config`, `facts_pending`, `facts_inject_latency`, `facts_v1_pending`, `batch_learning` |
+| `doctor` failure | `codex_hook_trust` |
+| `doctor` information | `loop_guard` |
+
+### Limits in the code
+
+| Value | Number | Where |
+|---|---|---|
+| Activation | 3 distinct sessions (environment lane); 3 confirmations with pairwise-disjoint files (repo lane) | `REPO_FACT_RULES.activate` |
+| Retirement by contradiction | The newest event, for every fact (1, from the #120 replay), unless pinned | `REPO_FACT_RULES.retire`, `retire_high_stakes` |
+| Learned-fact gate | At least 4 exercised, `(fired + prevented) × 5 ≥ exercised × 2` | `REPO_FACT_RULES.exercised`, `rate_num`, `rate_den` |
+| Learned citations | At least 2 | `REPO_FACT_RULES.learned_citations` |
+| User tier | Active in at least 2 repos of one profile | `REPO_FACT_RULES.user_tier_repos` |
+| Repair window | 5 commands | `REPO_FACT_RULES.repair_window`, `DETECT_LIMITS.window` |
+| Injection | 4 facts | `REPO_FACT_LIMITS.inject` |
+| Live and dormant facts per repo | 32 each | `REPO_FACT_LIMITS.live`, `dormant` |
+| Environment lanes per fact | 8 devices | `REPO_FACT_LIMITS.devices` |
+| Lane history | 12 confirmations, 16 events | `REPO_FACT_LIMITS.confirmations`, `events` |
+| Report | 32 observations, 32 families, 32 files, 16 injected; a proposal 8 observations | `REPO_FACT_LIMITS` |
+| Literal | 120 characters; learned 400 | `REPO_FACT_LIMITS.literal`, `learned_literal` |
+| Held facts for synthesis | 64 | `REPO_FACT_LIMITS.held` |
+| Receipts | 4,000 per profile within 120 days; daily rows 400 days | `REPO_FACT_LIMITS.receipts`, `receipt_days`, `day_rows_days` |
+| Flag reason | 200 characters | `REPO_FACT_LIMITS.flag_reason` |
+| Brief | 400 tokens; profile reads 800 ms; 160 characters per quoted line; 4 rules, 3 `me` items, 3 decisions, 1 journal pointer | `BRIEF_MAX_TOKENS`, `BRIEF_DEADLINE_MS`, `QUOTE_CHARS`, `BRIEF_LIMITS` |
+| Session start | 1,500 ms default, at most 10,000 ms | `FACTS_INJECT.timeout_ms`, `withDefaults()` |
+| Recall cutoffs | Fused score 0.01 without an exact or literal hit; vector cosine 0.3 | `MIN_FUSED_SCORE`, `VECTOR_MIN_SCORE` |
+| Known lessons per item | 30 | `KNOWN_MAX` |
+| Goal metrics | 12 weeks default, at most 26; 3 samples minimum | `GOAL_LIMITS` |
+| Synthesis | Every 3 sessions per partition; 3 calls per UTC day per device; 8 digests of 8,000 characters; 8 proposals; 3 attempts per job | `SYNTH_LIMITS` |
+| Loop guard | `repeat` 3, `variant` 4 in the last 10, `errors` 8 of the last 10, 200 tracked keys | `LOOP_GUARD` |
+| Loop guard Codex lookup | Last 1 MB of the rollout, at most 200 ms | `ROLLOUT_TAIL`, `ROLLOUT_WAIT_MS` |
+| Loop guard log | 256 KB per file, one rotation | `LOG_MAX` |

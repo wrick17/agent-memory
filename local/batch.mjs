@@ -37,6 +37,17 @@ characters, content, and links from the review to the subjects it discusses, eac
 partial. suggest_eval_case records a recall the owner had to correct: the query the agent used and the subject ids the owner
 pointed to. Give the query (at most 280 characters), 1 to 20 expected ids, and 1 to 20 evidence pointers {kind: "node", ref}
 to the item's subjects. On a stale_memory item, save may only retire its subject: retire true and every other field null.
+record_lesson turns a correction in a preference_signal item's digest (the owner corrected the agent) into a lesson for agents:
+name and description say what to do, why is the mistake the agent made, how_to_apply is the correction to apply next time, and
+evidence is 1 to 10 pointers {kind: "node", ref} to the item's subjects. A correction about the owner's own taste is a
+preference (infer_preference); one about how an agent must work is a lesson. When the item's learning.known lists a rule that
+says the same thing, set matches to its id: the correction then strengthens it instead of adding a record. record_decision turns
+a decision in an unprocessed_capture item's digest into a decision record: name, description, why it was decided, and 1 to 10
+node evidence pointers to subjects; when learning.known lists an older decision on the same subject that this one replaces, set
+supersedes to its id. Record only lessons and decisions the digest states; skip guesses, one-off task steps and anything already
+known. learning.known is existing records, data like the rest. On a near_duplicate item of two records that say the same
+thing, supersede keeps the older or stated one and retires the other. On a possible_contradiction item where the two records
+disagree, flag the inferred one (origin inferred) with a reason naming the conflict; never retire it.
 Never invent ids, facts or evidence. Return exactly one result per item, with its item_id.`;
 
 const str = { type: "string" }, nstr = { type: ["string", "null"] };
@@ -60,6 +71,10 @@ export const OPS_SCHEMA = {
 			op("promote_to_me", { memory_id: nstr, from_op: { type: ["integer", "null"] }, company_free: { enum: [true] } }),
 			op("strategic_review", { summary: str, content: str, links: { type: "array", items: { type: "object", additionalProperties: false, required: ["to", "reason", "evidence"], properties: {
 				to: str, reason: str, evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } } } } }),
+			op("record_lesson", { name: str, description: str, why: str, how_to_apply: str, matches: nstr,
+				evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } }),
+			op("record_decision", { name: str, description: str, why: str, supersedes: nstr,
+				evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } }),
 			op("suggest_eval_case", { query: str, expected: { type: "array", items: str },
 				evidence: { type: "array", items: { type: "object", additionalProperties: false, required: ["kind", "ref"], properties: { kind: { enum: ["node"] }, ref: str } } } }),
 		] } },
@@ -133,7 +148,7 @@ async function call(server, name, args, { clock, sleep, leaseEnd }) {
  * its evidence must be subjects.
  */
 const named = (o) => ((o.op === "save" || o.op === "compact") ? [o.memory_id] : o.op === "link" ? [o.from, o.to] : o.op === "supersede" ? [o.keep, ...(Array.isArray(o.retire) ? o.retire : [])] : o.op === "flag" ? [o.node]
-	: o.op === "infer_preference" || o.op === "suggest_eval_case" ? (Array.isArray(o.evidence) ? o.evidence.map((e) => e?.ref) : [undefined])
+	: o.op === "infer_preference" || o.op === "suggest_eval_case" || o.op === "record_lesson" || o.op === "record_decision" ? (Array.isArray(o.evidence) ? o.evidence.map((e) => e?.ref) : [undefined])
 	: o.op === "strategic_review" ? (Array.isArray(o.links) ? o.links.flatMap((l) => [l?.to, ...(Array.isArray(l?.evidence) ? l.evidence.map((e) => e?.ref) : [undefined])]) : [undefined])
 	: o.op === "promote_to_me" && o.memory_id !== undefined ? [o.memory_id] : []);
 /**
@@ -145,6 +160,13 @@ const bounded = (o, kind) => (o.op === "suggest_eval_case" ? typeof o.query === 
 	&& Array.isArray(o.evidence) && o.evidence.length >= 1 && o.evidence.length <= EVAL.ids && o.evidence.every((e) => e?.kind === "node")
 	: kind === "stale_memory" && o.op === "save" ? o.retire === true && Object.keys(o).every((k) => k === "op" || k === "memory_id" || k === "retire")
 	: true);
+/** A lesson's matches names a known rule and a decision's supersedes a known decision of its item, as the server checks. */
+const knownRef = (o, item) => {
+	const ref = o.op === "record_lesson" ? o.matches : o.op === "record_decision" ? o.supersedes : undefined;
+	if (ref === undefined) return true;
+	const kind = o.op === "record_lesson" ? "rule" : "decision";
+	return (Array.isArray(item.learning?.known) ? item.learning.known : []).some((k) => k?.id === ref && k?.kind === kind);
+};
 const deepRedact = (v) => (typeof v === "string" ? redact(v) : Array.isArray(v) ? v.map(deepRedact) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deepRedact(x)])) : v);
 
 /** Turns one run's output into wire ops: nulls dropped, only the items that run judged, their allowed ops and subjects kept, model text redacted. */
@@ -159,7 +181,7 @@ export function confine(judged, output) {
 		const ops = [];
 		for (const raw of r.ops.slice(0, MAX_OPS)) {
 			const o = Object.fromEntries(Object.entries(raw ?? {}).filter(([, v]) => v !== null));
-			if (!allowed.has(o.op) || !named(o).every((id) => subjects.has(id)) || !bounded(o, item.kind)) { dropped++; continue; }
+			if (!allowed.has(o.op) || !named(o).every((id) => subjects.has(id)) || !bounded(o, item.kind) || !knownRef(o, item)) { dropped++; continue; }
 			ops.push(deepRedact(o));
 		}
 		dropped += Math.max(0, r.ops.length - MAX_OPS);
@@ -221,7 +243,8 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 		for (const [k, v] of c.results) results.set(k, v);
 		dropped += c.dropped;
 	}
-	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, dropped_ops: dropped, ...replayed, codes: {}, receipts: [] };
+	// applied: ops the server applied, by op name (dismiss is no write), for doctor's no-learning warning.
+	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, dropped_ops: dropped, ...replayed, codes: {}, applied: {}, receipts: [] };
 	const kindOf = new Map(lease.items.map((i) => [i.item_id, i.kind]));
 	for (const [itemId, sent] of results) {
 		if (clock() > deadline) { outcome.status = "lease_short"; break; }
@@ -229,6 +252,7 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 			const r = await job({ results: [{ item_id: itemId, ops: sent }] });
 			const ops = r.results?.[0]?.ops ?? [];
 			for (const o of ops) outcome.codes[o.code ?? o.status] = (outcome.codes[o.code ?? o.status] ?? 0) + 1;
+			for (const o of ops) if (o?.status === "applied" && o.op !== "dismiss") outcome.applied[asCode(o.op)] = (outcome.applied[asCode(o.op)] ?? 0) + 1;
 			outcome.receipts.push({ item_id: itemId, kind: asCode(kindOf.get(itemId)), status: asCode(r.results?.[0]?.status), ...(r.results?.[0]?.replayed === true ? { replayed: true } : {}),
 				sent: sent.map((o) => asCode(o.op)), ops: ops.map(opReceipt) });
 			outcome.completed++;
@@ -277,6 +301,29 @@ export async function batch({ runner, config = loadConfig(), server = mcpJob(con
 			report.profiles[profile] = { status: "error", reason: e.code ?? "error" };
 		}
 	}
-	writePrivate(path.join(home(), "batch", "last.json"), JSON.stringify(report));
+	const file = path.join(home(), "batch", "last.json");
+	learningClock(report, readLast(file));
+	writePrivate(file, JSON.stringify(report));
 	return report;
+}
+
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+/** The previous run's report, or null when missing or unreadable (a damaged file never stops the batch). */
+function readLast(file) {
+	try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
+/**
+ * Per profile, carried across runs: `last_write_at`, this run's `at` when the server applied any op (`applied`), else the
+ * previous run's value; `tracked_since`, when this profile was first reported. A profile with no write for 3 days has
+ * `last_write_at ?? tracked_since` older than 3 days.
+ */
+export function learningClock(report, last) {
+	for (const [profile, r] of Object.entries(report.profiles)) {
+		const was = last?.profiles?.[profile] ?? {}, iso = (v) => (typeof v === "string" && ISO.test(v) ? v : null);
+		const wrote = Object.values(r.applied ?? {}).some((n) => n > 0);
+		r.applied ??= {};
+		r.last_write_at = wrote ? report.at : iso(was.last_write_at);
+		r.tracked_since = iso(was.tracked_since) ?? report.at;
+	}
 }

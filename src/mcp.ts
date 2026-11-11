@@ -10,7 +10,7 @@ import { statedFirst } from "./domain/rank";
 import { EVIDENCE_KINDS, fail, KNOWLEDGE_KINDS, MEMORY_KINDS, MEMORY_TYPES, ok, PROFILE_NAME, RELATIONS, type Caller, type Outcome, type ProfileRef, type ReadQuery, type RecallHit, type RecallPage, type Scope, type WriteCommand, type WriteContext } from "./domain/types";
 import { ANSWER_BYTES } from "./corpus/query";
 import { MAINTENANCE_TOOLS } from "./maintenance-tools";
-import { APPEND_MAX, embeddingsOn, NOTE_MAX, SEMANTIC_MS, type ProfileStore } from "./profile/store";
+import { APPEND_MAX, embeddingsOn, factRoute, ME_MERGE_KINDS, meMergeable, NOTE_MAX, projectScopes, REPO_KEY, scopedRulesFirst, SEMANTIC_MS, type ProfileStore } from "./profile/store";
 import { mayUse, readSet, routeWrite, type Route } from "./routing";
 import { explore, exploreSchema, GRAPH_TOOL_TEXT, timeline, timelineSchema, trace, traceSchema } from "./graph-tools";
 import { BOARD_TOOL_TEXT, workBoard, workBoardSchema } from "./board-tools";
@@ -89,6 +89,12 @@ const captureSchema = z.object({
 	source: z.record(z.string().max(64), z.string().max(512)).optional(), scope: scope.optional(), request_id: requestId.optional(), ...routing,
 }).strict();
 
+/** repo_facts (repo-facts contract section 7). */
+const repoFactsSchema = z.object({
+	action: z.enum(["list", "flag"]), repo_key: z.string().max(160).optional(), state: z.enum(["candidate", "active", "retired", "dormant", "all"]).optional(),
+	tier: z.enum(["repo", "user", "all"]).optional(), fact_key: z.string().regex(/^[0-9a-f]{16}$/).optional(), memory_id: memoryId.optional(), scope: z.enum(["repo", "user"]).optional(),
+	reason: z.string().max(200).optional(), limit: z.number().int().min(1).max(50).optional(), after: z.string().min(1).max(300).optional(), ...routing,
+}).strict();
 const reviewSchema = z.object({
 	action: z.enum(["list", "promote", "dismiss"]), candidate_id: z.string().min(1).max(128).optional(),
 	into: z.object({ name: z.string().min(1).max(512), type: z.enum(["feedback", "project", "reference", "user"]), description: text().optional() }).strict().optional(),
@@ -145,6 +151,8 @@ export const TOOLS = [
 	{ name: "trace", scope: "read" as Scope, schema: traceSchema, run: trace, description: GRAPH_TOOL_TEXT.trace },
 	{ name: "timeline", scope: "read" as Scope, schema: timelineSchema, run: timeline, description: GRAPH_TOOL_TEXT.timeline },
 	{ name: "work_board", scope: "read" as Scope, schema: workBoardSchema, run: workBoard, description: BOARD_TOOL_TEXT },
+	{ name: "repo_facts", scope: "read" as Scope, schema: repoFactsSchema, run: repoFacts,
+		description: `List the learned repo facts of the profile your repo routes to (or of profile), with state, lanes, firing counts and evidence; or flag a wrong fact (action flag, needs a write-scoped token and a reason): the fact retires at once, for this repo (scope repo) or every repo of the profile (scope user), undoable from the activity log. Name it by memory_id, or by fact_key with repo.${DATA_NOTE}` },
 	// Paid only (section 14): listed and callable only while the corpus module is on.
 	{ name: "corpus", scope: "read" as Scope, schema: corpusSchema, run: corpus, description: CORPUS_TOOL_TEXT, enabled: corpusOn },
 	// Job tools (job-scoped token only, section 7).
@@ -347,6 +355,35 @@ async function get(c: ToolContext, a: GetInput): Promise<Outcome<unknown>> {
 }
 
 /** review_candidates: list reads the routed profile; promote and dismiss are writes on the candidate's own profile. */
+/** repo_facts: routed like capture (raw remote and path, or profile); facts are keyed by the canonical repo key. Never me. */
+async function repoFacts(c: ToolContext, a: z.infer<typeof repoFactsSchema>): Promise<Outcome<unknown>> {
+	if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
+	let repoKey: string | undefined;
+	if (a.repo?.remote) { const k = factRoute(a.repo.remote, a.repo_key); if (!k.ok) return k; repoKey = k.value; }
+	else if (a.repo_key !== undefined) { if (!REPO_KEY.test(a.repo_key)) return fail("validation", "repo_key is github.com/<owner>/<repo>", { reason: "unsupported_remote" }); repoKey = a.repo_key; }
+	const route = routeWrite(c.caller, c.account.rules, c.account.known, { ...(a.profile !== undefined ? { profile: a.profile } : {}), ...(a.repo ? { repo: a.repo } : {}) });
+	if (!route.ok) return route;
+	if (route.value.profile === "me") return fail("forbidden", "repo facts never live in me");
+	const ref = refOf(c, route.value.profile);
+	if (!ref) return fail("validation", `profile '${route.value.profile}' is not active`);
+	if (a.action === "list") {
+		const r = await profileStub(c.env, ref).readV2(ref, { kind: "facts", ...(repoKey ? { repo_key: repoKey } : {}), ...(a.tier ? { tier: a.tier } : {}), ...(a.state ? { state: a.state } : {}),
+			after: a.after ?? null, limit: a.limit ?? 20 });
+		return r.ok ? ok({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: repoKey ?? null, ...(r.value as object) }) : r;
+	}
+	if (!c.caller.scopes.includes("write")) return fail("forbidden", "flagging a fact needs a write-scoped token");
+	const reason = a.reason?.trim();
+	if (!reason) return fail("validation", "a flag needs a reason", { reason: "reason_required" });
+	if (!a.memory_id && !(a.fact_key && (repoKey || a.scope === "user"))) return fail("validation", "name memory_id, or fact_key with repo");
+	const args = { ...(a.memory_id ? { memory_id: a.memory_id } : {}), ...(a.fact_key ? { fact_key: a.fact_key } : {}), ...(repoKey ? { repo_key: repoKey } : {}),
+		scope: a.scope ?? "repo", reason, request_id: `fact-flag:${crypto.randomUUID()}` } as const;
+	const res = await profileStub(c.env, ref).write(ref, { op: "fact_flag", args }, { actor: c.actor ?? "agent", ...(c.caller.deviceId ? { deviceId: c.caller.deviceId } : {}),
+		platform: c.platform, routedBy: route.value.routedBy, payloadHash: requestHash("fact_flag", args), userId: c.caller.userId });
+	if (!res.ok) return res;
+	const { created: _created, ...value } = res.value;
+	return ok(value);
+}
+
 async function review(c: ToolContext, a: ReviewInput): Promise<Outcome<unknown>> {
 	if (a.action === "list") {
 		if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
@@ -372,9 +409,11 @@ export async function recall(c: ToolContext, a: RecallInput, opts: RecallOptions
 	if (!c.caller.scopes.includes("read")) return fail("forbidden", "this token cannot read");
 	const rs = readSet(c.caller, c.account.rules, c.account.known, { ...(a.profile !== undefined ? { profile: a.profile } : {}), ...(a.repo ? { repo: a.repo } : {}) });
 	if (!rs.ok) return rs;
-	const names = [rs.value.primary, ...(rs.value.withMe && !c.withoutMe ? ["me"] : [])];
-	const refs = names.map((n) => refOf(c, n)!);
 	const keyword = (a.keyword ?? "").trim();
+	// B5: a keyword recall merges only me's preferences and rules (outside private scopes); with kinds that name neither, no me.
+	const meKinds = (a.kinds ?? [...ME_MERGE_KINDS]).filter((k): k is (typeof ME_MERGE_KINDS)[number] => (ME_MERGE_KINDS as readonly string[]).includes(k));
+	const names = [rs.value.primary, ...(rs.value.withMe && !c.withoutMe && (!keyword || meKinds.length) ? ["me"] : [])];
+	const refs = names.map((n) => refOf(c, n)!);
 	const limit = a.limit ?? 15;
 	const type = a.type ?? "all";
 	const common = { type, ...(a.kinds ? { kinds: a.kinds } : {}), ...(a.scope !== undefined ? { scope: a.scope } : {}), includeHistory: a.include_history === true, ...(a.as_of ? { asOf: a.as_of } : {}) };
@@ -387,13 +426,15 @@ export async function recall(c: ToolContext, a: RecallInput, opts: RecallOptions
 	const semantic = embeddingsOn(c.env) && !a.as_of && channels.includes("vector");
 	const diagnostics: Record<string, unknown> = semantic ? {} : { embedding: a.as_of ? "off:as_of" : "off" };
 	const deadline = Date.now() + SEMANTIC_MS;
-	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, includeCaptures: a.include_captures === true && ref.profile === rs.value.primary, semantic, deadline, expand: a.expand !== false }, { channels })));
+	const pages = await Promise.all(refs.map((ref) => profileStub(c.env, ref).read(ref, { kind: "recall", keyword, limit, ...common, includeCaptures: a.include_captures === true && ref.profile === rs.value.primary, semantic, deadline, expand: a.expand !== false,
+		...(ref.profile === "me" && rs.value.primary !== "me" ? { kinds: meKinds } : {}) }, { channels })));
 	const merged = new Map<string, { hit: RecallHit; score: number }>();
 	for (const [i, page] of pages.entries()) {
 		if (!page.ok) return page;
 		const p = page.value as RecallPage;
 		diagnostics[names[i]!] = p.diagnostics;
 		p.hits.forEach((hit, i) => {
+			if (hit.profile === "me" && rs.value.primary !== "me" && !meMergeable(hit)) return;
 			const key = `${hit.profile}:${hit.memory_id}`;
 			const prior = merged.get(key);
 			merged.set(key, { hit, score: (prior?.score ?? 0) + 1 / (RRF_K + (hit.rank ?? i) + 1) });
@@ -401,8 +442,9 @@ export async function recall(c: ToolContext, a: RecallInput, opts: RecallOptions
 	}
 	const vectorUsed = pages.some((p) => p.ok && (p.value as RecallPage).vectorUsed);
 	// Stated preferences outrank inferred ones before the limit and the token budget cut anything (section 12).
-	const ranked = statedFirst([...merged.values()].sort((x, y) => y.score - x.score || y.hit.score - x.hit.score)
-		.map(({ hit, score }) => ({ ...publicHit(hit), score: Math.round(score * 1e8) / 1e8, profile_score: hit.score }))).slice(0, limit);
+	// B5: then rules scoped to the request's repo project move first.
+	const ranked = scopedRulesFirst(statedFirst([...merged.values()].sort((x, y) => y.score - x.score || y.hit.score - x.hit.score)
+		.map(({ hit, score }) => ({ ...publicHit(hit), score: Math.round(score * 1e8) / 1e8, profile_score: hit.score }))), projectScopes(a.repo?.remote)).slice(0, limit);
 	const selected: unknown[] = [];
 	let used = 0;
 	for (const item of ranked) {

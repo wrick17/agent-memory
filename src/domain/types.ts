@@ -106,7 +106,7 @@ export interface SaveArgs {
 	new_name?: string; retire?: boolean; supersedes?: string | string[];
 	expected_revision?: number; request_id?: string;
 	compact?: { through_seq: number; summary: string };
-	/** `inferred` is internal: only the maintenance batch's infer_preference sets it. MCP exposes `evidence`, never `inferred`. */
+	/** `inferred` is internal: only the maintenance batch's infer_preference, record_lesson and record_decision set it. MCP exposes `evidence`, never `inferred`. */
 	origin?: "stated" | "agent" | "inferred";
 	evidence?: { kind: (typeof EVIDENCE_KINDS)[number]; ref: string; note?: string }[];
 	/** Judgment links from the saved node to nodes of its profile, as record_knowledge edges with an implicit `from`. */
@@ -162,28 +162,162 @@ export interface TicketUploadArgs {
 }
 export type UploadArgs = CommitUploadArgs | PRUploadArgs | TicketUploadArgs;
 
-/** Repo facts (#91-#95): the deterministic detectors that may name a fact. */
-export const FACT_DETECTORS = ["command_repair", "unavailable_tool", "env_var", "network", "empty_vcs"] as const;
+// ---------- Repo facts v2: the shared contract in docs/repo-facts-v2-contract.md. ----------
+
+export const REPO_FACT_DETECTORS = ["command_repair", "unavailable_tool", "env_var", "network", "empty_vcs", "form_repair", "arg_repair", "learned"] as const;
+export type FactDetector = (typeof REPO_FACT_DETECTORS)[number];
+/** environment: eligible, retired and activated per device, no disjoint-files rule. repo: one shared lane, disjoint edited files. */
+export const FACT_CLASSES = ["environment", "repo"] as const;
+export type FactClass = (typeof FACT_CLASSES)[number];
+export const DETECTOR_CLASS: Readonly<Record<Exclude<FactDetector, "learned">, FactClass>> = Object.freeze({
+	command_repair: "environment", unavailable_tool: "environment", env_var: "environment", network: "environment", empty_vcs: "environment",
+	form_repair: "environment", arg_repair: "repo",
+});
+/** form_repair fixes: the failing program run through exactly one of these launchers. */
+export const FORM_WRAPPERS = ["python -m", "python3 -m", "npx", "npm exec", "pnpm exec", "pnpm dlx", "yarn", "bunx", "uv run", "poetry run", "bundle exec"] as const;
+/** Programs a learned fix may never start with: shells, evaluators, privilege, network and deletion. */
+export const FIX_DENY = ["sh", "bash", "zsh", "dash", "fish", "eval", "exec", "source", "sudo", "doas", "su", "env", "xargs", "curl", "wget", "nc", "ncat", "ssh", "scp", "rsync", "rm", "dd", "mkfs", "chmod", "chown"] as const;
+/** The lane key of a repo-class fact; environment lanes are keyed by device id. */
+export const SHARED_LANE = "*";
+
 /**
- * One fact observation from a completed session (confirm, contradict) or a P2 proposal (propose), validated and redacted by the
- * Worker. `disjoint_from` (confirm only) lists the device's earlier confirming sessions whose edited-file sets this session's set
- * is disjoint from; absent means overlap or unknown history. `citations` (propose only) are bounded session refs, never confirmations.
+ * Named so a replay can recalibrate them. The firing-rate gate (exercised, rate_num, rate_den) applies to learned facts only:
+ * (fired + prevented) * rate_den >= exercised * rate_num. Deterministic facts inject as soon as their lane is active.
  */
-export interface FactObservation {
-	fact_key: string; kind: "confirm" | "contradict" | "propose"; detector: (typeof FACT_DETECTORS)[number];
-	statement: string; literal: string; family: string; disjoint_from?: string[]; citations?: string[];
+export const REPO_FACT_RULES = Object.freeze({ activate: 3, retire: 1, retire_high_stakes: 1, learned_citations: 2, exercised: 4, rate_num: 2, rate_den: 5, user_tier_repos: 2, repair_window: 5 });
+export const REPO_FACT_LIMITS = Object.freeze({
+	observations: 32, families: 32, files: 32, injected: 16, citations: 8, proposal_facts: 8, live: 32, dormant: 32, devices: 8, inject: 4,
+	confirmations: 12, events: 16, evidence: 20, legacy_seen: 64, literal: 120, learned_literal: 400, signature_set: 3, signature_string: 80,
+	fix: 120, fix_tokens: 8, held: 64, receipts: 4000, receipt_days: 120, day_rows_days: 400, flag_reason: 200,
+});
+
+const PROG = "[a-z0-9_][a-z0-9_.+-]{0,39}", WORD = "[a-z][a-z0-9_:.-]{0,39}", HEAD = `${PROG}(?: ${WORD}){0,2}`, VAR = "[A-Za-z_][A-Za-z0-9_]{0,63}";
+const ARG = "(?:--|--?[A-Za-z][A-Za-z0-9-]{0,31}(?:=[A-Za-z0-9_.:,/@+-]{1,40})?)";
+const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+/** Literal grammars; every literal is also one line, at most REPO_FACT_LIMITS.literal (120) chars, with no backtick, quote or secret. */
+export const FACT_LITERAL: Readonly<Record<Exclude<FactDetector, "learned">, RegExp>> = Object.freeze({
+	command_repair: new RegExp(`^(?=env -u |${VAR}=… )(?:env(?: -u ${VAR})+ )?(?:${VAR}=… )*${HEAD}$`),
+	unavailable_tool: new RegExp(`^(?:import ${VAR}(?:\\.${VAR}){0,7}|${PROG}|${HEAD} needs [A-Za-z0-9_][A-Za-z0-9_.+-]{0,39})$`),
+	env_var: new RegExp(`^${HEAD} needs [A-Z][A-Z0-9_]{2,63}$`),
+	network: new RegExp(`^(?=.{1,120}$)${LABEL}(?:\\.${LABEL})+$`),
+	empty_vcs: new RegExp(`^git(?: ${WORD}){0,2}$`),
+	form_repair: new RegExp(`^(${PROG}) => (?:${FORM_WRAPPERS.join("|")}) \\1$`),
+	arg_repair: new RegExp(`^${HEAD} (?:with|without) ${ARG}(?: ${ARG}){0,2}$`),
+});
+/** A learned signature's head. */
+export const FACT_HEAD = new RegExp(`^${HEAD}$`);
+/**
+ * A learned fix: one plain command, program then at most 7 argument tokens, at most 120 chars. The token charset excludes every shell
+ * metacharacter (; & | ` $ ( ) < > quotes, globs, newline). Also checked: no `://`, no `user@host:` token, program not in FIX_DENY,
+ * and head's program is one of its tokens.
+ */
+export const FACT_FIX = new RegExp(`^(?=.{2,120}$)${PROG}(?: [A-Za-z0-9_.,:@%+=/-]{1,64}){0,7}$`);
+/** One signature string (scope, confirm, contradict): 3 to 80 chars of lowercase printable ASCII without ` " ; | < > or doubled spaces. */
+export const FACT_SIGNATURE_STRING = /^(?=.{3,80}$)(?!.* {2})[a-z0-9 !#$%&'()*+,./:=?@[\\\]^_{}~-]+$/;
+
+/** Session order: ended_at (ISO UTC, ms) then the device's per-session counter, shared by every report of that session. */
+export interface FactOrder { ended_at: string; seq: number }
+/** `<ended_at>/<seq, 10 digits>/<device>`: sorts in session order. */
+export const orderKey = (o: FactOrder, device: string) => `${o.ended_at}/${String(o.seq).padStart(10, "0")}/${device}`;
+export const LEGACY_ORDER = "1970-01-01T00:00:00.000Z/0000000000/legacy";
+
+/**
+ * A learned fact's checkable signature: three bounded sets of lowercase plain substrings, never a regex. A step is in scope when its
+ * text holds every `scope` string; a failed in-scope step whose error lines hold any `confirm` string confirms; a proven-ok in-scope
+ * step holding any `contradict` string contradicts. head names the operation; fix (FACT_FIX) is optional.
+ * Identity is head, scope, confirm, fix and class; a revision may only add to `contradict`.
+ */
+export interface FactSignature { head: string; scope: string[]; confirm: string[]; contradict: string[]; fix?: string }
+/** The canonical learned literal (the identity the fact key hashes): sets sorted, joined with `; `. Excludes contradict. */
+export const learnedLiteral = (s: FactSignature, cls: FactClass) =>
+	`${s.head} | scope: ${[...s.scope].sort().join("; ")} | confirm: ${[...s.confirm].sort().join("; ")}${s.fix ? ` | fix: ${s.fix}` : ""} | class: ${cls}`;
+/** One HEAD's family label: `prog:<head>` for one word, else `head:<head>`. Family hash: sha256(repo_key + "\n" + label)[0:16]. */
+export const headLabel = (head: string) => (head.includes(" ") ? `head:${head}` : `prog:${head}`);
+
+/** One observation. No statement: the server derives it. class, signature and citations only on proposals of `learned`. */
+export interface FactReportObservation {
+	fact_key: string; kind: "confirm" | "contradict" | "propose"; detector: FactDetector; literal: string;
+	signature?: FactSignature; class?: FactClass; citations?: string[];
+	/** Retire on REPO_FACT_RULES.retire_high_stakes contradictions. A revision may set it, never clear it. */
+	high_stakes?: boolean;
 }
 /**
- * One durable fact report: a completed session (`session`, with the families it used and its explicit firing markers) or a P2
- * proposal (`proposal`). `device` is the authenticated token's device; `request_id` is derived from repo_key and the report identity.
+ * One item injected at this session's start and what happened to it: fired (its failure recurred), prevented (exercised, no failure),
+ * unexercised. `memory` items come from the session briefing; the facts lifecycle ignores them and the receipt keeps them.
  */
-export interface FactArgs {
-	repo_key: string; device: string; session?: string; proposal?: string; families: string[]; fired: string[];
-	observations: FactObservation[]; request_id: string;
+export type FactInjected = { kind: "fact"; fact_key: string; outcome: "fired" | "prevented" | "unexercised" }
+	| { kind: "memory"; memory_id: string; outcome: "fired" | "prevented" | "unexercised" };
+/** Cache-aware token use. input includes cached_input and cache_write. */
+export interface FactUsage { input: number; cached_input: number; output: number; cache_write?: number }
+export interface FactCommandCounts { total: number; failed: number; repeated_failures: number }
+/**
+ * Every fact route's location. remote is the raw origin URL (SSH aliases kept) and path the checkout toplevel: both route through
+ * routeWrite. repo_key is the canonical github.com/<owner>/<repo> the client resolved; the server checks it against the remote.
+ */
+export interface FactRoute { repo: { remote: string; path?: string }; repo_key: string; profile?: string }
+
+/**
+ * device: the authenticated token's device. machine: the client's stable machine id (32 lowercase hex, random, generated once per
+ * machine), which keys environment lanes. A v2 request without it reaches no environment lane; only v1 legacy reports use the device.
+ */
+interface FactReportBase { repo_key: string; device: string; machine?: string; request_id: string; observations: FactReportObservation[] }
+/**
+ * A completed session's report. attribution `legacy` marks a v1 report the Worker mapped in: order from receipt time, no files, no
+ * injected, and per-command repo attribution unknown. files absent = unknown (overlaps every set).
+ */
+export interface FactSessionReport extends FactReportBase {
+	type: "session"; session: string; order: FactOrder; attribution: "command" | "legacy";
+	families: string[]; files?: string[]; injected: FactInjected[]; usage?: FactUsage; commands?: FactCommandCounts;
+}
+/** A synthesis proposal: propose observations only. The proposal id is the idempotency key. */
+export interface FactProposalReport extends FactReportBase { type: "proposal"; proposal: string; /** legacy: a v1 proposal the Worker mapped in. */ attribution?: "legacy" }
+/** The validated report the Worker hands the store (`op: "fact"` in phase B). The receipt stores it whole. */
+export type FactReport = FactSessionReport | FactProposalReport;
+
+export type FactLaneState = "candidate" | "active" | "retired";
+export interface FactConfirmation { session: string; device: string; order: string; files: string[] | null }
+export interface FactEvent { order: string; session: string; kind: "confirm" | "contradict" | "flag" }
+/**
+ * One lane. state is recomputed from the ordered history after every accepted report unless retired_reason is `flagged` (terminal).
+ * activated is the order key at which the activation rule first held (sticky). updated_at drives oldest-updated eviction.
+ */
+export interface FactLane {
+	state: FactLaneState; confirmations: FactConfirmation[]; events: FactEvent[]; activated?: string;
+	exercised: number; fired: number; prevented: number; retired_reason?: "contradicted" | "flagged"; updated_at: string;
+}
+/** attrs.fact, v2. lanes: SHARED_LANE for repo class, device ids for environment class. label: the family label (section 4). */
+export interface FactRecord {
+	v: 2; repo_key: string; fact_key: string; detector: FactDetector; literal: string; signature?: FactSignature;
+	class: FactClass; label: string; family: string; lanes: Record<string, FactLane>; high_stakes?: boolean;
+	/** The owner's reason, set by a flag (redacted, at most 200 characters). */
+	flag_reason?: string;
+	/** v1 sessions this fact already counted; a later report for one of them skips this fact only. */
+	legacy_seen?: string[];
+}
+
+/** The injectable-facts read (src/profile/facts.ts `injectableFacts`), shared by POST /v1/facts and POST /v1/brief. device: the lane id (machine, else token device). */
+export interface FactInjectQuery { profile: string; repo_key: string; device: string }
+/** One injectable fact. line is the template-rendered bullet; renderFactBlock wraps lines in the fixed boundary. */
+export interface FactInjection {
+	fact_key: string; detector: FactDetector; class: FactClass; tier: "repo" | "user"; literal: string; signature?: FactSignature;
+	statement: string; line: string; exercised: number; fired: number; prevented: number;
+}
+/** The owner's flag: retire now, terminal, undoable through its activity. scope user retires the key in every repo of the profile. */
+export interface FactFlagArgs { memory_id?: string; repo_key?: string; fact_key?: string; scope: "repo" | "user"; reason: string; request_id: string }
+export interface FactListItem {
+	memory_id: string; repo_key: string; fact_key: string; detector: FactDetector; class: FactClass; literal: string; signature?: FactSignature;
+	statement: string; state: FactLaneState; user_tier: boolean; pinned: boolean; high_stakes: boolean; dormant: boolean; revision: number; flag_reason?: string;
+	lanes: { lane: string; state: FactLaneState; exercised: number; fired: number; prevented: number; rate: number | null; eligible: boolean; confirmations: number; last_event: FactEvent | null; updated_at: string }[];
+	evidence: { kind: string; ref: string; note: string | null }[]; created_at: string; updated_at: string;
+}
+/** Per repo per UTC day (of ended_at), summed from stored session receipts. usage_sessions counts sessions that carried usage. */
+export interface FactEfficiencyRow {
+	repo_key: string; day: string; sessions: number; usage_sessions: number; input: number; cached_input: number; output: number; cache_write: number;
+	commands: number; failed: number; repeated_failures: number; injected: number; prevented: number; fired: number;
 }
 
 export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs } | { op: "undo"; args: { activity_id: number; request_id: string } }
-	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs } | { op: "restore"; args: { activity_id: number; request_id: string } } | { op: "fact"; args: FactArgs };
+	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs } | { op: "restore"; args: { activity_id: number; request_id: string } } | { op: "fact"; args: FactReport } | { op: "fact_flag"; args: FactFlagArgs };
 /** The owner's dashboard actions on one node (section 15). */
 export interface OwnerArgs { action: "pin" | "unpin" | "forget" | "unflag"; memory_id: string; request_id?: string }
 

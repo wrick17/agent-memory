@@ -34,25 +34,63 @@ export function writePrivate(file, data, mode = 0o600) {
 export const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
 export const safeName = (s) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 
-// Same patterns as the server's src/domain/redact.ts (port of BothQ memory_privacy.py).
+// Same rules, in the same order, as the server's src/domain/redact.ts (port of BothQ memory_privacy.py): the server refuses any
+// uploaded string its redactor would still change, so the two copies must match.
 const REDACTED = "[REDACTED]";
-const PATTERNS = [
-	[/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, () => REDACTED],
-	[/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, () => REDACTED],
-	[/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g, () => REDACTED],
-	[/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, () => REDACTED],
-	[/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, () => REDACTED],
-	// Stricter than the server's KEY_VALUE: a quoted key (JSON, dict) and a bounded name prefix (github_token) count too, as
-	// the server's SENSITIVE_KEY segment rule does for object keys; the value goes before any literal, prompt or pending text.
-	[/\b((?:[\w-]{0,64}[_-])?(?:password|passwd|pwd|secret|api[_-]?key|token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret))(["']?)\s*([:=])\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, (_m, k, q, s) => `${k}${q}${s}${REDACTED}`],
-	// From the "://", with the scheme checked by one backward scan (see src/domain/redact.ts).
-	[/(:\/\/[^\s:/@]+:)[^\s/@]+(@)/g, (m, h, a, offset, whole) => (schemeBefore(whole, offset) ? `${h}${REDACTED}${a}` : m)],
-];
+const PRIVATE_KEY = /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g;
+const AUTH_HEADER = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+const VENDOR_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{16,}|[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}|xapp-[A-Za-z0-9-]{8,}|npm_[A-Za-z0-9]{30,}|AIza[A-Za-z0-9_-]{30,}|hf_[A-Za-z0-9]{30,})\b/g;
+const AWS_KEY = /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b/g;
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+// A secret's value: quoted, a $(..), ${..} or `..` reference, or one bare word.
+const VALUE = String.raw`(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$\([^)\n]*\)|\$\{[^}\n]*\}|\x60[^\x60\n]*\x60|[^\s,;]+)`;
+// A value that only names where the secret comes from holds none, and is kept whole: a plain variable ($VAR, ${VAR}), a file read
+// ($(cat <path>), $(<path), `cat <path>`) and an already-elided `…` (repo-fact literals such as `GH_TOKEN=… gh pr list`, contract
+// section 4). Any other expansion or substitution may carry the literal itself (${VAR:-secret}, $(printf secret)) and is redacted.
+const REFERENCE = /^["']?(?:\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\}|\$\((?:cat[ \t]+|<[ \t]*)[^\s;&|\x60$()<>'"]+\)|\x60cat[ \t]+[^\s;&|\x60$()<>'"]+\x60|…)["']?$/;
+// A quoted key (JSON, dict) and a bounded name prefix (github_token, AWS_SECRET_ACCESS_KEY) count too, as SENSITIVE_KEY's segment
+// rule does for object keys; the bound keeps a long hyphenated run linear. ENV_KEY: an upper-case NAME_KEY= style assignment.
+// Kept identical to src/domain/redact.ts.
+const KEY_VALUE = new RegExp(String.raw`\b((?:[\w-]{0,64}[_-])?(?:[a-z]{0,32}pass(?:word|wd)|pwd|secret|token|(?:api|secret|access|private|signing|encryption|master)[_-]?key))(["']?)\s*([:=])\s*(${VALUE})`, "gi");
+const ENV_KEY = new RegExp(String.raw`\b([A-Z][A-Z0-9_]{0,63}_(?:KEY|AUTH|CREDENTIALS?|PASS))=(${VALUE})`, "g");
+// A URL's user-info password, matched from its "://". The scheme is the run of scheme characters just before it and must
+// hold a letter, exactly as BothQ's `[a-z][a-z0-9+.-]*://` requires; scanning back once per "://" keeps a long run linear,
+// where retrying that pattern at every character was quadratic (a 1 MB run took minutes).
+const URL_PASSWORD = /(:\/\/[^\s:/@]+:)[^\s/@]+(@)/g;
+const SCHEME_CHAR = /[a-z0-9+.-]/i, LETTER = /[a-z]/i;
 function schemeBefore(text, end) {
-	for (let i = end - 1; i >= 0 && /[a-z0-9+.-]/i.test(text[i]); i--) if (/[a-z]/i.test(text[i])) return true;
+	for (let i = end - 1; i >= 0 && SCHEME_CHAR.test(text[i]); i--) if (LETTER.test(text[i])) return true;
 	return false;
 }
-export const redact = (s) => PATTERNS.reduce((t, [re, f]) => t.replace(re, f), s);
+// Any Authorization scheme (token, digest, a bare value), beyond AUTH_HEADER's Bearer and Basic.
+const AUTHORIZATION = /(\b(?:proxy-)?authorization["']?\s*[:=]\s*)(?:(?:bearer|basic|token|digest|bot|negotiate)\s+)?("(?:\\.|[^"\\])*"|[^\s'",;]+)/gi;
+// Secret flags with a space-separated value (--password x), the password flags of mysql, mongo, sshpass and redis-cli, curl's
+// user:password and `aws configure set` of a secret. Each prefix is bounded, so a long run stays linear.
+const SECRET_FLAGS = [
+	new RegExp(String.raw`(?<!\S)(--(?:[A-Za-z0-9]{1,32}-){0,4}(?:password|passwd|pass|token|secret|api-?key|access-key|secret-key)[ \t]+)(?!-)(${VALUE})`, "gi"),
+	new RegExp(String.raw`(\b(?:mysql\w*|mariadb\w*|mongo\w*|sshpass)\b[^;&|\n]{0,200}?[ \t]-p[ \t]*)(?!-)(${VALUE})`, "g"),
+	new RegExp(String.raw`(\bredis-cli\b[^;&|\n]{0,200}?[ \t]-a[ \t]*)(?!-)(${VALUE})`, "g"),
+	// curl's user:password, bare or quoted: only the user name stays.
+	new RegExp(String.raw`(\bcurl\b[^;&|\n]{0,200}?[ \t](?:-u|--user)[ \t=]*["']?[^\s:;&|'"]+:)([^\s;&|'"]+)`, "g"),
+	/(\baws[ \t]+configure[ \t]+set[ \t]+\S*(?:secret|key|token)\S*[ \t]+)(\S+)/gi,
+];
+const keepRef = (m, head, value) => (REFERENCE.test(value) ? m : `${head}${REDACTED}`);
+
+// Named in order, so a review can say which rule fired without showing what it matched.
+const RULES = [
+	["private_key", (s) => s.replace(PRIVATE_KEY, REDACTED)],
+	["auth_header", (s) => s.replace(AUTH_HEADER, REDACTED)],
+	["vendor_token", (s) => s.replace(VENDOR_TOKEN, REDACTED)],
+	["aws_key", (s) => s.replace(AWS_KEY, REDACTED)],
+	["jwt", (s) => s.replace(JWT, REDACTED)],
+	["key_value", (s) => s.replace(KEY_VALUE, (m, key, quote, sep, value) => (REFERENCE.test(value) ? m : `${key}${quote}${sep}${REDACTED}`))
+		.replace(ENV_KEY, (m, key, value) => keepRef(m, `${key}=`, value))],
+	["url_password", (s) => s.replace(URL_PASSWORD, (m, head, at, offset, whole) => (schemeBefore(whole, offset) ? `${head}${REDACTED}${at}` : m))],
+	["authorization", (s) => s.replace(AUTHORIZATION, keepRef)],
+	["secret_flag", (s) => SECRET_FLAGS.reduce((t, re) => t.replace(re, keepRef), s)],
+];
+/** Redacts secrets: the server's rules, applied in its order. Idempotent: redacting a redacted text changes nothing. */
+export const redact = (s) => RULES.reduce((t, [, rule]) => rule(t), s);
 
 // ---------- hook ----------
 
@@ -163,11 +201,55 @@ export function findTranscript(t) {
 		return null;
 	};
 	if (t.client === "codex") {
-		const root = path.join(t.client_home, "sessions");
-		return walk(root, (n) => n.startsWith("rollout-") && n.endsWith(`${t.session}.jsonl`), 4);
+		// `codex archive` moves a rollout from sessions/YYYY/MM/DD/ to archived_sessions/. An ephemeral thread (codex exec --ephemeral,
+		// app-server ephemeral threads) writes no rollout, no state_5 threads row and no thread_history rows, and its hooks get a null
+		// transcript_path (codex 0.167.1 Session::hook_transcript_path): there is no source to find.
+		const test = (n) => n.startsWith("rollout-") && n.endsWith(`${t.session}.jsonl`);
+		return walk(path.join(t.client_home, "sessions"), test, 4) ?? walk(path.join(t.client_home, "archived_sessions"), test, 0);
 	}
 	const root = path.join(t.client_home, "projects");
+	const sub = SUBAGENT_SESSION.exec(t.session);
+	if (sub) {
+		// projects/<project>/<parent session>/subagents/<agent>.jsonl
+		let projects = [];
+		try { projects = fs.readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()); } catch { return null; }
+		for (const p of projects) {
+			const f = path.join(root, p.name, sub[1], "subagents", `${sub[2]}.jsonl`);
+			if (fs.existsSync(f)) return f;
+		}
+		return null;
+	}
 	return walk(root, (n) => n === `${t.session}.jsonl`, 2);
+}
+
+/**
+ * A Claude Code sub-agent's own session: `<parent session>:<agent file name>`, for projects/<p>/<parent>/subagents/agent-<id>.jsonl.
+ * Its records are all isSidechain; its user turns are the parent agent's brief and tool results, never the owner's words.
+ */
+const SUBAGENT_SESSION = /^([A-Za-z0-9._-]{1,64}):(agent-[A-Za-z0-9_-]{1,60})$/;
+export const subagentSession = (parent, file) => {
+	const s = `${parent}:${path.basename(file, ".jsonl")}`;
+	return SUBAGENT_SESSION.test(s) ? s : null;
+};
+
+/** The transcript's first line, read up to 1 MB, parsed; null when there is none or it is not JSON. */
+function firstRecord(file) {
+	let fd;
+	try {
+		fd = fs.openSync(file, "r");
+		const b = Buffer.alloc(1 << 20), n = fs.readSync(fd, b, 0, b.length, 0), nl = b.subarray(0, n).indexOf(0x0a);
+		return nl < 0 ? null : JSON.parse(b.subarray(0, nl).toString("utf8"));
+	} catch { return null; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+/**
+ * Whether a session is a sub-agent's: a Claude sub-agent file (by its session id), or a Codex thread spawned by another (its
+ * session_meta names a subagent source or a parent thread). Its user turns are then the parent agent's text, not the owner's.
+ */
+export function isSubagent(client, session, src) {
+	if (client !== "codex") return SUBAGENT_SESSION.test(session);
+	const r = firstRecord(src);
+	return r?.type === "session_meta" && (r.payload?.source?.subagent != null || typeof r.payload?.parent_thread_id === "string");
 }
 
 /** SHA-256 of the transcript's first `len` bytes (at most what the file holds). */
@@ -225,8 +307,12 @@ const ownText = (blocks) => {
 	return COMMAND.test(texts[0] ?? "") ? "" : texts.filter((b) => !INJECTED.test(b)).join("\n");
 };
 
-/** Owner and assistant text only. Tool calls and output, thinking, and injected system or hook text are skipped. */
-export function extract(client, lines) {
+/**
+ * Owner and assistant text only. Tool calls and output, thinking, and injected system or hook text are skipped. With subagent, the
+ * lines are a sub-agent's own transcript: Claude's sidechain records are read, and every user turn (the parent agent's brief) is
+ * assistant text, so nothing a parent agent wrote is ever taken as the owner's ask or correction.
+ */
+export function extract(client, lines, { subagent = false } = {}) {
 	const out = [];
 	for (const { pos, next, obj } of lines) {
 		let role = null, text = "";
@@ -242,12 +328,13 @@ export function extract(client, lines) {
 				text = ownText((Array.isArray(item.content) ? item.content : []).filter((c) => /^text$/i.test(c?.type ?? "")).map((c) => c.text));
 			}
 		} else {
-			if ((obj.type !== "user" && obj.type !== "assistant") || obj.isMeta || obj.isSidechain) continue;
+			if ((obj.type !== "user" && obj.type !== "assistant") || obj.isMeta || (obj.isSidechain && !subagent)) continue;
 			const c = obj.message?.content;
 			role = obj.type === "user" ? "owner" : "assistant";
 			text = ownText(typeof c === "string" ? [c] : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => b.text) : []);
 		}
 		if (!role || !text) continue;
+		if (subagent) role = "assistant";
 		out.push({ role, text: redact(text), pos, next });
 	}
 	return out;
@@ -666,8 +753,10 @@ export function readServer(config = loadConfig()) {
 			if (limit !== undefined) url.searchParams.set("limit", String(limit));
 			return send(url);
 		},
-		/** POST /v1/facts: at most 4 injectable facts for { repo: { remote }, repo_key?, profile? } (facts-inject.mjs). */
+		/** POST /v1/facts: { repo: { remote, path }, repo_key, mode?: "inject" | "held" } → { profile, routed_by, repo_key, facts, block }. */
 		facts: async (body, { timeoutMs = 30_000 } = {}) => send(new URL("/v1/facts", config.server), { body, timeoutMs }),
+		/** POST /v1/brief: { repo: { remote, path }, repo_key, client, cwd } → { profile, routed_by, text, items } (facts-inject.mjs). */
+		brief: async (body, { timeoutMs = 30_000 } = {}) => send(new URL("/v1/brief", config.server), { body, timeoutMs }),
 	};
 }
 
@@ -718,15 +807,17 @@ function noteCapture(client, { refused, digestAt, version }) {
  * ids: true, also `local`, the session and range ids behind each count, which never leave this machine).
  * @returns {{ clients: Record<string, string>, last_digest_at: string | null, refused_since_last: number, pending_ranges: number,
  *   stuck_ranges: number, oldest_pending_at: string | null, missing_sources: number,
- *   local?: { pending: object[], stuck: object[], missing: object[] } }}
+ *   local?: { pending: object[], stuck: object[], missing: object[], settled: object[] } }}
+ * missing_sources counts sessions still waiting for their source; one settled as source_missing (no source after 7 days, a Codex
+ * ephemeral session or a Claude Code session that was not persisted) is listed under local.settled only.
  */
-export function captureSummary({ ids = false } = {}) {
+export function captureSummary({ ids = false, now = Date.now() } = {}) {
 	const s = readJson(statsFile(), {});
 	const out = { clients: {}, last_digest_at: null, refused_since_last: 0, pending_ranges: 0, stuck_ranges: 0, oldest_pending_at: null, missing_sources: 0 };
 	for (const [c, v] of Object.entries(s?.clients ?? {})) if (CLIENTS.has(c) && typeof v === "string" && VERSION.test(v)) out.clients[c] = v;
 	if (typeof s?.last_digest_at === "string" && !Number.isNaN(Date.parse(s.last_digest_at))) out.last_digest_at = new Date(s.last_digest_at).toISOString();
 	if (Number.isInteger(s?.refused_since_last) && s.refused_since_last > 0) out.refused_since_last = s.refused_since_last;
-	const local = { pending: [], stuck: [], missing: [] };
+	const local = { pending: [], stuck: [], missing: [], settled: [] };
 	let oldest = Infinity;
 	for (const client of CLIENTS) {
 		const dir = path.join(home(), "state", client);
@@ -734,7 +825,10 @@ export function captureSummary({ ids = false } = {}) {
 			const st = readJson(path.join(dir, f), null);
 			if (!st || typeof st !== "object") continue;
 			const session = typeof st.source?.session === "string" ? st.source.session : f.slice(0, -5);
-			if (st.pending_source_since != null) { out.missing_sources++; local.missing.push({ client, session }); }
+			// A wait older than 7 days is settled even before its trigger runs again (a state from before settlement was recorded).
+			const settled = st.source_missing || now - st.pending_source_since > PENDING_SOURCE_DAYS * 86_400_000;
+			if (st.pending_source_since != null && settled) local.settled.push({ client, session, reason: st.source_missing?.reason ?? "expired" });
+			else if (st.pending_source_since != null) { out.missing_sources++; local.missing.push({ client, session }); }
 			for (const [range, r] of Object.entries(st.ranges ?? {})) {
 				if (r?.status === "pending") {
 					out.pending_ranges++;
@@ -759,24 +853,31 @@ export function captureSummary({ ids = false } = {}) {
  * backfill.mjs). The trigger is linked, never renamed, into place, so a trigger a hook writes meanwhile is kept.
  * Returns whether this call queued it.
  */
-export function queueTrigger({ client, session, transcript_path, cwd = null, client_home = null, event }, { now = Date.now(), debounceMs = 0 } = {}) {
+export function queueTrigger({ client, session, transcript_path, cwd = null, client_home = null, event, ended = false }, { now = Date.now(), debounceMs = 0 } = {}) {
 	if (!CLIENTS.has(client) || typeof session !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(session) || typeof transcript_path !== "string") return false;
 	const qdir = path.join(home(), "queue"), name = `${client}-${safeName(session)}.json`;
 	if (fs.existsSync(path.join(qdir, name)) || fs.existsSync(path.join(claimDir(), name))) return false;
 	const tmp = path.join(qdir, `.${name}.${randomBytes(4).toString("hex")}.sweep`);
 	writePrivate(tmp, JSON.stringify({ client, session, gen: randomBytes(6).toString("hex"), event, transcript_path, cwd: cwd ?? null, client_home: client_home ?? null,
-		turn_id: null, at: now - debounceMs, first_at: now - debounceMs }));
+		turn_id: null, at: now - debounceMs, first_at: now - debounceMs, ...(ended === true ? { ended: true } : {}) }));
 	let queuedNow = true;
 	try { fs.linkSync(tmp, path.join(qdir, name)); } catch { queuedNow = false; }
 	fs.rmSync(tmp, { force: true });
 	return queuedNow;
 }
 
-/** The repo identity the server routes by: the origin remote from local git, and the session's working directory. */
+/**
+ * A remote as git reports it, without credentials: an http(s) remote loses its user-info (a token can stand in the user name), any
+ * other scheme its password. scp-style and ssh user names (git@) stay, so routing rules on raw remotes still match.
+ */
+export const safeRemote = (remote) => (typeof remote === "string"
+	? remote.replace(/^(https?:\/\/)[^\s/@]*@/i, "$1").replace(/^([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+):[^\s/@]*@/i, "$1@") : remote);
+
+/** The repo identity the server routes by: the origin remote from local git (credentials removed), and the session's working directory. */
 export function repoOf(cwd) {
 	if (!cwd || !fs.existsSync(cwd)) return null;
 	const r = spawnSync("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 5000 });
-	const remote = r.status === 0 ? r.stdout.trim() : "";
+	const remote = r.status === 0 ? safeRemote(r.stdout.trim()) : "";
 	return { ...(remote ? { remote } : {}), path: cwd };
 }
 
@@ -799,16 +900,28 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	const src = findTranscript(t);
 	if (!src) {
 		st.pending_source_since ??= now;
+		// Settled as source_missing, for a session never read here: a Codex session whose hooks never named a transcript is ephemeral
+		// (no rollout, no thread row, no history anywhere); a Claude Code session that ended with no transcript on disk was not persisted
+		// (--no-session-persistence, or closed before its first message). Any other session settles after 7 days without a source.
+		// Settled states are not counted as missing; a source that turns up later clears it.
+		const unread = !st.source && !st.epoch;
+		const ephemeral = unread && (t.client === "codex" ? !t.transcript_path : t.ended === true || t.event === "SessionEnd") ? (t.client === "codex" ? "ephemeral" : "not_persisted") : null;
+		if (!st.source_missing && (ephemeral || now - st.pending_source_since > PENDING_SOURCE_DAYS * 86_400_000)) {
+			st.source_missing = { at: new Date(now).toISOString(), reason: ephemeral ?? "expired" };
+			logCapture({ event: "source_missing", client: t.client, session: t.session, reason: st.source_missing.reason }, now);
+		}
 		save();
 	} else {
 		st.pending_source_since = null;
+		delete st.source_missing;
+		st.subagent ??= isSubagent(t.client, t.session, src);
 		// What a SessionStart sweep needs to queue this session again: the found transcript and the hook's routing input.
 		st.source = { client: t.client, session: t.session, transcript_path: src, cwd: t.cwd ?? null, client_home: t.client_home ?? null };
 		checkEpoch(st, src);
 		const epoch = st.epoch;
 		const { end, lines } = readLines(src, st.digested_to);
 		if (end > st.digested_to) {
-			const messages = extract(t.client, lines);
+			const messages = extract(t.client, lines, { subagent: st.subagent === true });
 			tally.version = versionOf(t.client, lines);
 			// shortcut: the hash set is rewritten with the state file; fine for hundreds of files, split it out if sessions reach tens of thousands.
 			const files = new Set(st.files ?? []);
@@ -833,6 +946,8 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 			}
 		}
 		save();
+		// A Claude parent's sub-agents are captured as their own sessions, `<parent>:agent-<id>`, queued here when behind.
+		if (t.client === "claude-code" && !st.subagent) try { queueSubagents(t, src, st.ended === true, now); } catch { /* best effort: the next run retries */ }
 	}
 	// A SessionEnd with nothing new to digest (its Stop already sent the tail) still reports the end, in a batch with no items.
 	if (st.ended && !st.ended_sent && st.digested_to > 0) {
@@ -905,8 +1020,41 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	advance();
 	save();
 	noteCapture(t.client, tally);
-	const missing = !src && (now - st.pending_source_since > PENDING_SOURCE_DAYS * 86_400_000 ? "source_missing_expired" : "source_missing");
-	return { status: missing || "done", digested_to: st.digested_to, consolidated_to: st.consolidated_to, outcomes };
+	const missing = !src && (st.source_missing ? "source_missing_settled" : "source_missing");
+	return { status: missing || "done", ...(missing && st.source_missing ? { reason: st.source_missing.reason } : {}), digested_to: st.digested_to, consolidated_to: st.consolidated_to, outcomes };
+}
+
+/** One JSON line per capture event in logs/capture.log (mode 600): the event, client, session id and a reason code only. */
+function logCapture(entry, now = Date.now()) {
+	try {
+		const dir = path.join(home(), "logs");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		fs.appendFileSync(path.join(dir, "capture.log"), `${JSON.stringify({ at: new Date(now).toISOString(), ...entry })}\n`, { mode: 0o600 });
+	} catch { /* logging never blocks capture */ }
+}
+
+/** Same size and same checked prefix as the state's cursor: nothing new to read. */
+function current(st, file) {
+	try {
+		const size = fs.statSync(file).size;
+		return !!st && st.digested_to === size && Number.isInteger(st.prefix_len) && st.prefix_len <= size && prefixHash(file, st.prefix_len) === st.prefix_hash;
+	} catch { return false; }
+}
+
+/**
+ * Queues each sub-agent transcript of a Claude session (projects/<p>/<session>/subagents/agent-*.jsonl) that is behind its own cursor,
+ * at most LIMITS.sweep per call, as its own session. Due at once; a parent that ended marks them ended. Returns how many it queued.
+ */
+export function queueSubagents(t, src, ended, now = Date.now()) {
+	const dir = path.join(path.dirname(src), t.session, "subagents");
+	let queuedCount = 0;
+	for (const f of fs.existsSync(dir) ? fs.readdirSync(dir).filter((x) => /^agent-[A-Za-z0-9_-]+\.jsonl$/.test(x)).sort() : []) {
+		if (queuedCount >= LIMITS.sweep) break;
+		const session = subagentSession(t.session, f), file = path.join(dir, f);
+		if (!session || current(readJson(statePath(t.client, session), null), file)) continue;
+		if (queueTrigger({ client: t.client, session, transcript_path: file, cwd: t.cwd ?? null, client_home: t.client_home ?? null, event: "subagent", ended }, { now, debounceMs: DEBOUNCE_MAX_MS })) queuedCount++;
+	}
+	return queuedCount;
 }
 
 /** `~` or `~/…` to the user's home; other strings unchanged; anything else to null. */
@@ -918,10 +1066,11 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
 /**
  * v2 keys, used when config.json leaves them out, so a v1 config keeps working unchanged. Injection is off by default and turns
  * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them. The loop guard is
- * off unless loop_guard.enabled is true. Repo-fact injection at SessionStart is off unless facts.inject is true.
+ * off unless loop_guard.enabled is true, and loop_guard.shadow is false unless set to true. Repo-fact injection at SessionStart is off
+ * unless facts.inject is true.
  */
 export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
-	loop_guard: { enabled: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null } });
+	loop_guard: { enabled: false, shadow: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -934,7 +1083,7 @@ export function withDefaults(raw) {
 		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
 		inject: { enabled: i.enabled === true && profile !== null, profile,
 			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) },
-		loop_guard: { enabled: c.loop_guard?.enabled === true },
+		loop_guard: { enabled: c.loop_guard?.enabled === true, shadow: c.loop_guard?.shadow === true },
 		// Repo facts: injection off by default; profile is an optional explicit route (never `me`), else the server routes by the remote.
 		facts: { inject: c.facts?.inject === true, profile: typeof c.facts?.profile === "string" && PROFILE_RE.test(c.facts.profile) && c.facts.profile !== "me" ? c.facts.profile : null,
 			timeout_ms: posInt(c.facts?.timeout_ms, d.facts.timeout_ms, 10_000),
@@ -1027,7 +1176,8 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 				// A range stuck under the current rules fails the same way until its transcript grows (a new trigger or the sweep) or
 				// DIGEST_REV changes (the sweep), so its trigger settles; its pending text and range state stay for that retry.
 				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused" || o === "stuck");
-				if (settled || r.status === "source_missing_expired") fs.rmSync(claimed, { force: true });
+				// A session settled as source_missing (ephemeral, or no source after 7 days) is removed from the queue; its state keeps the reason.
+				if (settled || r.status === "source_missing_settled") fs.rmSync(claimed, { force: true });
 				else unclaim(claimed, path.join(qdir, f));
 			}
 			if (progressed) continue;
@@ -1037,7 +1187,7 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
 		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
 		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
-		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, clock }); } catch { results.synthesis = { status: "error" }; }
+		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
@@ -1276,12 +1426,13 @@ export const claudeEnv = (config) => ({ PATH: process.env.PATH ?? "/usr/bin:/bin
 /** Same proved CODEX_HOME, config and cwd for captures and batch items. Check the config before and after every exec. */
 export function confinedExec({ exec, codex, runDir, env, configFile, configSha, schemaDir }) {
 	const unchanged = () => { try { return sha(fs.readFileSync(configFile)) === configSha; } catch { return false; } };
-	return async ({ prompt, schema, model, effort }) => {
+	return async ({ prompt, schema, model, effort, replyFile }) => {
 		if (!unchanged()) return { kind: "runtime_warning" };
 		const schemaFile = path.join(schemaDir, `output-${randomBytes(8).toString("hex")}.schema.json`);
 		try {
 			fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o400 });
-			const r = exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile, "-"],
+			const r = exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile,
+				...(typeof replyFile === "string" && path.isAbsolute(replyFile) ? ["-o", replyFile] : []), "-"],
 				{ cwd: runDir, env, input: prompt, encoding: "utf8", timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
 			if (!unchanged()) return { kind: "runtime_warning" };
 			// shortcut: recognize Codex 0.165's stderr-only router diagnostic; revisit when upgrading the CLI.
@@ -1542,6 +1693,11 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 	const link = `${bin}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
 	fs.symlinkSync("agent-memory.mjs", link);
 	fs.renameSync(link, bin);
+	// bin/node: a link to this Node's real binary (not fnm's per-shell link, which goes when that shell exits), replaced atomically on
+	// every install. Hook commands name the link, so their text, and Codex's trust hash of it, stay the same across Node upgrades.
+	const node = path.join(path.dirname(bin), "node"), nodeTmp = `${node}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	fs.symlinkSync(fs.realpathSync(process.execPath), nodeTmp);
+	fs.renameSync(nodeTmp, node);
 	const cfg = path.join(home(), "config.json");
 	if (!fs.existsSync(cfg)) writePrivate(cfg, JSON.stringify({ server, token_file: path.join(home(), "job-token"), consolidation_model: "gpt-6-luna", batch_profiles: [], batch_luna_model: "gpt-6-luna", batch_terra_model: "gpt-6.1-terra" }, null, 2));
 	fs.mkdirSync(path.join(home(), "probe"), { recursive: true, mode: 0o700 });
@@ -1551,9 +1707,9 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 	let launchd = null;
 	if (platform === "darwin") {
 		const label = launchdLabel(home()), file = plistPath(label);
-		// launchd runs the job with this Node, this home and the installer's PATH, since it inherits neither the shell nor its env.
+		// launchd runs the job with bin/node (this Node, stable across upgrades), this home and the installer's PATH; it inherits neither the shell nor its env.
 		writePrivate(file, plist({ label, bin, hour: config.batch_hour, log: path.join(home(), "logs", "batch.log"), agentHome: home(),
-			nodeExecutable: process.execPath, runnerPath: process.env.PATH }), 0o644);
+			nodeExecutable: node, runnerPath: process.env.PATH }), 0o644);
 		launchd = { label, plist: file, load: loadCommand(file) };
 	}
 	// Stop and PreCompact only queue a run, so they never hold up the client. UserPromptSubmit waits for its output, bounded by
@@ -1567,15 +1723,17 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}`
 		: LOOP_EVENTS.has(e) ? `\ntimeout = ${LOOP_TIMEOUT_S}` : e === "SessionStart" && startTimeout ? `\ntimeout = ${startTimeout}` : "");
 	const claudeEvents = hookEvents(config, "claude-code"), codexEvents = hookEvents(config, "codex");
-	return { bin, config: cfg, launchd, hooks: events,
-		claude: { hooks: Object.fromEntries(claudeEvents.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
-		codex: codexEvents.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
+	// An absolute Node: clients launched from the GUI have no fnm on PATH. Doctor matches "<bin> hook <client>", so bin stays unquoted.
+	const command = (client) => `${node} ${bin} hook ${client}`;
+	return { bin, node, config: cfg, launchd, hooks: events,
+		claude: { hooks: Object.fromEntries(claudeEvents.map((e) => [e, [{ hooks: [{ type: "command", command: command("claude-code"), ...claudeExtra(e) }] }]])) },
+		codex: codexEvents.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = ${JSON.stringify(command("codex"))}${codexExtra(e)}`).join("\n\n") };
 }
 
 // ---------- CLI ----------
 
 export const USAGE = "usage: agent-memory hook <claude-code|codex> | run [--scheduled] | install | eval --cases FILE --profile P [--channels lexical|vector|hybrid] [--k N] [--out FILE] [--write-baseline FILE] | eval export-candidates --profile P --out FILE | replay [--list] [--session ID] [--port N]"
-	+ " | backfill [--client claude-code|codex] [--since 30d] | doctor | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory <command> --help` for its options\n";
+	+ " | backfill [--client claude-code|codex] [--since 30d] | doctor | status [--json] | corpus-upload (--db FILE … | --git CHECKOUT[,…] …): run `agent-memory <command> --help` for its options\n";
 
 /** v2 commands: each module's main(argv, prog) resolves to the exit code. replay keeps its own branch below. */
 const COMMANDS = { eval: "./eval.mjs", backfill: "./backfill.mjs", doctor: "./doctor.mjs" };
@@ -1602,11 +1760,25 @@ function startHook(client, input) {
 	try { hook(client, input); } catch { /* never block the client */ }
 	const config = loadConfig();
 	if (!config.facts.inject) process.exit(0);
-	setTimeout(() => process.exit(0), config.facts.timeout_ms + 250);
+	// facts-inject.mjs logs each run's latency and outcome; a run cut off by this hard deadline cannot, so it is logged here as a timeout.
+	const started = Date.now();
+	setTimeout(() => { logInjectOutcome(Date.now() - started, "timeout"); process.exit(0); }, config.facts.timeout_ms + 250);
 	import("./facts-inject.mjs").then((m) => m.injectFacts(client, input, { config })).then((out) => {
 		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
 		else process.exit(0);
 	}, () => process.exit(0));
+}
+
+/**
+ * One SessionStart briefing outcome in facts/inject/<day>.jsonl, the file facts-inject.mjs writes and status.mjs reads for inject_p95_ms
+ * and inject_timeouts_7d: time, milliseconds and an outcome code only. Never throws.
+ */
+function logInjectOutcome(ms, outcome) {
+	try {
+		const dir = path.join(home(), "facts", "inject");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		fs.appendFileSync(path.join(dir, `${new Date().toISOString().slice(0, 10)}.jsonl`), `${JSON.stringify({ at: new Date().toISOString(), ms, outcome })}\n`, { mode: 0o600 });
+	} catch { /* status only */ }
 }
 
 /** The client's hook timeout for the tool-result hooks, in seconds; the hook gives up and prints nothing after LOOP_DEADLINE_MS. */
@@ -1645,6 +1817,14 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 		const r = install();
 		const job = r.launchd ? `Daily batch job written to ${r.launchd.plist} (not loaded). To load it, run:\n${r.launchd.load}\n` : "";
 		process.stdout.write(`Installed ${r.bin} and ${r.config}. No client settings were changed.\n${job}Claude Code hooks to add to settings.json:\n${JSON.stringify(r.claude, null, 2)}\nCodex hooks to add to config.toml:\n${r.codex}\n`);
+	} else if (cmd === "status") {
+		const args = process.argv.slice(3);
+		if (args.some((a) => a !== "--json")) { process.stderr.write("usage: agent-memory status [--json]\n"); process.exit(2); }
+		import("./status.mjs").then((m) => {
+			const s = m.localStatus({ config: loadConfig() });
+			process.stdout.write(args.includes("--json") ? `${JSON.stringify(s, null, 2)}\n` : `${m.formatLocalStatus(s)}\n`);
+			process.exit(0);
+		}, (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else if (cmd === "corpus-upload") {
 		import("./corpus-cli.mjs").then((m) => m.main(process.argv.slice(3), "agent-memory corpus-upload")).then((code) => process.exit(code), (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
 	} else if (cmd === "replay") {

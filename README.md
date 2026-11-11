@@ -22,6 +22,10 @@ These are merged and pass source and local tests, but they are not released or t
 - **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a variable unset. After 3 separate sessions confirm a fact, and it keeps proving useful, session start can add up to 4 of them. Turn it on with `facts.inject`.
 - **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`.
 
+### In progress, not tested
+
+A fix round for repo facts and the loop guard, and the first forever-context features, are on branch `fix/repo-facts-review`. They include a session-start brief with the repo's facts, rules, decisions and open journal, lessons and decisions learned from sessions, and a Goals tab. See the [feature manifest](docs/feature-manifest.md#repo-facts-v2-and-forever-context-123-131-2026-11-11).
+
 ## How it works
 
 ```mermaid

@@ -11,7 +11,9 @@ import type { Part } from "./dashboard/am";
 import { auditTab } from "./dashboard/audit";
 import { crystalsTab } from "./dashboard/crystals";
 import { dataClient } from "./dashboard/data";
+import { factsTab } from "./dashboard/facts";
 import { glossary } from "./dashboard/glossary";
+import { goalsTab } from "./dashboard/goals";
 import { graphTab } from "./dashboard/graph";
 import { healthTab } from "./dashboard/health";
 import { lessonsTab } from "./dashboard/lessons";
@@ -45,8 +47,8 @@ export const DASHBOARD_HTML = (env: Env) => `<!doctype html>
  * The parts after the shell: the glossary first, so every later part can read it, then the tabs and pages. The tab parts that
  * have no page yet register nothing, so they add no link or route; each tab's ticket fills its own file, and nobody else edits this list.
  */
-export const PARTS: Part[] = [dataClient, glossary, overviewTab, memoriesTab, lessonsTab, crystalsTab, graphTab, sessionsTab, actionsTab, replayTab,
-	activityTab, profileTab, healthTab, auditTab, ...ADMIN];
+export const PARTS: Part[] = [dataClient, glossary, overviewTab, memoriesTab, lessonsTab, factsTab, crystalsTab, graphTab, sessionsTab, actionsTab, replayTab,
+	activityTab, profileTab, goalsTab, healthTab, auditTab, ...ADMIN];
 
 /** The browser half, as /app.js runs it: the shell, every part, then sign-in and the first render. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- browser globals; this Worker project has no DOM types

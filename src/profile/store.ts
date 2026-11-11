@@ -1,18 +1,20 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, fail, ok, type FactArgs, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
-import { injectFacts, listFacts } from "./facts";
+import { Fail, fail, ok, type FactReport, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { factEfficiency, factHealth, factPruneStep, factScrubStep, heldFacts, injectableFacts, listFacts, renderFactBlock, type FactListQuery } from "./facts";
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
-import { candidates, filterIds, fuse, get, inventory, lexicalChannels, markers } from "./read";
+import { goalMetrics } from "./metrics";
+import { briefRead, candidates, filterIds, fuse, get, inventory, lexicalChannels, markers, type BriefQuery } from "./read";
+export { BRIEF_LIMITS, ME_MERGE_KINDS, MIN_FUSED_SCORE, meMergeable, projectScopes, scopedRulesFirst, type BriefItem, type BriefQuery } from "./read";
 import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
 import { expandLinks, explore, timeline, trace } from "./graph";
 import { board } from "./board";
 import { similarStep } from "./similar";
 import { audit, runImport, type ImportResult, type ImportStep } from "./import";
 import { cleanupPurge, housekeep, sizeLevel } from "./housekeeping";
-import { batchStatus, complete, dueOutbox, finishBatch, next, nextOutbox, nextPreview, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
+import { batchStatus, complete, CREATES, dueOutbox, finishBatch, next, nextOutbox, nextPreview, promotable, type JobContext, type MaintenanceCmd, type OpOutcome, type Outbox } from "./maintenance";
 import { ownerModel } from "./owner-model";
 import { acceptedCandidates, decideCandidate, listCandidates } from "./eval-candidates";
 import { noteRecall, recallStrength } from "./recall-stats";
@@ -44,7 +46,7 @@ export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { BATCH_GAP_MS } from "./maintenance";
 export { corpusFiles, corpusFilesSql } from "./insights";
 export { APPEND_MAX, NOTE_MAX } from "./write";
-export { checkObservation, factRepoKey, REPO_KEY, SESSION_REF } from "./facts";
+export { factRoute, REPO_KEY, SESSION_REF } from "./facts";
 export type { ImportStep } from "./import";
 export type { OpOutcome } from "./maintenance";
 export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLink, type NodeRef, type NodeSummary } from "./graph";
@@ -68,7 +70,11 @@ export type V2Read =
 	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string }
 	| { kind: "viewer_part"; day: string } | { kind: "changes"; after: number; limit: number }
 	// Repo facts: the owner's list (#95) and the injection read (#94), never through recall.
-	| { kind: "facts"; repo_key?: string; after: string | null; limit: number } | { kind: "fact_inject"; repo_key: string };
+	| ({ kind: "facts" } & FactListQuery) | { kind: "fact_inject"; repo_key: string; device: string } | { kind: "fact_held"; repo_key: string }
+	| { kind: "fact_efficiency"; repo_key?: string; from: string; to: string } | { kind: "fact_health" }
+	| { kind: "goal_metrics"; now: string; weeks?: number; repo_key?: string }
+	// B1 session-start brief (src/brief.ts): one synchronous read of facts, project rules, decisions and journal, or of me.
+	| BriefQuery;
 /** #11: one profile's search index counts for GET /api/health: live recall texts, and nodes whose current card is embedded. */
 export interface SearchCounts { lexical_documents: number; vectors: number }
 
@@ -535,7 +541,7 @@ export class ProfileStore extends DurableObject<Env> {
 			if (cmd.op === "next") return ok(this.metered(next(this.ctx.storage, cmd)));
 			if ("status" in cmd) return ok(this.metered(finishBatch(this.ctx.storage, cmd, job)));
 			// The wakeup is armed before an item can commit its outbox row, so a crash right after the commit is still settled.
-			if (cmd.results.some((r) => r.ops.some((o) => o.op === "infer_preference" || o.op === "promote_to_me" || o.op === "strategic_review"))) {
+			if (cmd.results.some((r) => r.ops.some((o) => CREATES.has(o.op) || o.op === "promote_to_me"))) {
 				const due = Date.now() + RESUME_MS, at = await this.ctx.storage.getAlarm();
 				if (at === null || at > due) await this.ctx.storage.setAlarm(due);
 				await this.access(who);
@@ -599,7 +605,7 @@ export class ProfileStore extends DurableObject<Env> {
 	 * wipe ledger, applied through runWrite as one transaction with replay, activity and undo, and its new records registered. A
 	 * replay returns the stored node_ids, so a registration that failed after the commit completes on retry.
 	 */
-	async facts(who: Who, args: FactArgs, ctx: Omit<WriteContext, "actor">): Promise<Outcome<Record<string, unknown>>> {
+	async facts(who: Who, args: FactReport, ctx: Omit<WriteContext, "actor">): Promise<Outcome<Record<string, unknown>>> {
 		if (who.profile === "me") return fail("forbidden", "repo facts never go to me");
 		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
 		const cmd = { op: "fact" as const, args };
@@ -614,6 +620,8 @@ export class ProfileStore extends DurableObject<Env> {
 			this.bind(who);
 			const out = this.metered(runWrite(this.ctx.storage, who, cmd, { ...ctx, actor: "agent" }));
 			committed = true;
+			// Receipt pruning runs after the report commits, in its own bounded transaction: it can never fail a report.
+			try { if (this.metered(factPruneStep(this.ctx.storage))) await this.ctx.storage.setAlarm(Date.now()); } catch { /* the alarm retries it */ }
 			await this.register(who, (out.result.node_ids ?? []) as string[]);
 			return ok(out.result);
 		} catch (e) {
@@ -838,7 +846,12 @@ export class ProfileStore extends DurableObject<Env> {
 				case "projects": return ok(listProjects(sql));
 				case "project_profile": { const p = projectProfile(sql, q.key, new Date().toISOString()); return p ? ok(p) : fail("not_found", "no such project"); }
 				case "facts": return ok(listFacts(sql, q));
-				case "fact_inject": return ok({ facts: injectFacts(sql, q.repo_key) });
+				case "fact_inject": { const facts = injectableFacts(sql, { profile: who.profile, repo_key: q.repo_key, device: q.device }); return ok({ facts, block: renderFactBlock(facts) }); }
+				case "fact_held": return ok({ facts: heldFacts(sql, q.repo_key) });
+				case "fact_efficiency": return ok(factEfficiency(sql, q));
+				case "fact_health": return ok(factHealth(sql));
+				case "brief": return ok(briefRead(sql, q));
+				case "goal_metrics": return ok(goalMetrics(sql, q));
 				case "search_counts": return ok({
 					lexical_documents: sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE live = 1 AND lane = 'recall'").one().n,
 					vectors: sql.exec<{ n: number }>(`SELECT count(*) AS n FROM nodes WHERE ${HAS_VECTOR}`).one().n,
@@ -952,7 +965,8 @@ export class ProfileStore extends DurableObject<Env> {
 			} else {
 				vectorUsed = true;
 				const prefix = `g${who.generation}:`;
-				const ids = res.matches.map((m) => m.id).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length));
+				// Below the cosine floor a match is noise: it never enters fusion, so it cannot pass the fused cutoff on rank alone.
+				const ids = res.matches.filter((m) => m.score >= VECTOR_MIN_SCORE).map((m) => m.id).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length));
 				const sql = this.ctx.storage.sql;
 				const rows = ids.length ? sql.exec<{ id: string; current: number }>("SELECT id, embed_hash IS card_hash AS current FROM nodes WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify(ids)).toArray() : [];
 				const present = new Set(rows.map((r) => r.id));
@@ -1040,6 +1054,10 @@ export class ProfileStore extends DurableObject<Env> {
 			const paused = meterError === null && !background;
 			let folding = false;
 			try { folding = foldStep(this.ctx.storage).more; } catch (e) { await failed("fold", e); folding = true; }
+			// Forgotten repo facts leave their receipts in bounded steps (facts.ts factScrubStep).
+			let scrubbing = false;
+			try { scrubbing = factScrubStep(this.ctx.storage); } catch (e) { await failed("fact_scrub", e); }
+			try { scrubbing = factPruneStep(this.ctx.storage) || scrubbing; } catch (e) { await failed("fact_prune", e); }
 			let next: number | null = null;
 			if (paused) next = embeddingsOn(this.env) ? midnight : null;
 			else try {
@@ -1092,7 +1110,7 @@ export class ProfileStore extends DurableObject<Env> {
 			await gate();
 			flushRows(this.ctx.storage);
 			// The alarm always comes back for the earliest stage due, so housekeeping runs with or without embeddings.
-			await this.ctx.storage.setAlarm(Math.max(Math.min(more ? Date.now() : embedError === null && meterError === null ? Infinity : Date.now() + RETRY_MS, next ?? Infinity, moves ?? Infinity, nextArchiveAlarm(sql) ?? Infinity, nextOutbox(this.ctx.storage.sql) ?? Infinity, (archiveMore || folding || foldDue(this.ctx.storage.sql)) ? Date.now() : Infinity, due, dangling), Date.now() + 1_000));
+			await this.ctx.storage.setAlarm(Math.max(Math.min(more ? Date.now() : embedError === null && meterError === null ? Infinity : Date.now() + RETRY_MS, next ?? Infinity, moves ?? Infinity, nextArchiveAlarm(sql) ?? Infinity, nextOutbox(this.ctx.storage.sql) ?? Infinity, (archiveMore || folding || scrubbing || foldDue(this.ctx.storage.sql)) ? Date.now() : Infinity, due, dangling), Date.now() + 1_000));
 		} catch (e) {
 			const stop = e instanceof Stopped ? e : await gate().then(() => null, (s: unknown) => (s instanceof Stopped ? s : null));
 			if (stop && !stop.retry) return;
@@ -1143,6 +1161,13 @@ export class ProfileStore extends DurableObject<Env> {
 			ON CONFLICT (stage) DO UPDATE SET last_run_at = excluded.last_run_at, last_error = excluded.last_error`, name, new Date().toISOString(), error);
 	}
 }
+
+/**
+ * B5: the lowest cosine similarity a vector match may have to count. Conservative for qwen3-embedding-0.6b, where unrelated text
+ * scores well below it; it drops only weak, vector-only matches such as an unrelated `me` record.
+ * shortcut: set from the model's typical ranges, not measured on this corpus; calibrate with the eval runs when they exist.
+ */
+export const VECTOR_MIN_SCORE = 0.3;
 
 /** Vector hits pass the same status, type, kind and scope filters as the lexical channels. */
 function filterVector(sql: SqlStorage, q: Extract<ReadQuery, { kind: "recall" }>, channels: Record<string, { id: string; chunk?: number }[]>) {

@@ -146,8 +146,8 @@ const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/act
 
 // The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
 // The registered Memories and Audit tabs take the built-in entries' places; Overview stands alone, before the groups.
-const GROUPED_NAV = [[null, ["Overview #overview"]], ["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
-	["Insight", ["Activity #activity", "Profile #profile"]], ["System", ["Health #health", "Audit #audit"]],
+const GROUPED_NAV = [[null, ["Overview #overview"]], ["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Facts #facts", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
+	["Insight", ["Activity #activity", "Profile #profile", "Goals #goals"]], ["System", ["Health #health", "Audit #audit"]],
 	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
 		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
 
@@ -299,7 +299,7 @@ describe("dashboard shell", () => {
 		expect(b.key("?", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(false);
 		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, o Overview, m Memories, l Lessons, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, h Health, u Audit.");
+		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, o Overview, m Memories, l Lessons, f Facts, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, t Goals, h Health, u Audit.");
 		expect(b.key("Escape", null)).toBe(true);
 		expect(b.els.gloss!.hidden).toBe(true);
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
@@ -2608,5 +2608,143 @@ describe("dashboard Overview and Health tabs", () => {
 		expect(text(b.view())).not.toContain("Every check passed");
 		b.listeners.pagehide!();
 		stream.close();
+	});
+});
+
+// Repo facts (#118) and goal metrics (#130): what the Facts, Goals and Lessons tabs show for empty, thin and populated data.
+const lane = (laneId: string, extra: Record<string, unknown> = {}) => ({ lane: laneId, state: "active", exercised: 5, fired: 2, prevented: 1, rate: 0.6, eligible: true, confirmations: 3,
+	last_event: { order: "2026-11-10T09:00:00.000Z/0000000004/d1", session: "codex:0123456789ab", kind: "confirm" }, updated_at: "2026-11-10T09:00:00Z", ...extra });
+const fact = (id: string, extra: Record<string, unknown> = {}) => ({ memory_id: id, repo_key: "github.com/acme/app", fact_key: "0123456789abcdef", detector: "form_repair", class: "environment",
+	literal: "pytest => python -m pytest", statement: "Run `python -m pytest` instead of plain `pytest`; plain `pytest` fails on this machine.", state: "active", user_tier: false,
+	pinned: false, high_stakes: false, dormant: false, revision: 2, lanes: [lane("d1"), lane("d2", { exercised: 1, fired: 0, prevented: 0, rate: null, eligible: false })],
+	evidence: [{ kind: "session", ref: "codex:0123456789ab", note: "confirm" }], created_at: "2026-11-01T09:00:00Z", updated_at: "2026-11-10T09:00:00Z", ...extra });
+const costDay = (extra: Record<string, unknown> = {}) => ({ repo_key: "github.com/acme/app", day: "2026-11-10", sessions: 4, usage_sessions: 2, input: 1000, cached_input: 600, output: 200,
+	cache_write: 0, commands: 40, failed: 2, repeated_failures: 1, injected: 3, prevented: 1, fired: 0, ...extra });
+const goalWeek = (week: string, extra: Record<string, unknown> = {}) => ({ week,
+	corrections: { total: 0, learned: 0, repeats: 0, pending: 0, rate: null }, guided: { sessions: 0, guided: 0, share: null, seen: 0, captured: 0, coverage: null },
+	followed: { injected: 0, exercised: 0, fired: 0, prevented: 0, rate: null, prevented_share: null, memory: { injected: 0, processed: 0, failed: 0, rate: null } },
+	cost: { sessions: 0, usage_sessions: 0, input: 0, cached_input: 0, output: 0, failed: 0, repeated_failures: 0, tokens_per_session: null, failures_per_session: null, cache_ratio: null }, ...extra });
+const goals = (repos: unknown[], missing: unknown[] = []) => ({ from: "2026-10-26", to: "2026-11-11", weeks: ["2026-10-26", "2026-11-02", "2026-11-09"],
+	targets: { repeat_correction: 0.1, guided_share: 0.8, capture_coverage: 0.95 }, min_sample: 3, repos, missing, truncated: false });
+const rows = (root: El) => find(find(root, "tbody")[0]!, "tr");
+
+describe("dashboard Facts, Goals and Lessons guidance", () => {
+	it("lists facts with state, tier, lanes and firing, and shows per-session cost from the daily rows", async () => {
+		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [fact("f1"),
+				fact("f2", { class: "repo", repo_key: "github.com/acme/web", state: "active", dormant: true, user_tier: true, pinned: true, statement: "Dormant one",
+					lanes: [lane("*", { state: "retired", exercised: 0, fired: 0, prevented: 0, rate: null })] })] });
+			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [costDay()] });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Facts");
+		const [first, second] = rows(b.view());
+		expect(text(first!)).toContain("ACTIVE");
+		expect(text(first!)).toContain("REPO TIER");
+		expect(text(first!)).toContain("2 devices");
+		expect(text(first!)).toContain("Exercised 6"); // summed over both device lanes
+		expect(text(first!)).toContain("Fired 2, prevented 1");
+		expect(text(first!)).toContain("50%"); // (fired + prevented) / exercised
+		expect(text(second!)).toContain("DORMANT");
+		expect(text(second!)).toContain("USER TIER");
+		expect(text(second!)).toContain("PINNED");
+		expect(text(second!)).toContain("Shared");
+		expect(text(second!)).toContain("Not exercised yet");
+		// The cost table: input minus cache reads per usage session, cached and output per usage session, failures per session.
+		const cost = find(b.view(), "table").find((t) => text(t).includes("Session cost per repo and day"))!;
+		const cells = find(rows(cost)[0]!, "td").map((td) => text(td));
+		expect(cells).toEqual(["2026-11-10", "github.com/acme/app", "4 (2 with usage)", "200", "300", "100", "60%", "0.5", "0.25"]);
+		const filter = find(b.view(), "select").find((x) => x.attrs.id === "facts-state")!;
+		filter.value = "dormant";
+		filter.on.change!();
+		expect(rows(b.view()).map((r) => text(r).includes("Dormant one"))).toEqual([true]);
+	});
+
+	it("flags a fact only with a reason, through the flag route, and offers its Undo", async () => {
+		let flagged: unknown;
+		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path, method, body) => {
+			if (path === "/api/profiles/work/facts/flag" && method === "POST") { flagged = body; return Response.json({ ok: true, action: "flagged", activity_id: 7 }); }
+			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [fact("f1")] });
+			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [] });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		click(button(b.view(), "Flag…"));
+		click(button(b.view(), "Flag it"));
+		await settle();
+		expect(b.seen.posted).toEqual([]);
+		expect(text(b.view())).toContain("Give a reason first.");
+		find(b.view(), "textarea")[0]!.value = "  python -m pytest is wrong here  ";
+		click(button(b.view(), "Flag it"));
+		for (let i = 0; i < 4; i++) await settle();
+		expect(b.seen.posted).toEqual(["/api/profiles/work/facts/flag"]);
+		expect(flagged).toEqual({ memory_id: "f1", scope: "repo", reason: "python -m pytest is wrong here", request_id: expect.stringMatching(/^dashboard:/) });
+		expect(text(b.view())).toContain("Done: flagged");
+		expect(button(b.view(), "Undo last change")).toBeDefined();
+	});
+
+	it("says so when a profile has no facts and no session cost yet", async () => {
+		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [] });
+			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [] });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(text(b.view())).toContain("No repo facts yet.");
+		expect(text(b.view())).toMatch(/No session cost recorded from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}\./);
+	});
+
+	it("shows goal metrics per repo and week, Not enough data for thin weeks, and every missing input", async () => {
+		const full = goalWeek("2026-11-09", {
+			corrections: { total: 10, learned: 10, repeats: 1, pending: 2, rate: 0.1 },
+			guided: { sessions: 10, guided: 9, share: 0.9, seen: 20, captured: 19, coverage: 0.95 },
+			followed: { injected: 6, exercised: 4, fired: 1, prevented: 3, rate: 1, prevented_share: 0.75, memory: { injected: 5, processed: 4, failed: 1, rate: 0.75 } },
+			cost: { sessions: 10, usage_sessions: 8, input: 80_000, cached_input: 40_000, output: 8_000, failed: 5, repeated_failures: 1, tokens_per_session: 11_000, failures_per_session: 0.5, cache_ratio: 0.5 } });
+		const b = browser({ signedIn: true, hash: "#goals?profile=work", api: (path) => {
+			if (path === "/api/profiles/work/goal-metrics?weeks=12") return Response.json(goals([
+				{ repo_key: "github.com/acme/app", weeks: [goalWeek("2026-10-26"), goalWeek("2026-11-02"), full] }, { repo_key: null, weeks: [goalWeek("2026-10-26")] }],
+				[{ metric: "cost", reason: "No daily session cost rows are stored yet." }]));
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Goals");
+		const page = text(b.view());
+		expect(page).toContain("Cost per session: No daily session cost rows are stored yet.");
+		expect(page).toContain("Sessions with no linked GitHub repo");
+		const repo = find(b.view(), "section").find((s) => text(s).includes("github.com/acme/app"))!;
+		const weeks = rows(repo);
+		expect(weeks.map((r) => text(find(r, "td")[0]!))).toEqual(["2026-11-09", "2026-11-02", "2026-10-26"]); // newest first
+		const newest = text(weeks[0]!);
+		for (const t of ["10%", "1 of 10 learned, 2 waiting", "90%", "95%", "19 of 20 seen", "Facts 100%", "75% prevented", "Lessons 75%", "3 of 4 processed followed", "11,000", "0.5"])
+			expect(newest).toContain(t);
+		expect(text(weeks[2]!)).toContain("Not enough data");
+		// Headlines sum the last 4 weeks: guided 9 of 10 meets the 80% target; repeat corrections have one week of data, so no decline yet.
+		const stats = find(repo, "div").filter((d) => d.attrs.class === "stat").map((d) => text(d));
+		expect(stats.find((t) => t.includes("Guided sessions"))).toContain("On target");
+		expect(text(repo)).toContain("fewer than 4 weeks with enough data");
+	});
+
+	it("says so when no sessions fall in the window", async () => {
+		const b = browser({ signedIn: true, hash: "#goals?profile=work", api: (path) => path.startsWith("/api/profiles/work/goal-metrics") ? Response.json(goals([])) : undefined });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		expect(text(b.view())).toContain("No sessions in this window yet.");
+	});
+
+	it("shows a lesson's guidance receipts as a chip, and nothing for one never injected", async () => {
+		const g = (injected: number, processed: number, failed: number) => ({ injected, processed, failed, followed: processed - failed, followed_rate: processed ? (processed - failed) / processed : null });
+		const b = browser({ signedIn: true, hash: "#lessons?profile=work", api: (path) => {
+			if (path.startsWith("/api/profiles/work/owner-model")) return Response.json({ next_after: null, items: [
+				pref("l1", { kind: "rule", name: "Run tests first", guidance: g(5, 4, 1) }), pref("l2", { kind: "rule", name: "Pending one", guidance: g(2, 0, 0) }),
+				pref("l3", { kind: "rule", name: "Never injected", guidance: null })] });
+			if (path.startsWith("/api/profiles/work/recall-strength")) return Response.json({ strength: {} });
+		} });
+		await dashboardMain(b.win);
+		for (let i = 0; i < 4; i++) await settle();
+		const chips = (name: string) => find(rows(b.view()).find((r) => text(r).includes(name))!, "span").filter((s) => /^(FOLLOWED|INJECTED)/.test(s.textContent));
+		expect(chips("Run tests first").map((c) => [c.textContent, c.attrs.class])).toEqual([["FOLLOWED 3/4", "chip c-warn"]]);
+		expect(chips("Pending one").map((c) => c.textContent)).toEqual(["INJECTED 2"]);
+		expect(chips("Never injected")).toEqual([]);
 	});
 });

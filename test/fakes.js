@@ -17,9 +17,10 @@ function embed(text) {
 	return v;
 }
 
+// v[0] carries the sentinel delay, not meaning: it stays out of the similarity (#125's vector floor would otherwise drop it).
 const cosine = (a, b) => {
 	let dot = 0, na = 0, nb = 0;
-	for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+	for (let i = 1; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
 	return na && nb ? dot / Math.sqrt(na * nb) : 0;
 };
 
