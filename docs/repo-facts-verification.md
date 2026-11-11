@@ -19,6 +19,58 @@ This page records the gates and evidence for repo facts (epic #105, issues #90 t
 | Isolated real synthesis call | Passed: one provider call, valid empty result ([details](#isolated-synthesis-call-2026-11-11)) |
 | Privacy and data-loss review | 5 of 5 findings closed |
 
+## v2 fix round, 2026-11-11
+
+A review on 2026-11-11 of epic #105 (PRs #106 to #111) found 4 must-fix and 8 should-fix defects, plus design gaps that kept facts from making agents more efficient. Epic [#123](https://github.com/wrick17/agent-memory/issues/123) tracks the fix round. The code is on branch `fix/repo-facts-review`. It is implemented, but not yet tested, reviewed or deployed; the combined test phase, review and deployment are [#122](https://github.com/wrick17/agent-memory/issues/122). The binding rules are the [repo facts v2 contract](repo-facts-v2-contract.md) ([#112](https://github.com/wrick17/agent-memory/issues/112), approved after two review rounds).
+
+| Area | What the review found | What changed | Issue |
+|---|---|---|---|
+| Client privacy and routing | Inline secrets such as `AWS_SECRET_ACCESS_KEY=…`, `--password` values and some token prefixes could reach synthesis input or uploads. Fact routes used the remote only, so path rules never applied, and an SSH host alias was refused. Commands run in another repo could become facts for the session's repo. Session-start git lookups could block for seconds. | Wider secret rules, shared by client and Worker. Routes carry `repo: { remote, path }` and a client-resolved `repo_key`. Each command is attributed to its own repo, and unattributed commands are dropped. Git runs asynchronously within the deadline. | [#113](https://github.com/wrick17/agent-memory/issues/113) |
+| Server lifecycle | Contradiction streaks followed upload order. Activation kept too little history to find any disjoint triple. Environment facts were not tracked per device. The Worker stored client-sent statements. A failure prevented after injection did not count. | Lanes recomputed from session-ordered history, any disjoint triple, per-device environment lanes, server-written statements, `prevented` outcomes, a user tier, report receipts with a watermark, and v1 bodies accepted as legacy | [#114](https://github.com/wrick17/agent-memory/issues/114) |
+| Loop guard | Codex shell loops were invisible, and the same command in two directories counted as one | Codex shell exit codes from the rollout, the directory in the invocation key, the `variant` rule, `loop_guard.shadow` and the hash-only fire log | [#115](https://github.com/wrick17/agent-memory/issues/115) |
+| Detectors | Fixes such as `pytest` to `python -m pytest` were invisible; a related but different command could count as a repair; `numpy.typing` became `import numpy` | `form_repair`, `arg_repair`, same-operation proof for every repair, full dotted module names | [#116](https://github.com/wrick17/agent-memory/issues/116) |
+| Synthesis | A crash after a paid reply could lose it or pay again; proposals could only repeat detector formats | Per-attempt reply files and recovery, learned facts as plain-substring signatures, held facts in the prompt | [#117](https://github.com/wrick17/agent-memory/issues/117) |
+| Visibility | No dashboard view, no flag, no measure of session cost | The Facts tab, MCP `repo_facts`, the efficiency route, and `status` and `doctor` fields | [#118](https://github.com/wrick17/agent-memory/issues/118) |
+| Injection gate | Deterministic facts also had to pass the firing-rate gate, and repo facts had served 0 items | Deterministic facts inject once active; only learned facts keep the gate | [#124](https://github.com/wrick17/agent-memory/issues/124) |
+
+Two items are decided or still open:
+
+- Tool pruning ([#119](https://github.com/wrick17/agent-memory/issues/119)) was measured and not built: removing every MCP server saves under 1% of a median session's price-weighted input.
+- Threshold calibration ([#120](https://github.com/wrick17/agent-memory/issues/120)) replayed local history and changed one threshold: a fact now retires on its newest contradiction ([history replay](#history-replay-120)).
+
+The fix round also changes these known limits: repo-class facts now activate from confirmations on any devices, Codex shell results now count for the loop guard, and the dashboard has a Facts tab. The daily synthesis cap stays per device. The two new switches are `loop_guard.shadow` (off) and the v2 brief behind the existing `facts.inject`. Verification evidence for this round will be appended here after the test phase.
+
+### History replay (#120)
+
+`node local/facts-replay.mjs --cache <dir> --out <report.md>` replays the owner's local Claude Code and Codex transcripts through the v2 detectors and a parameterised copy of the section 6 lifecycle. It is offline and read-only, makes no model or network call, and prints only counts. Rerun it to recheck the thresholds.
+
+The run read 4,000 transcripts: 1,897 sessions with commands, which gave 2,374 repo-sessions in 30 GitHub repos. Those held 76,126 commands, 4,684 of them failed. Detection found 32 distinct facts (58 per-repo candidates), and 19 activate under the rules before this change.
+
+- **Benefit.** Injected facts would have prevented 46 failed commands, about 1% of all failures. The `env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch` repair accounts for 31 of them, across 6 repos, and `import Quartz` and `import PIL` in bettergit for 7.
+- **Cost.** Injection roughly breaks even on tokens. The injected lines cost about 4.4M tokens over all model calls with `retire` = 1 (4.8M with `retire` = 2), almost all cached. The failures they prevent save at least 3.7M tokens, a lower bound, since a failure usually costs more than one turn.
+- **Wrong advice.** 7 activations were later contradicted: `env -u GITHUB_TOKEN -u GH_TOKEN gh api user` in 6 repos, and `import PIL` in bettergit. Activating at 2, 3 or 4 sessions does not change that. The `gh api user` fact had 176 confirmations and 125 contradictions in Codex sessions alone, so the token state changes from session to session, not between clients. Its advice still works when plain `gh` works, so the harm is low.
+
+| Run | Activated | Injections | Carry tokens | Failures prevented | Turn tokens saved | Wrong-advice injections |
+|---|---|---|---|---|---|---|
+| Before (activate 3, disjoint on, retire 2, no gate on deterministic facts) | 19 | 3,146 | 4.8M | 46 | 3.7M | 35 |
+| Activate 2 | 24 | 3,957 | 5.9M | 53 | 4.3M | 36 |
+| Activate 4 | 16 | 3,040 | 4.6M | 41 | 3.3M | 32 |
+| Disjoint rule off | 19 | 3,146 | 4.8M | 46 | 3.7M | 35 |
+| **Retire 1** | 19 | 2,857 | 4.4M | 46 | 3.7M | 23 |
+| Retire 3 | 19 | 3,455 | 5.5M | 46 | 3.7M | 45 |
+| Firing gate on deterministic facts | 19 | 3,108 | 4.7M | 45 | 3.7M | 34 |
+
+Recommendation, now in the code: `REPO_FACT_RULES.retire` goes from 2 to 1. It prevents the same 46 failures with the same activations, cuts wrong-advice injections by 34% (35 to 23) and saves 0.4M carry tokens. Activation stays sticky, so one fresh confirmation brings a fact back. The other thresholds stay. Activating at 2 adds 5 facts, and none of them prevents a failure; its 7 extra hits come from activating existing facts earlier, for 1.1M more carry tokens. Retire 3 is worse in every column.
+
+Limits:
+
+- The replay simulates one device and one profile. It has no flags, dormant cap, proposals or receipts.
+- Learned facts need a model, so the replay cannot measure them or their firing gate. The deterministic-fact gate row is only a proxy.
+- The disjoint rule could not be measured: none of the 8 `arg_repair` candidates reached 3 sessions, even with the rule off.
+- 42,618 commands ran outside a GitHub checkout and are not attributed. A directory that no longer exists also counts as unattributed.
+- Only top-level transcripts are read; Claude Code sub-agent transcripts are excluded.
+- Prevented failures come from the detectors' `outcomes`, not the client's `injectedOutcomes`, and the two disagree.
+
 ## Switches
 
 | Part | Switch | Default |

@@ -1009,7 +1009,7 @@ Graph reads have work budgets, not only output caps: `explore` reads at most 200
 | Tool | Input | Output | Contract |
 |---|---|---|---|
 | `maintenance_next` | `profile`, `kinds`, `limit` (up to 40), `lease_seconds` (up to 900) | `lease_id`, `lease_until`, `items[]` with `kind`, `subjects`, `context` (passages, current edges, candidate pairs) and `allowed_ops`; or an empty list with `next_allowed_at` | Leases open items. Returns nothing if this profile already ran a batch in the last 20 hours. An expired lease returns its items to the queue. |
-| `maintenance_complete` | `lease_id`, `results[]` of `{item_id, ops[], outcome}` | per item `applied`, `flagged`, `rejected` with reasons | Ops are `save`, `link`, `end_link`, `supersede`, `compact`, `infer_preference`, `promote_to_me`, `flag`, `dismiss`. Each op must stay within its item's subjects. Ops go through the normal write path with actor `maintenance`. Changes to protected nodes become flags. `promote_to_me` must carry `company_free: true` and passes the `me` guard. |
+| `maintenance_complete` | `lease_id`, `results[]` of `{item_id, ops[], outcome}` | per item `applied`, `flagged`, `rejected` with reasons | Ops are `save`, `link`, `end_link`, `supersede`, `compact`, `infer_preference`, `promote_to_me`, `flag`, `dismiss`, and, on branch `fix/repo-facts-review`, `record_lesson` and `record_decision` ([lessons and decisions](#lessons-and-decisions-from-digests-126)). Each op must stay within its item's subjects. Ops go through the normal write path with actor `maintenance`. Changes to protected nodes become flags. `promote_to_me` must carry `company_free: true` and passes the `me` guard. |
 
 `/v1/ingest` (scope `ingest`) takes the upload shown in section 2. `GET /v1/markers?repo=` returns the repo marker, the capture cursors the server has acknowledged, and the daily-slot flags. Both are REST for shell-friendliness. They build the same `WriteCommand` values the MCP tools build.
 
@@ -1210,11 +1210,18 @@ Source-only checkpoint, 2026-10-31: caller v3 adopts a resumable `SessionStart` 
 | Codex | `SessionStart` | Recovery sweep | Same as Claude Code |
 | Both | `PreCompact` (v2, #16) | Capture before compaction | Registered by `install`. Runs in the background like `Stop`. Source only; no client run has been observed. |
 | Both | `UserPromptSubmit` (v2, #19) | Opt-in prompt recall | Registered only when `inject.enabled` and `inject.profile` are set. Off by default. |
-| Both | `SessionStart` (repo facts, #94) | Opt-in repo facts | The same hook, which then prints the repo's injectable facts only when `facts.inject` is true. Off by default. |
+| Both | `SessionStart` (brief, #94 and #125) | Opt-in session-start brief | The same hook, which then prints the checkout's brief, facts included, only when `facts.inject` is true. Off by default. |
 | Claude Code | `PostToolUse`, `PostToolUseFailure` (#102) | Opt-in loop guard | Registered only when `loop_guard.enabled` is true. Off by default. |
-| Codex | `PostToolUse` (#102) | Opt-in loop guard | Same switch. Codex has no failure event, so only MCP results with an explicit `isError` count. |
+| Codex | `PostToolUse` (#102, #115) | Opt-in loop guard | Same switch. Codex has no failure event: MCP results count by an explicit `isError`, and shell results by the exit code in the session rollout ([loop guard](#loop-guard)). |
 
 Under T3 Code, Codex custom hooks run only after hook trust: the test saw trusted plugin hooks fire while custom hooks were not exposed. Phase 2 checks that `codex` lists the installed hooks as trusted and that they fire under T3 (section 22). MCP disconnects alone are never treated as session completion.
+
+Capture gaps (#128), on branch `fix/repo-facts-review` and not yet tested or deployed:
+
+- **Codex hook trust.** `doctor`'s `codex_hook_trust` check fails when a configured Codex hook has no matching trusted entry in `[hooks.state]` of `config.toml`, because Codex 0.167.1 runs only trusted hooks.
+- **Sessions with no source.** The source lookup also searches Codex's `archived_sessions/`. A session is settled as `source_missing`, and leaves the queue, when it is a Codex ephemeral session (its hooks never named a transcript), a Claude Code session that was not persisted, or has had no source for 7 days. `doctor` lists such sessions and any trigger queued for more than 7 days; they are reported, not failed.
+- **Sub-agents.** Each Claude Code sub-agent transcript (`projects/<p>/<session>/subagents/agent-*.jsonl`) is captured as its own session, `<parent session>:<agent file>`. In a sub-agent session, and in a Codex thread spawned by another, every user turn is the parent agent's text, so it is read as assistant text and never as the owner's ask or correction.
+- **Pending.** Backfilling the work Claude account's sessions from before its hooks were installed.
 
 ### The hook returns at once
 
@@ -1282,75 +1289,147 @@ A lone string argument shows as its bare value only when redaction would leave i
 
 ### Repo facts
 
-Repo facts (epic #105) are short, checkable statements about one GitHub repository, such as "`import Quartz` fails in the recorded Python environments". The client learns them from its own sessions' commands, and the server injects a fact at session start only after several sessions have confirmed it. Injection, synthesis and the loop guard each have a switch, and each is off by default. Deterministic detection and session reports follow capture, as approved: they run whenever the capture run processes a session in a GitHub checkout, and they have no switch of their own. Turning synthesis off (#99) leaves them working. Status, gates, evidence and the closed review findings are in [repo facts verification](repo-facts-verification.md); wire contracts are in [module contracts](module-contracts.md#repo-facts-and-loop-guard-modules-2026-11-11).
+Repo facts (epic #105) are short, checkable statements about one GitHub repository, such as "`import Quartz` fails in the recorded Python environments". The client learns them from its own sessions' commands, and the Worker decides when a fact is active and injectable. The v2 fix round (epic #123, #112 to #122) rebuilt the feature after a review of PRs #106 to #111. The v2 code is on branch `fix/repo-facts-review`; its combined test phase and deployment (#122) have not run. The binding wire and lifecycle rules are in the [repo facts v2 contract](repo-facts-v2-contract.md); this section summarizes them, and the contract wins on detail. Evidence and gates are in [repo facts verification](repo-facts-verification.md); module contracts are in [module contracts](module-contracts.md#repo-facts-v2-and-forever-context-modules-2026-11-11).
 
 ```mermaid
 flowchart LR
-	T["Transcript (this machine)"] --> D["Command digest: redacted, bounded"]
-	D --> X["5 detectors (no model)"]
-	X --> R["Session report: hashes, keys, fixed statements"]
-	D -. "off by default, #100 gate" .-> S["Synthesis: Codex proposer, citation check"]
+	T["Transcript (this machine)"] --> D["Command digest per partition: redacted, bounded"]
+	D --> X["7 detectors (no model)"]
+	X --> R["Session report: order, hashes, keys, outcomes, usage"]
+	D -. "facts.synthesis, off" .-> S["Synthesis: Codex proposer, grounding check"]
 	S --> P["Proposal: candidate only"]
-	R --> W["Worker: routed profile, lifecycle"]
+	R --> W["Worker: routed profile, session-ordered lifecycle"]
 	P --> W
-	W --> A{"Active, 4 exercised, rate at least 40%?"}
-	A -->|yes| I["SessionStart: up to 4 facts, about 150 tokens"]
+	W --> A{"Lane active? Learned facts: firing gate too"}
+	A -->|yes| I["SessionStart brief: up to 4 facts"]
 ```
 
-**Repo identity (#93).** The key is `github.com/<owner>/<repo>`, in lowercase, from the checkout's origin remote. HTTPS, `ssh://` and scp-style forms of one repository give one key. An SSH host alias counts only when `ssh -G` resolves it to `github.com` or `ssh.github.com`. That command reads the owner's SSH configuration and opens no connection. A checkout without a GitHub origin gets no key and produces no facts.
+**Switches.** Each part with a switch is off by default.
 
-**Profile.** The client sends the remote; the Worker routes it with the existing routing rules (section 9) and adds no second routing table. `facts.profile` names an explicit profile instead. The Worker refuses `me`, refuses a `repo_key` that does not match `repo.remote`, and never moves a fact between profiles: a transfer refuses it with `not_movable`.
-
-**Command digest (#90).** While a session runs, the client reads the transcript from its own cursor and keeps a digest of the shell commands: at most 400 commands, each at most 200 characters, and at most 2 error lines per failure. Every string goes through the client's secret redaction, then a scrub of the home directory, temporary paths, email addresses, 32-hex ids and the local user name. Status is only what the transcript records (`ok`, `failed`, `error`, `unknown` or `pending`); an exit code is never guessed. Edited files are kept as 16-hex hashes of the repo key and relative path, for the local disjointness check only.
-
-**Detectors (#91).** Once the session has ended (a sticky `SessionEnd`), five fixed rules read the digest. They make no model or network call, and the same digest and known facts always give the same output.
-
-| Detector | Fires when | Literal |
+| Switch | Default | Turns on |
 |---|---|---|
-| `command_repair` | A failed command is followed, within 5 commands, by a proven success of the same program and subcommands with an added environment change | `env -u GH_TOKEN gh auth switch` |
-| `unavailable_tool` | An error names a missing Python module, or a program the shell could not find | `import PIL`, `npm test needs vitest` |
-| `env_var` | An error names a missing variable, and a later run of the same program sets it | `npm run deploy needs API_URL` |
-| `network` | A name or connection failure to a host other than loopback | `registry.example.com` |
-| `empty_vcs` | A `git` command fails because the checkout has no commits | `git log` |
+| `facts.inject` | `false` | The session-start brief, with its facts ([session-start brief](#session-start-brief-125)) |
+| `facts.synthesis` | `false` | Synthesis of proposals by the Codex CLI |
+| `loop_guard.enabled` | `false` | The loop guard's hooks and notes ([loop guard](#loop-guard)) |
+| `loop_guard.shadow` | `false` | With `loop_guard.enabled`, the rules run and log but print no note |
 
-A success is proven only for a single command or an `&&` chain with a recorded exit 0. Pipes, `||` and cut commands prove nothing. A fact's statement is a fixed template filled from its detector and literal. A session contradicts a fact when it proves that the failing command works. For a `network` fact, only a recognized network command aimed at that host counts, both for contradiction and for exercise: `curl`, `wget`, `http` or `https` with one URL, `ssh`, `ping` or `nc` with the host, or `git clone`, `fetch`, `pull`, `push` or `ls-remote` with a URL. A command that only mentions the host, such as a search, counts for neither. `env_var` facts are never contradicted.
+Deterministic detection and session reports follow capture, as approved. They run whenever the capture run processes a session in a GitHub checkout, and they have no switch of their own.
 
-**Session report (#92).** The report holds the session ref (`<client>:<12 hex>`), hashed trigger families, the confirmed fact keys and, per fact, the detector, literal and template statement. It holds no command text, output or path. The client saves the exact report bytes before sending them to `POST /v1/ingest` with the job token, so a retry replays the same request. A 400 or 403 is final; a 409, a 503 or a network error is retried on the next run.
+**Routing and repo identity.** Every fact request carries `repo: { remote, path }` and `repo_key`. `remote` is the raw origin URL, SSH host aliases included, and `path` is the checkout's git top level. The Worker routes both through the same `routeWrite` as capture, so path rules apply and there is no second routing table. `repo_key` is the canonical `github.com/<owner>/<repo>` key. The client resolves it, because only the client can expand an SSH alias (`ssh -G`, which opens no connection). The Worker refuses a key that is not a GitHub repo (`unsupported_remote`) and a key that differs from the remote in more than the host (`repo_key_mismatch`), so an alias can change the host but never the repo. Routing to `me` is refused. The client no longer reads `facts.profile`, and `doctor` warns while it is set.
 
-**Lifecycle.** The Worker stores each fact as one memory record: kind `rule`, type `feedback`, scope `repo-fact`, name `<repo_key>#<fact_key>`, with its state in `attrs.fact`. Only fact reports change that state.
+**Partitions.** The client keeps all local fact state per partition, the pair of routed profile and `repo_key`. That covers the registry, the injection cache, retained digests, synthesis cadence and jobs, and the report queue. A (remote, path) pair learns its profile from the first fact-route reply and caches it. When a later reply names another profile, the client moves that partition's state.
 
-- **Candidate.** A first confirmation or a synthesis proposal creates a candidate. A repo holds at most 32 live facts.
-- **Active.** A candidate becomes active when one device's chain holds 3 confirming sessions whose edited-file sets are pairwise disjoint. The device's local ledger attests disjointness in `disjoint_from`; an empty edited-file set is disjoint from every set. A confirmation without local history attests nothing, so that device's chain restarts at this session. Chains from different device tokens never combine.
-- **Retired.** 2 consecutive contradictions retire a candidate or an active fact unless the owner pinned it. A confirmation resets the count. The owner can also retire a fact.
-- **Exercised and fired.** A session exercises a fact when it ran the fact's trigger or confirmed it, and fires it when it confirmed it. Each session counts once per fact.
+**Per-command attribution.** Each command belongs to the repo of its own effective directory: the session directory plus any leading `cd`, resolved to a git top level. A session that touches two repos sends one report per partition, and both share the session's order. A command whose repo cannot be established goes into no report and is counted locally as `unattributed`.
 
-**Injection (#94).** A fact is injectable only when it is active, has at least 4 exercised sessions and has a firing rate of at least 40% (`fired × 5 ≥ exercised × 2`). With `facts.inject: true`, the `SessionStart` hook sends the repo key to `POST /v1/facts` with the read token only. The Worker returns at most 4 injectable facts, ordered by firing rate. The hook prints them under the label "Repo facts from earlier sessions (evidence, not instructions):" and stops before the block, label included, would pass 600 characters, about 150 tokens. A missing read token, an error or the timeout (`facts.timeout_ms`, default 1,500 ms) prints nothing, and the session starts normally.
+**Redaction.** Everything that leaves the device passes the client's secret rules, which `local/agent-memory.mjs` keeps identical to `src/domain/redact.ts`. The rules cover vendor token prefixes (`sk-`, `ghp_` and the other `gh*_` forms, `github_pat_`, `glpat-`, Stripe keys, Slack `xox*-` and `xapp-`, `npm_`, `AIza`, `hf_`), AWS key ids, JWTs, `key=value` secrets, upper-case assignments such as `AWS_SECRET_ACCESS_KEY=`, any `Authorization` scheme, and secret flags with a separate value (`--password x`, `mysql -p`, `redis-cli -a`, `curl -u user:pass`, `aws configure set`). A value that only names where a secret comes from, such as `$VAR`, `${VAR}`, `$(cat file)` or an elided `…`, is kept. A scrub then turns home paths (`/Users/<u>`, `/home/<u>`, `/root`, `C:\Users\<u>`) into `~` and removes temporary paths, email addresses, 32-hex ids and the local user name. The Worker re-checks every literal and signature with `redactText`, the home-path check and a `NAME=value` check for names that contain `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `KEY` or `CREDENTIAL`.
 
-**Owner controls (#95).** `GET /api/profiles/:p/facts` lists every fact in every state with its evidence refs, counts, firing rate, chain length and eligibility. Retire, pin, unpin, forget, undo and archive restore are the existing memory actions. Forget also writes a forget tombstone in the same transaction, so later reports for that fact are refused with `fact_forgotten` until a restore clears it.
+**Command digest.** While a session runs, the client reads the transcript from its own cursor and keeps a digest of the shell commands: at most 400 commands, each at most 200 characters, and at most 2 error lines per failure. Status is only what the transcript records (`ok`, `failed`, `error`, `unknown` or `pending`); an exit code is never guessed. Edited files become 16-hex hashes of the repo key and relative path. They go to the Worker as `files`, and the client's local disjointness ledger is gone.
 
-**Kept out of ordinary memory.** Ordinary saves, appends, captures and knowledge writes cannot create or change a fact (`repo_fact_reserved`); only a retire-only save is allowed, and no graph edge can reach one. Recall, `get`, inventory, graph expansion, the owner model, dedupe and the stale-record queue skip the `repo-fact` scope. A fact is never embedded. The similarity pass never starts from a fact and never targets one, even when a point-in-time restore or re-embed leaves a vector for it.
+**Detectors.** Once the session has ended, seven fixed rules read the digest. They make no model or network call.
 
-**Synthesis (#96 to #99).** Synthesis is off unless `facts.synthesis` is true, and the owner turns it on only after signing off the #100 review. When it is off, the code reads and writes nothing for it.
+| Detector | Class | Fires when | Literal |
+|---|---|---|---|
+| `command_repair` | environment | A failed command is followed by a proven success of the same operation with an added environment change | `env -u GH_TOKEN gh auth switch` |
+| `unavailable_tool` | environment | An error names a missing Python module, or a program the shell could not find | `import numpy.typing`, `npm test needs vitest` |
+| `env_var` | environment | An error names a missing variable, and a later proven run of the same operation sets it | `npm run deploy needs API_URL` |
+| `network` | environment | A name or connection failure from a recognized network command aimed at a host other than loopback | `registry.example.com` |
+| `empty_vcs` | environment | A `git` command fails because the checkout has no commits | `git log` |
+| `form_repair` | environment | A program fails, then a proven run of the same arguments through one launcher from `FORM_WRAPPERS` (`python -m`, `python3 -m`, `npx`, `npm exec`, `pnpm exec`, `pnpm dlx`, `yarn`, `bunx`, `uv run`, `poetry run`, `bundle exec`) | `pytest => python -m pytest` |
+| `arg_repair` | repo | A command fails, then a proven run with exactly 1 to 3 options added or removed | `npm test with --runInBand` |
 
-- **Cadence.** When a session completes, the client writes a durable completion marker before it saves the session's report. The run counts each marker once and keeps a tombstone, so a rebuilt report never counts twice. Every 3rd completed session of a repo queues one job; a queued job absorbs the next.
-- **Input.** A job sends the newest 8 completed digests of that repo, each re-scrubbed and cut to 8,000 characters, never a transcript. The proposer is the confined Codex runner of section 12 (read-only, ephemeral, no tools, output schema) on `consolidation_model` at low effort. The Codex CLI sends that input to the owner's Codex subscription provider; no local model runs.
-- **Check.** Output that breaks the schema is rejected whole. A proposal is kept only if its literal has a detector's format, it cites only sessions that were sent, and its literal and every citation snippet appear verbatim in each cited digest. `env_var` and the `needs` forms can never be proposed. The model's sentence is discarded and the fixed template is used. Citations show that text is present; they do not make a fact true.
-- **Upload.** Kept proposals go to the Worker as `propose` observations. They create candidates with `cited` evidence and never count as confirmations. A proposed fact becomes active only through later real confirmations.
-- **Daily cap.** At most 3 provider calls per UTC day on each device, retries included. The cap is per device; no counter is shared. Each attempt is saved and its slot charged before the call.
-- **Crash safety.** A validated result and its upload bytes are saved before the upload, and an upload retry resends the same bytes, so a model call is never repeated to recover an upload. An attempt whose run died is recorded as `unknown`, with null token counts.
-- **Cost log.** `facts/synth/cost.jsonl` holds one line per attempt: ids, model, effort, outcome and token counts. `cost_usd` stays null unless the owner sets `facts.synthesis_rates`. The log holds no prompt, statement, path, error or output.
+Every repair (`command_repair`, `env_var`, `form_repair` and `arg_repair`) needs same-operation proof. The fix is a proven-ok step at most 5 commands after the failure, in the same partition. Once the fix's own change is removed (the environment prefix, the launcher, or the added or removed options), its arguments must equal the failing step's, token for token. So `npm test --listTests` no longer proves `npm test`. `arg_repair` never teaches an option that only informs (help, version, listing, dry run), options such as `--force`, `--hard` or `--no-verify`, or an option whose name looks like a secret. A missing `numpy.typing` stays `import numpy.typing`; v1 cut it to `import numpy`.
+
+A success is proven only for a single command or an `&&` chain with a recorded exit 0. A session contradicts a fact when it proves that the failing operation works. For a `network` fact, only a recognized network command aimed at that host counts, for contradiction and for exercise.
+
+**Learned facts.** Synthesis can also propose facts no detector finds, as a signature of plain lowercase substrings: a `head` that names the operation, 1 to 3 `scope` strings, 1 to 3 `confirm` strings, up to 3 `contradict` strings, and an optional `fix`. A step is in scope when its text contains every `scope` string. A failed in-scope step whose error lines contain a `confirm` string confirms the fact; a proven-ok in-scope step that contains a `contradict` string contradicts it. Matching is `String.prototype.includes`, so the client never compiles a model-written regex. Signature strings are 3 to 80 characters with no backtick, `"`, `;`, `|`, `<` or `>`. A `fix` is one plain command of at most 8 tokens, with no shell metacharacters, no URL, no `user@host:` token and no program from `FIX_DENY` (shells, `eval`, `sudo`, `env`, `xargs`, `curl`, `wget`, `ssh`, `rm`, `chmod` and others). A learned fact's line quotes only `head`, the first `confirm` string and `fix`, inside a fixed template.
+
+**Statements.** The Worker writes every statement from a fixed template, filled from the detector and literal or from the signature. It ignores any client text. The five v1 templates keep their wording, so migrated statements do not change.
+
+**Session report.** A report holds the session ref, the session order (`ended_at` and a per-device counter `seq`), at most 32 family hashes, at most 32 edited-file hashes, at most 32 observations, at most 16 `injected` items with an outcome (`fired`, `prevented` or `unexercised`), cache-aware token usage and command counts. Usage goes only into the report for the partition where the session started. It holds no command text, output or path. The client saves the exact bytes before it sends them to `POST /v1/ingest` with the job token.
+
+| Reply | Meaning | Client |
+|---|---|---|
+| `stored` | Applied | Settled |
+| `seen` | The same payload was already applied; the stored result is replayed | Settled |
+| `stale` | The order is at or below the receipt watermark; nothing counted | Settled |
+| 409 `report_conflict` | Another payload already used this session's request id; the first wins | Settled and counted as `conflicts` in status, never retried |
+| 400 or 403 | Refused | Final |
+| 503 or a network error | Not applied | Retried on the next run |
+
+**Lifecycle.** The Worker stores each fact as one memory record: kind `rule`, type `feedback`, scope `repo-fact`, name `<repo_key>#<fact_key>`, with its state in `attrs.fact`. Only fact reports, flags and the owner's memory actions change it.
+
+- **Lanes.** A repo-class fact has one shared lane (`*`). An environment-class fact has one lane per device, at most 8; a ninth device evicts the lane updated longest ago. Each lane keeps its newest 12 confirmations and newest 16 events, ordered by session order, not upload order.
+- **Recompute.** After every accepted report the Worker recomputes the lane's state from its ordered history. So a late report lands in place, and can bring back a lane that contradictions retired.
+- **Active.** An environment lane activates after 3 distinct confirming sessions. A repo lane activates when some 3 confirmations, from any devices, have known, pairwise-disjoint edited files. Activation is sticky.
+- **Retired by contradiction.** The newest event is a contradiction, and the fact is not pinned. `REPO_FACT_RULES.retire` is 1, set from the #120 history replay; a `high_stakes` fact also retires on 1. Activation stays sticky, so one fresh confirmation brings the lane back. When every lane is retired this way, the fact is dormant: still stored, out of injection and outside the live cap.
+- **Terminal.** A flag, an owner retire and forget never recompute. A repo holds at most 32 live and 32 dormant facts; past the dormant cap, the dormant fact with the oldest newest event is retired for good.
+- **Exercise.** A report exercises a lane when its family is in the report's families, the fact has an observation, or its `injected` outcome is `fired` or `prevented`. A confirmation or `fired` outcome adds to `fired`; a `prevented` outcome without a confirmation adds to `prevented`.
+- **Injectable.** A deterministic fact is injectable once its lane is active. A learned fact must also pass the firing-rate gate: at least 4 exercised sessions and `(fired + prevented) × 5 ≥ exercised × 2`. The counters stay on every fact for metrics.
+- **User tier.** A fact key active in the same lane in at least 2 repos of one profile is injectable in every repo of that profile, unless that repo's own copy is retired or flagged. It never crosses profiles.
+
+**Receipts and retention.** Profile schema v10 adds three tables. `fact_reports` keeps each accepted report's complete validated body for a later replay, and `fact_report_facts` indexes which receipts name each fact. `fact_days` holds per-repo, per-day cost rows. A profile keeps its newest 4,000 receipts within 120 days. Pruning deletes whole groups of equal order keys, oldest first, and moves the watermark up in the same transaction. A later session report at or below the watermark is `stale`. Daily rows are kept for 400 days. Forget removes the fact from every receipt that names it, in the forget transaction. Backups include all three tables.
+
+**Injection.** With `facts.inject: true`, the `SessionStart` hook asks `POST /v1/brief` for the checkout's brief. A server without that route (404) is asked `POST /v1/facts` with `mode: "inject"` instead. Both use `injectableFacts`: at most 4 facts for this device's lanes, repo tier before user tier, then firing rate, then fact key. `/v1/facts` returns them with the fixed `<repo-facts>` block; `/v1/brief` renders them as quoted brief lines. The hook prints the server's text unchanged and saves the injected items per session and partition, so the session's report can fill `injected`. It caches each directory's route for 7 days, runs git asynchronously and kills it at the deadline. A missing read token, an error or the timeout (`facts.timeout_ms`, default 1,500 ms) prints nothing.
+
+**Owner controls (#118).** The MCP tool `repo_facts` lists the facts of the profile a repo routes to, with state, lanes, firing counts and evidence. Its `flag` action needs a write-scoped token and a reason of 1 to 200 characters. A flag retires the fact at once in this repo (`scope: "repo"`) or every repo of the profile (`scope: "user"`), and it is undoable from the activity log. The dashboard's Facts tab sits next to Lessons and reads `GET /api/profiles/:p/facts`. It offers pin, unpin, flag, retire and forget, each with undo, and a per-repo, per-day cost table over 7, 30 or 92 days from `GET /api/profiles/:p/facts/efficiency`. Forget writes a tombstone in the same transaction, so later reports for that fact are refused with `fact_forgotten` until a restore clears it.
+
+**Status and health.** `GET /api/health` adds a `facts` object per profile: live, dormant and active counts, user-tier keys, receipts, the watermark and the oldest receipt day. `agent-memory status --json` adds `facts` (the switches, partitions, pending and v1-pending reports, the oldest pending time, the last report time, conflicts, session-start p95 latency and timeouts over 7 days, unattributed commands over 7 days, and synthesis slots) and `loop_guard`. `doctor` warns on `facts_profile_config`, `facts_pending` (more than 20 pending reports, or the oldest older than 3 days), `facts_inject_latency` (p95 over 1,500 ms) and `facts_v1_pending`.
+
+**Kept out of ordinary memory.** Ordinary saves, appends, captures and knowledge writes cannot create or change a fact (`repo_fact_reserved`); only a retire-only save is allowed, and no graph edge can reach one. Recall, `get`, inventory, graph expansion, the owner model, dedupe and the stale-record queue skip the `repo-fact` scope. A fact is never embedded, and the similarity pass never starts from or targets one.
+
+**Synthesis (#117).** Synthesis is off unless `facts.synthesis` is true. When it is off, the code reads and writes nothing for it.
+
+- **Cadence and cap.** Every 3rd completed session of a partition queues one job; a queued job absorbs the next. At most 3 provider calls per UTC day on each device, across all partitions, retries included. A job gets at most 3 attempts.
+- **Input.** A job sends the partition's newest 8 completed digests, each re-scrubbed and cut to 8,000 characters, and the facts already held for the repo (at most 64, from `POST /v1/facts` with `mode: "held"`), so a paid call does not rediscover them. The proposer is the confined Codex runner of section 12 on `consolidation_model` at low effort.
+- **Output.** At most 8 proposals: detector-format facts, new learned signatures and contradiction-only revisions of held learned facts. A revision may only add `contradict` strings or set `high_stakes`.
+- **Grounding.** Every citation is a session sent in this call. A detector-format literal, or a learned fact's `head` and every `confirm` string, appears verbatim in each cited digest. A learned fact needs at least 2 cited sessions. Every string is checked against the contract grammar before upload. Citations show that text is present; they do not make a fact true.
+- **Upload.** A proposal creates candidates that never count as a confirmation, exercise or fire. Later sessions must confirm them with their own evidence.
+- **Crash safety.** Each attempt gets a stable `attempt_id`, is saved as `running` and charged its daily slot under the run lock before the runner starts. Codex writes the final reply straight to `attempts/<attempt_id>.reply` (`--output-last-message`). After the run, and in a recovery pass on every run, a `running` attempt with a reply that parses is adopted, and one without a reply becomes `unknown` and keeps its slot. The proposal id derives from the attempt id, and the upload bytes are saved before sending, so an upload retry is deduplicated by the Worker. One window remains: if the provider finishes but the process dies before Codex writes the file, that reply is lost and paid for, and is logged as `unknown`.
+- **Cost log.** `facts/synth/cost.jsonl` holds one line per attempt: ids, model, effort, outcome and token counts. `cost_usd` stays null unless the owner sets `facts.synthesis_rates`.
+
+**v1 compatibility and rollout.** The Worker deploys first. It keeps accepting v1 reports and never refuses a well-formed v1 report as a whole: it maps one to a `legacy` report ordered at receipt time and refuses only the observations whose literal fails a v2 grammar. Stored v1 facts upgrade lazily when read and persist on the next write, with ids, pins, evidence and statements unchanged; a v1 retirement by contradiction becomes dormant, not terminal. The client follows. It rebuilds a pending v1 report from its transcript when the transcript still exists, and otherwise sends the stored v1 bytes unchanged. v1 acceptance ends in a later release, once `doctor` shows no `facts_v1_pending` on any device.
+
+**Tool pruning (#119).** Measured and not built. With every MCP server removed, Codex showed no measurable difference, and Claude Code saved at most about 0.86% of a median session's price-weighted input, below the 5% bar. Pruning only unused tools would save less ([measurement](https://github.com/wrick17/agent-memory/issues/119)).
+
+**Threshold calibration (#120).** `node local/facts-replay.mjs` replays local Claude Code and Codex history per repo through the v2 detectors and a parameterised copy of the lifecycle, offline and read-only. Its first run led to one change: retirement on the newest contradiction instead of the newest 2. Activation at 3, the disjoint rule and the firing gate stay as they were ([replay results](repo-facts-verification.md#history-replay-120)).
 
 ### Loop guard
 
-The loop guard (#102) adds one fixed note to a turn that is stuck. It is off unless `loop_guard.enabled` is true. It makes no model or network call.
+The loop guard (#102, revised in #115) adds one fixed note to a turn that is stuck. It is off unless `loop_guard.enabled` is true. It makes no model or network call. The #115 changes are on branch `fix/repo-facts-review` and not yet tested or deployed.
 
-- **Rules.** The note fires when the same invocation fails 3 times in one turn with the same normalized error, or when 8 of the turn's last 10 tool results failed. It fires at most once per turn.
-- **Hooks.** Claude Code's `PostToolUse` counts as a success and `PostToolUseFailure` as a failure, unless the user interrupted. Codex's `PostToolUse` counts only for an MCP result with an explicit boolean `isError`; shell and other results are skipped, never guessed from text or exit codes.
-- **Ids.** A payload without a session id, tool use id, tool name and turn id (`prompt_id` for Claude Code, `turn_id` for Codex) is ignored. A repeated tool use id is counted once. A subagent keeps its own state.
-- **State.** Each session's state file holds hashes and counts only, never tool input, output or the hook payload. It is written under a lock with a 2 s deadline and pruned after 7 idle days.
-- **Note.** Fixed text with the counts and a sanitized tool name, labelled as a local rule, not the user. No tool text reaches the agent through it.
+- **Rules.** The note fires on the first of these, at most once per turn:
+  - `repeat`: the same invocation fails 3 times in the turn with the same normalized error.
+  - `variant`: 4 failures of the same shell program and subcommand in the same directory among the turn's last 10 results, with at least 2 different command lines and no success of that program or file edit in between. Programs whose nonzero exit is an answer (`grep`, `rg`, `diff`, `cmp`, `test`, `which`, `pgrep`, `git grep`, `git diff` and similar) never count for this rule.
+  - `errors`: 8 of the turn's last 10 tool results failed.
+- **Working directory.** The directory is part of the invocation, so the same command in another directory is another attempt.
+- **Claude Code.** `PostToolUse` counts as a success and `PostToolUseFailure` as a failure, unless the user interrupted.
+- **Codex.** An MCP result counts by its explicit `isError`. Codex 0.167.1 hook payloads carry no exit status for shell commands (openai/codex#34289 and #42864), so the guard reads the exit code from the session rollout record that matches the hook's tool use id. It reads at most the last 1 MB and waits at most 200 ms. Without a matching record the result is not counted. The rollout format is undocumented; if Codex changes it, shell results stop counting and nothing else breaks.
+- **Shadow mode.** With `loop_guard.shadow: true` as well, the rules run and log, but no note is printed.
+- **Fire log.** Each fire or would-fire appends one line to `loop-guard/fires.jsonl`: time, client, hashed session and turn, rule, shadow flag and counts. It holds no command, path or error text. Past 256 KB the file rotates to `fires.jsonl.1`, so the two stay under 512 KB.
+- **Ids and state.** A payload without a session id, tool use id, tool name and turn id is ignored, and a repeated tool use id counts once. Each session's state file holds hashes and counts only, written under a lock with a 2 s deadline and pruned after 7 idle days.
+- **Note.** Fixed text with the counts and a sanitized tool name, labelled as a local rule, not the user.
+- **Reporting.** `status` shows the mode and the fires and shadow would-fires of the last 7 days, by rule. `doctor` prints the same as an information line, and its `codex_hook_trust` check fails when a configured Codex hook is not trusted, since an untrusted hook never runs.
 
-A Codex-backed check (#103) is design only. It would run locally, make one call per stuck turn only after the rules fire, and act only at confidence 0.7 or higher. It is built only if the six P3 paired tasks (#101) show that the rules miss real loops. Decision, 2026-11-11: it stays design only, with no provider judge. The P3 traces had no repeated failed commands, and the guard's coverage of Codex shell runs is not established. Revisit only when a concrete missed loop appears ([P3 results](repo-facts-verification.md#p3-paired-evaluation-2026-11-11)).
+A Codex-backed check (#103) stays design only, with no provider judge (decision of 2026-11-11). Shadow mode's fire log is the evidence for revisiting it ([P3 results](repo-facts-verification.md#p3-paired-evaluation-2026-11-11)).
+
+### Session-start brief (#125)
+
+The brief is the one automatic context a session gets at start (epic #131). It is on the branch and not yet tested or deployed. `facts.inject` is its switch, and it replaces the facts-only session-start call.
+
+- **Request.** The `SessionStart` hook sends `{ repo: { remote, path }, repo_key, client, cwd }` to `POST /v1/brief` with the read token. The Worker routes it like the fact routes.
+- **Sections.** In priority order: the repo's injectable facts; a pointer to the open journal for this checkout (its id and name, never its content); up to 4 of the project's rules and preferences, stated first, inferred last; up to 3 `me` preferences and rules; and the 3 newest project decisions. A record belongs to the project when its scope names the repo or it links to the repo's project node.
+- **`me`.** Only preferences and rules, and never one in a private scope (`personal`, `identity`, `household`). Facts never come from `me`.
+- **Budget.** At most 400 tokens, estimated as characters divided by 4. Sections take turns, so each gets its best item before any gets a second. The profile reads use exact SQL only, with no text index or vector call, and stop at 800 ms; a part that misses the deadline is listed in `omitted` and the rest is still returned.
+- **Quoting.** Every line is quoted stored text, cut to 160 characters, under a header that labels each line as evidence, not instructions. The reply carries `origin: { system: "agent-memory", trust: "untrusted" }`.
+- **Receipts.** The reply lists its items. The client saves them per session and partition, and the session report sends them in `injected`: facts with their outcome, memory items as `unexercised` (see [guidance receipts](#guidance-receipts-127)).
+- **Fallback.** Until the new Worker is deployed, a 404 falls back to `POST /v1/facts`.
+
+### Guidance receipts (#127)
+
+Guidance receipts track whether injected guidance helped. Only the first part is on the branch:
+
+- Built: the session report's `injected` list accepts `memory` items next to facts, the brief's memory items are saved and reported, and the Worker stores them in each receipt. The facts lifecycle ignores memory items.
+- Pending: exercised, fired and prevented counts for lessons and other memory items; counting a correction that matches an injected lesson against it; the dashboard's followed rate per lesson; and dropping a lesson that keeps failing from briefs. Until then the client reports every memory item as `unexercised`.
 
 ### Other upload items, each with its own id
 
@@ -1440,6 +1519,7 @@ flowchart LR
 - Passages: 700 characters around the best match in the best chunk, from FTS5 `snippet()` offsets.
 - Merge: the Worker runs a second RRF over the lists from `work` and `me`, dedupes on `(profile, id)`, and packs results in rank order until `token_budget` is spent, with each result's cost estimated as JSON length divided by 4, as BothQ does.
 - FTS5-only mode: with `EMBEDDINGS=off` the vector channel and similarity edges are skipped, and every response says `lexical_only: true`. BothQ works this way today. Recall also falls back to lexical, and says so in `diagnostics`, when Vectorize or Workers AI errors.
+- Relevance (#129, on branch `fix/repo-facts-review`, not yet tested or deployed): recall in another profile merges only `me` preferences and rules (`ME_MERGE_KINDS`), and never one in a scope that names `personal`, `identity` or `household`. An explicit `profile: "me"` read is unchanged. A vector match below cosine 0.3 (`VECTOR_MIN_SCORE`) never enters fusion. A hit that no exact or literal channel found is dropped when its fused score is below 0.01 (`MIN_FUSED_SCORE`): one channel alone passes to about rank 39 for a stated record, 29 for an agent one and 9 for an inferred one. After stated-first ranking, rules scoped to the request repo's project move to the front. Neither cutoff is tuned against the eval set yet. Prompt recall stays off until this ships.
 
 ### Recall measurement and evaluation (v2, #9 and #20)
 
@@ -1513,6 +1593,17 @@ The server never decides what a record means. It computes, deterministically, wh
 | `stale_memory` (v2, #10) | An active record older than 90 days with no recall hit in 90 days. Journals, preferences, stated, pinned and `me` records are excluded. | Luna. Only a retire-only save, `flag` or `dismiss`; nothing is deleted automatically. |
 
 Each item has a fingerprint (kind, subject ids, card hashes), so an unchanged item is never queued twice and a changed record queues again.
+
+### Lessons and decisions from digests (#126)
+
+On branch `fix/repo-facts-review`, not yet tested or deployed. The daily batch learns two more kinds of record from session digests, besides inferred preferences:
+
+- **`record_lesson`**, allowed on a `preference_signal` item: a correction about how an agent must work becomes a rule. Its `why` is the mistake, `how_to_apply` the correction, and its evidence 1 to 10 pointers to the item's subjects. A correction about the owner's own taste stays an inferred preference.
+- **`record_decision`**, allowed on an `unprocessed_capture` item: a decision the digest states becomes a decision record with its reason and evidence, linked to the session's project.
+- **Scope and project.** The server derives them from the session's project, never from the model: the project's repo name when it is a valid scope, else `default`. The lease item carries `learning.known`, at most 30 active lessons and decisions in that scope or `default`.
+- **No duplicates.** A lesson whose `matches` names a known rule, or that has the same name in the scope, adds its evidence to that rule instead of creating one. A decision with the name of an active decision in the scope updates it, and `supersedes` retires a known older decision. A merged `near_duplicate` hands its evidence to the record kept, so a repeated lesson strengthens one record. Near-duplicates merge on a later batch run, not at once.
+- **Origin and protection.** Both are written with origin `inferred` through the normal write path, so protection, undo and profile checks apply. Neither is ever written to `me`.
+- **Batch report.** `batch/last.json` records per profile the ops the server applied, by op name, plus `last_write_at` and `tracked_since`. `doctor`'s `batch_learning` check warns when a configured batch profile has applied no op for 3 days.
 
 ### v2 leases, eval suggestions and health (#10, #11)
 
@@ -1719,6 +1810,7 @@ Earlier dated notes for this section, superseded by this status:
 | Health | any | Health checks, eval runs and pending eval candidates (accept or dismiss), Re-check now, a copied `agent-memory doctor` | #25 |
 | Memories | any | Filters, search within the chosen profile, recall strength, detail, history and diff, copies, bulk archive with undo and export. No hard delete. | #26 |
 | Lessons | any | Preferences and rules from the owner model, with 90-day uses and pin, unpin, unflag and forget, each with undo | #27 |
+| Facts | any | Repo facts by repo with state, tier, class, per-device lanes, firing counts, evidence and literal; pin, unpin, flag, retire and forget, each with undo; per-repo, per-day session cost. On branch, not deployed. | #118 |
 | Crystals | any | Compacted journal summaries and finished sessions with consolidated digests | #27 |
 | Actions | any | The board filtered by `state` (open, closed or all), with uploaded state and Jira status text. No issue-state writes. | #27 |
 | Graph | path profile | The graph with a shape and colour legend, toolbar, detail, deep links and confirmed maintenance queueing | #28 |
@@ -1726,9 +1818,24 @@ Earlier dated notes for this section, superseded by this status:
 | Replay | one | Hosted digest replay in order only, with a notice that full transcripts play only locally | #29 |
 | Activity | any | The activity heatmap, filters and session links, with covered or truncated ranges | #30 |
 | Profile | one | One project's profile | #30 |
+| Goals | any | The four goal metrics per repo and week ([goal metrics](#goal-metrics-130)). On branch, not deployed. | #130 |
 | Audit | any | The activity log by actor and profile, with undo and conflicts | #31 |
 
 Admin keeps every earlier page, with its confirmations and aliases: Write, Paths, Map, Timeline, Journals, Review, Backups and recovery, Routing, Profiles, Moves, Wipe, Work, About you and Settings (#31).
+
+### Goal metrics (#130)
+
+The Goals tab measures the forever-context goal (#124, #131) from data the profile already stores. It reads `GET /api/profiles/:p/goal-metrics?weeks&repo_key` (1 to 26 UTC weeks, default 12, starting Monday). It is on branch `fix/repo-facts-review` and not yet tested or deployed.
+
+| Metric | Definition | Target |
+|---|---|---|
+| Repeat-correction rate | Corrections whose session the learning batch matched to a lesson that existed before the session started, over the corrections the batch has processed | Below 10% after 4 weeks of decline |
+| Guided-session share | Session receipts with at least one `injected` item, over session receipts | 80% |
+| Capture coverage | Sessions with a consolidated digest, over every session seen (a session node or a session receipt) | 95% |
+| Guidance-followed rate | `(fired + prevented) / exercised` over injected items in session receipts; the tab also shows the prevented share, since the followed rate is close to 100% by construction | None |
+| Cost per session | From `fact_days`: tokens per session over `usage_sessions`, failed commands per session, and the cache ratio | Trend only |
+
+A rate below 3 samples shows "Not enough data". An input that is not stored yet, such as session receipts before the v2 Worker is deployed, is named in `missing` and never shown as zero. Exact repeat-correction counting needs one stored match per correction, planned in #127.
 
 The v3.2 design below planned a Preact and Cytoscape.js app on Workers Static Assets. The built dashboard is a house module that the Worker serves as `/app.js`, like `/settings`, with no Preact or Cytoscape. Clerk JS signs the owner in. The app calls `/api/*` with the Clerk session token. The API runs the same commands as MCP with actor `owner`. The page table and API list below are the v3.2 design record; the v2 owner routes are in section 8.
 
