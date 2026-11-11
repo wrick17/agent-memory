@@ -15,6 +15,13 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 - **Backups and recovery.** Nightly encrypted exports go to your own R2 bucket, and the two newest are kept. Profiles and account state can be restored.
 - **Careful cleanup.** Housekeeping is rule-based, with no model on the server. Stated rules, pinned records and `me` are never changed by the background batch, and changes can be undone.
 
+### Source-verified, not released
+
+These pass source and local tests but are not released, and no live client has run them yet; see the [repo facts verification](docs/repo-facts-verification.md). Session-start facts, fact synthesis and the loop guard are off by default.
+
+- **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a variable unset. After 3 separate sessions confirm a fact, and it keeps proving useful, session start can add up to 4 of them. Turn it on with `facts.inject`.
+- **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`.
+
 ## How it works
 
 ```mermaid
@@ -101,6 +108,7 @@ For a machine without a browser, see [headless machines](docs/self-host.md#headl
 - Automatic capture uploads only short, redacted digests of each session, never the full transcript. A digest can contain short excerpts. What an agent saves or imports on purpose is stored as written.
 - Full sessions stay on the machine that recorded them. `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
 - The server never calls GitHub or Jira, and holds no credentials for them.
+- In a GitHub checkout, the capture client also sends a small repo-fact report per finished session: hashes, fact keys and fixed sentences, never command output or paths. Optional fact synthesis (`facts.synthesis`, off) sends redacted command digests to the Codex CLI on your own Codex subscription.
 
 ## Learn more
 

@@ -1173,3 +1173,87 @@ Status on 2026-11-04: #55 and #56 are merged, and #4 stays open. #17 (PR57) is h
 Each issue PR adds its own dated section to `docs/feature-manifest.md`. README and `docs/import-verification.md` stay with the delivery owner.
 
 Original module tests for #9, #10, #11 and #15 were not preserved, and author-reported results on other trees are not reused as evidence. The combined phase added the coverage they lacked: channel and filter ranks, count rows, eval auth and fences (#9); lease replay, expiry, the stale queue and the purge pages (#10); health thresholds with a fake clock and status-body refusals (#11); and summary values, budget cuts and Corpus on, off and failing (#15). It passed in the combined local run ([evidence](import-verification.md#v2-combined-local-verification-2026-11-04)).
+
+## Repo facts and loop guard modules, 2026-11-11
+
+Source: commit `ebd91f0` in PR #110, where CI passed. Source and local verification passed; not merged, released, deployed or installed. Behaviour and rules are in [architecture, repo facts](architecture.md#repo-facts) and [loop guard](architecture.md#loop-guard). Gates and evidence are in [repo facts verification](repo-facts-verification.md).
+
+### Modules
+
+| File | Issues | Input | Output |
+|---|---|---|---|
+| `local/facts.mjs` | #90, #93 | An origin remote; transcript lines of one session | `repoKey()`: `github.com/<owner>/<repo>` or null. `commandDigest()` and `mergeDigest()`: a redacted digest `{ v, client, session, repo, started_at, ended_at, files, commands, dropped }` |
+| `local/facts-detect.mjs` | #91 | A merged digest and the facts this device knows | `detect()`: at most 32 observations `{ fact_key, kind, detector, statement, literal, label }`, fired keys and trigger labels. No model, network or clock |
+| `local/facts-client.mjs` | #92, #95 | Capture triggers from the run (run-lock holder only) | One saved report per completed session, sent as exact bytes; the local ledger, registry and the 16 newest digests per repo |
+| `local/facts-inject.mjs` | #94 | `SessionStart` hook JSON and the config | Hook output with at most 4 facts in 600 characters, or nothing |
+| `local/facts-synth.mjs` | #96 to #99 | Completion markers, recent digests, the confined runner | Proposal uploads, cadence and cap state, and the cost log. Off: nothing |
+| `local/loop-guard.mjs` | #102 | `PostToolUse` and `PostToolUseFailure` hook JSON | At most one fixed note per turn as `additionalContext`, or nothing |
+| `src/profile/facts.ts` | #92 to #95 | A validated `FactArgs` report inside `runWrite` | Fact records and their lifecycle; `injectFacts()` and `listFacts()` reads |
+| `src/api.ts` (`factsIngest`) | #92, #93 | `POST /v1/ingest` with a `facts` body | The routed profile's report result |
+| `src/v2-api.ts` | #94, #95 | `POST /v1/facts`; `GET /api/profiles/:p/facts` | Injectable facts; the owner's fact list |
+
+`local/agent-memory.mjs` owns the shared wiring: config defaults, hook registration and dispatch, the run's `flushPending()` and `synthesize()` calls, and installing these modules beside the CLI. `local/doctor.mjs` checks the read token when `facts.inject` is on and the hooks each client registers.
+
+### Wire contracts
+
+| Route | Credential | Body or query | Reply |
+|---|---|---|---|
+| `POST /v1/ingest`, facts branch | Device token with `ingest` scope (the job token) | `{ repo: { remote }, repo_key?, profile?, facts: { session \| proposal, families[≤32], fired[≤32], observations[≤32] } }` | `{ profile, routed_by, repo_key, report: { action, facts: [{ fact_key, memory_id, status, reason?, state?, chain? }], activity_id? } }` |
+| `POST /v1/facts` | Device token with `read` scope (the read token) | `{ repo: { remote }, repo_key?, profile? }`, at most 4,000 bytes | `{ profile, routed_by, repo_key, facts: [≤4 { fact_key, detector, statement, literal, exercised, fired }] }` |
+| `GET /api/profiles/:p/facts` | Owner | `repo_key?`, `after?`, `limit` 1 to 200 (default 100) | `{ facts: [{ memory_id, repo_key, fact_key, detector, statement, literal, state, status, pinned, revision, exercised, fired, rate, contradictions, chain, eligible, evidence, created_at, updated_at }], next_after }` |
+
+An observation is `{ fact_key, kind, detector, statement, literal, family, disjoint_from?, citations? }`:
+
+- `fact_key` is the first 16 hex of SHA-256 of `<detector>\n<literal>`, and the Worker checks it.
+- `kind` is `confirm` or `contradict` in a session report, and `propose` in a proposal.
+- `disjoint_from` (at most 8 session refs) is for `confirm` only. `citations` (1 to 8 session refs) is for `propose` only.
+- `statement` is at most 200 characters; `literal` is at most 120, one line, unchanged by redaction and free of home or user paths. `family` is 16 hex.
+- A session ref is `claude-code:<12 hex>` or `codex:<12 hex>`.
+
+The request id is `facts:` plus SHA-256 of `<repo_key>\ns:<session>` or `<repo_key>\np:<proposal>`, so a resend replays and a changed body for the same session is refused.
+
+| Refusal | When |
+|---|---|
+| 400 `validation`, reason `unsupported_remote` | `repo.remote` is not a GitHub repository |
+| 400 `validation`, reason `repo_key_mismatch` | `repo_key` names another repository |
+| 400 `validation`, reason `invalid_observation` | A literal or statement fails the checks above |
+| 403 `forbidden` | Not a device token, the token lacks the scope, or routing chose `me` |
+| 400 or 410 `profile_wiped` | The routed profile is not active |
+| Per fact: `fact_forgotten`, `fact_retired`, `fact_busy`, `unknown_fact`, `fact_limit` | Forgotten or retired fact; the fact is moving; a contradiction for an unknown fact; the repo already has 32 live facts |
+
+### Local files
+
+All under `<home>/facts/` (default `~/.agent-memory/facts/`), mode 600, never uploaded.
+
+| Path | Holds | Writer |
+|---|---|---|
+| `sessions/<client>-<session>.json` | Read cursor, digest until sent, the saved report bytes and status | Run |
+| `ledger/<repo id>.json` | Per fact, this device's confirming sessions and their file hashes | Run |
+| `registry/<repo id>.json` | Facts this device reported or had accepted as proposals | Run |
+| `seen/<repo id>.json` | The last injection read: fact keys, detectors and literals | `SessionStart` hook only |
+| `digests/<repo id>/<session>.json` | The 16 newest completed digests | Run |
+| `synth/due/`, `synth/counted/` | Completion markers and their tombstones | Run |
+| `synth/state.json` | Cadence counts, the day's used calls, jobs and attempts | Run |
+| `synth/cost.jsonl` | One line per attempt: ids, model, effort, outcome, token counts, `cost_usd` | Run |
+
+The loop guard keeps `<home>/loop-guard/<scope hash>.json` and a `.lock` beside it, with hashes, counts and the last 64 hashed tool use ids.
+
+### Limits in the code
+
+| Value | Number | Where |
+|---|---|---|
+| Activation | 3 pairwise-disjoint confirming sessions in one device's chain | `FACT_RULES.activate` |
+| Retirement | 2 consecutive contradictions, unless pinned | `FACT_RULES.retire` |
+| Injection gate | Active, at least 4 exercised, firing rate at least 40% | `FACT_RULES.exercised`, `eligible()` |
+| Injection cap | 4 facts; 150 tokens counted as 600 characters, label included | `FACT_LIMITS.inject`, `FACTS_INJECT` |
+| Injection timeout | 1,500 ms default, at most 10,000 ms | `FACTS_INJECT.timeout_ms`, `withDefaults()` |
+| Live facts per repo | 32 | `FACT_LIMITS.live` |
+| Evidence refs per fact | 20 | `FACT_LIMITS.evidence` |
+| Repair window | 5 commands | `DETECT_LIMITS.window` |
+| Synthesis cadence | Every 3 completed sessions per repo | `SYNTH_LIMITS.cadence` |
+| Synthesis daily cap | 3 provider calls per UTC day per device, retries included | `SYNTH_LIMITS.daily` |
+| Synthesis input | Newest 8 digests, 8,000 characters each | `SYNTH_LIMITS.digests`, `digestChars` |
+| Synthesis output | At most 8 facts, 1 to 8 citations each | `SYNTH_LIMITS.facts`, `citations` |
+| Attempts per job | 3 | `SYNTH_LIMITS.attempts` |
+| Loop guard | Same failure 3 times, or 8 failures in the last 10 results, once per turn | `LOOP_GUARD` |
+| Loop guard hook | 2 s lock deadline, 5 s client hook timeout | `LOOP_DEADLINE_MS`, `LOOP_TIMEOUT_S` |
