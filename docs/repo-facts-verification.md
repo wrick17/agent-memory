@@ -2,7 +2,7 @@
 
 This page records the gates and evidence for repo facts (epic #105, issues #90 to #103) and the loop guard (#102, #103). It lists what the source does, which checks passed, and which gates are still open. Fill in an open line only from a result that actually exists.
 
-**Status, 2026-11-11:** source and local verification passed at commit `ebd91f0`, pushed for review in PR #110, where CI passed. The feature is not merged, not released, not deployed and not installed. All five findings from the independent privacy and data-loss review are closed. The #100 review is clear and waits for the owner's sign-off, so synthesis stays off. P3 (#101) has not run, so there is no benefit claim.
+**Status, 2026-11-11:** source and local verification passed at commit `ebd91f0`, pushed for review in PR #110, where CI passed. The feature is not merged, not released, not deployed and not installed. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call, which is pending. Normal synthesis stays off; turning it on is a separate owner step. P3 (#101) is not complete: its setup pilot was invalid and the paired run is pending, so there is no benefit claim.
 
 | Check | Result |
 |---|---|
@@ -19,7 +19,7 @@ This page records the gates and evidence for repo facts (epic #105, issues #90 t
 | Part | Switch | Default |
 |---|---|---|
 | Session-start injection | `facts.inject` | Off |
-| Synthesis | `facts.synthesis` | Off, and held until the owner signs off #100 |
+| Synthesis | `facts.synthesis` | Off. #100 is signed off; turning it on is a separate owner step |
 | Loop guard | `loop_guard.enabled` | Off |
 | Deterministic detection and session reports | None of its own | Runs with capture, as approved |
 
@@ -47,8 +47,8 @@ The verified source is commit `ebd91f001f7b1d52c08004c07b5af003a49a2799`, tree `
 
 | Gate | Rule | State on 2026-11-11 |
 |---|---|---|
-| Synthesis enable (#100) | `facts.synthesis` stays `false` until the owner signs off a written privacy and data-loss review. Turning it on is a separate owner step after the sign-off. | Review clear: all 5 findings closed ([review](#privacy-and-data-loss-review-2026-11-11)). **Waiting for the owner's sign-off.** Synthesis is not enabled. |
-| P3 benefit (#101) | Six paired tasks, memory alone against memory plus facts: completion, repeated failures and cache-aware cost. | Not started. Twelve trials are planned: six controlled replays, each run with memory alone and with memory plus facts. Only 2 replays have a relevant eligible fact (`import Quartz` and `import PIL` in bettergit); the other 4 are controls. Preparation is in progress and no trial has run. No benefit claim exists. |
+| Synthesis enable (#100) | `facts.synthesis` stays `false` until the owner signs off a written privacy and data-loss review. Turning it on is a separate owner step after the sign-off. | Review clear: all 5 findings closed ([review](#privacy-and-data-loss-review-2026-11-11)). **Signed off by the owner on 2026-11-11** ("Approve review and isolated call"), for source `ebd91f0` and exactly one isolated real call. That call is pending. Normal synthesis is not enabled. |
+| P3 benefit (#101) | Six paired tasks, memory alone against memory plus facts: completion, repeated failures and cache-aware cost. | Twelve trials are planned: six controlled replays, each run with memory alone and with memory plus facts. Only 2 replays have a relevant eligible fact; the other 4 are controls. Setup pilot invalid; the paired run is pending. The first attempt (trial 1, memory-alone arm) had a wrong sandbox setup: an empty `TMPDIR`, a login shell and denied patches. Its task did not complete. It used 48,626 input tokens (28,544 cached) and 752 output tokens, counted separately from any result. The other 11 trials have not run, and the memory-plus-facts context is not yet verified. The isolated test Worker holds the two seeded facts: bettergit `import Quartz` (exercised 9, fired 8) and `import PIL` (exercised 8, fired 6), with a 232-character injected context (SHA-256 prefix `78715f28`); the other three replay repos have none. No benefit or missed-loop conclusion exists. |
 | Codex-backed loop check (#103) | Design only. It is built only if P3 shows that the rules miss real loops. | Design only; no code. |
 | Injection on | `facts.inject` is an owner choice, like prompt recall. | Off. Not turned on anywhere. |
 | Loop guard on | `loop_guard.enabled` is an owner choice. | Off. Not turned on anywhere. |
@@ -91,10 +91,10 @@ The `whole_local_history` counts in each file come from every local session, bui
 
 ### Not run
 
-- [ ] A real provider call for synthesis. Not allowed before the owner signs off #100.
+- [ ] One isolated real provider call for synthesis, approved by the owner on 2026-11-11: pending.
 - [ ] A live Claude Code or Codex client with injection or the loop guard turned on.
 - [ ] Merge, packaging release and deployment.
-- [ ] P3 paired tasks (#101).
+- [ ] P3 paired tasks (#101): setup pilot invalid; paired run pending.
 
 ## Privacy and data-loss review, 2026-11-11
 
@@ -113,7 +113,7 @@ Not findings:
 - Deterministic reports that follow the approved capture setting without a new switch.
 - Exact-id graph access and the profile boundary, judged non-blocking.
 
-Confirmed by the review: Codex CLI 0.167.1 reports `input_tokens`, `cached_input_tokens` and `output_tokens`, the fields the cost log reads. The review checked the compiled binary and the [non-interactive mode docs](https://learn.chatgpt.com/docs/non-interactive-mode). No real provider call has run, and synthesis stays off.
+Confirmed by the review: Codex CLI 0.167.1 reports `input_tokens`, `cached_input_tokens` and `output_tokens`, the fields the cost log reads. The review checked the compiled binary and the [non-interactive mode docs](https://learn.chatgpt.com/docs/non-interactive-mode). No synthesis provider call has run yet; the one approved isolated call is pending, and normal synthesis stays off.
 
 ## Known limits
 

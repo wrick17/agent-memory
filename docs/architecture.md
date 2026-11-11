@@ -70,7 +70,7 @@ Each issue ships in its own PR, in the order in the [module contracts](module-co
 - No invented metrics: no uptime, MCP call or failure counts, semantic latency, confidence percentages or hosted tool counts.
 - No hard delete from the Memories tab, and no issue-state writes from the Actions tab.
 - Prompt recall stays off. The persistent read credential and turning it on are owner choices.
-- Repo-fact injection, repo-fact synthesis and the loop guard stay off (section 10). Synthesis also waits for the owner's #100 sign-off.
+- Repo-fact injection, repo-fact synthesis and the loop guard stay off (section 10). The owner signed off #100 on 2026-11-11 for one isolated call only; turning synthesis on is a separate owner step.
 - No BothQ shutdown and no aggregate v2 release. Each issue ships in its own PR.
 
 ## Changes since v3.1
