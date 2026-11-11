@@ -593,6 +593,18 @@ export function httpServer(config) {
 		status: (body) => post("/v1/status", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		/** POST /v1/eval/runs: one eval run's scores and counts, never prompt or record text. */
 		evalRun: (body) => post("/v1/eval/runs", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		/**
+		 * POST /v1/ingest, facts branch (facts-client.mjs), job token: one saved session report sent as its exact bytes, so a resend
+		 * replays. Throws with status (and error on a 400) like post.
+		 */
+		facts: async (bytes) => {
+			const res = await fetch(new URL("/v1/ingest", config.server), { method: "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" }, body: bytes, redirect: "error", signal: AbortSignal.timeout(30_000) });
+			if (!res.ok) {
+				const error = await res.json().then((r) => r?.error ?? null, () => null);
+				throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, ...(error ? { error } : {}) });
+			}
+			return res.json();
+		},
 		/** GET /v1/whoami with the job token: this device's own identity and scopes. */
 		whoami: async () => {
 			const res = await fetch(new URL("/v1/whoami", config.server), { headers: { authorization: `Bearer ${token()}` }, redirect: "error", signal: AbortSignal.timeout(10_000) });
@@ -654,6 +666,8 @@ export function readServer(config = loadConfig()) {
 			if (limit !== undefined) url.searchParams.set("limit", String(limit));
 			return send(url);
 		},
+		/** POST /v1/facts: at most 4 injectable facts for { repo: { remote }, repo_key?, profile? } (facts-inject.mjs). */
+		facts: async (body, { timeoutMs = 30_000 } = {}) => send(new URL("/v1/facts", config.server), { body, timeoutMs }),
 	};
 }
 
@@ -829,6 +843,11 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		}
 		save();
 	}
+	// Repo facts (facts-client.mjs): this session's command digest, and its one report once the session has ended. It reads the transcript
+	// from its own cursor and never changes capture state; any failure leaves capture untouched and is retried on a later run.
+	if (src) {
+		try { await (await import("./facts-client.mjs")).observeSession(t, src, repo, { server, ended: st.ended === true, config: loadConfig() }); } catch { /* retried later */ }
+	}
 	// consolidated_to moves over contiguous consolidated ranges of the current epoch only.
 	const advance = () => {
 		for (const r of Object.values(st.ranges).filter((x) => x.epoch === st.epoch).sort((a, b) => a.start - b.start)) {
@@ -895,10 +914,10 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
 /**
  * v2 keys, used when config.json leaves them out, so a v1 config keeps working unchanged. Injection is off by default and turns
  * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them. The loop guard is
- * off unless loop_guard.enabled is true.
+ * off unless loop_guard.enabled is true. Repo-fact injection at SessionStart is off unless facts.inject is true.
  */
 export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
-	loop_guard: { enabled: false } });
+	loop_guard: { enabled: false }, facts: { inject: false, profile: null, timeout_ms: 1500 } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -911,7 +930,10 @@ export function withDefaults(raw) {
 		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
 		inject: { enabled: i.enabled === true && profile !== null, profile,
 			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) },
-		loop_guard: { enabled: c.loop_guard?.enabled === true } };
+		loop_guard: { enabled: c.loop_guard?.enabled === true },
+		// Repo facts: injection off by default; profile is an optional explicit route (never `me`), else the server routes by the remote.
+		facts: { inject: c.facts?.inject === true, profile: typeof c.facts?.profile === "string" && PROFILE_RE.test(c.facts.profile) && c.facts.profile !== "me" ? c.facts.profile : null,
+			timeout_ms: posInt(c.facts?.timeout_ms, d.facts.timeout_ms, 10_000) } };
 }
 
 export function loadConfig() {
@@ -1004,6 +1026,8 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
+		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
+		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
@@ -1481,9 +1505,11 @@ const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 const LO_LOCAL = ["launchd.mjs", "status.mjs", "doctor.mjs", "backfill.mjs"];
 // The eval command and its scorer.
 const EVAL_LOCAL = ["eval.mjs", "eval-score.mjs"];
+// Repo facts: digest primitives, detectors, the per-session client (imported by run) and SessionStart injection.
+const FACTS_LOCAL = ["facts.mjs", "facts-detect.mjs", "facts-client.mjs", "facts-inject.mjs"];
 // Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit and loop-guard.mjs for the tool-result hooks. They
 // import only ./agent-memory.mjs and each other.
-export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", "loop-guard.mjs", ...EVAL_LOCAL];
+export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", "loop-guard.mjs", ...FACTS_LOCAL, ...EVAL_LOCAL];
 
 export function install({ server = "https://memory.wrick17.com", platform = process.platform } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1519,9 +1545,12 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout. The tool-result hooks run
 	// after every tool call and exit by themselves well inside LOOP_TIMEOUT_S.
 	const promptTimeout = Math.ceil(config.inject.timeout_ms / 1000) + 1;
-	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : LOOP_EVENTS.has(e) ? { timeout: LOOP_TIMEOUT_S } : {});
+	// With repo-fact injection on, SessionStart waits for its output, bounded by the facts timeout.
+	const startTimeout = config.facts.inject ? Math.ceil(config.facts.timeout_ms / 1000) + 1 : null;
+	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : LOOP_EVENTS.has(e) ? { timeout: LOOP_TIMEOUT_S }
+		: e === "SessionStart" && startTimeout ? { timeout: startTimeout } : {});
 	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}`
-		: LOOP_EVENTS.has(e) ? `\ntimeout = ${LOOP_TIMEOUT_S}` : "");
+		: LOOP_EVENTS.has(e) ? `\ntimeout = ${LOOP_TIMEOUT_S}` : e === "SessionStart" && startTimeout ? `\ntimeout = ${startTimeout}` : "");
 	const claudeEvents = hookEvents(config, "claude-code"), codexEvents = hookEvents(config, "codex");
 	return { bin, config: cfg, launchd, hooks: events,
 		claude: { hooks: Object.fromEntries(claudeEvents.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
@@ -1545,6 +1574,21 @@ function promptHook(client, input) {
 	if (!config.inject.enabled) process.exit(0);
 	setTimeout(() => process.exit(0), config.inject.timeout_ms + 250);
 	import("./inject.mjs").then((m) => m.inject(client, input, { config })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
+
+/**
+ * SessionStart: the existing sweep request first (hook(), no network), then, only with facts.inject, the repo facts for this checkout
+ * (facts-inject.mjs), bounded by facts.timeout_ms. Any failure, a missing read token or the deadline prints nothing and exits 0.
+ */
+function startHook(client, input) {
+	try { hook(client, input); } catch { /* never block the client */ }
+	const config = loadConfig();
+	if (!config.facts.inject) process.exit(0);
+	setTimeout(() => process.exit(0), config.facts.timeout_ms + 250);
+	import("./facts-inject.mjs").then((m) => m.injectFacts(client, input, { config })).then((out) => {
 		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
 		else process.exit(0);
 	}, () => process.exit(0));
@@ -1575,6 +1619,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 			try { event = JSON.parse(input)?.hook_event_name ?? null; } catch { /* hook() ignores bad input */ }
 			if (event === "UserPromptSubmit" && CLIENTS.has(arg)) { try { promptHook(arg, input); } catch { process.exit(0); } return; }
 			if (LOOP_EVENTS.has(event) && CLIENTS.has(arg)) { try { loopHook(arg, input); } catch { process.exit(0); } return; }
+			if (event === "SessionStart" && CLIENTS.has(arg)) { try { startHook(arg, input); } catch { process.exit(0); } return; }
 			try { hook(arg, input); } catch { /* never block the client */ }
 			process.exit(0);
 		});

@@ -33,15 +33,16 @@ function jobTokenCheck(config) {
 }
 
 function readTokenCheck(config) {
-	// loadConfig turns injection on only when inject.enabled is true and inject.profile is set.
-	if (!config.inject?.enabled) return pass("read_token", "injection is off; no read token needed");
+	// loadConfig turns prompt injection on only when inject.enabled is true and inject.profile is set; repo facts with facts.inject.
+	const uses = [config.inject?.enabled ? `injection reads profile ${config.inject.profile}` : null, config.facts?.inject ? "repo facts are read at session start" : null].filter(Boolean);
+	if (!uses.length) return pass("read_token", "injection is off; no read token needed");
 	const file = expandHome(config.read_token_file), job = expandHome(config.token_file);
-	if (readToken(config)) return pass("read_token", `${file} is private; injection reads profile ${config.inject.profile}`);
+	if (readToken(config)) return pass("read_token", `${file} is private; ${uses.join("; ")}`);
 	if (file && job && path.resolve(file) === path.resolve(job)) {
 		return failed("read_token", `${file} is the job token file`, "Set read_token_file in config.json to a separate file that holds a read-scoped device token.");
 	}
 	const p = file ? tokenFileProblem(file) ?? "unusable" : "not configured";
-	return failed("read_token", `${file ?? "read_token_file"}: ${p}`, `Write a read-scoped device token to ${file}, then run: chmod 600 ${file}. Or set inject.enabled to false.`);
+	return failed("read_token", `${file ?? "read_token_file"}: ${p}`, `Write a read-scoped device token to ${file}, then run: chmod 600 ${file}. Or set inject.enabled and facts.inject to false.`);
 }
 
 /** The events whose hook command runs this home's CLI, per client settings file. Reads the settings; never changes them. */
