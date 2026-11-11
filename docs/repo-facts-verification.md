@@ -2,7 +2,7 @@
 
 This page records the gates and evidence for repo facts (epic #105, issues #90 to #103) and the loop guard (#102, #103). It lists what the source does, which checks passed, and which gates are still open. Fill in an open line only from a result that actually exists.
 
-**Status, 2026-11-11:** source and local verification passed at commit `ebd91f0`, pushed for review in PR #110, where CI passed. The feature is not merged, not released, not deployed and not installed. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call, which is pending. Normal synthesis stays off; turning it on is a separate owner step. P3 (#101) is not complete: its setup pilot was invalid and the paired run is pending, so there is no benefit claim.
+**Status, 2026-11-11:** source and local verification passed at commit `ebd91f0`, pushed for review in PR #110, where CI passed. The feature is not merged, not released, not deployed and not installed. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call; that call passed, and #100 is closed. Normal synthesis stays off; turning it on is a separate owner step. P3 (#101) is not complete: its setup pilot was invalid and the paired run is pending, so there is no benefit claim.
 
 | Check | Result |
 |---|---|
@@ -12,6 +12,7 @@ This page records the gates and evidence for repo facts (epic #105, issues #90 t
 | Type check and lint (`npm run lint`) | Passed |
 | Isolated Linux install | Passed: all six fact and loop guard modules match source by SHA-256, with every default off |
 | PR #110 CI at `ebd91f0` | All checks passed |
+| Isolated real synthesis call | Passed: one provider call, valid empty result ([details](#isolated-synthesis-call-2026-11-11)) |
 | Privacy and data-loss review | 5 of 5 findings closed |
 
 ## Switches
@@ -47,7 +48,7 @@ The verified source is commit `ebd91f001f7b1d52c08004c07b5af003a49a2799`, tree `
 
 | Gate | Rule | State on 2026-11-11 |
 |---|---|---|
-| Synthesis enable (#100) | `facts.synthesis` stays `false` until the owner signs off a written privacy and data-loss review. Turning it on is a separate owner step after the sign-off. | Review clear: all 5 findings closed ([review](#privacy-and-data-loss-review-2026-11-11)). **Signed off by the owner on 2026-11-11** ("Approve review and isolated call"), for source `ebd91f0` and exactly one isolated real call. That call is pending. Normal synthesis is not enabled. |
+| Synthesis enable (#100) | `facts.synthesis` stays `false` until the owner signs off a written privacy and data-loss review. Turning it on is a separate owner step after the sign-off. | Review clear: all 5 findings closed ([review](#privacy-and-data-loss-review-2026-11-11)). **Signed off by the owner on 2026-11-11** ("Approve review and isolated call"), for source `ebd91f0` and exactly one isolated real call. That call passed ([details](#isolated-synthesis-call-2026-11-11)), and #100 is closed. Normal synthesis is not enabled. |
 | P3 benefit (#101) | Six paired tasks, memory alone against memory plus facts: completion, repeated failures and cache-aware cost. | Twelve trials are planned: six controlled replays, each run with memory alone and with memory plus facts. Only 2 replays have a relevant eligible fact; the other 4 are controls. Setup pilot invalid; the paired run is pending. The first attempt (trial 1, memory-alone arm) had a wrong sandbox setup: an empty `TMPDIR`, a login shell and denied patches. Its task did not complete. It used 48,626 input tokens (28,544 cached) and 752 output tokens, counted separately from any result. The other 11 trials have not run, and the memory-plus-facts context is not yet verified. The isolated test Worker holds the two seeded facts: bettergit `import Quartz` (exercised 9, fired 8) and `import PIL` (exercised 8, fired 6), with a 232-character injected context (SHA-256 prefix `78715f28`); the other three replay repos have none. No benefit or missed-loop conclusion exists. |
 | Codex-backed loop check (#103) | Design only. It is built only if P3 shows that the rules miss real loops. | Design only; no code. |
 | Injection on | `facts.inject` is an owner choice, like prompt recall. | Off. Not turned on anywhere. |
@@ -79,6 +80,8 @@ The `whole_local_history` counts in each file come from every local session, bui
 - [x] The self-host guide package check (the staged guide must be self-contained) passed in the full local run and in a scoped run.
 - [x] Isolated Linux install in a scratch home against the placeholder server `example.invalid`: all six fact and loop guard modules match source by SHA-256, and every default is off.
 - [x] Committed and pushed as `ebd91f0` in PR #110; all CI checks passed.
+- [x] One isolated real synthesis call, approved by the owner on 2026-11-11: passed ([details](#isolated-synthesis-call-2026-11-11)).
+- CI at `d1882bd`: all 674 Worker tests passed, but the run reported one `EnvironmentTeardownError` from a graph test file; its root cause is not established. CI now runs the Worker tests with `--no-file-parallelism --maxWorkers=1`, with no assertion, timeout or error-handling change. That run is pending.
 - Expected log lines, not failures: 4 fake-vector log lines and the meter's negative-value validation message are intentional.
 - The first full run at `f917866` had resource failures: two 30 s timeouts, a 3,830 ms result against a 3,800 ms deadline, and a Cloudflare test pool startup timeout. They did not recur in the controlled run. Their root cause is not established.
 
@@ -91,10 +94,40 @@ The `whole_local_history` counts in each file come from every local session, bui
 
 ### Not run
 
-- [ ] One isolated real provider call for synthesis, approved by the owner on 2026-11-11: pending.
 - [ ] A live Claude Code or Codex client with injection or the loop guard turned on.
 - [ ] Merge, packaging release and deployment.
 - [ ] P3 paired tasks (#101): setup pilot invalid; paired run pending.
+
+## Isolated synthesis call, 2026-11-11
+
+The owner approved exactly one isolated real synthesis call on 2026-11-11. It ran once and passed.
+
+- One queued job made exactly one provider call through the product path: `synthesize()` and the confined Codex runner, on `gpt-6-luna` at low effort.
+- The daily slot was charged before the call.
+- The input was one recorded, redacted command digest, scanned before the call.
+- The model returned a valid, empty fact list: 0 proposed and 0 accepted, so nothing needed an upload. An empty list is a valid result for this pipeline.
+- Usage: 13,541 input tokens, 0 cached and 14 output. `cost_usd` is null because no rates are set.
+- The event stream held only the agent message, with no tool events.
+- The confinement controls passed outside the sandbox, and the canary, home and network probes were denied inside it.
+- After the call, normal synthesis and injection stayed off and the Codex login link was removed.
+
+What this call does not show:
+
+- It does not revalidate every fixture.
+- It did not exercise acceptance of a real proposal. The fake-provider tests in `local/facts-synth.test.mjs` cover acceptance.
+
+<details><summary>Proof</summary>
+
+| Item | Value |
+|---|---|
+| Source | `ebd91f001f7b1d52c08004c07b5af003a49a2799`; runtime JavaScript and fixture matched it |
+| Confined runner config SHA-256 | `548736e6f247ee9296a9088afd887ba77e5adde56e7c7614b570b007b0e7af27` |
+| Model and effort | `gpt-6-luna`, `low` |
+| Provider calls | 1 |
+| Tokens | input 13,541; cached 0; output 14 |
+| `cost_usd` | null |
+
+</details>
 
 ## Privacy and data-loss review, 2026-11-11
 
@@ -113,7 +146,7 @@ Not findings:
 - Deterministic reports that follow the approved capture setting without a new switch.
 - Exact-id graph access and the profile boundary, judged non-blocking.
 
-Confirmed by the review: Codex CLI 0.167.1 reports `input_tokens`, `cached_input_tokens` and `output_tokens`, the fields the cost log reads. The review checked the compiled binary and the [non-interactive mode docs](https://learn.chatgpt.com/docs/non-interactive-mode). No synthesis provider call has run yet; the one approved isolated call is pending, and normal synthesis stays off.
+Confirmed by the review: Codex CLI 0.167.1 reports `input_tokens`, `cached_input_tokens` and `output_tokens`, the fields the cost log reads. The review checked the compiled binary and the [non-interactive mode docs](https://learn.chatgpt.com/docs/non-interactive-mode). The one approved isolated call has run and passed, and normal synthesis stays off.
 
 ## Known limits
 
