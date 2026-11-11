@@ -7,93 +7,143 @@
 		"sessions_in_fixture": 11,
 		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
 		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
-		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint"
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint",
+		"expectations": "strict P1 rules: local/facts-detect.mjs detect and facts-client.mjs reportBody over digests.jsonl in order, with the server lifecycle of the facts wire contract as corrected on 2026-11-11 (chain keeps only attested-disjoint prior sessions, then appends; 3 activates; 2 consecutive contradictions retire a candidate or active fact)",
+		"superseded": "the P0 expectations (2026-11-11) came from a broader replay with no 5-command repair window and a lenient success check; they are replaced, not cherry-picked",
+		"owner_examples": "the owner-approved facts are examples, not an allowlist: every fact these sessions qualify is listed",
+		"whole_local_history": "counts from scratch digests of every local session, built before the final scrub fix; for context only, not reproducible from this fixture"
 	},
 	"rules": {
-		"activation": "3 confirming sessions whose edited-file sets are disjoint from the union of earlier counted sets; an empty set is disjoint",
-		"retirement": "an active, unpinned fact retires after 2 consecutive contradicting sessions",
-		"exercised": "from the proposing session on, a session that ran the fact's program, ran its trigger, confirmed it or ran its fix",
-		"fired": "an exercised session that confirmed the fact or ran its fix with a recorded success",
-		"injectable": "active, at least 4 exercised sessions and a firing rate of at least 0.40"
+		"repair": "a failed command, then within 5 commands the same program and head with an added environment change and a proven success (single command or && chain, recorded exit 0, not cut)",
+		"reuse": "a known command_repair fact is confirmed again when its fix runs with a proven success",
+		"contradiction": "a proven success of exactly what the fact says fails; it wins over a confirmation in the same session",
+		"activation": "3 sessions in the device chain, each attested disjoint from the earlier ones; an empty edited-file set is disjoint; no local history means no attestation",
+		"exercised": "a session whose triggers include the fact's trigger, or that fired it",
+		"fired": "a session that confirmed it",
+		"injectable": "active, at least 4 exercised and fired * 5 >= exercised * 2"
 	},
 	"facts": [
 		{
 			"id": "gh-env-token",
+			"owner_example": true,
+			"fact_key": "93c55b551429d9d2",
 			"detector": "command_repair",
-			"statement": "Run `gh` as `env -u GITHUB_TOKEN -u GH_TOKEN gh ...`; with GITHUB_TOKEN set, `gh auth switch` fails.",
-			"literals": [
-				"env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch",
-				"The value of the GITHUB_TOKEN environment variable is being used for authentication."
-			],
-			"program": "gh",
+			"literal": "env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch",
+			"statement": "Run `env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch …` here; plain `gh auth switch` fails in sessions here.",
+			"trigger": "prog:gh",
+			"proposed_in": "codex:e7c8e3947ee2",
 			"expected": {
-				"state": "active",
-				"injectable": true,
-				"exercised": 8,
-				"fired": 5,
-				"rate": 0.625,
-				"confirming_counted": 3
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 5,
+				"fired": 1,
+				"rate": 0.2,
+				"injectable": false,
+				"contradictions": 0
 			},
 			"whole_local_history": {
 				"state": "active",
-				"injectable": true,
-				"exercised": 20,
-				"fired": 16
+				"chain": 5,
+				"exercised": 18,
+				"fired": 5,
+				"rate": 0.278,
+				"injectable": false,
+				"contradictions": 0
+			}
+		},
+		{
+			"id": null,
+			"owner_example": false,
+			"fact_key": "c07e2890be340fef",
+			"detector": "unavailable_tool",
+			"literal": "import PIL",
+			"statement": "In the recorded Python environments `import PIL` fails (No module named 'PIL').",
+			"trigger": "pymod:pil",
+			"proposed_in": "claude-code:19da548deed9",
+			"expected": {
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 1,
+				"fired": 1,
+				"rate": 1,
+				"injectable": false,
+				"contradictions": 0
 			},
-			"timeline": [
+			"whole_local_history": {
+				"state": "candidate",
+				"chain": 2,
+				"exercised": 2,
+				"fired": 2,
+				"rate": 1,
+				"injectable": false,
+				"contradictions": 0
+			}
+		},
+		{
+			"id": "vitest-missing",
+			"owner_example": true,
+			"fact_key": "5af605bee5673bdf",
+			"detector": "unavailable_tool",
+			"literal": "npm test needs vitest",
+			"statement": "`npm test` fails in sessions here with `vitest: command not found`.",
+			"trigger": "head:npm test",
+			"proposed_in": "codex:799b08423172",
+			"expected": {
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 1,
+				"fired": 1,
+				"rate": 1,
+				"injectable": false,
+				"contradictions": 0
+			},
+			"whole_local_history": {
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 1,
+				"fired": 1,
+				"rate": 1,
+				"injectable": false,
+				"contradictions": 0
+			}
+		}
+	],
+	"timeline": [
+		{
+			"session": "codex:e7c8e3947ee2",
+			"observations": [
 				{
-					"session": "codex:e7c8e3947ee2",
-					"observation": "confirm",
+					"fact_key": "93c55b551429d9d2",
+					"kind": "confirm",
 					"files": 0,
-					"disjoint": true,
+					"disjoint_from": 0,
+					"chain": 1,
 					"state_after": "candidate"
-				},
-				{
-					"session": "codex:c78ca5880336",
-					"observation": "confirm",
-					"files": 0,
-					"disjoint": true,
-					"state_after": "candidate"
-				},
-				{
-					"session": "codex:ec6518889fbf",
-					"observation": "confirm",
-					"files": 0,
-					"disjoint": true,
-					"activated": true,
-					"state_after": "active"
 				}
 			]
 		},
 		{
-			"id": "vitest-missing",
-			"detector": "unavailable_tool",
-			"statement": "In a fresh checkout run `npm ci` first; `npm test` fails with `vitest: command not found`.",
-			"literals": [
-				"npm ci",
-				"sh: vitest: command not found"
-			],
-			"program": "npm",
-			"expected": {
-				"state": "candidate",
-				"injectable": false,
-				"exercised": 1,
-				"fired": 1,
-				"rate": 1,
-				"confirming_counted": 1
-			},
-			"whole_local_history": {
-				"state": "candidate",
-				"injectable": false,
-				"exercised": 1,
-				"fired": 1
-			},
-			"timeline": [
+			"session": "claude-code:19da548deed9",
+			"observations": [
 				{
-					"session": "codex:799b08423172",
-					"observation": "confirm",
+					"fact_key": "c07e2890be340fef",
+					"kind": "confirm",
 					"files": 0,
-					"disjoint": true,
+					"disjoint_from": 0,
+					"chain": 1,
+					"state_after": "candidate"
+				}
+			]
+		},
+		{
+			"session": "codex:799b08423172",
+			"observations": [
+				{
+					"fact_key": "5af605bee5673bdf",
+					"kind": "confirm",
+					"files": 0,
+					"disjoint_from": 0,
+					"chain": 1,
 					"state_after": "candidate"
 				}
 			]
@@ -106,11 +156,13 @@
 				"codex:11ac58f7579c",
 				"codex:799b08423172"
 			],
-			"why": "`fatal: not a git repository` came from probes outside the checkout; the empty-repo detector fires only on `does not have any commits yet` or `ambiguous argument 'HEAD'`"
+			"why": "`fatal: not a git repository` came from probes outside the checkout; the empty-repo detector fires only on `does not have any commits yet` or `ambiguous argument 'HEAD'`",
+			"produced": []
 		}
 	],
 	"quiet_sessions": [
 		"claude-code:a4cc33eb6826",
 		"codex:d7889a488cd9"
-	]
+	],
+	"quiet_observations": 0
 }

@@ -7,16 +7,23 @@
 		"sessions_in_fixture": 7,
 		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
 		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
-		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint"
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint",
+		"expectations": "strict P1 rules: local/facts-detect.mjs detect and facts-client.mjs reportBody over digests.jsonl in order, with the server lifecycle of the facts wire contract as corrected on 2026-11-11 (chain keeps only attested-disjoint prior sessions, then appends; 3 activates; 2 consecutive contradictions retire a candidate or active fact)",
+		"superseded": "the P0 expectations (2026-11-11) came from a broader replay with no 5-command repair window and a lenient success check; they are replaced, not cherry-picked",
+		"owner_examples": "the owner-approved facts are examples, not an allowlist: every fact these sessions qualify is listed",
+		"whole_local_history": "counts from scratch digests of every local session, built before the final scrub fix; for context only, not reproducible from this fixture"
 	},
 	"rules": {
-		"activation": "3 confirming sessions whose edited-file sets are disjoint from the union of earlier counted sets; an empty set is disjoint",
-		"retirement": "an active, unpinned fact retires after 2 consecutive contradicting sessions",
-		"exercised": "from the proposing session on, a session that ran the fact's program, ran its trigger, confirmed it or ran its fix",
-		"fired": "an exercised session that confirmed the fact or ran its fix with a recorded success",
-		"injectable": "active, at least 4 exercised sessions and a firing rate of at least 0.40"
+		"repair": "a failed command, then within 5 commands the same program and head with an added environment change and a proven success (single command or && chain, recorded exit 0, not cut)",
+		"reuse": "a known command_repair fact is confirmed again when its fix runs with a proven success",
+		"contradiction": "a proven success of exactly what the fact says fails; it wins over a confirmation in the same session",
+		"activation": "3 sessions in the device chain, each attested disjoint from the earlier ones; an empty edited-file set is disjoint; no local history means no attestation",
+		"exercised": "a session whose triggers include the fact's trigger, or that fired it",
+		"fired": "a session that confirmed it",
+		"injectable": "active, at least 4 exercised and fired * 5 >= exercised * 2"
 	},
 	"facts": [],
+	"timeline": [],
 	"must_not_produce": [
 		{
 			"signal": "any",
@@ -29,10 +36,12 @@
 				"codex:587d8a0946ba",
 				"claude-code:c5792ce69049"
 			],
-			"why": "no failed command repeats in this repo; expect zero candidates"
+			"why": "no failed command repeats in this repo; expect zero candidates",
+			"produced": []
 		}
 	],
 	"quiet_sessions": [
 		"codex:2b1ab94638e2"
-	]
+	],
+	"quiet_observations": 0
 }
