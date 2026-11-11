@@ -114,7 +114,7 @@ type Change = { node: NodeRow | null; f: FactState; statement: string; retire: b
  * One fact report (#92). Per fact and session at most one confirmation, contradiction, exercise and firing. A same-session conflict
  * counts only as a contradiction. A first deterministic confirm creates a candidate and starts its device's chain; a P2 proposal
  * creates a candidate and never confirms. A candidate becomes active when one device's chain holds 3 pairwise-disjoint confirming
- * sessions; an active, unpinned fact retires after 2 consecutive contradictions. Forgotten, retired and fenced facts are refused.
+ * sessions; a live (candidate or active), unpinned fact retires after 2 consecutive contradictions. Forgotten, retired and fenced facts are refused.
  */
 export function applyFacts(tx: Tx, who: Who, a: FactArgs): WriteOutput {
 	if (who.profile === "me") throw Fail.of("forbidden", "repo facts never go to me");
@@ -146,18 +146,18 @@ export function applyFacts(tx: Tx, who: Who, a: FactArgs): WriteOutput {
 		const contradict = obs.find((o) => o.kind === "contradict"), confirm = obs.find((o) => o.kind === "confirm");
 		if (contradict) {
 			c.f.contradictions++;
-			if (c.f.state === "active" && c.f.contradictions >= FACT_RULES.retire && !c.node?.pinned) { c.f.state = "retired"; c.retire = true; }
+			// Candidates too, so a fact that keeps failing never holds one of the repo's 32 live slots.
+			if (c.f.contradictions >= FACT_RULES.retire && !c.node?.pinned) { c.f.state = "retired"; c.retire = true; }
 		} else if (confirm && session) {
 			c.f.contradictions = 0;
-			if (confirm.disjoint_from) {
-				// Only sessions the server holds in this device's chain and the ledger attested disjoint stay, so the chain self-heals.
-				const prior = (c.f.chains[device] ?? []).filter((s) => confirm.disjoint_from!.includes(s));
-				delete c.f.chains[device];
-				c.f.chains[device] = [...prior, session].slice(-FACT_LIMITS.chain);
-				const devices = Object.keys(c.f.chains);
-				for (const d of devices.slice(0, Math.max(0, devices.length - FACT_LIMITS.devices))) delete c.f.chains[d];
-				if (c.f.state === "candidate" && c.f.chains[device]!.length >= FACT_RULES.activate) c.f.state = "active";
-			}
+			// Every confirm starts or extends this device's chain. Earlier sessions stay only where the server holds them and the
+			// ledger attested this session disjoint from them; an absent (unknown or overlapping) or empty list keeps none.
+			const prior = (c.f.chains[device] ?? []).filter((s) => confirm.disjoint_from?.includes(s));
+			delete c.f.chains[device];
+			c.f.chains[device] = [...prior, session].slice(-FACT_LIMITS.chain);
+			const devices = Object.keys(c.f.chains);
+			for (const d of devices.slice(0, Math.max(0, devices.length - FACT_LIMITS.devices))) delete c.f.chains[d];
+			if (c.f.state === "candidate" && c.f.chains[device]!.length >= FACT_RULES.activate) c.f.state = "active";
 		}
 	}
 	if (session) {
