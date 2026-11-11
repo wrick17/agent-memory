@@ -1260,11 +1260,11 @@ The loop guard keeps `<home>/loop-guard/<scope hash>.json` and a `.lock` beside 
 
 ## Repo facts v2 and forever context modules, 2026-11-11
 
-Source: branch `fix/repo-facts-review` (epics #123 and #131), implemented and not yet tested, reviewed or deployed (#122). The binding facts contract is [repo facts v2 contract](repo-facts-v2-contract.md). Behaviour is in [architecture, repo facts](architecture.md#repo-facts), [loop guard](architecture.md#loop-guard), [session-start brief](architecture.md#session-start-brief-125), [lessons and decisions](architecture.md#lessons-and-decisions-from-digests-126) and [goal metrics](architecture.md#goal-metrics-130). The [earlier section](#repo-facts-and-loop-guard-modules-2026-11-11) records the merged v1 modules; where it differs, this section describes the branch.
+Source: epics #123 and #131, merged in PR #132 (`b909583`), deployed 11 Nov 2026 as Worker version `62bb7947-6a9b-417c-9548-534eb29cf0fb`, client installed through dotfiles `77008fc` ([delivery](repo-facts-verification.md#delivery-11-nov-2026)). The binding facts contract is [repo facts v2 contract](repo-facts-v2-contract.md). Behaviour is in [architecture, repo facts](architecture.md#repo-facts), [loop guard](architecture.md#loop-guard), [session-start brief](architecture.md#session-start-brief-125), [lessons and decisions](architecture.md#lessons-and-decisions-from-digests-126) and [goal metrics](architecture.md#goal-metrics-130). The [earlier section](#repo-facts-and-loop-guard-modules-2026-11-11) records the merged v1 modules; where it differs, this section describes the deployed code.
 
 ### Modules
 
-| File | Issues | Change on the branch |
+| File | Issues | Change in PR #132 |
 |---|---|---|
 | `local/facts.mjs` | #113 | Per-command attribution, partitions (`partitionId`), the route and directory caches, usage and edited-file hashes for v2 reports, and the saved injected items per session and partition |
 | `local/facts-detect.mjs` | #116 | Seven detectors with `form_repair` and `arg_repair`, same-operation proof, full dotted module names, contract family labels and learned-signature matching |
@@ -1284,6 +1284,7 @@ Source: branch `fix/repo-facts-review` (epics #123 and #131), implemented and no
 | `src/mcp.ts` | #118, #129 | MCP `repo_facts`; recall relevance |
 | `src/profile/lessons.ts`, `src/profile/maintenance.ts`, `src/maintenance-tools.ts` | #126 | `record_lesson` and `record_decision` ops |
 | `src/profile/metrics.ts`, `src/dashboard/goals.ts` | #130 | Goal metrics and the Goals tab |
+| `src/profile/guidance.ts`, `src/dashboard/lessons.ts` | #127 | Guidance receipts: `guidance_injections` rows, settling after the batch, correction matches, per-lesson followed rate, and dropping a failing inferred lesson from briefs (`GUIDANCE_RULES`: 3 failures and more than half of processed sessions) |
 | `src/dashboard/facts.ts` | #118 | The Facts tab |
 | `src/domain/redact.ts` | #113 | Wider secret rules, shared with the client |
 

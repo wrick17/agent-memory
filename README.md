@@ -15,16 +15,15 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 - **Backups and recovery.** Nightly encrypted exports go to your own R2 bucket, and the two newest are kept. Profiles and account state can be restored.
 - **Careful cleanup.** Housekeeping is rule-based, with no model on the server. Stated rules, pinned records and `me` are never changed by the background batch, and changes can be undone.
 
-### Source-verified, not released
+### Session guidance
 
-These are merged and pass source and local tests, but they are not released or turned on in any owner client; see the [repo facts verification](docs/repo-facts-verification.md). Session-start facts, fact synthesis and the loop guard are off by default. This limited replay did not demonstrate efficiency savings from repo facts.
+Deployed on 11 Nov 2026. Each switch below is off by default in a new client. The details and evidence are in the [feature manifest](docs/feature-manifest.md#repo-facts-v2-and-forever-context-123-131-2026-11-11).
 
-- **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a variable unset. After 3 separate sessions confirm a fact, and it keeps proving useful, session start can add up to 4 of them. Turn it on with `facts.inject`.
-- **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`.
-
-### In progress, not tested
-
-A fix round for repo facts and the loop guard, and the first forever-context features, are on branch `fix/repo-facts-review`. They include a session-start brief with the repo's facts, rules, decisions and open journal, lessons and decisions learned from sessions, and a Goals tab. See the [feature manifest](docs/feature-manifest.md#repo-facts-v2-and-forever-context-123-131-2026-11-11).
+- **Session-start brief.** At session start, a repo gets its active repo facts, its open journal, the project's rules and recent decisions, and your `me` preferences and rules, in at most 400 tokens. Turn it on with `facts.inject`.
+- **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction. Facts start empty and build from new sessions. A replay of past sessions found they would have prevented about 1% of failed commands.
+- **Lessons and decisions.** The nightly batch turns corrections and decisions in session digests into lessons and decision records, and tracks whether briefed lessons were followed.
+- **Goals tab.** The dashboard shows repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
+- **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`. In Codex, hooks run only after you trust them once.
 
 ## How it works
 
@@ -112,7 +111,7 @@ For a machine without a browser, see [headless machines](docs/self-host.md#headl
 - Automatic capture uploads only short, redacted digests of each session, never the full transcript. A digest can contain short excerpts. What an agent saves or imports on purpose is stored as written.
 - Full sessions stay on the machine that recorded them. `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
 - The server never calls GitHub or Jira, and holds no credentials for them.
-- In a GitHub checkout, the capture client also sends a small repo-fact report per finished session: hashes, fact keys and fixed sentences, never command output or paths. Optional fact synthesis (`facts.synthesis`, off) sends redacted command digests to the Codex CLI on your own Codex subscription.
+- In a GitHub checkout, the capture client also sends a small repo-fact report per finished session: hashes, fact keys, short detector literals, outcomes and token counts, never command output or paths. Optional fact synthesis (`facts.synthesis`, off) sends redacted command digests to the Codex CLI on your own Codex subscription.
 
 ## Learn more
 
