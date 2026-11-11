@@ -30,7 +30,7 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 	if (!cur.mark && writeSeq > cur.seq) cur.mark = { seq: writeSeq, at: now };
 	const retry = Object.entries(cur.pending).filter(([, p]) => p.at <= now).sort((x, y) => x[1].at - y[1].at).slice(0, STEP / 2).map(([id]) => id);
 	const settled = cur.mark !== null && now >= cur.mark.at + SETTLE_MS, room = STEP - retry.length;
-	const fresh = settled ? sql.exec<{ id: string; seq: number }>(`SELECT id, seq FROM nodes WHERE (seq, id) > (?, ?) AND seq <= ? AND status = 'active' AND embed_hash = card_hash
+	const fresh = settled ? sql.exec<{ id: string; seq: number }>(`SELECT id, seq FROM nodes WHERE (seq, id) > (?, ?) AND seq <= ? AND status = 'active' AND embed_hash = card_hash AND scope <> 'repo-fact'
 		ORDER BY seq, id LIMIT ?`, cur.seq, cur.id, cur.mark!.seq, room).toArray() : [];
 	// A pending card that changed, retired or lost its embedding since is dropped; a change brings it back through the cursor.
 	const live = new Set(retry.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND embed_hash = card_hash",

@@ -25,6 +25,7 @@ type GetQuery = { target: { memory_id?: string; name?: string; scope?: string; t
 export function get(sql: SqlStorage, who: Who, q: GetQuery) {
 	if (q.asOf) return getAt(sql, who, q, q.asOf);
 	const n = findNode(sql, q.target, !q.includeRetired);
+	if (n.scope === "repo-fact") throw Fail.of("not_found", "no memory found; repo facts are read through their own routes");
 	const full = readContent(sql, n.id);
 	const page = contentPage(n, full, q.content);
 	// Current links whose source is readable here, as graph reads show them, each with its reason and evidence pointers.
@@ -183,7 +184,7 @@ function getAt(sql: SqlStorage, who: Who, q: GetQuery, at: string) {
 	let scope: string | undefined;
 	try { scope = t.scope !== undefined ? normalizeScope(t.scope) : undefined; } catch (e) { throw Fail.of("validation", (e as Error).message, { reason: "invalid_scope" }); }
 	const rows = sql.exec<NodeRow>(`SELECT rowid, * FROM nodes WHERE ${t.memory_id ? "id" : "norm_name"} = ? AND memory_type IS NOT NULL AND ${READABLE_NODE}`,
-		t.memory_id ?? normalizeName(t.name!)).toArray().filter((r) => (!t.type || r.memory_type === t.type) && (scope === undefined || r.scope === scope));
+		t.memory_id ?? normalizeName(t.name!)).toArray().filter((r) => r.scope !== "repo-fact" && (!t.type || r.memory_type === t.type) && (scope === undefined || r.scope === scope));
 	const what = t.memory_id ? `id '${t.memory_id}'` : `name '${t.name}'`;
 	if (!rows.length) throw Fail.of("not_found", `no memory found with ${what}`);
 	const pasts = rows.map((n) => ({ n, p: pastOf(sql, n, at, false) })).filter((x): x is { n: NodeRow; p: Past } => !!x.p && x.p.started);
@@ -285,7 +286,8 @@ type Filter = { includeCaptures?: boolean; type: MemoryType | "all"; kinds?: Mem
  * have, so any record with history passes), and `admit` decides on the stored state then.
  */
 export function filters(q: Filter): { where: string; params: SqlStorageValue[] } {
-	const parts = ["n.memory_type IS NOT NULL", q.includeHistory || q.asOf ? "n.status IN ('active','retired','superseded')" : "n.status = 'active'"];
+	// Repo facts (scope repo-fact) never reach recall, inventory or graph expansion; they have their own read routes.
+	const parts = ["n.memory_type IS NOT NULL", "n.scope <> 'repo-fact'", q.includeHistory || q.asOf ? "n.status IN ('active','retired','superseded')" : "n.status = 'active'"];
 	const params: SqlStorageValue[] = [];
 	if (q.asOf) {
 		parts.push(EXISTED, STARTED, ...(q.includeHistory ? [] : [NOT_ENDED]));

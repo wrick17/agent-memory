@@ -11,7 +11,8 @@ import { assembleSnapshot } from "./viewer/snapshot";
 import { eventStream, parseCursor, STREAM_MAX_MS } from "./viewer/events";
 import { parseClientStatus, STATUS_MAX_BYTES } from "./client-status";
 import { healthReport } from "./health";
-import { mayUse } from "./routing";
+import { mayUse, routeWrite } from "./routing";
+import { factRepoKey, REPO_KEY } from "./profile/store";
 import { parseEvalRun } from "./eval";
 import { mergeSessions, parseSessionsCursor } from "./sessions";
 import type { ActivitySummary, FeedItem, LeaseFacts, Page, ProfileSnapshotPart, ProjectProfile, SessionRow, ViewerCursor } from "./viewer/types";
@@ -32,6 +33,10 @@ async function deviceCaller(request: Request, env: Env): Promise<Response | Acco
 	const ctx = await accountStub(env, env.OWNER_USER_ID!).context(auth.principal as Principal);
 	return ctx.ok ? ctx.value : json({ error: ctx.error }, ctx.error.code === "unavailable" ? 503 : 401);
 }
+/** Repo-fact routes (#93): repo.remote is the only routing input and the source of repo_key; a body repo_key must match it. */
+export const factRepoSchema = z.object({ repo: z.object({ remote: z.string().min(1).max(512) }).strict(), repo_key: z.string().max(160).optional(),
+	profile: profileName.optional() });
+
 /** The job token: a device holding ingest and maintenance. Its device id comes from the token, never from a body. */
 const isJob = (c: AccountContext) => c.caller.kind === "device" && !!c.caller.deviceId && c.caller.scopes.includes("ingest") && c.caller.scopes.includes("maintenance");
 /** An active profile the caller named and may use; never inferred. */
@@ -68,6 +73,25 @@ export async function deviceV2(request: Request, env: Env, url: URL, waitUntil: 
 		const { channels, count_hits, ...a } = p.data;
 		return reply(await recall({ env, caller: c.caller, account: c, platform: `${c.caller.kind}:${c.caller.deviceName ?? "unknown"}`, ...(waitUntil ? { waitUntil } : {}) },
 			a, { ...(channels ? { channels } : {}), ...(count_hits !== undefined ? { count_hits } : {}) }));
+	}
+	// #94 repo-fact injection: the read scope; at most 4 eligible facts of the repo key, from the profile its remote routes to. Never me.
+	if (path === "/v1/facts" && method === "POST") {
+		const c = await deviceCaller(request, env);
+		if (c instanceof Response) return c;
+		if (!c.caller.scopes.includes("read")) return forbidden("this token cannot read");
+		const body = await boundedJson(request, 4_000);
+		if (body instanceof Response) return body;
+		const p = factRepoSchema.strict().safeParse(body.value);
+		if (!p.success) return invalid(issues(p.error));
+		const key = factRepoKey(p.data.repo.remote, p.data.repo_key);
+		if (!key.ok) return reply(key);
+		const route = routeWrite(c.caller, c.rules, c.known, { ...(p.data.profile ? { profile: p.data.profile } : {}), repo: { remote: key.value } });
+		if (!route.ok) return reply(route);
+		if (route.value.profile === "me") return forbidden("repo facts never come from me");
+		const ref = c.profiles.find((x) => x.profile === route.value.profile);
+		if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 410);
+		const r = await profileStub(env, ref).readV2(ref, { kind: "fact_inject", repo_key: key.value });
+		return r.ok ? json({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value, ...(r.value as object) }) : reply(r);
 	}
 	// #9 accepted candidates for `agent-memory eval export-candidates`: the read scope, an explicit profile the token may use.
 	if (path === "/v1/eval/candidates" && method === "GET") {
@@ -258,6 +282,14 @@ export async function ownerV2(request: Request, env: Env, url: URL, ctx: Account
 		if (!r.ok) return reply(r);
 		const pp = r.value as ProjectProfile, f = await files(ref, corpusFilesSql({ project: pp.key, now: new Date().toISOString() }));
 		return f.ok ? json({ ...pp, files: f.value }) : reply(f);
+	}
+	// #95 repo facts: every state with evidence and firing rate. Retire, pin, unpin and forget stay the existing memory actions.
+	if (p && sub === "facts" && method === "GET") {
+		if (!ref) return notActive();
+		const q = z.object({ repo_key: z.string().regex(REPO_KEY).optional(), after: z.string().min(1).max(300).optional(),
+			limit: z.coerce.number().int().min(1).max(200).optional() }).strict().safeParse(params);
+		if (!q.success) return invalid("repo_key github.com/<owner>/<repo>, after, limit 1 to 200");
+		return reply(await profileStub(env, ref).readV2(ref, { kind: "facts", ...(q.data.repo_key ? { repo_key: q.data.repo_key } : {}), after: q.data.after ?? null, limit: q.data.limit ?? 100 }));
 	}
 	if (p && sub === "recall-strength" && method === "GET") {
 		if (!ref) return notActive();

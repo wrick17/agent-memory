@@ -61,7 +61,7 @@ export function ownerModel(sql: SqlStorage, q: OwnerModelQuery): OwnerModelPage 
 			(SELECT count(*) FROM edges e WHERE e.src = n.id AND e.ended_at IS NULL) AS links, (n.origin = 'stated') AS s, (n.pinned <> 0) AS p,
 			(SELECT json_group_array(name) FROM (SELECT p.name FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = n.id AND e.ended_at IS NULL
 				AND e.dst_profile = '' AND p.kind = 'project' AND p.status = 'active' GROUP BY p.name ORDER BY p.name LIMIT ${OWNER_PROJECTS_MAX})) AS projects
-		FROM nodes n WHERE n.kind IN (SELECT value FROM json_each(?)) AND n.status = 'active' ${key ? "AND ((n.origin = 'stated'), (n.pinned <> 0), n.updated_at, n.id) < (?, ?, ?, ?)" : ""}
+		FROM nodes n WHERE n.kind IN (SELECT value FROM json_each(?)) AND n.status = 'active' AND n.scope <> 'repo-fact' ${key ? "AND ((n.origin = 'stated'), (n.pinned <> 0), n.updated_at, n.id) < (?, ?, ?, ?)" : ""}
 		ORDER BY s DESC, p DESC, n.updated_at DESC, n.id DESC LIMIT ?`, JSON.stringify(kinds), ...(key ?? []), limit + 1).toArray();
 	const page = rows.slice(0, limit);
 	// One statement for the page's evidence: the ids travel as one JSON parameter, and each owner reads at most cap + 1 rows.
