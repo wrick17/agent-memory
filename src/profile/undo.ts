@@ -14,6 +14,7 @@ import type { Consumed } from "./extract";
 import { assertWritable } from "./transfer";
 import { assertNotWiped } from "./wipe";
 import { snapshotEdges, uploadKey, uploadNodeKeys } from "./work-upload";
+import { liveFactIds } from "./facts";
 
 /** At most this many candidate nodes, and edges around them, are imaged; a write that changes anything else stores no undo. */
 const MAX_IMAGES = 200;
@@ -73,6 +74,8 @@ export function beforeImages(sql: SqlStorage, cmd: WriteCommand): Before {
 			if (node) ends.push(...snapshotEdges(sql, cmd.args.item, node.id).map((e) => e.id));
 		}
 	}
+	// A fact report changes only the repo's live facts (at most 32); the ones it creates need no image.
+	if (cmd.op === "fact") for (const id of liveFactIds(sql, cmd.args.repo_key)) ids.add(id);
 	if (cmd.op === "knowledge") {
 		for (const n of cmd.args.nodes ?? []) { name(n.name); if (n.key) keys.add(n.key); }
 		for (const e of cmd.args.end ?? []) ends.push(e.edge);

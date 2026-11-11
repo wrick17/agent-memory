@@ -18,6 +18,7 @@ import { assertWritable } from "./transfer";
 import { beforeImages, recordUndo, restore, revert } from "./undo";
 import { assertNotWiped, assertOpen } from "./wipe";
 import { upload, uploadIds, uploadKey } from "./work-upload";
+import { applyFacts, assertFactReserved, assertNotFactEdge, factIds, markForgotten } from "./facts";
 
 export interface Who { userId: string; profile: string; generation: string }
 
@@ -88,6 +89,7 @@ export const knowledgeId = (who: Who, n: Pick<NonNullable<KnowledgeArgs["nodes"]
 export function writeIds(who: Who, cmd: WriteCommand): string[] {
 	if (cmd.op === "knowledge") return (cmd.args.nodes ?? []).map((n) => knowledgeId(who, n));
 	if (cmd.op === "upload") return uploadIds(who, cmd.args);
+	if (cmd.op === "fact") return factIds(who, cmd.args);
 	const a = cmd.args as SaveArgs;
 	return [...(a.memory_id ? [a.memory_id] : []), ...(a.name && a.type ? [newMemoryId(who.userId, who.profile, a.scope !== undefined ? scopeOf(a.scope) : "default", a.type, a.name)] : [])];
 }
@@ -492,6 +494,9 @@ function assertArchiveUnchanged(sql: SqlStorage, ids: string[]): void {
  * supersedes a stated, pinned or me node (section 12); its callers flag those first, so reaching here is refused.
  */
 function gate(sql: SqlStorage, _who: Who, cmd: WriteCommand, ctx: WriteContext): void {
+	assertFactReserved(sql, cmd, (ident) => {
+		try { return findNode(sql, ident, false).id; } catch (e) { if (e instanceof Fail && ["not_found", "ambiguous", "validation"].includes(e.failure.code)) return undefined; throw e; }
+	});
 	if (cmd.op === "knowledge") for (const n of cmd.args.nodes ?? []) {
 		if (n.attrs && (Object.hasOwn(n.attrs,"import_review") || Object.hasOwn(Object(n.attrs.source),"owner_classification"))) throw Fail.of("validation","import_review and source.owner_classification are reserved for authenticated import",{reason:"reserved_import_policy"});
 		const ids = sql.exec<{id:string}>("SELECT id FROM nodes WHERE key = ? OR (key IS NULL AND kind = ? AND scope = ? AND norm_name = ?)",n.key ?? null,n.kind,n.scope ?? "default",normalizeName(n.name)).toArray().map(r=>r.id);
@@ -544,6 +549,7 @@ function owner(tx: Tx, a: OwnerArgs): WriteOutput {
 	if (!node || ["moving", "incoming", "moved"].includes(node.status)) throw Fail.of("not_found", `no node '${a.memory_id}' in this profile`);
 	if (a.action === "forget") {
 		const activityId = activity(tx, "forget", `forgot '${node.name}'`, [node.id]);
+		markForgotten(tx, node, tx.now);
 		archiveNode(tx, activityId, node.id, purgeAfter(tx.now));
 		return { result: { ok: true, action: "forgotten", memory_id: node.id, name: node.name, activity_id: activityId }, created: [], embedDue: false };
 	}
@@ -636,6 +642,7 @@ function judgmentEdge(tx: Tx, e: EdgeInput, ends: () => [string, string]): { id:
 	if (typeof e.reason !== "string" || e.reason.trim().length < 8 || e.reason.length > 600) throw Fail.of("validation", "a judgment edge needs a reason of 8 to 600 characters", { reason: "missing_reason" });
 	if (!e.evidence?.length) throw Fail.of("validation", "a judgment edge needs at least one evidence pointer", { reason: "missing_evidence" });
 	const [src, dst] = ends();
+	assertNotFactEdge(tx.sql, src, dst);
 	assertWritable(tx.sql, src);
 	assertArchiveEndpoints(tx.sql,src,dst,"");
 	if (src === dst) throw Fail.of("validation", "an edge needs two different nodes", { reason: "self_edge" });
@@ -822,7 +829,7 @@ function writeOnce(storage: DurableObjectStorage, who: Who, cmd: WriteCommand, c
 		const before = cmd.op === "undo" || refused.length ? undefined : beforeImages(sql, cmd);
 		const flags = refused.map((n) => flagProtected(tx, n.id, n.why, cmd.op, ctx.actor));
 		const out: WriteOutput = flags.length ? { result: { action: "flagged", memory_id: refused[0]!.id, activity_id: flags.at(-1) }, created: [], embedDue: false }
-			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : candidate(tx, who, cmd.args);
+			: cmd.op === "undo" ? revert(tx, cmd.args) : cmd.op === "restore" ? restore(tx, cmd.args) : cmd.op === "owner" ? owner(tx, cmd.args) : cmd.op === "save" ? save(tx, who, cmd.args) : cmd.op === "append" ? append(tx, cmd.args) : cmd.op === "capture" ? capture(tx, cmd.args) : cmd.op === "knowledge" ? knowledge(tx, who, cmd.args) : cmd.op === "upload" ? upload(tx, who, cmd.args) : cmd.op === "fact" ? applyFacts(tx, who, cmd.args) : candidate(tx, who, cmd.args);
 		out.result = { ...out.result, profile: who.profile, routed_by: ctx.routedBy };
 		if (before) recordUndo(tx, before, { ...out, consumed: tx.consumed, commitReceipt: tx.commitReceipt });
 		if (requestId) {

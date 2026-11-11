@@ -10,6 +10,7 @@ import { bundleTexts } from "./transfer";
 import { sizeLevel } from "./housekeeping";
 import { mayChange } from "./protect";
 import { assertNotWiped, assertOpen } from "./wipe";
+import { clearForgotten, markForgotten } from "./facts";
 import type { Who } from "./write";
 
 export type ArchiveCommand =
@@ -147,6 +148,7 @@ function begin(tx: BudgetTx, who: Who, c: Extract<ArchiveCommand, { action: "for
 	}
 	if (c.action === "forget") {
 		tx.run("UPDATE nodes SET status='moving',attrs=json_set(attrs,'$.archive_operation',?),seq=? WHERE id=?", id, tx.seq, o.node);
+		markForgotten(tx, n, tx.now);
 	} else {
 		guard(sql,o,n);
 		putRow(tx,"nodes",{ ...n,status:"incoming",attrs:JSON.stringify({ ...JSON.parse(String(n.attrs)),archive_operation:id }),embed_hash:null });
@@ -228,6 +230,8 @@ function restorePage(tx: BudgetTx, o: ArchiveOperation, limit: number, rollback=
 	} else if(o.phase === "publish") {
 		if(o.guardVersion!==guardVersion(tx.sql,o)){advance(o,"validate");o.guardVersion=guardVersion(tx.sql,o);return;}
 		tx.run("UPDATE nodes SET status=?,attrs=?,embed_hash=NULL,seq=? WHERE id=?",o.original!.status,o.original!.attrs,tx.seq,o.node);
+		// A published restore or a forget's completed abort: the fact is back, so its forget tombstone goes.
+		clearForgotten(tx,o.node);
 		if(rollback){o.state="aborted";o.cleanup=true;advance(o,"cleanup_metadata");tx.run("UPDATE activity SET summary='archive operation aborted',undo=NULL,seq=? WHERE id=?",tx.seq,o.activity);}
 		else {o.publishedSeq=tx.seq;finish(tx,o);}
 	}

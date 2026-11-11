@@ -153,7 +153,7 @@ export const TOOLS = [
 
 // Stubs typed with the stores' own signatures; every value crossing RPC is plain JSON-like data.
 export const profileStub = (env: Env, ref: ProfileRef) =>
-	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "archiveOperation" | "archiveOperationStatus" | "write" | "read" | "ingest" | "upload" | "captureState" | "importStep" | "maintenance" | "noteRecall" | "decideEvalCandidate" | "readV2" | "queueOwner">;
+	env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`)) as unknown as Pick<ProfileStore, "archiveOperation" | "archiveOperationStatus" | "write" | "read" | "ingest" | "upload" | "captureState" | "importStep" | "maintenance" | "noteRecall" | "decideEvalCandidate" | "readV2" | "queueOwner" | "facts">;
 export const accountStub = (env: Env, userId: string) =>
 	env.ACCOUNT.get(env.ACCOUNT.idFromName(userId)) as unknown as Pick<AccountStore, "context" | "bindRequest" | "releaseRequest" | "recordNodes" | "resolveNode" | "meter" | "admin" | "bindImport" | "reserveImport" | "finishTransferRequest">;
 
