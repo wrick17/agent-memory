@@ -1,17 +1,20 @@
-// `agent-memory doctor` (LO1): the job token file, the read token file when injection is on, the registered hooks, the launchd job,
-// the spool, local capture state and the server's whoami. One line per check, with a fix for each failure. Read only: it never
+// `agent-memory doctor` (LO1): the job token file, the read token file when injection is on, the registered hooks and Codex's trust
+// of them, the launchd job, the spool, local capture state and queue age, batch learning, repo-fact warnings and the server's whoami. One line per check, with a fix for each failure. Read only: it never
 // prints a token, never edits client settings and never loads the job. Session ids it shows stay on this machine.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { captureSummary, clientHome, expandHome, hookEvents, home, httpServer, LIMITS, loadConfig, readJson, readToken } from "./agent-memory.mjs";
 import { launchdLabel, launchdLoaded, loadCommand, plistPath } from "./launchd.mjs";
-import { spoolStats } from "./status.mjs";
+import { factsStatus, loopGuardStatus, spoolStats } from "./status.mjs";
 
-/** @typedef {{ id: string, ok: boolean, detail: string, fix: string | null }} Check */
+/** @typedef {{ id: string, ok: boolean, warn?: boolean, detail: string, fix: string | null }} Check */
 
 const DAY = 86_400_000;
 const pass = (id, detail) => ({ id, ok: true, detail, fix: null });
 const failed = (id, detail, fix) => ({ id, ok: false, detail, fix });
+/** A warning: printed with its fix, but it does not fail the doctor. */
+const warned = (id, detail, fix) => ({ id, ok: true, warn: true, detail, fix });
 
 /** A private token file: a regular file (not a link) owned by this user with no group or other access, holding one word. */
 function tokenFileProblem(file) {
@@ -45,7 +48,11 @@ function readTokenCheck(config) {
 	return failed("read_token", `${file ?? "read_token_file"}: ${p}`, `Write a read-scoped device token to ${file}, then run: chmod 600 ${file}. Or set inject.enabled and facts.inject to false.`);
 }
 
-/** The events whose hook command runs this home's CLI, per client settings file. Reads the settings; never changes them. */
+/**
+ * The events whose hook command runs this home's CLI, per client settings file. Reads the settings; never changes them. A command
+ * matches by "<bin> hook <client>" anywhere in it, so the stable `<home>/bin/node <bin> hook …` form, an older versioned Node path
+ * before bin, and a bare bin all count.
+ */
 function registered(client, bin) {
 	const dir = clientHome(client);
 	if (client === "claude-code") {
@@ -110,16 +117,190 @@ function spoolCheck(now) {
 	return pass("spool", `${detail}; the next run sends it`);
 }
 
-/** Pending, stuck and missing-source sessions, with their local ids. These ids are printed here only, never uploaded. */
+/** Queued triggers first written more than 7 days ago: a run settles or removes every trigger within 7 days. */
+function staleTriggers(now) {
+	const out = [];
+	for (const dir of ["queue", "claimed"]) {
+		const d = path.join(home(), dir);
+		for (const f of fs.existsSync(d) ? fs.readdirSync(d).filter((x) => x.endsWith(".json")) : []) {
+			const t = readJson(path.join(d, f), null);
+			if (Number.isFinite(t?.first_at) && now - t.first_at > 7 * DAY) out.push({ client: t.client, session: t.session });
+		}
+	}
+	return out;
+}
+
+/**
+ * Pending, stuck and missing-source sessions and triggers queued over 7 days, with their local ids. These ids are printed here only,
+ * never uploaded. A session settled as source_missing (Codex ephemeral, Claude not persisted, or no source after 7 days) is reported, not failed.
+ */
 function captureCheck(now) {
-	const s = captureSummary({ ids: true });
+	const s = captureSummary({ ids: true, now });
 	const ids = (rows) => [...new Set(rows.map((r) => `${r.client}:${r.session}`))].slice(0, 3).join(", ");
 	const old = s.oldest_pending_at && now - Date.parse(s.oldest_pending_at) > 7 * DAY;
-	const counts = `${s.pending_ranges} pending, ${s.stuck_ranges} stuck, ${s.missing_sources} with no transcript`;
-	if (!s.stuck_ranges && !s.missing_sources && !old) return pass("capture", counts);
-	const parts = [s.stuck_ranges && `stuck: ${ids(s.local.stuck)}`, s.missing_sources && `no transcript: ${ids(s.local.missing)}`, old && `oldest pending ${s.oldest_pending_at}`].filter(Boolean);
+	const stale = staleTriggers(now);
+	const counts = `${s.pending_ranges} pending, ${s.stuck_ranges} stuck, ${s.missing_sources} with no transcript yet, ${s.local.settled.length} settled with no source`;
+	if (!s.stuck_ranges && !s.missing_sources && !old && !stale.length) return pass("capture", counts);
+	const parts = [s.stuck_ranges && `stuck: ${ids(s.local.stuck)}`, s.missing_sources && `no transcript: ${ids(s.local.missing)}`, old && `oldest pending ${s.oldest_pending_at}`,
+		stale.length && `${stale.length} queued over 7 days: ${ids(stale)}`].filter(Boolean);
 	return failed("capture", `${counts} (${parts.join("; ")})`,
-		"Stuck ranges retry when the session grows; check the runner with agent-memory run. A session with no transcript stays preserved and cannot be recovered here.");
+		"Run agent-memory run: it settles a session with no transcript after 7 days and drains the queue. Stuck ranges retry when the session grows.");
+}
+
+// ---------- Codex hook trust ----------
+
+// Codex 0.167.1 (codex-rs/hooks): a configured hook runs only when [hooks.state."<source file>:<event>:<group>:<handler>"].trusted_hash
+// equals the hash of its normalized declaration (engine/discovery.rs hook_hash; config fingerprint.rs version_for_toml), unless the
+// invocation passes --dangerously-bypass-hook-trust. A missing hash is untrusted; a different one is modified. Neither runs.
+const CODEX_EVENT_KEYS = { PreToolUse: "pre_tool_use", PermissionRequest: "permission_request", PostToolUse: "post_tool_use", PreCompact: "pre_compact",
+	PostCompact: "post_compact", SessionStart: "session_start", SessionEnd: "session_end", UserPromptSubmit: "user_prompt_submit",
+	SubagentStart: "subagent_start", SubagentStop: "subagent_stop", Stop: "stop" };
+// Events whose group matcher is kept in the identity (hooks/src/events/common.rs matcher_pattern_for_event).
+const MATCHER_EVENTS = new Set(["PreToolUse", "PermissionRequest", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact"]);
+// Events that keep additionalContextLimit, and its default, which normalizes to unset.
+const CONTEXT_EVENTS = new Set(["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "SubagentStart"]), CONTEXT_DEFAULT = 2500;
+
+const sortKeys = (v) => (Array.isArray(v) ? v.map(sortKeys) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v);
+
+/** Codex's trust hash of one command handler, as discovery.rs computes it: sha256 of the sorted-key JSON of its normalized identity. */
+export function codexHookHash(event, matcher, h) {
+	const timeout = event === "SessionEnd" ? Math.min(Math.max(h.timeout ?? 1, 1), 3) : Math.max(h.timeout ?? 600, 1);
+	const limit = CONTEXT_EVENTS.has(event) && Number.isInteger(h.additionalContextLimit) && h.additionalContextLimit !== CONTEXT_DEFAULT ? h.additionalContextLimit : undefined;
+	const handler = { type: "command", command: h.command, timeout, async: h.async === true,
+		...(typeof h.statusMessage === "string" ? { statusMessage: h.statusMessage } : {}), ...(limit !== undefined ? { additionalContextLimit: limit } : {}) };
+	const identity = { event_name: CODEX_EVENT_KEYS[event], ...(MATCHER_EVENTS.has(event) && typeof matcher === "string" ? { matcher } : {}), hooks: [handler] };
+	return `sha256:${createHash("sha256").update(JSON.stringify(sortKeys(identity))).digest("hex")}`;
+}
+
+/** A TOML scalar: a basic or literal string, an integer or a boolean; anything else is undefined. */
+function tomlScalar(raw) {
+	const v = raw.trim();
+	const basic = /^"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/.exec(v);
+	if (basic) { try { return JSON.parse(`"${basic[1]}"`); } catch { return undefined; } }
+	const literal = /^'([^']*)'\s*(?:#.*)?$/.exec(v);
+	if (literal) return literal[1];
+	if (/^(true|false)\s*(?:#.*)?$/.test(v)) return v.startsWith("true");
+	if (/^[+-]?\d[\d_]*\s*(?:#.*)?$/.test(v)) return Number(v.replace(/[_\s]|#.*$/g, ""));
+	return undefined;
+}
+
+/**
+ * Hook groups and [hooks.state] entries of a Codex config.toml, in the [[hooks.<Event>]] / [[hooks.<Event>.hooks]] form that install
+ * prints. Inline-table hooks are not read. Returns { groups: { event: [{ matcher, hooks: [handler] }] }, state: { key: { trusted_hash, enabled } } }.
+ */
+export function parseCodexHooks(text) {
+	const groups = {}, state = {};
+	let target = null, inState = false;
+	for (const line of text.split("\n")) {
+		const header = /^\s*(\[\[?)\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line);
+		if (header) {
+			const name = header[2], array = header[1] === "[[";
+			inState = name === "hooks.state";
+			const ev = /^hooks\.([A-Za-z]+)$/.exec(name)?.[1], handler = /^hooks\.([A-Za-z]+)\.hooks$/.exec(name)?.[1];
+			const st = /^hooks\.state\."((?:\\.|[^"\\])+)"$/.exec(name);
+			if (array && ev && ev !== "state") { (groups[ev] ??= []).push({ matcher: null, hooks: [] }); target = groups[ev].at(-1); }
+			else if (array && handler && groups[handler]?.length) { const h = {}; groups[handler].at(-1).hooks.push(h); target = h; }
+			else if (!array && st) { let key; try { key = JSON.parse(`"${st[1]}"`); } catch { key = st[1]; } target = state[key] ??= {}; }
+			else target = null;
+			continue;
+		}
+		const inline = inState && /^\s*"((?:\\.|[^"\\])+)"\s*=\s*\{(.*)\}\s*(?:#.*)?$/.exec(line);
+		if (inline) {
+			let key;
+			try { key = JSON.parse(`"${inline[1]}"`); } catch { key = inline[1]; }
+			const entry = state[key] ??= {};
+			for (const m of inline[2].matchAll(/(trusted_hash|enabled)\s*=\s*("(?:\\.|[^"\\])*"|true|false)/g)) entry[m[1]] = tomlScalar(m[2]);
+			continue;
+		}
+		const kv = target && /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/.exec(line);
+		if (kv) { const v = tomlScalar(kv[2]); if (v !== undefined) target[kv[1]] = v; }
+	}
+	return { groups, state };
+}
+
+/**
+ * Trust of each agent-memory Codex hook in config.toml and hooks.json under the Codex home: trusted, modified (hash changed since it
+ * was trusted), untrusted (never trusted) or disabled. Codex skips all but trusted ones in an interactive session.
+ */
+export function codexHookTrust(dir, bin, events) {
+	const configFile = path.join(dir, "config.toml"), jsonFile = path.join(dir, "hooks.json");
+	let text = "";
+	try { text = fs.readFileSync(configFile, "utf8"); } catch { /* none */ }
+	const { groups, state } = parseCodexHooks(text);
+	const sources = [[configFile, groups]];
+	const json = readJson(jsonFile, null)?.hooks;
+	if (json && typeof json === "object") sources.push([jsonFile, Object.fromEntries(Object.entries(json).map(([e, gs]) => [e, Array.isArray(gs) ? gs.map((g) => ({ matcher: g?.matcher ?? null, hooks: Array.isArray(g?.hooks) ? g.hooks : [] })) : []]))]);
+	const out = [];
+	for (const [file, byEvent] of sources) {
+		for (const event of events) {
+			(byEvent[event] ?? []).forEach((g, gi) => g.hooks.forEach((h, hi) => {
+				if (h?.type !== "command" || typeof h.command !== "string" || !h.command.includes(`${bin} hook codex`) || !CODEX_EVENT_KEYS[event]) return;
+				const key = `${file}:${CODEX_EVENT_KEYS[event]}:${gi}:${hi}`, s = state[key];
+				const status = s?.enabled === false ? "disabled" : typeof s?.trusted_hash !== "string" ? "untrusted" : s.trusted_hash === codexHookHash(event, g.matcher, h) ? "trusted" : "modified";
+				out.push({ event, key, status });
+			}));
+		}
+	}
+	return out;
+}
+
+function codexTrustCheck(config) {
+	const dir = clientHome("codex"), bin = path.join(home(), "bin", "agent-memory");
+	if (!fs.existsSync(dir)) return pass("codex_hook_trust", "no Codex home");
+	const rows = codexHookTrust(dir, bin, hookEvents(config, "codex"));
+	if (!rows.length) return pass("codex_hook_trust", "no agent-memory hooks in Codex config");
+	const bad = rows.filter((r) => r.status !== "trusted");
+	if (!bad.length) return pass("codex_hook_trust", `${rows.map((r) => r.event).join(", ")} trusted`);
+	return failed("codex_hook_trust", bad.map((r) => `${r.event} ${r.status}`).join(", "),
+		"Start codex in a terminal and choose \"Trust all and continue\" at \"Hooks need review\"; until then Codex skips these hooks (only --dangerously-bypass-hook-trust runs run them).");
+}
+
+// ---------- batch learning ----------
+
+/**
+ * A configured batch profile whose learning clock (batch/last.json: profiles[p].last_write_at, else tracked_since) is more than 3 days
+ * old: the batch applied no record for 3 days, a warning (not a failure). A missing or unreadable file, or a profile with neither field, is reported, not failed.
+ */
+function batchCheck(config, now) {
+	const profiles = Array.isArray(config.batch_profiles) ? config.batch_profiles.filter((p) => typeof p === "string") : [];
+	if (!profiles.length) return pass("batch_learning", "batch is off (no batch_profiles)");
+	const last = readJson(path.join(home(), "batch", "last.json"), null);
+	if (!last || typeof last !== "object") return pass("batch_learning", "no batch run recorded yet");
+	const idle = [], unknown = [];
+	for (const p of profiles) {
+		const r = last.profiles?.[p], at = Date.parse(r?.last_write_at ?? r?.tracked_since ?? "");
+		if (Number.isNaN(at)) unknown.push(p);
+		else if (now - at > 3 * DAY) idle.push(`${p} since ${new Date(at).toISOString()}`);
+	}
+	if (idle.length) return warned("batch_learning", `no record written for 3 days: ${idle.join("; ")}`, "Check the batch's skip reasons in batch/last.json and logs/batch.log; a runtime that is not proved writes nothing.");
+	return pass("batch_learning", `records written within 3 days${unknown.length ? `; no learning clock yet for ${unknown.join(", ")}` : ""}`);
+}
+
+// ---------- repo facts (contract section 7) ----------
+
+/** facts_profile_config, facts_pending, facts_inject_latency and facts_v1_pending. They warn; none fails the doctor. */
+async function factsChecks(config, now) {
+	const out = [];
+	// The raw config: loadConfig drops an invalid facts.profile, and any value set is a leftover.
+	const raw = readJson(path.join(home(), "config.json"), null)?.facts?.profile;
+	out.push(raw != null ? warned("facts_profile_config", "facts.profile is set in config.json; the client no longer reads it", "Remove facts.profile from config.json: repo facts route by the remote, like capture.")
+		: pass("facts_profile_config", "facts.profile is not set"));
+	let s;
+	try { s = factsStatus(config, now); } catch { return [...out, warned("facts_pending", "the facts status could not be read", "Run agent-memory install, then try again.")]; }
+	const oldDays = s.oldest_pending_at ? (now - Date.parse(s.oldest_pending_at)) / DAY : 0;
+	out.push(s.pending_reports > 20 || oldDays > 3
+		? warned("facts_pending", `${s.pending_reports} pending reports, oldest ${s.oldest_pending_at}`, "Check that the server is reachable; each run sends pending reports.")
+		: pass("facts_pending", `${s.pending_reports} pending reports`));
+	out.push(s.inject_p95_ms > 1500
+		? warned("facts_inject_latency", `session-start p95 ${s.inject_p95_ms} ms over 7 days (${s.inject_timeouts_7d} timeouts)`, "Check the network to the server; injection gives up at facts.timeout_ms.")
+		: pass("facts_inject_latency", s.inject_p95_ms === null ? "no session-start runs logged in 7 days" : `session-start p95 ${s.inject_p95_ms} ms over 7 days, ${s.inject_timeouts_7d} timeouts`));
+	// The loop guard, for information: its hooks' registration and Codex trust are the hooks and codex_hook_trust checks.
+	const g = loopGuardStatus(config, now);
+	out.push(pass("loop_guard", `${g.enabled ? "on" : "off"}${g.shadow ? " (shadow)" : ""}; ${g.fires_7d} fires and ${g.shadow_fires_7d} shadow would-fires in 7 days`));
+	out.push(s.pending_v1 > 0
+		? warned("facts_v1_pending", `${s.pending_v1} v1 reports pending`, "Let the next runs migrate them; v1 acceptance ends only after every device shows 0.")
+		: pass("facts_v1_pending", "no v1 reports pending"));
+	return out;
 }
 
 async function whoamiCheck(config, server, jobOk) {
@@ -143,17 +324,18 @@ async function whoamiCheck(config, server, jobOk) {
 export async function doctorChecks({ config, server, now = Date.now(), platform = process.platform } = {}) {
 	const guard = (id, f) => { try { return f(); } catch { return failed(id, "the check could not run", "Run agent-memory install, then try again."); } };
 	const job = guard("job_token", () => jobTokenCheck(config));
-	return [job, guard("read_token", () => readTokenCheck(config)), guard("hooks", () => hooksCheck(config)), guard("launchd", () => launchdCheck(platform)),
-		guard("spool", () => spoolCheck(now)), guard("capture", () => captureCheck(now)),
+	return [job, guard("read_token", () => readTokenCheck(config)), guard("hooks", () => hooksCheck(config)), guard("codex_hook_trust", () => codexTrustCheck(config)),
+		guard("launchd", () => launchdCheck(platform)), guard("spool", () => spoolCheck(now)), guard("capture", () => captureCheck(now)), guard("batch_learning", () => batchCheck(config, now)),
+		...await factsChecks(config, now).catch(() => [warned("facts_pending", "the facts checks could not run", "Run agent-memory install, then try again.")]),
 		await whoamiCheck(config, server ?? httpServer(config), job.ok).catch(() => failed("whoami", "the check could not run", "Check config.json."))];
 }
 
-/** One line per check: "ok   <id>  <detail>" or "FAIL <id>  <detail> — fix: <fix>". */
+/** One line per check: "ok   <id>  <detail>", "WARN <id>  <detail> — fix: <fix>" or "FAIL <id>  <detail> — fix: <fix>". */
 export function formatChecks(checks) {
-	return checks.map((c) => (c.ok ? `ok   ${c.id}  ${c.detail}` : `FAIL ${c.id}  ${c.detail} — fix: ${c.fix}`)).join("\n") + "\n";
+	return checks.map((c) => (c.warn ? `WARN ${c.id}  ${c.detail} — fix: ${c.fix}` : c.ok ? `ok   ${c.id}  ${c.detail}` : `FAIL ${c.id}  ${c.detail} — fix: ${c.fix}`)).join("\n") + "\n";
 }
 
-/** Resolves to 0 when every check passes, else 1. */
+/** Resolves to 0 when every check passes (warnings included), else 1. */
 export async function main(argv, prog = "agent-memory doctor") {
 	if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write(`usage: ${prog}\nChecks this machine's Agent Memory setup and prints a fix for each failure.\n`); return 0; }
 	if (argv.length) { process.stderr.write(`usage: ${prog}\n`); return 2; }
