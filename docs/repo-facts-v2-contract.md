@@ -1,6 +1,6 @@
 # Repo facts v2: shared contract
 
-Status: approved contract for the `fix/repo-facts-review` round (#112), revised after Sol's review. Server, client, detector, synthesis, briefing and dashboard code on the branch implements it, with the v2 types in `src/domain/types.ts` ("Repo facts v2" section). The combined test phase and deployment (#122) have not run yet. Where this file and the code disagree, change both together.
+Status: approved contract for the `fix/repo-facts-review` round (#112), revised after Sol's review. Server, client, detector, synthesis, briefing and dashboard code implements it, with the v2 types in `src/domain/types.ts` ("Repo facts v2" section). It was merged in PR #132 (`b909583`) and deployed on 11 Nov 2026 ([delivery](repo-facts-verification.md#delivery-11-nov-2026)). v1 acceptance (section 0, step 3) is still open. Where this file and the code disagree, change both together.
 
 Scope: every confirmed defect in the review plus steps 1 to 8. Out of scope: the loop guard (step 3) and tool-definition measurement (step 8), except the fields they share.
 

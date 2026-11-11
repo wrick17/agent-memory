@@ -1009,7 +1009,7 @@ Graph reads have work budgets, not only output caps: `explore` reads at most 200
 | Tool | Input | Output | Contract |
 |---|---|---|---|
 | `maintenance_next` | `profile`, `kinds`, `limit` (up to 40), `lease_seconds` (up to 900) | `lease_id`, `lease_until`, `items[]` with `kind`, `subjects`, `context` (passages, current edges, candidate pairs) and `allowed_ops`; or an empty list with `next_allowed_at` | Leases open items. Returns nothing if this profile already ran a batch in the last 20 hours. An expired lease returns its items to the queue. |
-| `maintenance_complete` | `lease_id`, `results[]` of `{item_id, ops[], outcome}` | per item `applied`, `flagged`, `rejected` with reasons | Ops are `save`, `link`, `end_link`, `supersede`, `compact`, `infer_preference`, `promote_to_me`, `flag`, `dismiss`, and, on branch `fix/repo-facts-review`, `record_lesson` and `record_decision` ([lessons and decisions](#lessons-and-decisions-from-digests-126)). Each op must stay within its item's subjects. Ops go through the normal write path with actor `maintenance`. Changes to protected nodes become flags. `promote_to_me` must carry `company_free: true` and passes the `me` guard. |
+| `maintenance_complete` | `lease_id`, `results[]` of `{item_id, ops[], outcome}` | per item `applied`, `flagged`, `rejected` with reasons | Ops are `save`, `link`, `end_link`, `supersede`, `compact`, `infer_preference`, `promote_to_me`, `flag`, `dismiss`, and, since PR #132, `record_lesson` and `record_decision` ([lessons and decisions](#lessons-and-decisions-from-digests-126)). Each op must stay within its item's subjects. Ops go through the normal write path with actor `maintenance`. Changes to protected nodes become flags. `promote_to_me` must carry `company_free: true` and passes the `me` guard. |
 
 `/v1/ingest` (scope `ingest`) takes the upload shown in section 2. `GET /v1/markers?repo=` returns the repo marker, the capture cursors the server has acknowledged, and the daily-slot flags. Both are REST for shell-friendliness. They build the same `WriteCommand` values the MCP tools build.
 
@@ -1216,12 +1216,12 @@ Source-only checkpoint, 2026-10-31: caller v3 adopts a resumable `SessionStart` 
 
 Under T3 Code, Codex custom hooks run only after hook trust: the test saw trusted plugin hooks fire while custom hooks were not exposed. Phase 2 checks that `codex` lists the installed hooks as trusted and that they fire under T3 (section 22). MCP disconnects alone are never treated as session completion.
 
-Capture gaps (#128), on branch `fix/repo-facts-review` and not yet tested or deployed:
+Capture gaps (#128), deployed 11 Nov 2026 from PR #132:
 
 - **Codex hook trust.** `doctor`'s `codex_hook_trust` check fails when a configured Codex hook has no matching trusted entry in `[hooks.state]` of `config.toml`, because Codex 0.167.1 runs only trusted hooks.
 - **Sessions with no source.** The source lookup also searches Codex's `archived_sessions/`. A session is settled as `source_missing`, and leaves the queue, when it is a Codex ephemeral session (its hooks never named a transcript), a Claude Code session that was not persisted, or has had no source for 7 days. `doctor` lists such sessions and any trigger queued for more than 7 days; they are reported, not failed.
 - **Sub-agents.** Each Claude Code sub-agent transcript (`projects/<p>/<session>/subagents/agent-*.jsonl`) is captured as its own session, `<parent session>:<agent file>`. In a sub-agent session, and in a Codex thread spawned by another, every user turn is the parent agent's text, so it is read as assistant text and never as the owner's ask or correction.
-- **Pending.** Backfilling the work Claude account's sessions from before its hooks were installed.
+- **Backfill.** `agent-memory backfill [--client claude-code|codex] [--since 30d]` queues earlier transcripts. On 11 Nov 2026 it queued the work Claude account's sessions from before its hooks were installed ([delivery](repo-facts-verification.md#delivery-11-nov-2026)).
 
 ### The hook returns at once
 
@@ -1289,7 +1289,7 @@ A lone string argument shows as its bare value only when redaction would leave i
 
 ### Repo facts
 
-Repo facts (epic #105) are short, checkable statements about one GitHub repository, such as "`import Quartz` fails in the recorded Python environments". The client learns them from its own sessions' commands, and the Worker decides when a fact is active and injectable. The v2 fix round (epic #123, #112 to #122) rebuilt the feature after a review of PRs #106 to #111. The v2 code is on branch `fix/repo-facts-review`; its combined test phase and deployment (#122) have not run. The binding wire and lifecycle rules are in the [repo facts v2 contract](repo-facts-v2-contract.md); this section summarizes them, and the contract wins on detail. Evidence and gates are in [repo facts verification](repo-facts-verification.md); module contracts are in [module contracts](module-contracts.md#repo-facts-v2-and-forever-context-modules-2026-11-11).
+Repo facts (epic #105) are short, checkable statements about one GitHub repository, such as "`import Quartz` fails in the recorded Python environments". The client learns them from its own sessions' commands, and the Worker decides when a fact is active and injectable. The v2 fix round (epic #123, #112 to #122) rebuilt the feature after a review of PRs #106 to #111. The v2 code was deployed 11 Nov 2026 from PR #132 ([delivery](repo-facts-verification.md#delivery-11-nov-2026)). Repo facts started empty on that Worker and build from new session reports. The binding wire and lifecycle rules are in the [repo facts v2 contract](repo-facts-v2-contract.md); this section summarizes them, and the contract wins on detail. Evidence and gates are in [repo facts verification](repo-facts-verification.md); module contracts are in [module contracts](module-contracts.md#repo-facts-v2-and-forever-context-modules-2026-11-11).
 
 ```mermaid
 flowchart LR
@@ -1395,7 +1395,7 @@ A success is proven only for a single command or an `&&` chain with a recorded e
 
 ### Loop guard
 
-The loop guard (#102, revised in #115) adds one fixed note to a turn that is stuck. It is off unless `loop_guard.enabled` is true. It makes no model or network call. The #115 changes are on branch `fix/repo-facts-review` and not yet tested or deployed.
+The loop guard (#102, revised in #115) adds one fixed note to a turn that is stuck. It is off unless `loop_guard.enabled` is true. It makes no model or network call. The #115 changes were deployed 11 Nov 2026 from PR #132. In Codex the guard runs only after the owner trusts the hooks once.
 
 - **Rules.** The note fires on the first of these, at most once per turn:
   - `repeat`: the same invocation fails 3 times in the turn with the same normalized error.
@@ -1414,7 +1414,7 @@ A Codex-backed check (#103) stays design only, with no provider judge (decision 
 
 ### Session-start brief (#125)
 
-The brief is the one automatic context a session gets at start (epic #131). It is on the branch and not yet tested or deployed. `facts.inject` is its switch, and it replaces the facts-only session-start call.
+The brief is the one automatic context a session gets at start (epic #131). It was deployed 11 Nov 2026 from PR #132. `facts.inject` is its switch, and it replaces the facts-only session-start call.
 
 - **Request.** The `SessionStart` hook sends `{ repo: { remote, path }, repo_key, client, cwd }` to `POST /v1/brief` with the read token. The Worker routes it like the fact routes.
 - **Sections.** In priority order: the repo's injectable facts; a pointer to the open journal for this checkout (its id and name, never its content); up to 4 of the project's rules and preferences, stated first, inferred last; up to 3 `me` preferences and rules; and the 3 newest project decisions. A record belongs to the project when its scope names the repo or it links to the repo's project node.
@@ -1422,14 +1422,18 @@ The brief is the one automatic context a session gets at start (epic #131). It i
 - **Budget.** At most 400 tokens, estimated as characters divided by 4. Sections take turns, so each gets its best item before any gets a second. The profile reads use exact SQL only, with no text index or vector call, and stop at 800 ms; a part that misses the deadline is listed in `omitted` and the rest is still returned.
 - **Quoting.** Every line is quoted stored text, cut to 160 characters, under a header that labels each line as evidence, not instructions. The reply carries `origin: { system: "agent-memory", trust: "untrusted" }`.
 - **Receipts.** The reply lists its items. The client saves them per session and partition, and the session report sends them in `injected`: facts with their outcome, memory items as `unexercised` (see [guidance receipts](#guidance-receipts-127)).
-- **Fallback.** Until the new Worker is deployed, a 404 falls back to `POST /v1/facts`.
+- **Fallback.** A server without `/v1/brief` (404) is asked `POST /v1/facts` instead.
 
 ### Guidance receipts (#127)
 
-Guidance receipts track whether injected guidance helped. Only the first part is on the branch:
+Guidance receipts track whether injected guidance helped. They were deployed 11 Nov 2026 from PR #132.
 
-- Built: the session report's `injected` list accepts `memory` items next to facts, the brief's memory items are saved and reported, and the Worker stores them in each receipt. The facts lifecycle ignores memory items.
-- Pending: exercised, fired and prevented counts for lessons and other memory items; counting a correction that matches an injected lesson against it; the dashboard's followed rate per lesson; and dropping a lesson that keeps failing from briefs. Until then the client reports every memory item as `unexercised`.
+- **Injection rows.** The session report's `injected` list carries the brief's `memory` items next to facts. The Worker stores one pending row per (session, memory) in `guidance_injections`, for this profile's memories only. The facts lifecycle ignores memory items.
+- **Settling.** Once the nightly batch has processed every digest item of the session, each pending row settles. It is `failed` when a correction of that session matched the lesson (`record_lesson` with `matches`, or a same-name merge), and `followed` otherwise. A session the batch already processed settles at once, so a late report still counts.
+- **Correction matches.** Each match is also stored on its own row, which gives the Goals tab an exact repeat-correction count.
+- **Followed rate.** The Lessons tab shows each lesson's injected, processed, failed and followed counts and its followed rate.
+- **Dropping.** An inferred lesson leaves briefs once it has failed at least 3 times and in more than half of its processed sessions (`GUIDANCE_RULES`). A stated record is never dropped automatically.
+- **Retention.** Injection rows are kept 120 days and correction matches 400 days.
 
 ### Other upload items, each with its own id
 
@@ -1519,7 +1523,7 @@ flowchart LR
 - Passages: 700 characters around the best match in the best chunk, from FTS5 `snippet()` offsets.
 - Merge: the Worker runs a second RRF over the lists from `work` and `me`, dedupes on `(profile, id)`, and packs results in rank order until `token_budget` is spent, with each result's cost estimated as JSON length divided by 4, as BothQ does.
 - FTS5-only mode: with `EMBEDDINGS=off` the vector channel and similarity edges are skipped, and every response says `lexical_only: true`. BothQ works this way today. Recall also falls back to lexical, and says so in `diagnostics`, when Vectorize or Workers AI errors.
-- Relevance (#129, on branch `fix/repo-facts-review`, not yet tested or deployed): recall in another profile merges only `me` preferences and rules (`ME_MERGE_KINDS`), and never one in a scope that names `personal`, `identity` or `household`. An explicit `profile: "me"` read is unchanged. A vector match below cosine 0.3 (`VECTOR_MIN_SCORE`) never enters fusion. A hit that no exact or literal channel found is dropped when its fused score is below 0.01 (`MIN_FUSED_SCORE`): one channel alone passes to about rank 39 for a stated record, 29 for an agent one and 9 for an inferred one. After stated-first ranking, rules scoped to the request repo's project move to the front. Neither cutoff is tuned against the eval set yet. Prompt recall stays off until this ships.
+- Relevance (#129, deployed 11 Nov 2026 from PR #132): recall in another profile merges only `me` preferences and rules (`ME_MERGE_KINDS`), and never one in a scope that names `personal`, `identity` or `household`. An explicit `profile: "me"` read is unchanged. A vector match below cosine 0.3 (`VECTOR_MIN_SCORE`) never enters fusion. A hit that no exact or literal channel found is dropped when its fused score is below 0.01 (`MIN_FUSED_SCORE`): one channel alone passes to about rank 39 for a stated record, 29 for an agent one and 9 for an inferred one. After stated-first ranking, rules scoped to the request repo's project move to the front. Both cutoffs are uncalibrated judgements, not tuned against the eval set. Prompt recall is still off by default.
 
 ### Recall measurement and evaluation (v2, #9 and #20)
 
@@ -1596,7 +1600,7 @@ Each item has a fingerprint (kind, subject ids, card hashes), so an unchanged it
 
 ### Lessons and decisions from digests (#126)
 
-On branch `fix/repo-facts-review`, not yet tested or deployed. The daily batch learns two more kinds of record from session digests, besides inferred preferences:
+Deployed 11 Nov 2026 from PR #132. The daily batch learns two more kinds of record from session digests, besides inferred preferences:
 
 - **`record_lesson`**, allowed on a `preference_signal` item: a correction about how an agent must work becomes a rule. Its `why` is the mistake, `how_to_apply` the correction, and its evidence 1 to 10 pointers to the item's subjects. A correction about the owner's own taste stays an inferred preference.
 - **`record_decision`**, allowed on an `unprocessed_capture` item: a decision the digest states becomes a decision record with its reason and evidence, linked to the session's project.
@@ -1810,7 +1814,7 @@ Earlier dated notes for this section, superseded by this status:
 | Health | any | Health checks, eval runs and pending eval candidates (accept or dismiss), Re-check now, a copied `agent-memory doctor` | #25 |
 | Memories | any | Filters, search within the chosen profile, recall strength, detail, history and diff, copies, bulk archive with undo and export. No hard delete. | #26 |
 | Lessons | any | Preferences and rules from the owner model, with 90-day uses and pin, unpin, unflag and forget, each with undo | #27 |
-| Facts | any | Repo facts by repo with state, tier, class, per-device lanes, firing counts, evidence and literal; pin, unpin, flag, retire and forget, each with undo; per-repo, per-day session cost. On branch, not deployed. | #118 |
+| Facts | any | Repo facts by repo with state, tier, class, per-device lanes, firing counts, evidence and literal; pin, unpin, flag, retire and forget, each with undo; per-repo, per-day session cost. | #118 |
 | Crystals | any | Compacted journal summaries and finished sessions with consolidated digests | #27 |
 | Actions | any | The board filtered by `state` (open, closed or all), with uploaded state and Jira status text. No issue-state writes. | #27 |
 | Graph | path profile | The graph with a shape and colour legend, toolbar, detail, deep links and confirmed maintenance queueing | #28 |
@@ -1818,14 +1822,14 @@ Earlier dated notes for this section, superseded by this status:
 | Replay | one | Hosted digest replay in order only, with a notice that full transcripts play only locally | #29 |
 | Activity | any | The activity heatmap, filters and session links, with covered or truncated ranges | #30 |
 | Profile | one | One project's profile | #30 |
-| Goals | any | The four goal metrics per repo and week ([goal metrics](#goal-metrics-130)). On branch, not deployed. | #130 |
+| Goals | any | The four goal metrics per repo and week ([goal metrics](#goal-metrics-130)). | #130 |
 | Audit | any | The activity log by actor and profile, with undo and conflicts | #31 |
 
 Admin keeps every earlier page, with its confirmations and aliases: Write, Paths, Map, Timeline, Journals, Review, Backups and recovery, Routing, Profiles, Moves, Wipe, Work, About you and Settings (#31).
 
 ### Goal metrics (#130)
 
-The Goals tab measures the forever-context goal (#124, #131) from data the profile already stores. It reads `GET /api/profiles/:p/goal-metrics?weeks&repo_key` (1 to 26 UTC weeks, default 12, starting Monday). It is on branch `fix/repo-facts-review` and not yet tested or deployed.
+The Goals tab measures the forever-context goal (#124, #131) from data the profile already stores. It reads `GET /api/profiles/:p/goal-metrics?weeks&repo_key` (1 to 26 UTC weeks, default 12, starting Monday). It was deployed 11 Nov 2026 from PR #132.
 
 | Metric | Definition | Target |
 |---|---|---|
@@ -1835,7 +1839,7 @@ The Goals tab measures the forever-context goal (#124, #131) from data the profi
 | Guidance-followed rate | `(fired + prevented) / exercised` over injected items in session receipts; the tab also shows the prevented share, since the followed rate is close to 100% by construction | None |
 | Cost per session | From `fact_days`: tokens per session over `usage_sessions`, failed commands per session, and the cache ratio | Trend only |
 
-A rate below 3 samples shows "Not enough data". An input that is not stored yet, such as session receipts before the v2 Worker is deployed, is named in `missing` and never shown as zero. Exact repeat-correction counting needs one stored match per correction, planned in #127.
+A rate below 3 samples shows "Not enough data". An input that is not stored yet is named in `missing` and never shown as zero. Repeat corrections are counted exactly from the stored correction matches of [guidance receipts](#guidance-receipts-127).
 
 The v3.2 design below planned a Preact and Cytoscape.js app on Workers Static Assets. The built dashboard is a house module that the Worker serves as `/app.js`, like `/settings`, with no Preact or Cytoscape. Clerk JS signs the owner in. The app calls `/api/*` with the Clerk session token. The API runs the same commands as MCP with actor `owner`. The page table and API list below are the v3.2 design record; the v2 owner routes are in section 8.
 

@@ -215,13 +215,13 @@ A separately installed capture client reads these keys. A config without them ke
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `facts.inject` | `false` | At session start, add the checkout's brief: up to 4 injectable repo facts, a pointer to the open journal, the project's rules and preferences, your `me` preferences and rules, and recent decisions, in at most 400 tokens. Needs a read-scoped token in `read_token_file`; `agent-memory doctor` checks it. The v2 brief is on branch `fix/repo-facts-review` and not yet released. |
-| `facts.profile` | `null` | Released client: an explicit profile for fact reports and reads, never `me`. The v2 client on branch `fix/repo-facts-review` no longer reads it: the server routes by the remote and checkout path with your routing rules, and `agent-memory doctor` warns while it is set. |
+| `facts.inject` | `false` | At session start, add the checkout's brief: up to 4 injectable repo facts, a pointer to the open journal, the project's rules and preferences, your `me` preferences and rules, and recent decisions, in at most 400 tokens. Needs a read-scoped token in `read_token_file`; `agent-memory doctor` checks it. |
+| `facts.profile` | `null` | No longer read since the v2 client (PR #132): the server routes by the remote and checkout path with your routing rules, and `agent-memory doctor` warns while it is set. |
 | `facts.timeout_ms` | `1500` | How long session start waits for the brief, at most 10,000 ms. On a timeout it adds nothing. |
 | `facts.synthesis` | `false` | Send redacted command digests to the Codex CLI on your Codex subscription to propose facts: at most 3 calls per UTC day on each machine, retries included. Keep it off until you have reviewed what it sends and accept that your Codex provider receives those digests. |
 | `facts.synthesis_rates` | `null` | USD per million `input`, `cached_input` and `output` tokens. Used only to fill `cost_usd` in `~/.agent-memory/facts/synth/cost.jsonl`; without it, `cost_usd` is null. |
 | `loop_guard.enabled` | `false` | Register the tool-result hooks and add one fixed note to a turn that keeps failing. No network or model call. |
-| `loop_guard.shadow` | `false` | With `loop_guard.enabled`, run the rules and log each would-fire to `~/.agent-memory/loop-guard/fires.jsonl`, but print no note. The log holds hashes, rule names and counts only. On branch `fix/repo-facts-review`, not yet released. |
+| `loop_guard.shadow` | `false` | With `loop_guard.enabled`, run the rules and log each would-fire to `~/.agent-memory/loop-guard/fires.jsonl`, but print no note. The log holds hashes, rule names and counts only. |
 
 Deterministic fact detection follows capture and has no switch of its own: with capture installed, the client reports detector results for each completed session in a GitHub repository, whatever these settings say. Those reports hold hashes, fact keys, detector literals, injected-item outcomes, token counts and command counts, never command output or paths. The v2 server writes every statement itself. Turning `facts.synthesis` off stops only synthesis. After you change `facts.inject` or `loop_guard.enabled`, run `agent-memory install` again so the client registers the hooks.
 

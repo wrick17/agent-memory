@@ -2,6 +2,8 @@
 
 This page records the gates and evidence for repo facts (epic #105, issues #90 to #103) and the loop guard (#102, #103). It lists what the source does, which checks passed, and which gates are still open. Fill in an open line only from a result that actually exists.
 
+**v2 status, 11 Nov 2026:** Merged in PR #132 (`b909583`), deployed 11 Nov 2026 as Worker version `62bb7947-6a9b-417c-9548-534eb29cf0fb`, client installed through dotfiles `77008fc`. Evidence is in [delivery](#delivery-11-nov-2026). The v1 status below is the record for PR #110.
+
 **Status, 2026-11-11:** merged to `master` in PR #110 as `a0478c5`, after source and local verification and passing CI. The feature is not released, not deployed and not installed on any owner client. All five findings from the independent privacy and data-loss review are closed. The owner signed off the #100 review on 2026-11-11 and approved exactly one isolated real synthesis call; that call passed, and #100 is closed. Normal synthesis stays off; turning it on is a separate owner step. The P3 paired evaluation (#101) ran in full and did not demonstrate efficiency savings ([results](#p3-paired-evaluation-2026-11-11)). The Codex-backed loop check (#103) stays design only.
 
 | Check | Result |
@@ -21,7 +23,7 @@ This page records the gates and evidence for repo facts (epic #105, issues #90 t
 
 ## v2 fix round, 2026-11-11
 
-A review on 2026-11-11 of epic #105 (PRs #106 to #111) found 4 must-fix and 8 should-fix defects, plus design gaps that kept facts from making agents more efficient. Epic [#123](https://github.com/wrick17/agent-memory/issues/123) tracks the fix round. The code is on branch `fix/repo-facts-review`. It is implemented, but not yet tested, reviewed or deployed; the combined test phase, review and deployment are [#122](https://github.com/wrick17/agent-memory/issues/122). The binding rules are the [repo facts v2 contract](repo-facts-v2-contract.md) ([#112](https://github.com/wrick17/agent-memory/issues/112), approved after two review rounds).
+A review on 2026-11-11 of epic #105 (PRs #106 to #111) found 4 must-fix and 8 should-fix defects, plus design gaps that kept facts from making agents more efficient. Epic [#123](https://github.com/wrick17/agent-memory/issues/123) tracks the fix round. The code was built on branch `fix/repo-facts-review`. Merged in PR #132 (`b909583`), deployed 11 Nov 2026 as Worker version `62bb7947-6a9b-417c-9548-534eb29cf0fb`, client installed through dotfiles `77008fc`. The test phase, reviews and deployment were [#122](https://github.com/wrick17/agent-memory/issues/122). The binding rules are the [repo facts v2 contract](repo-facts-v2-contract.md) ([#112](https://github.com/wrick17/agent-memory/issues/112), approved after two review rounds).
 
 | Area | What the review found | What changed | Issue |
 |---|---|---|---|
@@ -38,7 +40,7 @@ Two items are decided or still open:
 - Tool pruning ([#119](https://github.com/wrick17/agent-memory/issues/119)) was measured and not built: removing every MCP server saves under 1% of a median session's price-weighted input.
 - Threshold calibration ([#120](https://github.com/wrick17/agent-memory/issues/120)) replayed local history and changed one threshold: a fact now retires on its newest contradiction ([history replay](#history-replay-120)).
 
-The fix round also changes these known limits: repo-class facts now activate from confirmations on any devices, Codex shell results now count for the loop guard, and the dashboard has a Facts tab. The daily synthesis cap stays per device. The two new switches are `loop_guard.shadow` (off) and the v2 brief behind the existing `facts.inject`. Verification evidence for this round will be appended here after the test phase.
+The fix round also changes these known limits: repo-class facts now activate from confirmations on any devices, Codex shell results now count for the loop guard, and the dashboard has a Facts tab. The daily synthesis cap stays per device. The two new switches are `loop_guard.shadow` (off) and the v2 brief behind the existing `facts.inject`. The evidence for this round is in [delivery](#delivery-11-nov-2026).
 
 ### History replay (#120)
 
@@ -70,6 +72,42 @@ Limits:
 - 42,618 commands ran outside a GitHub checkout and are not attributed. A directory that no longer exists also counts as unattributed.
 - Only top-level transcripts are read; Claude Code sub-agent transcripts are excluded.
 - Prevented failures come from the detectors' `outcomes`, not the client's `injectedOutcomes`, and the two disagree.
+
+## Delivery, 11 Nov 2026
+
+The v2 fix round (#123) and the forever-context work (#131) shipped together. Merged in PR #132 (`b909583`), deployed 11 Nov 2026 as Worker version `62bb7947-6a9b-417c-9548-534eb29cf0fb`, client installed through dotfiles `77008fc`.
+
+| Check | Result |
+|---|---|
+| Type check and lint | Passed |
+| Worker tests, CI mode | 702 passed |
+| Local tests (`npm run test:local`) | 364 passed |
+| PR #132 CI | All checks passed |
+| Independent reviews | Two reviews found 22 defects, and a re-check found 3 more. All 25 are fixed, each with a regression test, and re-checked. |
+
+**Rollback point.** Before the deploy, nondeleting exports of the four profiles went to the R2 bucket `am-core-ledger-a8ad574089`:
+
+| Profile | Export id |
+|---|---|
+| me | `20261111T182454862Z-72153a0d` |
+| personal | `20261111T182455674Z-9b8a8402` |
+| test | `20261111T182458522Z-aa80ef88` |
+| work | `20261111T182459727Z-a8ea5490` |
+
+**Live checks.**
+
+- `/v1/whoami` and `/v1/brief` returned 200.
+- A new Claude Code session received the brief at `SessionStart`.
+- The `repo_facts` MCP tool answers.
+- `doctor` passed every check except `codex_hook_trust`, which waits for the owner to trust the hooks once in Codex.
+
+**Backfill.** `agent-memory backfill` queued 43 transcripts from the work Claude account and 22 Codex transcripts. 127 Codex transcripts were already current.
+
+**Known limits.**
+
+- Until the owner trusts the Codex hooks once in Codex, interactive Codex sessions are not captured and the loop guard does not run there.
+- Repo facts start empty on the deployed Worker and build from new session reports.
+- `VECTOR_MIN_SCORE` (0.3) and `MIN_FUSED_SCORE` (0.01) are uncalibrated judgements, not tuned against the eval set.
 
 ## Switches
 
