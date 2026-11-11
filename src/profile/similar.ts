@@ -30,7 +30,7 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 	if (!cur.mark && writeSeq > cur.seq) cur.mark = { seq: writeSeq, at: now };
 	const retry = Object.entries(cur.pending).filter(([, p]) => p.at <= now).sort((x, y) => x[1].at - y[1].at).slice(0, STEP / 2).map(([id]) => id);
 	const settled = cur.mark !== null && now >= cur.mark.at + SETTLE_MS, room = STEP - retry.length;
-	const fresh = settled ? sql.exec<{ id: string; seq: number }>(`SELECT id, seq FROM nodes WHERE (seq, id) > (?, ?) AND seq <= ? AND status = 'active' AND embed_hash = card_hash
+	const fresh = settled ? sql.exec<{ id: string; seq: number }>(`SELECT id, seq FROM nodes WHERE (seq, id) > (?, ?) AND seq <= ? AND status = 'active' AND embed_hash = card_hash AND scope <> 'repo-fact'
 		ORDER BY seq, id LIMIT ?`, cur.seq, cur.id, cur.mark!.seq, room).toArray() : [];
 	// A pending card that changed, retired or lost its embedding since is dropped; a change brings it back through the cursor.
 	const live = new Set(retry.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND embed_hash = card_hash",
@@ -68,8 +68,8 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 				cur.pending[n.id]={n:0,at:now+SETTLE_MS,card:n.card};return;
 			}
 			delete cur.pending[n.id];
-			// Only neighbours that are still active nodes of this profile.
-			const live = new Set(hits.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active'",
+			// Only neighbours that are still active nodes of this profile, never a repo fact (it may hold a vector after a re-embed).
+			const live = new Set(hits.length ? sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND scope <> 'repo-fact'",
 				JSON.stringify(hits.map((h) => h.id))).toArray().map((r) => r.id) : []);
 			const keep = hits.filter((h) => live.has(h.id) && h.score >= MIN_SCORE);
 			sql.exec(`UPDATE edges SET ended_at = ?, valid_to = ?, seq = ? WHERE src = ? AND basis = 'similarity' AND ended_at IS NULL AND dst NOT IN (SELECT value FROM json_each(?))`,
@@ -105,7 +105,7 @@ export async function similarStep(storage: DurableObjectStorage, env: Env, who: 
 		if (!source) return;
 		const items: { kind: string; subjects: string[] }[] = [];
 		for (const hit of near[i] ?? []) {
-			const target = sql.exec<{ kind: string; scope: string }>("SELECT kind, scope FROM nodes WHERE id = ? AND status = 'active'", hit.id).toArray()[0];
+			const target = sql.exec<{ kind: string; scope: string }>("SELECT kind, scope FROM nodes WHERE id = ? AND status = 'active' AND scope <> 'repo-fact'", hit.id).toArray()[0];
 			if (!target) continue;
 			if (source.kind === target.kind && hit.score >= 0.92) items.push({ kind: "near_duplicate", subjects: [n.id, hit.id] });
 			else if (hit.score < 0.92 && [source.kind, target.kind].every((kind) => ["rule", "preference", "decision"].includes(kind))) {

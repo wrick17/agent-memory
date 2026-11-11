@@ -5,6 +5,8 @@ import path from "node:path";
 import { captureSummary, hookEvents, home } from "./agent-memory.mjs";
 import { launchdLabel, launchdLoaded as loadedCheck } from "./launchd.mjs";
 
+// The server's allowlist (src/client-status.ts). The loop guard's PostToolUse and PostToolUseFailure are not on it, so the
+// report leaves them out; doctor checks them locally.
 const HOOKS = new Set(["Stop", "SessionEnd", "SessionStart", "PreCompact", "UserPromptSubmit"]);
 
 /** The spool's file count, bytes and oldest file time. The spool holds digests and manifests only; none of it is read here. */

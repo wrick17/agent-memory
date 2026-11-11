@@ -67,6 +67,8 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	try { h = JSON.parse(input); } catch { return; }
 	// A prompt hook is the opt-in injection path (inject.mjs, dispatched by the CLI). It never queues a capture run.
 	if (h?.hook_event_name === "UserPromptSubmit") return;
+	// Tool hooks are the opt-in loop guard (loop-guard.mjs, dispatched by the CLI). They never queue a capture run either.
+	if (LOOP_EVENTS.has(h?.hook_event_name)) return;
 	const session = typeof h?.session_id === "string" ? h.session_id : null;
 	if (!session || !/^[A-Za-z0-9._:-]{1,128}$/.test(session)) return;
 	const name = `${client}-${safeName(session)}.json`;
@@ -591,6 +593,18 @@ export function httpServer(config) {
 		status: (body) => post("/v1/status", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
 		/** POST /v1/eval/runs: one eval run's scores and counts, never prompt or record text. */
 		evalRun: (body) => post("/v1/eval/runs", body, { redirect: "error", signal: AbortSignal.timeout(30_000) }),
+		/**
+		 * POST /v1/ingest, facts branch (facts-client.mjs), job token: one saved session report sent as its exact bytes, so a resend
+		 * replays. Throws with status (and error on a 400) like post.
+		 */
+		facts: async (bytes) => {
+			const res = await fetch(new URL("/v1/ingest", config.server), { method: "POST", headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" }, body: bytes, redirect: "error", signal: AbortSignal.timeout(30_000) });
+			if (!res.ok) {
+				const error = await res.json().then((r) => r?.error ?? null, () => null);
+				throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, ...(error ? { error } : {}) });
+			}
+			return res.json();
+		},
 		/** GET /v1/whoami with the job token: this device's own identity and scopes. */
 		whoami: async () => {
 			const res = await fetch(new URL("/v1/whoami", config.server), { headers: { authorization: `Bearer ${token()}` }, redirect: "error", signal: AbortSignal.timeout(10_000) });
@@ -652,6 +666,8 @@ export function readServer(config = loadConfig()) {
 			if (limit !== undefined) url.searchParams.set("limit", String(limit));
 			return send(url);
 		},
+		/** POST /v1/facts: at most 4 injectable facts for { repo: { remote }, repo_key?, profile? } (facts-inject.mjs). */
+		facts: async (body, { timeoutMs = 30_000 } = {}) => send(new URL("/v1/facts", config.server), { body, timeoutMs }),
 	};
 }
 
@@ -827,6 +843,15 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		}
 		save();
 	}
+	// Repo facts (facts-client.mjs): this session's command digest, and its one report once the session has ended. It reads the transcript
+	// from its own cursor and never changes capture state; any failure leaves capture untouched and is retried on a later run.
+	if (src) {
+		try {
+			const config = loadConfig(), r = await (await import("./facts-client.mjs")).observeSession(t, src, repo, { server, ended: st.ended === true, config });
+			// Synthesis cadence (facts-synth.mjs, off unless facts.synthesis): count the completion marker now; a crash leaves it for the next run.
+			if (r?.completed) (await import("./facts-synth.mjs")).reconcileCompleted(config);
+		} catch { /* retried later */ }
+	}
 	// consolidated_to moves over contiguous consolidated ranges of the current epoch only.
 	const advance = () => {
 		for (const r of Object.values(st.ranges).filter((x) => x.epoch === st.epoch).sort((a, b) => a.start - b.start)) {
@@ -892,9 +917,11 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
 
 /**
  * v2 keys, used when config.json leaves them out, so a v1 config keeps working unchanged. Injection is off by default and turns
- * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them.
+ * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them. The loop guard is
+ * off unless loop_guard.enabled is true. Repo-fact injection at SessionStart is off unless facts.inject is true.
  */
-export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 } });
+export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
+	loop_guard: { enabled: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -906,7 +933,15 @@ export function withDefaults(raw) {
 		batch_hour: Number.isInteger(c.batch_hour) && c.batch_hour >= 0 && c.batch_hour <= 23 ? c.batch_hour : d.batch_hour,
 		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
 		inject: { enabled: i.enabled === true && profile !== null, profile,
-			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) } };
+			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) },
+		loop_guard: { enabled: c.loop_guard?.enabled === true },
+		// Repo facts: injection off by default; profile is an optional explicit route (never `me`), else the server routes by the remote.
+		facts: { inject: c.facts?.inject === true, profile: typeof c.facts?.profile === "string" && PROFILE_RE.test(c.facts.profile) && c.facts.profile !== "me" ? c.facts.profile : null,
+			timeout_ms: posInt(c.facts?.timeout_ms, d.facts.timeout_ms, 10_000),
+			// Synthesis is off unless facts.synthesis is true; synthesis_rates (USD per million input, cached input and output tokens) only prices the cost log.
+			synthesis: c.facts?.synthesis === true,
+			synthesis_rates: ["input", "cached_input", "output"].every((k) => typeof c.facts?.synthesis_rates?.[k] === "number" && c.facts.synthesis_rates[k] >= 0)
+				? { input: c.facts.synthesis_rates.input, cached_input: c.facts.synthesis_rates.cached_input, output: c.facts.synthesis_rates.output } : null } };
 }
 
 export function loadConfig() {
@@ -999,6 +1034,10 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
+		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
+		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
+		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
+		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
 		if (config.batch_profiles?.length) {
 			const { batch } = await import("./batch.mjs");
@@ -1046,11 +1085,18 @@ async function sendStatus(config, server, now) {
 	} catch { return "failed"; }
 }
 
+/** Tool-result events the loop guard handles. Claude Code reports failures as PostToolUseFailure; Codex has PostToolUse only. */
+const LOOP_EVENTS = new Set(["PostToolUse", "PostToolUseFailure"]);
+const loopEventsOf = (client) => (client === "codex" ? ["PostToolUse"] : ["PostToolUse", "PostToolUseFailure"]);
+
 /**
- * The hook events install registers, for both clients: UserPromptSubmit only when injection is on. status.mjs reports this list
- * and doctor.mjs checks the client settings against it.
+ * The hook events install registers for a client: UserPromptSubmit only when injection is on, the tool-result events only when
+ * the loop guard is on. Without a client, every event either client registers. status.mjs reports this list and doctor.mjs
+ * checks each client's settings against its own.
+ * @param {object} [config] @param {"claude-code" | "codex"} [client]
  */
-export const hookEvents = (config = loadConfig()) => ["Stop", "SessionEnd", "SessionStart", "PreCompact", ...(config.inject?.enabled === true ? ["UserPromptSubmit"] : [])];
+export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop", "SessionEnd", "SessionStart", "PreCompact", ...(config.inject?.enabled === true ? ["UserPromptSubmit"] : []),
+	...(config.loop_guard?.enabled === true ? (client ? loopEventsOf(client) : ["claude-code", "codex"].flatMap(loopEventsOf)) : [])])];
 
 /**
  * Whether a configured profile may get a batch lease now. The server allows one lease per profile every 20 hours (BATCH_GAP_MS in
@@ -1084,7 +1130,10 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 				const spooled = fs.existsSync(spoolDir) && fs.readdirSync(spoolDir).some((f) => f.endsWith(".json"));
 				// Under the lock every entry in claimed/ is a dead run's; drain returns it to the queue first.
 				const retained = fs.existsSync(claimDir()) && fs.readdirSync(claimDir()).length > 0;
-				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock())) {
+				const synth = await import("./facts-synth.mjs").then((m) => m.synthDue(config, clock()), () => false);
+				// A fact report saved but not yet accepted is retried by any run, whatever the synthesis switch says.
+				const reports = await import("./facts-client.mjs").then((m) => m.hasPending(), () => false);
+				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock()) && !synth && !reports) {
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
@@ -1431,13 +1480,15 @@ const ENVELOPES = new Set(["thread.started", "turn.started", "turn.completed", "
  * range pending; unknown output fails closed.
  */
 export function parseEvents(stdout) {
-	let final = null;
+	// usage: turn.completed's token counts, kept for the repo-fact cost log; null when the stream has none.
+	let final = null, usage = null;
 	for (const line of stdout.split("\n")) {
 		if (!line.trim()) continue;
 		let e;
 		try { e = JSON.parse(line); } catch { return { kind: "bad_events" }; }
 		if (e.type === "error" || e.type === "turn.failed") return { kind: "runtime_error" };
 		if (!ENVELOPES.has(e.type)) return { kind: "runtime_warning" };
+		if (e.type === "turn.completed" && e.usage && typeof e.usage === "object") usage = e.usage;
 		if (!e.type.startsWith("item.")) continue;
 		const item = e.item;
 		if (!item || typeof item !== "object") return { kind: "bad_events" };
@@ -1447,8 +1498,8 @@ export function parseEvents(stdout) {
 		if (item.type === "agent_message") { if (e.type === "item.completed") final = item.text; continue; }
 		return { kind: "tool_event" };
 	}
-	if (typeof final !== "string") return { kind: "no_output" };
-	try { return { kind: "ok", part: JSON.parse(final) }; } catch { return { kind: "bad_output" }; }
+	if (typeof final !== "string") return { kind: "no_output", usage };
+	try { return { kind: "ok", part: JSON.parse(final), usage }; } catch { return { kind: "bad_output", usage }; }
 }
 
 // ---------- install ----------
@@ -1469,8 +1520,11 @@ const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 const LO_LOCAL = ["launchd.mjs", "status.mjs", "doctor.mjs", "backfill.mjs"];
 // The eval command and its scorer.
 const EVAL_LOCAL = ["eval.mjs", "eval-score.mjs"];
-// Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit. They import only ./agent-memory.mjs and each other.
-export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", ...EVAL_LOCAL];
+// Repo facts: digest primitives, detectors, the per-session client and synthesis (imported by run) and SessionStart injection.
+const FACTS_LOCAL = ["facts.mjs", "facts-detect.mjs", "facts-client.mjs", "facts-inject.mjs", "facts-synth.mjs"];
+// Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit and loop-guard.mjs for the tool-result hooks. They
+// import only ./agent-memory.mjs and each other.
+export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", "loop-guard.mjs", ...FACTS_LOCAL, ...EVAL_LOCAL];
 
 export function install({ server = "https://memory.wrick17.com", platform = process.platform } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1503,13 +1557,19 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 		launchd = { label, plist: file, load: loadCommand(file) };
 	}
 	// Stop and PreCompact only queue a run, so they never hold up the client. UserPromptSubmit waits for its output, bounded by
-	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout.
+	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout. The tool-result hooks run
+	// after every tool call and exit by themselves well inside LOOP_TIMEOUT_S.
 	const promptTimeout = Math.ceil(config.inject.timeout_ms / 1000) + 1;
-	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : {});
-	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}` : "");
+	// With repo-fact injection on, SessionStart waits for its output, bounded by the facts timeout.
+	const startTimeout = config.facts.inject ? Math.ceil(config.facts.timeout_ms / 1000) + 1 : null;
+	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : LOOP_EVENTS.has(e) ? { timeout: LOOP_TIMEOUT_S }
+		: e === "SessionStart" && startTimeout ? { timeout: startTimeout } : {});
+	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}`
+		: LOOP_EVENTS.has(e) ? `\ntimeout = ${LOOP_TIMEOUT_S}` : e === "SessionStart" && startTimeout ? `\ntimeout = ${startTimeout}` : "");
+	const claudeEvents = hookEvents(config, "claude-code"), codexEvents = hookEvents(config, "codex");
 	return { bin, config: cfg, launchd, hooks: events,
-		claude: { hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
-		codex: events.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
+		claude: { hooks: Object.fromEntries(claudeEvents.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
+		codex: codexEvents.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
 }
 
 // ---------- CLI ----------
@@ -1534,6 +1594,37 @@ function promptHook(client, input) {
 	}, () => process.exit(0));
 }
 
+/**
+ * SessionStart: the existing sweep request first (hook(), no network), then, only with facts.inject, the repo facts for this checkout
+ * (facts-inject.mjs), bounded by facts.timeout_ms. Any failure, a missing read token or the deadline prints nothing and exits 0.
+ */
+function startHook(client, input) {
+	try { hook(client, input); } catch { /* never block the client */ }
+	const config = loadConfig();
+	if (!config.facts.inject) process.exit(0);
+	setTimeout(() => process.exit(0), config.facts.timeout_ms + 250);
+	import("./facts-inject.mjs").then((m) => m.injectFacts(client, input, { config })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
+
+/** The client's hook timeout for the tool-result hooks, in seconds; the hook gives up and prints nothing after LOOP_DEADLINE_MS. */
+const LOOP_TIMEOUT_S = 5, LOOP_DEADLINE_MS = 2000;
+
+/**
+ * PostToolUse and PostToolUseFailure: the loop guard. Off unless loop_guard.enabled. No network; prints at most one fixed note
+ * per turn, and on any failure, lock contention or the deadline prints nothing and exits 0.
+ */
+function loopHook(client, input) {
+	if (!loadConfig().loop_guard.enabled) process.exit(0);
+	setTimeout(() => process.exit(0), LOOP_DEADLINE_MS);
+	import("./loop-guard.mjs").then((m) => m.loopHook(client, input, { deadline: Date.now() + LOOP_DEADLINE_MS - 500 })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
+
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
 	const [cmd, arg] = process.argv.slice(2);
 	if (cmd === "hook") {
@@ -1542,6 +1633,8 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 			let event = null;
 			try { event = JSON.parse(input)?.hook_event_name ?? null; } catch { /* hook() ignores bad input */ }
 			if (event === "UserPromptSubmit" && CLIENTS.has(arg)) { try { promptHook(arg, input); } catch { process.exit(0); } return; }
+			if (LOOP_EVENTS.has(event) && CLIENTS.has(arg)) { try { loopHook(arg, input); } catch { process.exit(0); } return; }
+			if (event === "SessionStart" && CLIENTS.has(arg)) { try { startHook(arg, input); } catch { process.exit(0); } return; }
 			try { hook(arg, input); } catch { /* never block the client */ }
 			process.exit(0);
 		});

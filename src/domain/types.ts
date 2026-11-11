@@ -162,8 +162,28 @@ export interface TicketUploadArgs {
 }
 export type UploadArgs = CommitUploadArgs | PRUploadArgs | TicketUploadArgs;
 
+/** Repo facts (#91-#95): the deterministic detectors that may name a fact. */
+export const FACT_DETECTORS = ["command_repair", "unavailable_tool", "env_var", "network", "empty_vcs"] as const;
+/**
+ * One fact observation from a completed session (confirm, contradict) or a P2 proposal (propose), validated and redacted by the
+ * Worker. `disjoint_from` (confirm only) lists the device's earlier confirming sessions whose edited-file sets this session's set
+ * is disjoint from; absent means overlap or unknown history. `citations` (propose only) are bounded session refs, never confirmations.
+ */
+export interface FactObservation {
+	fact_key: string; kind: "confirm" | "contradict" | "propose"; detector: (typeof FACT_DETECTORS)[number];
+	statement: string; literal: string; family: string; disjoint_from?: string[]; citations?: string[];
+}
+/**
+ * One durable fact report: a completed session (`session`, with the families it used and its explicit firing markers) or a P2
+ * proposal (`proposal`). `device` is the authenticated token's device; `request_id` is derived from repo_key and the report identity.
+ */
+export interface FactArgs {
+	repo_key: string; device: string; session?: string; proposal?: string; families: string[]; fired: string[];
+	observations: FactObservation[]; request_id: string;
+}
+
 export type WriteCommand = { op: "save"; args: SaveArgs } | { op: "append"; args: AppendArgs } | { op: "capture"; args: CaptureArgs } | { op: "candidate"; args: CandidateArgs } | { op: "knowledge"; args: KnowledgeArgs } | { op: "undo"; args: { activity_id: number; request_id: string } }
-	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs } | { op: "restore"; args: { activity_id: number; request_id: string } };
+	| { op: "owner"; args: OwnerArgs } | { op: "upload"; args: UploadArgs } | { op: "restore"; args: { activity_id: number; request_id: string } } | { op: "fact"; args: FactArgs };
 /** The owner's dashboard actions on one node (section 15). */
 export interface OwnerArgs { action: "pin" | "unpin" | "forget" | "unflag"; memory_id: string; request_id?: string }
 

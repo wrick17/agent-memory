@@ -20,6 +20,6 @@ jobs:
       - run: npx wrangler types --strict-vars=false --check
       - run: npm run typecheck
       - run: npm run lint
-      - run: npm test
+      - run: npm test -- --no-file-parallelism --maxWorkers=1
       # The local capture client; the real-sandbox probe test skips where Codex is not installed.
       - run: npm run test:local

@@ -9,6 +9,7 @@ import { Fail, ok, type Failure, type Outcome } from "../domain/types";
 import { nextSeq } from "../storage";
 import { archiveRows, BudgetTx, purgeAfter, putRow, type ArchiveSource, type Row } from "./archive";
 import { embeddingsOn, vectorId } from "./index";
+import { FACT_SCOPE } from "./facts";
 import { flagProtected, mayChange } from "./protect";
 import { assertNotWiped, assertOpen } from "./wipe";
 import type { Who } from "./write";
@@ -509,6 +510,7 @@ function apply(sql: SqlStorage, who: Who, s: TransferStep): TransferOut {
 			const n = nodeRow(sql, s.nodeId);
 			if (!n) throw Fail.of("not_found", `no record '${s.nodeId}' in profile '${who.profile}'`);
 			if (n.status === "moving" || n.status === "incoming") assertWritable(sql, s.nodeId);
+			if (n.scope === FACT_SCOPE) throw refuse("not_movable", "a repo fact stays in its repo's routed profile");
 			if (!MOVABLE.includes(String(n.status)) || n.other_label === "capture") throw refuse("not_movable", `a ${String(n.status)} ${n.other_label === "capture" ? "capture" : "record"} cannot be transferred`);
 			const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
 			// A maintenance promotion is refused here, in the fencing transaction, if the owner stated or pinned the record since it

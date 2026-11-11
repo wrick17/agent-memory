@@ -1,0 +1,86 @@
+{
+	"repo": "github.com/wrick17/postplan",
+	"provenance": {
+		"source": "recorded",
+		"sessions_in_local_history": 52,
+		"sample": "bounded sequence, not the whole history: counts, rates and injectability hold for these sessions only",
+		"sessions_in_fixture": 8,
+		"builder": "local/facts.mjs commandDigest, one digest per client session (copies of one transcript merged by call id)",
+		"selection": "for each fact, its sessions in time order from proposal until it is active with at least 4 exercised sessions (all of them if it never is); up to 2 newest sessions per must-not-produce signal; the 2 newest sessions of at least 5 commands that all succeeded; browser-mcp: every session",
+		"approved": "owner, 2026-11-11: these repos and facts, and an empty edited-file set counts as disjoint",
+		"expectations": "strict P1 rules: local/facts-detect.mjs detect and facts-client.mjs reportBody over digests.jsonl in order, with the server lifecycle of the facts wire contract as corrected on 2026-11-11 (chain keeps only attested-disjoint prior sessions, then appends; 3 activates; 2 consecutive contradictions retire a candidate or active fact)",
+		"superseded": "the P0 expectations (2026-11-11) came from a broader replay with no 5-command repair window and a lenient success check; they are replaced, not cherry-picked",
+		"owner_examples": "the owner-approved facts are examples, not an allowlist: every fact these sessions qualify is listed",
+		"whole_local_history": "counts from scratch digests of every local session, built before the final scrub fix; for context only, not reproducible from this fixture"
+	},
+	"rules": {
+		"repair": "a failed command, then within 5 commands the same program and head with an added environment change and a proven success (single command or && chain, recorded exit 0, not cut)",
+		"reuse": "a known command_repair fact is confirmed again when its fix runs with a proven success",
+		"contradiction": "a proven success of exactly what the fact says fails; it wins over a confirmation in the same session",
+		"activation": "3 sessions in the device chain, each attested disjoint from the earlier ones; an empty edited-file set is disjoint; no local history means no attestation",
+		"exercised": "a session whose triggers include the fact's trigger, or that fired it",
+		"fired": "a session that confirmed it",
+		"injectable": "active, at least 4 exercised and fired * 5 >= exercised * 2"
+	},
+	"facts": [
+		{
+			"id": "gh-env-token",
+			"owner_example": true,
+			"fact_key": "93c55b551429d9d2",
+			"detector": "command_repair",
+			"literal": "env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch",
+			"statement": "Run `env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch …` here; plain `gh auth switch` fails in sessions here.",
+			"trigger": "prog:gh",
+			"proposed_in": "codex:510d38d46d87",
+			"expected": {
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 3,
+				"fired": 1,
+				"rate": 0.333,
+				"injectable": false,
+				"contradictions": 0
+			},
+			"whole_local_history": {
+				"state": "candidate",
+				"chain": 1,
+				"exercised": 5,
+				"fired": 1,
+				"rate": 0.2,
+				"injectable": false,
+				"contradictions": 0
+			}
+		}
+	],
+	"timeline": [
+		{
+			"session": "codex:510d38d46d87",
+			"observations": [
+				{
+					"fact_key": "93c55b551429d9d2",
+					"kind": "confirm",
+					"files": 0,
+					"disjoint_from": 0,
+					"chain": 1,
+					"state_after": "candidate"
+				}
+			]
+		}
+	],
+	"must_not_produce": [
+		{
+			"signal": "unavailable_tool",
+			"sessions": [
+				"codex:406fa39bd7e4",
+				"codex:298ec4fbff55"
+			],
+			"why": "the global `wrangler` reported `Not logged in` in 2 sessions: an account login state, which no detector covers, not a missing tool or a repo fact",
+			"produced": []
+		}
+	],
+	"quiet_sessions": [
+		"codex:50cf6762f4c9",
+		"claude-code:8e716fb68f84"
+	],
+	"quiet_observations": 0
+}

@@ -81,7 +81,7 @@ function dedupe(storage: DurableObjectStorage, who: Who, after: number): StepRes
 	const rows = storage.sql.exec<{ r: number; id: string; origin: string; pinned: number; flagged: string | null; keep: string | null }>(
 		`SELECT n.rowid AS r, n.id, n.origin, n.pinned, n.flagged, (SELECT o.id FROM nodes o WHERE o.kind = n.kind AND o.scope = n.scope
 			AND o.content_hash = n.content_hash AND o.status = 'active' AND o.memory_type IS NOT NULL AND o.rowid < n.rowid ORDER BY o.rowid LIMIT 1) AS keep
-		FROM nodes n WHERE n.rowid > ? AND n.status = 'active' AND n.memory_type IS NOT NULL ORDER BY n.rowid LIMIT ?`, after, STEP.dedupe).toArray();
+		FROM nodes n WHERE n.rowid > ? AND n.status = 'active' AND n.memory_type IS NOT NULL AND n.scope <> 'repo-fact' ORDER BY n.rowid LIMIT ?`, after, STEP.dedupe).toArray();
 	const stats = { superseded: 0, flagged: 0, failed: 0 };
 	for (const n of rows) {
 		if (!n.keep) continue;
@@ -233,7 +233,7 @@ function queueStep(storage: DurableObjectStorage, who: Who, after: number, now: 
 	const rows = sql.exec<{ r: number; id: string; kind: string; attrs: string; memory_type: string | null; chars: number; updated_at: string; created_at: string; stale: number }>(
 		`SELECT rowid AS r, id, kind, attrs, memory_type, chars, updated_at, created_at, (status = 'active' AND memory_type IS NOT NULL AND kind NOT IN ('journal', 'preference') AND origin <> 'stated'
 			AND pinned = 0 AND ?1 <> 'me' AND updated_at < ?2 AND NOT EXISTS (SELECT 1 FROM recall_daily d WHERE d.node_id = nodes.id AND d.day >= ?3)) AS stale
-		FROM nodes WHERE rowid > ?4 AND status IN ('active','candidate') ORDER BY rowid LIMIT ?5`, who.profile, staleBefore, hitsFrom, after, STEP.queue).toArray();
+		FROM nodes WHERE rowid > ?4 AND status IN ('active','candidate') AND scope <> 'repo-fact' ORDER BY rowid LIMIT ?5`, who.profile, staleBefore, hitsFrom, after, STEP.queue).toArray();
 	let items = 0;
 	for (const n of rows) {
 		const kinds: string[] = [];

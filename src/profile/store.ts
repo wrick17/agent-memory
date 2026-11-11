@@ -1,6 +1,7 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, fail, ok, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { Fail, fail, ok, type FactArgs, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { injectFacts, listFacts } from "./facts";
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
 import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorId } from "./index";
@@ -43,6 +44,7 @@ export { embeddingsOn, SEMANTIC_MS } from "./index";
 export { BATCH_GAP_MS } from "./maintenance";
 export { corpusFiles, corpusFilesSql } from "./insights";
 export { APPEND_MAX, NOTE_MAX } from "./write";
+export { checkObservation, factRepoKey, REPO_KEY, SESSION_REF } from "./facts";
 export type { ImportStep } from "./import";
 export type { OpOutcome } from "./maintenance";
 export { EDGE_ROWS, LEVEL_NODES, newBudget, REL_CLASS, type Budget, type GraphLink, type NodeRef, type NodeSummary } from "./graph";
@@ -64,7 +66,9 @@ export type V2Read =
 	| { kind: "sessions"; q: SessionQuery } | { kind: "session"; id: string }
 	| { kind: "lease_facts" } | { kind: "search_counts" }
 	| { kind: "activity_summary"; q: ActivitySummaryQuery } | { kind: "projects" } | { kind: "project_profile"; key: string }
-	| { kind: "viewer_part"; day: string } | { kind: "changes"; after: number; limit: number };
+	| { kind: "viewer_part"; day: string } | { kind: "changes"; after: number; limit: number }
+	// Repo facts: the owner's list (#95) and the injection read (#94), never through recall.
+	| { kind: "facts"; repo_key?: string; after: string | null; limit: number } | { kind: "fact_inject"; repo_key: string };
 /** #11: one profile's search index counts for GET /api/health: live recall texts, and nodes whose current card is embedded. */
 export interface SearchCounts { lexical_documents: number; vectors: number }
 
@@ -590,6 +594,35 @@ export class ProfileStore extends DurableObject<Env> {
 	 * wipe-ledger check for its ids, so a refusal or failure leaves nothing behind and a retry starts clean. The repo marker moves
 	 * only when every item of the request is held.
 	 */
+	/**
+	 * Repo facts (#92): one durable session report or proposal per call. Bound in the account like an upload, checked against the
+	 * wipe ledger, applied through runWrite as one transaction with replay, activity and undo, and its new records registered. A
+	 * replay returns the stored node_ids, so a registration that failed after the commit completes on retry.
+	 */
+	async facts(who: Who, args: FactArgs, ctx: Omit<WriteContext, "actor">): Promise<Outcome<Record<string, unknown>>> {
+		if (who.profile === "me") return fail("forbidden", "repo facts never go to me");
+		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
+		const cmd = { op: "fact" as const, args };
+		let newBinding = false, committed = false;
+		try {
+			await this.access(who, writeIds(who, cmd));
+			const bound = await account.bindRequest({ requestId: args.request_id, profile: who.profile, op: "fact", payloadHash: ctx.payloadHash, generation: who.generation });
+			if (!bound.ok) throw new Fail(bound.error);
+			newBinding = !bound.value.existing;
+			if (bound.value.profile !== who.profile) throw Fail.of("idempotency_mismatch", "this fact report belongs to another profile");
+			await this.access(who, writeIds(who, cmd));
+			this.bind(who);
+			const out = this.metered(runWrite(this.ctx.storage, who, cmd, { ...ctx, actor: "agent" }));
+			committed = true;
+			await this.register(who, (out.result.node_ids ?? []) as string[]);
+			return ok(out.result);
+		} catch (e) {
+			if (newBinding && !committed) await account.releaseRequest(args.request_id, ctx.payloadHash);
+			if (e instanceof Fail) return { ok: false, error: e.failure };
+			throw e;
+		}
+	}
+
 	async upload(who: Who, batch: WorkBatch, ctx: Omit<WriteContext, "actor" | "payloadHash">): Promise<Outcome<{ commits: WorkItemResult[]; prs?: WorkItemResult[]; tickets?: WorkItemResult[]; marker?: MarkerResult; created: string[] }>> {
 		if (who.profile === "me") return { ok: false, error: { code: "forbidden", message: "uploads never go to me" } };
 		const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "bindRequest" | "releaseRequest">;
@@ -772,7 +805,7 @@ export class ProfileStore extends DurableObject<Env> {
 			this.bind(who);
 			const sql = this.ctx.storage.sql, ids = q.kind === "unlinked" ? q.ids : [q.session];
 			const held = sql.exec<{ id: string }>(q.kind === "unlinked"
-				? "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND memory_type IS NOT NULL"
+				? "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active' AND memory_type IS NOT NULL AND scope <> 'repo-fact'"
 				: "SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND kind = 'session' AND status = 'active'", JSON.stringify(ids)).toArray().map((r) => r.id);
 			if (held.length !== new Set(ids).size) return fail("not_found", q.kind === "unlinked" ? "every id must be an active memory in this profile" : "no such session");
 			return ok(this.ctx.storage.transactionSync(() => {
@@ -804,6 +837,8 @@ export class ProfileStore extends DurableObject<Env> {
 				case "changes": return ok(changesSince(sql, who.profile, q.after, q.limit));
 				case "projects": return ok(listProjects(sql));
 				case "project_profile": { const p = projectProfile(sql, q.key, new Date().toISOString()); return p ? ok(p) : fail("not_found", "no such project"); }
+				case "facts": return ok(listFacts(sql, q));
+				case "fact_inject": return ok({ facts: injectFacts(sql, q.repo_key) });
 				case "search_counts": return ok({
 					lexical_documents: sql.exec<{ n: number }>("SELECT count(*) AS n FROM texts WHERE live = 1 AND lane = 'recall'").one().n,
 					vectors: sql.exec<{ n: number }>(`SELECT count(*) AS n FROM nodes WHERE ${HAS_VECTOR}`).one().n,
@@ -1124,6 +1159,6 @@ function lexicalFilterIds(sql: SqlStorage, q: Extract<ReadQuery, { kind: "recall
 	if (q.type !== "all") { extra.push("memory_type = ?"); params.push(q.type); }
 	if (q.kinds?.length) { extra.push(`kind IN (${q.kinds.map(() => "?").join(",")})`); params.push(...q.kinds); }
 	if (q.scope !== undefined) { extra.push("scope = ?"); params.push(q.scope.trim().toLowerCase()); }
-	return new Set(sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND memory_type IS NOT NULL AND ${[status, ...extra].join(" AND ")}`, ...params).toArray().map((r) => r.id));
+	return new Set(sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND memory_type IS NOT NULL AND scope <> 'repo-fact' AND ${[status, ...extra].join(" AND ")}`, ...params).toArray().map((r) => r.id));
 }
 

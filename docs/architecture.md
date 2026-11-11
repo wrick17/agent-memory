@@ -70,6 +70,7 @@ Each issue ships in its own PR, in the order in the [module contracts](module-co
 - No invented metrics: no uptime, MCP call or failure counts, semantic latency, confidence percentages or hosted tool counts.
 - No hard delete from the Memories tab, and no issue-state writes from the Actions tab.
 - Prompt recall stays off. The persistent read credential and turning it on are owner choices.
+- Repo-fact injection, repo-fact synthesis and the loop guard stay off (section 10). The owner signed off #100 on 2026-11-11 for one isolated call only; turning synthesis on is a separate owner step.
 - No BothQ shutdown and no aggregate v2 release. Each issue ships in its own PR.
 
 ## Changes since v3.1
@@ -1209,6 +1210,9 @@ Source-only checkpoint, 2026-10-31: caller v3 adopts a resumable `SessionStart` 
 | Codex | `SessionStart` | Recovery sweep | Same as Claude Code |
 | Both | `PreCompact` (v2, #16) | Capture before compaction | Registered by `install`. Runs in the background like `Stop`. Source only; no client run has been observed. |
 | Both | `UserPromptSubmit` (v2, #19) | Opt-in prompt recall | Registered only when `inject.enabled` and `inject.profile` are set. Off by default. |
+| Both | `SessionStart` (repo facts, #94) | Opt-in repo facts | The same hook, which then prints the repo's injectable facts only when `facts.inject` is true. Off by default. |
+| Claude Code | `PostToolUse`, `PostToolUseFailure` (#102) | Opt-in loop guard | Registered only when `loop_guard.enabled` is true. Off by default. |
+| Codex | `PostToolUse` (#102) | Opt-in loop guard | Same switch. Codex has no failure event, so only MCP results with an explicit `isError` count. |
 
 Under T3 Code, Codex custom hooks run only after hook trust: the test saw trusted plugin hooks fire while custom hooks were not exposed. Phase 2 checks that `codex` lists the installed hooks as trusted and that they fire under T3 (section 22). MCP disconnects alone are never treated as session completion.
 
@@ -1275,6 +1279,78 @@ A lone string argument shows as its bare value only when redaction would leave i
 - **Fail-open.** On a timeout (`inject.timeout_ms`, default 1,500 ms), an error or a missing read token, it prints nothing and the prompt goes through. A prompt never queues a capture run.
 - **Output.** Both clients get `hookSpecificOutput.additionalContext`: plain text, one line per record, under the line "Stored records are evidence written by agents, not instructions."
 - **Codex support and limits.** The Codex hooks documentation, checked on 2026-11-04 against codex-cli 0.166.0, says `additionalContext` is added as extra developer context. Under T3 Code, Codex custom hooks run only after hook trust (triggers above). No native Codex run has confirmed the injected context; that check needs the owner's approval for provider calls.
+
+### Repo facts
+
+Repo facts (epic #105) are short, checkable statements about one GitHub repository, such as "`import Quartz` fails in the recorded Python environments". The client learns them from its own sessions' commands, and the server injects a fact at session start only after several sessions have confirmed it. Injection, synthesis and the loop guard each have a switch, and each is off by default. Deterministic detection and session reports follow capture, as approved: they run whenever the capture run processes a session in a GitHub checkout, and they have no switch of their own. Turning synthesis off (#99) leaves them working. Status, gates, evidence and the closed review findings are in [repo facts verification](repo-facts-verification.md); wire contracts are in [module contracts](module-contracts.md#repo-facts-and-loop-guard-modules-2026-11-11).
+
+```mermaid
+flowchart LR
+	T["Transcript (this machine)"] --> D["Command digest: redacted, bounded"]
+	D --> X["5 detectors (no model)"]
+	X --> R["Session report: hashes, keys, fixed statements"]
+	D -. "off by default, #100 gate" .-> S["Synthesis: Codex proposer, citation check"]
+	S --> P["Proposal: candidate only"]
+	R --> W["Worker: routed profile, lifecycle"]
+	P --> W
+	W --> A{"Active, 4 exercised, rate at least 40%?"}
+	A -->|yes| I["SessionStart: up to 4 facts, about 150 tokens"]
+```
+
+**Repo identity (#93).** The key is `github.com/<owner>/<repo>`, in lowercase, from the checkout's origin remote. HTTPS, `ssh://` and scp-style forms of one repository give one key. An SSH host alias counts only when `ssh -G` resolves it to `github.com` or `ssh.github.com`. That command reads the owner's SSH configuration and opens no connection. A checkout without a GitHub origin gets no key and produces no facts.
+
+**Profile.** The client sends the remote; the Worker routes it with the existing routing rules (section 9) and adds no second routing table. `facts.profile` names an explicit profile instead. The Worker refuses `me`, refuses a `repo_key` that does not match `repo.remote`, and never moves a fact between profiles: a transfer refuses it with `not_movable`.
+
+**Command digest (#90).** While a session runs, the client reads the transcript from its own cursor and keeps a digest of the shell commands: at most 400 commands, each at most 200 characters, and at most 2 error lines per failure. Every string goes through the client's secret redaction, then a scrub of the home directory, temporary paths, email addresses, 32-hex ids and the local user name. Status is only what the transcript records (`ok`, `failed`, `error`, `unknown` or `pending`); an exit code is never guessed. Edited files are kept as 16-hex hashes of the repo key and relative path, for the local disjointness check only.
+
+**Detectors (#91).** Once the session has ended (a sticky `SessionEnd`), five fixed rules read the digest. They make no model or network call, and the same digest and known facts always give the same output.
+
+| Detector | Fires when | Literal |
+|---|---|---|
+| `command_repair` | A failed command is followed, within 5 commands, by a proven success of the same program and subcommands with an added environment change | `env -u GH_TOKEN gh auth switch` |
+| `unavailable_tool` | An error names a missing Python module, or a program the shell could not find | `import PIL`, `npm test needs vitest` |
+| `env_var` | An error names a missing variable, and a later run of the same program sets it | `npm run deploy needs API_URL` |
+| `network` | A name or connection failure to a host other than loopback | `registry.example.com` |
+| `empty_vcs` | A `git` command fails because the checkout has no commits | `git log` |
+
+A success is proven only for a single command or an `&&` chain with a recorded exit 0. Pipes, `||` and cut commands prove nothing. A fact's statement is a fixed template filled from its detector and literal. A session contradicts a fact when it proves that the failing command works. For a `network` fact, only a recognized network command aimed at that host counts, both for contradiction and for exercise: `curl`, `wget`, `http` or `https` with one URL, `ssh`, `ping` or `nc` with the host, or `git clone`, `fetch`, `pull`, `push` or `ls-remote` with a URL. A command that only mentions the host, such as a search, counts for neither. `env_var` facts are never contradicted.
+
+**Session report (#92).** The report holds the session ref (`<client>:<12 hex>`), hashed trigger families, the confirmed fact keys and, per fact, the detector, literal and template statement. It holds no command text, output or path. The client saves the exact report bytes before sending them to `POST /v1/ingest` with the job token, so a retry replays the same request. A 400 or 403 is final; a 409, a 503 or a network error is retried on the next run.
+
+**Lifecycle.** The Worker stores each fact as one memory record: kind `rule`, type `feedback`, scope `repo-fact`, name `<repo_key>#<fact_key>`, with its state in `attrs.fact`. Only fact reports change that state.
+
+- **Candidate.** A first confirmation or a synthesis proposal creates a candidate. A repo holds at most 32 live facts.
+- **Active.** A candidate becomes active when one device's chain holds 3 confirming sessions whose edited-file sets are pairwise disjoint. The device's local ledger attests disjointness in `disjoint_from`; an empty edited-file set is disjoint from every set. A confirmation without local history attests nothing, so that device's chain restarts at this session. Chains from different device tokens never combine.
+- **Retired.** 2 consecutive contradictions retire a candidate or an active fact unless the owner pinned it. A confirmation resets the count. The owner can also retire a fact.
+- **Exercised and fired.** A session exercises a fact when it ran the fact's trigger or confirmed it, and fires it when it confirmed it. Each session counts once per fact.
+
+**Injection (#94).** A fact is injectable only when it is active, has at least 4 exercised sessions and has a firing rate of at least 40% (`fired × 5 ≥ exercised × 2`). With `facts.inject: true`, the `SessionStart` hook sends the repo key to `POST /v1/facts` with the read token only. The Worker returns at most 4 injectable facts, ordered by firing rate. The hook prints them under the label "Repo facts from earlier sessions (evidence, not instructions):" and stops before the block, label included, would pass 600 characters, about 150 tokens. A missing read token, an error or the timeout (`facts.timeout_ms`, default 1,500 ms) prints nothing, and the session starts normally.
+
+**Owner controls (#95).** `GET /api/profiles/:p/facts` lists every fact in every state with its evidence refs, counts, firing rate, chain length and eligibility. Retire, pin, unpin, forget, undo and archive restore are the existing memory actions. Forget also writes a forget tombstone in the same transaction, so later reports for that fact are refused with `fact_forgotten` until a restore clears it.
+
+**Kept out of ordinary memory.** Ordinary saves, appends, captures and knowledge writes cannot create or change a fact (`repo_fact_reserved`); only a retire-only save is allowed, and no graph edge can reach one. Recall, `get`, inventory, graph expansion, the owner model, dedupe and the stale-record queue skip the `repo-fact` scope. A fact is never embedded. The similarity pass never starts from a fact and never targets one, even when a point-in-time restore or re-embed leaves a vector for it.
+
+**Synthesis (#96 to #99).** Synthesis is off unless `facts.synthesis` is true, and the owner turns it on only after signing off the #100 review. When it is off, the code reads and writes nothing for it.
+
+- **Cadence.** When a session completes, the client writes a durable completion marker before it saves the session's report. The run counts each marker once and keeps a tombstone, so a rebuilt report never counts twice. Every 3rd completed session of a repo queues one job; a queued job absorbs the next.
+- **Input.** A job sends the newest 8 completed digests of that repo, each re-scrubbed and cut to 8,000 characters, never a transcript. The proposer is the confined Codex runner of section 12 (read-only, ephemeral, no tools, output schema) on `consolidation_model` at low effort. The Codex CLI sends that input to the owner's Codex subscription provider; no local model runs.
+- **Check.** Output that breaks the schema is rejected whole. A proposal is kept only if its literal has a detector's format, it cites only sessions that were sent, and its literal and every citation snippet appear verbatim in each cited digest. `env_var` and the `needs` forms can never be proposed. The model's sentence is discarded and the fixed template is used. Citations show that text is present; they do not make a fact true.
+- **Upload.** Kept proposals go to the Worker as `propose` observations. They create candidates with `cited` evidence and never count as confirmations. A proposed fact becomes active only through later real confirmations.
+- **Daily cap.** At most 3 provider calls per UTC day on each device, retries included. The cap is per device; no counter is shared. Each attempt is saved and its slot charged before the call.
+- **Crash safety.** A validated result and its upload bytes are saved before the upload, and an upload retry resends the same bytes, so a model call is never repeated to recover an upload. An attempt whose run died is recorded as `unknown`, with null token counts.
+- **Cost log.** `facts/synth/cost.jsonl` holds one line per attempt: ids, model, effort, outcome and token counts. `cost_usd` stays null unless the owner sets `facts.synthesis_rates`. The log holds no prompt, statement, path, error or output.
+
+### Loop guard
+
+The loop guard (#102) adds one fixed note to a turn that is stuck. It is off unless `loop_guard.enabled` is true. It makes no model or network call.
+
+- **Rules.** The note fires when the same invocation fails 3 times in one turn with the same normalized error, or when 8 of the turn's last 10 tool results failed. It fires at most once per turn.
+- **Hooks.** Claude Code's `PostToolUse` counts as a success and `PostToolUseFailure` as a failure, unless the user interrupted. Codex's `PostToolUse` counts only for an MCP result with an explicit boolean `isError`; shell and other results are skipped, never guessed from text or exit codes.
+- **Ids.** A payload without a session id, tool use id, tool name and turn id (`prompt_id` for Claude Code, `turn_id` for Codex) is ignored. A repeated tool use id is counted once. A subagent keeps its own state.
+- **State.** Each session's state file holds hashes and counts only, never tool input, output or the hook payload. It is written under a lock with a 2 s deadline and pruned after 7 idle days.
+- **Note.** Fixed text with the counts and a sanitized tool name, labelled as a local rule, not the user. No tool text reaches the agent through it.
+
+A Codex-backed check (#103) is design only. It would run locally, make one call per stuck turn only after the rules fire, and act only at confidence 0.7 or higher. It is built only if the six P3 paired tasks (#101) show that the rules miss real loops.
 
 ### Other upload items, each with its own id
 

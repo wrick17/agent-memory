@@ -33,15 +33,16 @@ function jobTokenCheck(config) {
 }
 
 function readTokenCheck(config) {
-	// loadConfig turns injection on only when inject.enabled is true and inject.profile is set.
-	if (!config.inject?.enabled) return pass("read_token", "injection is off; no read token needed");
+	// loadConfig turns prompt injection on only when inject.enabled is true and inject.profile is set; repo facts with facts.inject.
+	const uses = [config.inject?.enabled ? `injection reads profile ${config.inject.profile}` : null, config.facts?.inject ? "repo facts are read at session start" : null].filter(Boolean);
+	if (!uses.length) return pass("read_token", "injection is off; no read token needed");
 	const file = expandHome(config.read_token_file), job = expandHome(config.token_file);
-	if (readToken(config)) return pass("read_token", `${file} is private; injection reads profile ${config.inject.profile}`);
+	if (readToken(config)) return pass("read_token", `${file} is private; ${uses.join("; ")}`);
 	if (file && job && path.resolve(file) === path.resolve(job)) {
 		return failed("read_token", `${file} is the job token file`, "Set read_token_file in config.json to a separate file that holds a read-scoped device token.");
 	}
 	const p = file ? tokenFileProblem(file) ?? "unusable" : "not configured";
-	return failed("read_token", `${file ?? "read_token_file"}: ${p}`, `Write a read-scoped device token to ${file}, then run: chmod 600 ${file}. Or set inject.enabled to false.`);
+	return failed("read_token", `${file ?? "read_token_file"}: ${p}`, `Write a read-scoped device token to ${file}, then run: chmod 600 ${file}. Or set inject.enabled and facts.inject to false.`);
 }
 
 /** The events whose hook command runs this home's CLI, per client settings file. Reads the settings; never changes them. */
@@ -70,12 +71,12 @@ function registered(client, bin) {
 }
 
 function hooksCheck(config) {
-	const bin = path.join(home(), "bin", "agent-memory"), want = hookEvents(config), seen = [], gaps = [];
+	const bin = path.join(home(), "bin", "agent-memory"), seen = [], gaps = [];
 	for (const client of ["claude-code", "codex"]) {
 		const r = registered(client, bin);
 		if (!r.exists && !r.found.size) continue;
 		seen.push(client);
-		const missing = want.filter((e) => !r.found.has(e));
+		const missing = hookEvents(config, client).filter((e) => !r.found.has(e));
 		if (missing.length) gaps.push({ client, file: r.file, missing });
 	}
 	if (!seen.length) return failed("hooks", "no Claude Code or Codex home found", "Run agent-memory install and add the printed hooks to your client settings.");
@@ -83,7 +84,7 @@ function hooksCheck(config) {
 		return failed("hooks", gaps.map((g) => `${g.client} is missing ${g.missing.join(", ")}`).join("; "),
 			`Run agent-memory install and add the printed hooks to ${gaps.map((g) => g.file).join(" and ")}.`);
 	}
-	return pass("hooks", `${seen.join(" and ")} register ${want.join(", ")}`);
+	return pass("hooks", seen.map((c) => `${c} registers ${hookEvents(config, c).join(", ")}`).join("; "));
 }
 
 function launchdCheck(platform) {

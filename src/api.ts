@@ -3,8 +3,8 @@ import type { AccountCommand, AccountContext, AccountStore, Principal } from "./
 import { authenticate, verifyJwt } from "./auth";
 import { canonicalJson, requestHash, sha256 } from "./domain/ids";
 import { stripPersonal } from "./domain/personal";
-import { redactPayload } from "./domain/redact";
-import { Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
+import { redactPayload, redactText } from "./domain/redact";
+import { FACT_DETECTORS, Fail, MEMORY_KINDS, MEMORY_TYPES, NODE_KINDS, ok, SCOPES, type FactArgs, type OwnerArgs, type ProfileRef, type ReadQuery, type WriteCommand } from "./domain/types";
 import { z } from "zod";
 import { PROFILE_NAME } from "./domain/types";
 import { accountStub, callTool, ownerOf, profileStub } from "./mcp";
@@ -16,7 +16,8 @@ import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
 import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
-import { deviceV2, ownerV2 } from "./v2-api";
+import { deviceV2, factRepoSchema, ownerV2 } from "./v2-api";
+import { checkObservation, factRepoKey, SESSION_REF } from "./profile/store";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
@@ -122,6 +123,7 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	if (!ctx.value.caller.scopes.includes("ingest")) return json({ error: { code: "forbidden", message: "this token cannot upload captures" } }, 403);
 	const text = (request.headers.get("content-type") ?? "").includes("application/json") ? await request.text() : "", raw = parseBody(text);
 	if (path === "/v1/ingest" && raw && "refresh" in raw) return refreshPart(env, ctx.value, text, raw);
+	if (path === "/v1/ingest" && raw && "facts" in raw) return factsIngest(env, ctx.value, raw);
 	const work = path === "/v1/ingest" && !!raw && ("commits" in raw || "prs" in raw || "tickets" in raw || "marker" in raw);
 	const parsed = (path === "/v1/ingest" ? (work ? workSchema : ingestSchema) : stateSchema).safeParse(raw);
 	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
@@ -163,6 +165,51 @@ async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, ro
 	
 	return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: res.value.commits, ...(res.value.prs ? { prs: res.value.prs } : {}),
 		...(res.value.tickets ? { tickets: res.value.tickets } : {}), ...(res.value.marker ? { marker: res.value.marker } : {}) });
+}
+
+const hex16 = z.string().regex(/^[0-9a-f]{16}$/), sessionRef = z.string().regex(SESSION_REF);
+const factObservation = z.object({ fact_key: hex16, kind: z.enum(["confirm", "contradict", "propose"]), detector: z.enum(FACT_DETECTORS),
+	statement: z.string().min(1).max(200), literal: z.string().min(1).max(120), family: hex16,
+	disjoint_from: z.array(sessionRef).max(8).optional(), citations: z.array(sessionRef).min(1).max(8).optional() }).strict()
+	.refine((o) => (o.kind === "confirm" || !o.disjoint_from) && (o.kind === "propose") === !!o.citations, { message: "disjoint_from is for confirm, citations for propose only" });
+/**
+ * A repo-facts report (#92): repo.remote is the only routing input and the source of repo_key, so a report can never route one repo's
+ * facts through another's rule. Bounded refs and hashes only, plus a statement and literal the Worker checks and redacts; no digest,
+ * path or output text has a field here.
+ */
+const factsSchema = factRepoSchema.extend({
+	facts: z.object({ session: sessionRef.optional(), proposal: z.string().regex(/^[0-9a-f]{16,64}$/).optional(),
+		families: z.array(hex16).max(32).default([]), fired: z.array(hex16).max(32).default([]), observations: z.array(factObservation).max(32).default([]) }).strict()
+		.refine((f) => !f.session !== !f.proposal, { message: "name exactly one of session or proposal" })
+		.refine((f) => f.session ? f.observations.every((o) => o.kind !== "propose") : !f.families.length && !f.fired.length && f.observations.every((o) => o.kind === "propose"),
+			{ message: "a session reports confirm and contradict with families and fired; a proposal only proposes" }),
+}).strict();
+
+/** The fact report branch of /v1/ingest: the device token's own report, routed like an upload and never to me. */
+async function factsIngest(env: Env, account: AccountContext, raw: Record<string, unknown>): Promise<Response> {
+	const caller = account.caller;
+	if (caller.kind !== "device" || !caller.deviceId) return json({ error: { code: "forbidden", message: "fact reports need a device token" } }, 403);
+	const parsed = factsSchema.safeParse(raw);
+	if (!parsed.success) return json({ error: { code: "validation", message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 500) } }, 400);
+	const input = parsed.data, key = factRepoKey(input.repo.remote, input.repo_key);
+	if (!key.ok) return json({ error: key.error }, 400);
+	for (const o of input.facts.observations) {
+		const bad = checkObservation(o);
+		if (bad) return json({ error: { code: "validation", message: `observation ${o.fact_key}: ${bad}`, details: { reason: "invalid_observation" } } }, 400);
+	}
+	const route = routeWrite(caller, account.rules, account.known, { ...(input.profile ? { profile: input.profile } : {}), repo: { remote: key.value } });
+	if (!route.ok) return json({ error: route.error }, route.error.code === "forbidden" ? 403 : 400);
+	if (route.value.profile === "me") return json({ error: { code: "forbidden", message: "repo facts never go to me" } }, 403);
+	const ref = account.profiles.find((p) => p.profile === route.value.profile);
+	if (!ref) return json({ error: { code: "profile_wiped", message: `profile '${route.value.profile}' is not active` } }, 400);
+	const f = input.facts, identity = f.session ? `s:${f.session}` : `p:${f.proposal}`;
+	const args: FactArgs = { repo_key: key.value, device: caller.deviceId, ...(f.session ? { session: f.session } : { proposal: f.proposal! }), families: f.families, fired: f.fired,
+		observations: f.observations.map((o) => ({ ...o, statement: redactText(o.statement) })), request_id: `facts:${sha256(`${key.value}\n${identity}`)}` };
+	const res = await profileStub(env, ref).facts(ref, args, { platform: "facts", routedBy: route.value.routedBy, userId: caller.userId, deviceId: caller.deviceId,
+		payloadHash: requestHash("fact", args as unknown as Record<string, unknown>) });
+	if (!res.ok) return json({ error: res.error }, res.error.code === "forbidden" ? 403 : res.error.code === "busy" || res.error.code === "unavailable" ? 503 : res.error.code === "profile_wiped" ? 410 : 400);
+	const { node_ids: _ids, profile: _p, routed_by: _r, ok: _ok, repo_key: _k, ...report } = res.value;
+	return json({ profile: ref.profile, routed_by: route.value.routedBy, repo_key: key.value, report });
 }
 
 const markersQuery = z.object({ repo: z.string().min(1).max(512).optional(), path: z.string().min(1).max(1024).optional(), profile: z.string().regex(PROFILE_NAME).optional(),
