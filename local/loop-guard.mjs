@@ -1,8 +1,11 @@
-// Rule-based loop nudge (#102). Deterministic: no model call, no network, no file I/O. The caller persists the state between
-// tool results and shows the note to the agent. The note is fixed text with counts and a sanitized tool name only, so no tool
-// input or output, which may hold untrusted instructions or secrets, ever reaches the agent through it. The state holds hashes
-// and counts, never raw text.
+// Rule-based loop nudge (#102). Deterministic: no model call and no network. observe() and scan() are pure; loopHook() is the
+// PostToolUse / PostToolUseFailure hook, which keeps each session's state in a private file between hook processes. The note is
+// fixed text with counts and a sanitized tool name only, so no tool input or output, which may hold untrusted instructions or
+// secrets, ever reaches the agent through it. The state holds hashes and counts, never raw text or the hook payload.
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { home, loadConfig, readJson, writePrivate } from "./agent-memory.mjs";
 
 /**
  * Thresholds. repeat: the same invocation failing with the same normalized error this many times in one turn. errors: this
@@ -96,4 +99,89 @@ export function scan(events, opts) {
 		}
 	}
 	return fired;
+}
+
+// ---------- hook ----------
+
+const SEEN_MAX = 64, STALE_LOCK_MS = 5000, STATE_DAYS = 7;
+const ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const str = (v) => (typeof v === "string" && v ? v : null);
+
+/**
+ * One hook payload as a ToolOutcome plus its dedupe id, or null when it must not count. Claude Code: PostToolUse is a success,
+ * PostToolUseFailure a failure unless the user interrupted it; the turn is prompt_id. Codex: PostToolUse with turn_id, and only
+ * an MCP result with an explicit boolean isError says whether it failed; shell and other results are skipped, never guessed
+ * from their text or exit code.
+ * @param {"claude-code" | "codex"} client @param {any} h the parsed hook input
+ * @returns {{ outcome: ToolOutcome, id: string, scope: string } | null}
+ */
+export function hookOutcome(client, h) {
+	const event = h?.hook_event_name, session = str(h?.session_id), id = str(h?.tool_use_id), tool = str(h?.tool_name);
+	if (!session || !ID.test(session) || !id || !tool) return null;
+	let turn, failed, output;
+	if (client === "claude-code") {
+		turn = str(h.prompt_id);
+		if (event === "PostToolUse") failed = false;
+		else if (event === "PostToolUseFailure" && h.is_interrupt !== true) { failed = true; output = h.error; }
+		else return null;
+	} else if (client === "codex" && event === "PostToolUse") {
+		turn = str(h.turn_id);
+		const r = h.tool_response;
+		if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.isError !== "boolean") return null;
+		failed = r.isError;
+		output = failed ? r.content ?? r.structuredContent ?? null : undefined;
+	} else return null;
+	if (!turn) return null;
+	// Subagents keep their own state: their tool calls are not the parent's turn.
+	const scope = hash(`${client}\0${session}\0${str(h.agent_id) ?? ""}`);
+	return { outcome: { turn: hash(`${client}\0${turn}`), tool, input: h.tool_input, output, failed }, id: hash(id), scope };
+}
+
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** An exclusive lock file per state file, waited for until the deadline; a lock older than STALE_LOCK_MS is a dead hook's. */
+function lock(file, deadline) {
+	while (Date.now() < deadline) {
+		try { fs.writeFileSync(file, String(process.pid), { flag: "wx", mode: 0o600 }); return true; } catch (e) { if (e.code !== "EEXIST") throw e; }
+		// shortcut: a hook stalled past STALE_LOCK_MS can lose its lock to another; the cost is one miscounted result, not data.
+		try { if (Date.now() - fs.statSync(file).mtimeMs > STALE_LOCK_MS) fs.rmSync(file, { force: true }); } catch { /* released meanwhile */ }
+		pause(20);
+	}
+	return false;
+}
+
+/** Removes state and lock files idle over STATE_DAYS. Run when a session's first state file is made, so once per session. */
+function prune(dir, now) {
+	for (const f of fs.readdirSync(dir)) {
+		if (!/\.(?:json|lock)$/.test(f)) continue;
+		try { if (now - fs.statSync(path.join(dir, f)).mtimeMs > STATE_DAYS * 86_400_000) fs.rmSync(path.join(dir, f), { force: true }); } catch { /* gone */ }
+	}
+}
+
+/**
+ * The hook: reads the payload, folds it into the session's state under a lock and returns the client's output, or null.
+ * Output, for both clients: { hookSpecificOutput: { hookEventName: <the triggering event>, additionalContext: <note> } }.
+ * A tool_use_id seen before (the last SEEN_MAX per session) is not counted again.
+ * @param {"claude-code" | "codex"} client @param {string} input @param {{ deadline: number, now?: number }} opts
+ */
+export function loopHook(client, input, { deadline, now = Date.now() }) {
+	if (loadConfig().loop_guard?.enabled !== true) return null;
+	let h;
+	try { h = JSON.parse(input); } catch { return null; }
+	const r = hookOutcome(client, h);
+	if (!r) return null;
+	const dir = path.join(home(), "loop-guard"), file = path.join(dir, `${r.scope}.json`), lockFile = path.join(dir, `${r.scope}.lock`);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	if (!lock(lockFile, deadline)) return null;
+	let note = null;
+	try {
+		const prior = readJson(file, null);
+		if (!prior) prune(dir, now);
+		const seen = Array.isArray(prior?.seen) ? prior.seen.filter((x) => typeof x === "string") : [];
+		if (seen.includes(r.id)) return null;
+		const o = observe(prior?.guard, r.outcome);
+		writePrivate(file, JSON.stringify({ v: 1, seen: [...seen, r.id].slice(-SEEN_MAX), guard: o.state }));
+		note = o.note;
+	} finally { fs.rmSync(lockFile, { force: true }); }
+	return note ? JSON.stringify({ hookSpecificOutput: { hookEventName: h.hook_event_name, additionalContext: note } }) : null;
 }

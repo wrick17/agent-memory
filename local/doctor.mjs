@@ -70,12 +70,12 @@ function registered(client, bin) {
 }
 
 function hooksCheck(config) {
-	const bin = path.join(home(), "bin", "agent-memory"), want = hookEvents(config), seen = [], gaps = [];
+	const bin = path.join(home(), "bin", "agent-memory"), seen = [], gaps = [];
 	for (const client of ["claude-code", "codex"]) {
 		const r = registered(client, bin);
 		if (!r.exists && !r.found.size) continue;
 		seen.push(client);
-		const missing = want.filter((e) => !r.found.has(e));
+		const missing = hookEvents(config, client).filter((e) => !r.found.has(e));
 		if (missing.length) gaps.push({ client, file: r.file, missing });
 	}
 	if (!seen.length) return failed("hooks", "no Claude Code or Codex home found", "Run agent-memory install and add the printed hooks to your client settings.");
@@ -83,7 +83,7 @@ function hooksCheck(config) {
 		return failed("hooks", gaps.map((g) => `${g.client} is missing ${g.missing.join(", ")}`).join("; "),
 			`Run agent-memory install and add the printed hooks to ${gaps.map((g) => g.file).join(" and ")}.`);
 	}
-	return pass("hooks", `${seen.join(" and ")} register ${want.join(", ")}`);
+	return pass("hooks", seen.map((c) => `${c} registers ${hookEvents(config, c).join(", ")}`).join("; "));
 }
 
 function launchdCheck(platform) {

@@ -67,6 +67,8 @@ export function hook(client, input, { spawnRun = true } = {}) {
 	try { h = JSON.parse(input); } catch { return; }
 	// A prompt hook is the opt-in injection path (inject.mjs, dispatched by the CLI). It never queues a capture run.
 	if (h?.hook_event_name === "UserPromptSubmit") return;
+	// Tool hooks are the opt-in loop guard (loop-guard.mjs, dispatched by the CLI). They never queue a capture run either.
+	if (LOOP_EVENTS.has(h?.hook_event_name)) return;
 	const session = typeof h?.session_id === "string" ? h.session_id : null;
 	if (!session || !/^[A-Za-z0-9._:-]{1,128}$/.test(session)) return;
 	const name = `${client}-${safeName(session)}.json`;
@@ -892,9 +894,11 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
 
 /**
  * v2 keys, used when config.json leaves them out, so a v1 config keeps working unchanged. Injection is off by default and turns
- * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them.
+ * on only when the owner sets both inject.enabled: true and inject.profile; nothing picks a profile for them. The loop guard is
+ * off unless loop_guard.enabled is true.
  */
-export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 } });
+export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
+	loop_guard: { enabled: false } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -906,7 +910,8 @@ export function withDefaults(raw) {
 		batch_hour: Number.isInteger(c.batch_hour) && c.batch_hour >= 0 && c.batch_hour <= 23 ? c.batch_hour : d.batch_hour,
 		read_token_file: typeof c.read_token_file === "string" && c.read_token_file ? c.read_token_file : d.read_token_file,
 		inject: { enabled: i.enabled === true && profile !== null, profile,
-			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) } };
+			max_tokens: posInt(i.max_tokens, d.inject.max_tokens, 4000), timeout_ms: posInt(i.timeout_ms, d.inject.timeout_ms, 10_000) },
+		loop_guard: { enabled: c.loop_guard?.enabled === true } };
 }
 
 export function loadConfig() {
@@ -1046,11 +1051,18 @@ async function sendStatus(config, server, now) {
 	} catch { return "failed"; }
 }
 
+/** Tool-result events the loop guard handles. Claude Code reports failures as PostToolUseFailure; Codex has PostToolUse only. */
+const LOOP_EVENTS = new Set(["PostToolUse", "PostToolUseFailure"]);
+const loopEventsOf = (client) => (client === "codex" ? ["PostToolUse"] : ["PostToolUse", "PostToolUseFailure"]);
+
 /**
- * The hook events install registers, for both clients: UserPromptSubmit only when injection is on. status.mjs reports this list
- * and doctor.mjs checks the client settings against it.
+ * The hook events install registers for a client: UserPromptSubmit only when injection is on, the tool-result events only when
+ * the loop guard is on. Without a client, every event either client registers. status.mjs reports this list and doctor.mjs
+ * checks each client's settings against its own.
+ * @param {object} [config] @param {"claude-code" | "codex"} [client]
  */
-export const hookEvents = (config = loadConfig()) => ["Stop", "SessionEnd", "SessionStart", "PreCompact", ...(config.inject?.enabled === true ? ["UserPromptSubmit"] : [])];
+export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop", "SessionEnd", "SessionStart", "PreCompact", ...(config.inject?.enabled === true ? ["UserPromptSubmit"] : []),
+	...(config.loop_guard?.enabled === true ? (client ? loopEventsOf(client) : ["claude-code", "codex"].flatMap(loopEventsOf)) : [])])];
 
 /**
  * Whether a configured profile may get a batch lease now. The server allows one lease per profile every 20 hours (BATCH_GAP_MS in
@@ -1469,8 +1481,9 @@ const REPLAY_LOCAL = ["replay.mjs", "transcript-full.mjs", "replay-player.js"];
 const LO_LOCAL = ["launchd.mjs", "status.mjs", "doctor.mjs", "backfill.mjs"];
 // The eval command and its scorer.
 const EVAL_LOCAL = ["eval.mjs", "eval-score.mjs"];
-// Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit. They import only ./agent-memory.mjs and each other.
-export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", ...EVAL_LOCAL];
+// Every v2 module copied beside the CLI, with inject.mjs for UserPromptSubmit and loop-guard.mjs for the tool-result hooks. They
+// import only ./agent-memory.mjs and each other.
+export const V2_LOCAL = [...LO_LOCAL, "inject.mjs", "loop-guard.mjs", ...EVAL_LOCAL];
 
 export function install({ server = "https://memory.wrick17.com", platform = process.platform } = {}) {
 	const bin = path.join(home(), "bin", "agent-memory");
@@ -1503,13 +1516,16 @@ export function install({ server = "https://memory.wrick17.com", platform = proc
 		launchd = { label, plist: file, load: loadCommand(file) };
 	}
 	// Stop and PreCompact only queue a run, so they never hold up the client. UserPromptSubmit waits for its output, bounded by
-	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout.
+	// the injection timeout; Codex always runs SessionEnd synchronously, so it gets a short timeout. The tool-result hooks run
+	// after every tool call and exit by themselves well inside LOOP_TIMEOUT_S.
 	const promptTimeout = Math.ceil(config.inject.timeout_ms / 1000) + 1;
-	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : {});
-	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}` : "");
+	const claudeExtra = (e) => (e === "Stop" || e === "PreCompact" ? { async: true } : e === "UserPromptSubmit" ? { timeout: promptTimeout } : LOOP_EVENTS.has(e) ? { timeout: LOOP_TIMEOUT_S } : {});
+	const codexExtra = (e) => (e === "Stop" || e === "PreCompact" ? "\nasync = true" : e === "SessionEnd" ? "\ntimeout = 3" : e === "UserPromptSubmit" ? `\ntimeout = ${promptTimeout}`
+		: LOOP_EVENTS.has(e) ? `\ntimeout = ${LOOP_TIMEOUT_S}` : "");
+	const claudeEvents = hookEvents(config, "claude-code"), codexEvents = hookEvents(config, "codex");
 	return { bin, config: cfg, launchd, hooks: events,
-		claude: { hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
-		codex: events.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
+		claude: { hooks: Object.fromEntries(claudeEvents.map((e) => [e, [{ hooks: [{ type: "command", command: `${bin} hook claude-code`, ...claudeExtra(e) }] }]])) },
+		codex: codexEvents.map((e) => `[[hooks.${e}]]\n[[hooks.${e}.hooks]]\ntype = "command"\ncommand = "${bin} hook codex"${codexExtra(e)}`).join("\n\n") };
 }
 
 // ---------- CLI ----------
@@ -1534,6 +1550,22 @@ function promptHook(client, input) {
 	}, () => process.exit(0));
 }
 
+/** The client's hook timeout for the tool-result hooks, in seconds; the hook gives up and prints nothing after LOOP_DEADLINE_MS. */
+const LOOP_TIMEOUT_S = 5, LOOP_DEADLINE_MS = 2000;
+
+/**
+ * PostToolUse and PostToolUseFailure: the loop guard. Off unless loop_guard.enabled. No network; prints at most one fixed note
+ * per turn, and on any failure, lock contention or the deadline prints nothing and exits 0.
+ */
+function loopHook(client, input) {
+	if (!loadConfig().loop_guard.enabled) process.exit(0);
+	setTimeout(() => process.exit(0), LOOP_DEADLINE_MS);
+	import("./loop-guard.mjs").then((m) => m.loopHook(client, input, { deadline: Date.now() + LOOP_DEADLINE_MS - 500 })).then((out) => {
+		if (typeof out === "string" && out) process.stdout.write(out, () => process.exit(0));
+		else process.exit(0);
+	}, () => process.exit(0));
+}
+
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
 	const [cmd, arg] = process.argv.slice(2);
 	if (cmd === "hook") {
@@ -1542,6 +1574,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 			let event = null;
 			try { event = JSON.parse(input)?.hook_event_name ?? null; } catch { /* hook() ignores bad input */ }
 			if (event === "UserPromptSubmit" && CLIENTS.has(arg)) { try { promptHook(arg, input); } catch { process.exit(0); } return; }
+			if (LOOP_EVENTS.has(event) && CLIENTS.has(arg)) { try { loopHook(arg, input); } catch { process.exit(0); } return; }
 			try { hook(arg, input); } catch { /* never block the client */ }
 			process.exit(0);
 		});
