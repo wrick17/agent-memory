@@ -6,20 +6,18 @@
 import type { Am, Failure, J, Node, Route } from "./am";
 
 export function auditTab(am: Am): void {
-	const { act, active, btn, call, choose, copy, curl, el, enc, facts, intro, link, note, pageStatus, recorded, undoOf, why } = am;
+	const { act, active, btn, call, choose, copy, curl, el, enc, facts, link, note, pageStatus, recorded, undoOf, why } = am;
 	// The server's write actors (src/api.ts activityQuery). Imports write as "migration"; the label says what the owner knows them as.
 	const ACTORS: [string, string][] = [["", "All actors"], ["owner", "Owner"], ["agent", "Agent"], ["maintenance", "Maintenance"], ["migration", "Import"],
 		["keep", "Keep"], ["index", "Index"], ["transfer", "Transfer"]];
-	const ACTOR_CHIP: Record<string, string> = { owner: "c-blue", agent: "c-teal", maintenance: "c-amber", migration: "c-blue", transfer: "c-amber" };
 	const actorName = (a: unknown) => a === "migration" ? "import" : recorded(a);
-	const TARGETS_SHOWN = 5;
 	const pendingOps = new Map<string, { id: string; cursor: string; label: string }>(); // per profile: a staged archive restore not finished
 
+	const cls2 = (e: Node, c: string) => e.setAttribute("class", c);
 	const chip = (parent: Node, text: string, cls = "") => el("span", parent, text).setAttribute("class", `chip${cls ? ` ${cls}` : ""}`);
-	const stamp = (iso: unknown) => typeof iso === "string" && !Number.isNaN(Date.parse(iso)) ? iso.replace("T", " ").slice(0, 19) : recorded(iso);
 	const listOf = (parent: Node, label: string) => {
 		const ul = el("ul", parent);
-		ul.setAttribute("class", "prefs");
+		ul.setAttribute("class", "prefs compact");
 		ul.setAttribute("aria-label", label);
 		ul.setAttribute("data-list", "");
 		return ul;
@@ -81,63 +79,54 @@ export function auditTab(am: Am): void {
 
 	const audit = (view: Node, names: string[], actor: string, query: Record<string, string>, one?: string) => {
 		const version = am.pageVersion, all = one === undefined;
-		const h = el("h2", view, all ? "Audit" : `Audit: ${one}`);
-		intro(view, "Audit", "activity", "Every change your agents, imports, the batch and you made, newest first. Undo reverses one; if its records changed again since, review them by hand.");
+		const h = el("h2", view, all ? "Change history" : `Change history: ${one}`);
 		const { say } = pageStatus(view);
 		if (!names.length) { am.empty(view, "No active profile to read. Activity appears here once a profile is active and something writes to it."); return h; }
-		note(view, all ? `Showing every active profile: ${names.join(", ")}.` : `Showing ${one}.`);
 		if (query.actor !== undefined && !ACTORS.some(([v]) => v && v === query.actor)) note(view, `No actor named “${query.actor}”; showing every actor.`, "warn");
 
 		// ---- Activity ----
 		const logBox = el("section", view);
 		logBox.setAttribute("class", "panel");
 		logBox.setAttribute("aria-label", "Activity");
-		const head = el("h3", logBox, "Activity");
-		am.help(head, "undo");
+		el("h3", logBox, "Changes");
 		const tools = el("div", logBox);
 		tools.setAttribute("class", "toolbar");
 		const pick = choose(tools, "audit-actor", "Actor", ACTORS);
 		pick.value = actor;
 		am.help(tools, "actor");
 		pick.addEventListener("change", () => { am.win.location.hash = hashOf(one, pick.value); });
-		const listPath = (p: string, before: number | null) => `/api/profiles/${enc(p)}/activity?limit=50${before ? `&before=${before}` : ""}${actor ? `&actor=${enc(actor)}` : ""}`;
+		const listPath = (p: string, before: number | null) => `/api/profiles/${enc(p)}/activity?limit=25${before ? `&before=${before}` : ""}${actor ? `&actor=${enc(actor)}` : ""}`;
 		if (one !== undefined) { copy(tools, "Copy curl", () => curl("GET", listPath(one, null))); am.help(tools, "curl"); }
 		const logFailed = el("div", logBox), log = listOf(logBox, "Activity"), wait = am.loading(logBox, 4);
 		const moreLog = btn(logBox, "Older activity", () => loadLog());
 		moreLog.hidden = true;
+		am.autoMore(moreLog); // scrolls on demand: the next page loads as the end comes into view
 		const logFeed = merged(one ?? null, names, listPath);
 		let shownLog = 0;
+		// One line per change: when, what happened in words, the record by its title, who did it, and Undo when it can be undone.
+		const WHO: Record<string, string> = { owner: "You", agent: "An agent", maintenance: "Background tidy-up", migration: "Import", transfer: "A move", keep: "Keep", index: "Indexing" };
 		const activityRow = (p: string, it: J) => {
-			const li = row(log), base = `/api/profiles/${enc(p)}`, summary = String(it.summary ?? "");
-			const top = el("p", li);
-			chip(top, recorded(it.op));
-			chip(top, actorName(it.actor), ACTOR_CHIP[String(it.actor)] ?? "");
-			if (all) chip(top, p);
-			el("span", top, ` ${stamp(it.at)}`).setAttribute("class", "mono muted");
-			el("span", top, ` · change ${recorded(it.id)}`).setAttribute("class", "mono muted");
-			if (it.redacted) note(li, "Its summary was removed by a wipe.");
-			else el("p", li, recorded(summary));
+			const li = row(log), base = `/api/profiles/${enc(p)}`, lib: J = am.library(one ?? null);
+			cls2(li, "change");
+			am.time(li, it.at);
 			const ids: string[] = Array.isArray(it.targets) ? it.targets.map(String) : [];
-			if (ids.length && !it.redacted) {
-				const t = el("p", li, ids.length === 1 ? "Record: " : "Records: ");
-				ids.slice(0, TARGETS_SHOWN).forEach((id, i) => {
-					if (i) el("span", t, ", ");
-					// Targets are record ids, except "e:<id>" links (knowledge writes) and records a purge already deleted: those stay text.
-					if (id.startsWith("e:") || it.op === "purge") el("span", t, id).setAttribute("class", "mono");
-					else link(t, `#memories/${enc(id)}?profile=${enc(p)}`, id);
-				});
-				if (ids.length > TARGETS_SHOWN) el("span", t, ` and ${ids.length - TARGETS_SHOWN} more`);
-			} else if (ids.length) note(li, `${ids.length} record(s).`);
-			const meta = [it.device_id ? `On device ${String(it.device_id)}.` : "", Number.isSafeInteger(it.undo_of) ? `Undoes change ${it.undo_of}.` : "",
-				it.undo === "undone" ? `Undone${Number.isSafeInteger(it.undone_by) ? ` by change ${it.undone_by}` : ""}.` : it.undo === "redacted" ? "Undo removed by a wipe." : it.undo === "available" ? "" : "No undo."].filter(Boolean).join(" ");
-			if (meta) note(li, meta);
+			const rec = ids.map((id) => lib.items.get(`${p}/${id}`)).find(Boolean);
+			// Quoted slugs in the stored summary read as their human titles.
+			const words = it.redacted ? "A change whose summary a wipe removed" : String(it.summary ?? recorded(it.op)).replace(/'([^']+)'/g, (_m: string, q: string) => `“${am.human(q)}”`);
+			const what = el("span", li, words);
+			cls2(what, "what");
+			if (rec && am.itemHref(rec, one ?? null)) { el("span", li, " · "); const a = el("a", li); a.setAttribute("href", am.itemHref(rec, one ?? null)); am.title(rec, a); }
+			const who = el("span", li, `${WHO[String(it.actor)] ?? recorded(it.actor)}${all ? ` · ${p}` : ""}`);
+			cls2(who, "muted");
+			if (it.undo === "undone") cls2(el("span", li, "Undone"), "muted");
 			if (it.undo !== "available") return;
-			const cut = summary.slice(0, 80);
+			const cut = String(it.summary ?? "").slice(0, 80);
 			// A conflict (the records changed again since) is an answer, not a failure: the owner reviews those records by hand.
-			btn(li, "Undo", () => act(() => call(`${base}/activity/${enc(String(it.id))}/undo`, "POST").catch((e: Failure) =>
+			const u = btn(li, "Undo", () => act(() => call(`${base}/activity/${enc(String(it.id))}/undo`, "POST").catch((e: Failure) =>
 				e.status === 409 || e.code === "revision_conflict" ? { conflict: true } : Promise.reject(e)), `undo “${cut}”`, undefined,
-			(r) => r?.conflict ? { text: `Changed since. Review by hand: the records of “${cut}” in ${p} changed after it, so nothing was undone.` } : { text: `Undone: “${cut}” in ${p}.` }),
+			(r) => r?.conflict ? { text: "Nothing was undone: those records changed again since. Review them by hand." } : { text: "Undone." }),
 			`Undo ${cut}`);
+			cls2(u, "linklike undo");
 		};
 		const loadLog = async () => {
 			moreLog.disabled = true;
@@ -184,6 +173,7 @@ export function auditTab(am: Am): void {
 		const archFailed = el("div", archBox), arch = listOf(archBox, "Archive"), archWait = am.loading(archBox, 2);
 		const moreArch = btn(archBox, "Older removals", () => loadArch());
 		moreArch.hidden = true;
+		am.autoMore(moreArch);
 		const archFeed = merged(one ?? null, names, (p, before) => `/api/profiles/${enc(p)}/archive?limit=20${before ? `&before=${before}` : ""}`);
 		let shownArch = 0;
 		const archiveRow = (p: string, it: J) => {
@@ -222,7 +212,7 @@ export function auditTab(am: Am): void {
 	// The old #/activity and #/activity/P routes (through am.legacy): the same view for one profile.
 	am.pages.activity = (view, p) => audit(view, [String(p.name)], "", {}, String(p.name));
 	// The shell's profile gate has already refused an unknown or inactive ?profile, so `named` is absent or active.
-	am.tab({ id: "audit", group: "system", label: "Audit", key: "u", profiles: "any", render: (root, route: Route) => {
+	am.tab({ id: "audit", group: null, label: "Change history", key: "u", profiles: "any", hidden: true, render: (root, route: Route) => {
 		const named = route.query.profile, actor = ACTORS.some(([v]) => v && v === route.query.actor) ? route.query.actor! : "";
 		return named === undefined ? audit(root, active().map((p) => p.name), actor, route.query) : audit(root, [named], actor, route.query, named);
 	} });

@@ -9,7 +9,7 @@ export function glossary(am: Am): void {
 		graph: { term: "Graph", text: "Records and the links between them, drawn for one profile. Each link keeps the reason and evidence it was made with." },
 		memories: { term: "Memories", text: "Records your agents saved: decisions, references, rules and project facts. Each edit keeps the older version." },
 		activity: { term: "Audit", text: "Every change your agents, imports, the batch and you made, newest first, with who made it, and the archive of removed records. Undo reverses most changes." },
-		profiles: { term: "Profiles", text: "One card per profile with its status, devices and daily batch. Each profile keeps its records apart from the others." },
+		profiles: { term: "Profiles", text: "One card per profile with its status, devices and batch. Each profile keeps its records apart from the others." },
 		paths: { term: "Paths", text: "Pick two records and see how they connect, with the reason on each step. It shows at most 3 paths of up to 4 hops." },
 		map: { term: "Map", text: "Records around a center and their links, up to 300 records. What-if items try links on screen without saving them." },
 		timeline: { term: "Timeline", text: "What changed in a profile, by day: entries, revisions and uploads." },
@@ -23,6 +23,8 @@ export function glossary(am: Am): void {
 		about: { term: "About you", text: "Preferences and rules about you, stated or inferred with evidence. Pin, forget or undo them here." },
 		backups: { term: "Backups and recovery", text: "Exports of each profile, the restore drill, and recovery after a restore." },
 
+		manage: { term: "Manage", text: "The owner's tools in one place: writing and review, backups, moves and wipes, devices, profiles and routing." },
+		devices: { term: "Devices and tokens", text: "The machines and tokens that can read and write your memory. Create one per machine; revoke one you no longer use." },
 		// Tabs.
 		overview: { term: "Overview", text: "Counts across every profile, health at a glance, recent sessions and the live feed of changes. A link with ?profile= narrows the lists and health to that profile; the totals stay for every profile and say so." },
 		health: { term: "Health", text: "Checks on capture, search, consolidation and backups, each OK, WARN or FAIL." },
@@ -50,7 +52,7 @@ export function glossary(am: Am): void {
 		corpus: { term: "Corpus", text: "Uploaded code history (commits, pull requests and tickets) that agents search with the corpus tool. File paths in Activity and project profiles come from corpus commits. Paid plan only." },
 		capture: { term: "Capture", text: "Each device's hooks upload session digests. A device that stops reporting shows as stale." },
 		inject: { term: "Prompt injection", text: "An opt-in hook that recalls related memories when you send a prompt and adds them to the agent's context." },
-		scheduled_batch: { term: "Scheduled batch", text: "The daily consolidation run: it reads new captures, merges near-duplicates and links related records, leasing at most 40 items for 900 seconds at a time." },
+		scheduled_batch: { term: "Scheduled batch", text: "Reads new captures, merges near-duplicates and links related records. Each lease holds at most 40 items for up to 900 seconds." },
 
 		// Terms on those pages.
 		profile_choice: { term: "Profile", text: "Which profile a tab reads. All profiles reads every active profile and labels each row with its profile; a link with ?profile=NAME reads only that one. Totals from the server always cover all profiles." },
@@ -66,8 +68,8 @@ export function glossary(am: Am): void {
 		feed: { term: "Live feed", text: "Changes as they happen. MEMORY is a saved record, IMPORT an upload, FORGET a removal, PREFERENCE a lesson change, BATCH a consolidation run." },
 		first_upload: { term: "First upload", text: "When the first digest for this session reached the server. The session itself may have started earlier." },
 		pending_ranges: { term: "Pending ranges", text: "Captured ranges a device has not finished uploading. WARN when a range is stuck or has waited more than 7 days." },
-		consolidation: { term: "Consolidation", text: "The scheduled batch reads new captures, merges near-duplicates and links related records. It leases at most 40 items for 900 seconds at a time." },
-		lease: { term: "Lease", text: "Items the batch holds while it works. A lease expires after 900 seconds, and the items return to the queue." },
+		consolidation: { term: "Consolidation", text: "The scheduled batch reads new captures, merges near-duplicates and links related records. Each drain of a capture run can lease up to 40 waiting items per profile for up to 900 seconds. Later drains retry only after a clean or idle lease; failures wait for the next run." },
+		lease: { term: "Lease", text: "Up to 40 items the batch holds for up to 900 seconds while it works. Expired leases return their items to the queue." },
 		similarity: { term: "Similarity thresholds", text: "Cosine 0.92 or higher between records of the same kind marks a likely duplicate. Matches below 0.80 are ignored." },
 		stale: { term: "Stale", text: "Journals untouched for 7 days and memories unused for 90 days are offered for review. They are review items, never automatic deletions." },
 		eval: { term: "Recall quality", text: "Scores from agent-memory eval: the share of expected records a recall returns in its top results." },
@@ -84,7 +86,7 @@ export function glossary(am: Am): void {
 		origin: { term: "Origin", text: "Where a rule or preference came from: STATED from you, AGENT from an agent's save, INFERRED from evidence in sessions." },
 		revisions: { term: "Older versions", text: "Earlier versions of a memory, kept when it is edited." },
 		relations: { term: "Relations", text: "Links between records in the graph." },
-		daily_batch: { term: "Daily batch", text: "The scheduled consolidation run for a profile: the date of its last lease, and its last skip or park with the reason." },
+		daily_batch: { term: "Batch", text: "The batch leases waiting items once per profile on each drain of a capture run. Later drains retry only after a clean or idle lease; failures wait for the next run. Shows its last lease date and last skip or park reason." },
 		undo: { term: "Undo", text: "Reverses a change. If the record changed again since, undo stops and asks you to review it by hand." },
 		actor: { term: "Actor", text: "Who made a change: owner, agent, maintenance, import, keep or index." },
 		mcp_call: { term: "MCP call", text: "The tool name and arguments an agent sends to the memory MCP server, as JSON." },

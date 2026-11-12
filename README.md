@@ -14,7 +14,7 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 - **Sessions tagged by project.** Each captured session links to the GitHub project of the folder it ran in, and to an optional workspace. Lessons and decisions learned from the session inherit that project. See [capture project tagging](docs/self-host.md#capture-project-tagging).
 - **Guidance while agents work.** Each session starts with a brief of at most 400 tokens: repo facts, the open journal, project rules and decisions, and your `me` preferences. The loop guard adds one short note when a turn keeps failing the same way.
 - **Repo facts.** The client spots repeatable command failures in a GitHub repo, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction.
-- **A dashboard.** Browse memories, the graph, sessions, lessons, goals and health at `/app`. Manage devices and routing at `/settings`.
+- **A dashboard.** Browse memories, learnings, journals and projects, and see how they connect on the Map, at `/app`. Owner tools, devices included, sit behind the Settings gear (`/settings` redirects there).
 - **Backups and recovery.** A nightly job writes encrypted exports to your own R2 bucket and keeps the two newest. Profiles and account state can be restored.
 - **Careful cleanup.** Server housekeeping is rule-based and runs no model. The background batch never changes stated rules, pinned records or `me`, and every change can be undone.
 
@@ -30,7 +30,7 @@ The brief, fact synthesis and the loop guard are off in a new client. Turn them 
 2. **Detect.** In a GitHub checkout, the client also sends a repo-fact report: hashes, fact keys and outcomes, never command output or paths.
 3. **Learn.** The server queues review items from digests and housekeeping rules. Each drain of a capture run leases up to 40 open items per profile, again on a later drain only after a clean or idle lease; a profile whose lease failed waits for the next run. The batch judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
 4. **Guide.** At the next session start, the Worker builds the brief from the repo's profile and `me`. The client injects it into the agent's context.
-5. **Measure.** The dashboard's **Goals** tab tracks repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
+5. **Measure.** `GET /api/profiles/:p/goal-metrics` reports repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
 
 ### Components
 
