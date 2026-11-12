@@ -950,7 +950,7 @@ describe("D2 inferred preferences and D3 promotion to me", () => {
 	/** The armed wakeup; while a write's own immediate alarm is still running it reads null, so this waits for that run to re-arm. */
 	async function armed(stub: DurableObjectStub<ProfileStore>) {
 		let at: number | null = null;
-		for (let i = 0; i < 50 && at === null; i++) if ((at = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())) === null) await new Promise((x) => setTimeout(x, 20));
+		for (const end = Date.now() + 10_000; at === null && Date.now() < end;) if ((at = await runInDurableObject(stub, (_i, s) => s.storage.getAlarm())) === null) await new Promise((x) => setTimeout(x, 20));
 		return at;
 	}
 	type Op = { op: string; status: string; code?: string; reason?: string; created?: string[]; memory_id?: string; transfer_id?: string; activity_id?: number };

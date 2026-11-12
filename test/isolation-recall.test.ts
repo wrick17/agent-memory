@@ -1,5 +1,5 @@
 // G4 isolation and the local half of G5 (vector channel, 300 ms fallback, EMBEDDINGS=off), plus generation identities.
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountStore, Principal } from "../src/account/store";
@@ -13,24 +13,17 @@ import { recallStrength } from "../src/profile/recall-stats";
 import { nextSeq } from "../src/storage";
 import type { RecallOptions } from "../src/viewer/types";
 import { readSet, routeWrite } from "../src/routing";
-import { call, contextFor, deviceToken, devicePrincipal, OWNER, outcome, registered } from "./helpers";
+import { call, contextFor, deviceToken, devicePrincipal, drainEmbeddings, OWNER, outcome, registered } from "./helpers";
 
 const workRepo = { remote: "git@github.com:Sequoia-Engineering/web.git" };
 const profileStub = (c: Awaited<ReturnType<typeof contextFor>>, name: string) => {
 	const ref = c.account.profiles.find((p) => p.profile === name)!;
 	return env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`));
 };
-/**
- * A write arms the embed alarm for now, and it may already be running, so run it only if still pending. Then wait until each
- * card is embedded and fail here if it never is: recall counts a vector only once its embedding is recorded.
- */
+/** Embeds the test profile's waiting cards by awaited alarm runs, and fails here unless each card is: recall counts a vector only once its embedding is recorded. */
 const embedded = async (c: Awaited<ReturnType<typeof contextFor>>, ...ids: unknown[]) => {
-	await runDurableObjectAlarm(profileStub(c, "test"));
-	for (const id of ids) {
-		let status: unknown;
-		for (let i = 0; i < 200 && (status = (await call(c, "get_memory", { memory_id: id })).embedding_status) !== "embedded"; i++) await new Promise((r) => setTimeout(r, 50));
-		expect(status, `embedding_status of ${String(id)}`).toBe("embedded");
-	}
+	await drainEmbeddings(profileStub(c, "test"));
+	for (const id of ids) expect((await call(c, "get_memory", { memory_id: id })).embedding_status, `embedding_status of ${String(id)}`).toBe("embedded");
 };
 
 describe("G4 isolation", () => {
@@ -364,10 +357,7 @@ describe("recall channels and the vector fallback", () => {
 		}
 		const target = await call(c, "save_memory", { name: "Wombat ledger", type: "feedback", description: "wombat ledger", content: "wombat ledger", profile: "work" });
 		const stub = profileStub(c, "work");
-		for (let i = 0; i < 40; i++) {
-			await runDurableObjectAlarm(stub);
-			if (!await runInDurableObject(stub, (_i, s) => s.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM nodes WHERE embed_hash IS NOT card_hash AND status = 'active'").one().n)) break;
-		}
+		expect(await drainEmbeddings(stub), "work cards still waiting for an embedding").toBe(0);
 		type R = { results: { memory_id: string; type: string; kind: string; score: number; matched_by: string[] }[]; diagnostics: Record<string, Record<string, string>> };
 		const recall = (extra: Record<string, unknown>) => call<R>(c, "recall_memories", { keyword: "wombat ledger", profile: "work", limit: 100, ...extra });
 		const all = await recall({});

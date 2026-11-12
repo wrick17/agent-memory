@@ -1,7 +1,7 @@
 // The session-start brief (#125, POST /v1/brief, src/brief.ts and read.ts briefRead) and the recall changes that ship with it:
 // me merges only preferences and rules, the fused cutoff, the vector floor and project-scoped rules first. Real Worker routes and
 // stores; Workers AI and Vectorize are the bag-of-words fakes in test/fakes.js.
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256 } from "../src/domain/ids";
@@ -10,7 +10,7 @@ import { recall, type ToolContext } from "../src/mcp";
 import { fuse, MIN_FUSED_SCORE } from "../src/profile/read";
 import { VECTOR_MIN_SCORE } from "../src/profile/store";
 import { runWrite } from "../src/profile/write";
-import { call, contextFor, devicePrincipal, deviceToken, registered } from "./helpers";
+import { call, contextFor, devicePrincipal, deviceToken, drainEmbeddings, registered } from "./helpers";
 
 const origin = new URL(env.RESOURCE_URL).origin;
 const uniq = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -120,17 +120,15 @@ describe("recall changes (#125)", () => {
 	});
 
 	it("drops vector matches below VECTOR_MIN_SCORE", async () => {
-		const c = await contextFor(), a = `zephyr${uniq()}`, b = `quokka${uniq()}`;
+		// The fake embeds by hashing words into 63 buckets, so random words can cross the floor; these fixed ones score 0.94 and 0.02.
+		const c = await contextFor(), a = "zephyr", b = "quokka";
 		const strong = await save(c, { name: `${a} ${b}`, type: "reference", profile: "test", description: `${a} ${b}` });
-		const filler = Array.from({ length: 40 }, () => `w${uniq()}`).join(" ");
+		const filler = "elephant ".repeat(40);
 		const weak = await save(c, { name: `weak ${uniq()}`, type: "reference", profile: "test", description: `${a} ${filler}` });
 		const ref = c.account.profiles.find((p) => p.profile === "test")!;
 		const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:test:${ref.generation}`));
-		for (let i = 0; i < 50; i++) {
-			const waiting = await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id IN (?, ?) AND (embed_hash IS NULL OR embed_hash <> card_hash)", strong.memory_id, weak.memory_id).one().n);
-			if (!waiting) break;
-			if (!(await runDurableObjectAlarm(stub))) await new Promise((r) => setTimeout(r, 20));
-		}
+		await drainEmbeddings(stub);
+		expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id IN (?, ?) AND embed_hash IS NOT card_hash", strong.memory_id, weak.memory_id).one().n), "cards still waiting for an embedding").toBe(0);
 		expect(VECTOR_MIN_SCORE).toBe(0.3);
 		const r = await recall(c, { keyword: `${a} ${b}`, profile: "test" }, { channels: ["vector"] });
 		if (!r.ok) throw new Error(r.error.message);
