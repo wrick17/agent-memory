@@ -1167,9 +1167,10 @@ function sweep(now, debounceMs) {
 /**
  * One pass of the lock holder: handle every queued trigger that is due, sleep until the next one is due, and return only when
  * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
- * trigger written meanwhile lands in a new queue file and is handled after it.
+ * trigger written meanwhile lands in a new queue file and is handled after it. Then at most one lease per batch profile;
+ * `blocked` holds the profiles of this run() whose last lease was not clean (see run()).
  */
-async function drain({ server, runner, clock, sleep, debounceMs, trigger, batched = new Set() }, results) {
+async function drain({ server, runner, clock, sleep, debounceMs, trigger, blocked = new Set() }, results) {
 	const config = loadConfig();
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
@@ -1218,12 +1219,14 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger, batche
 		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
 		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
-		// One batch per profile per run(): a later drain of the same run (a hook that fired meanwhile) captures but never leases again.
-		const profiles = (config.batch_profiles ?? []).filter((p) => !batched.has(p));
+		// One lease per profile per drain. A profile leases again on a later drain of this run() only after a clean or idle lease;
+		// a failed, discarded or thrown one waits for the next run(), so one run never spends an item's 3 attempts.
+		const profiles = (config.batch_profiles ?? []).filter((p) => !blocked.has(p));
 		if (profiles.length) {
-			for (const p of profiles) batched.add(p);
-			const { batch } = await import("./batch.mjs");
-			results.batch = await batch({ runner, config, profiles, clock, trigger });
+			for (const p of profiles) blocked.add(p);
+			const { batch, leaseClean } = await import("./batch.mjs");
+			results.batch = await batch({ runner, config, profiles, clock, trigger, earlier: results.batch });
+			for (const p of profiles) if (leaseClean(results.batch.profiles[p])) blocked.delete(p);
 		}
 		results.status = await sendStatus(config, server, clock());
 	} finally {
@@ -1285,9 +1288,12 @@ export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop"
  * (a client hook started it) or "scheduled" (`run --scheduled` from launchd). A scheduled run with no queued trigger, no claim a
  * crashed run left behind, no spooled batch and no batch profile configured sends its status report and returns "idle" without
  * starting the confined runtime. The server has no batch cooldown, so a configured batch profile always makes the run drain.
+ * A run lives as long as triggers keep arriving (a backfill beside active sessions can keep it for an hour or more), so each
+ * drain leases every batch profile whose previous lease in this run was clean or idle; a profile whose lease failed waits for
+ * the next run.
  */
 export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
-	const results = {}, batched = new Set();
+	const results = {}, blocked = new Set();
 	let last = null, idle = null;
 	while (takeLock()) {
 		try {
@@ -1303,7 +1309,7 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
-			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger, batched }, results);
+			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger, blocked }, results);
 		} finally { dropLock(); }
 		// A trigger written after the last scan (or during the idle report) saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");

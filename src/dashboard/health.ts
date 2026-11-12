@@ -174,7 +174,7 @@ export function healthTab(am: Am): void {
 		// The thresholds the code uses: src/profile/maintenance.ts, similar.ts and housekeeping.ts, and the health sweep rules in src/health.ts.
 		const ul = el("ul", sec);
 		const li = (text: string, term?: string) => { const x = el("li", ul, text); if (term) help(x, term); };
-		li("A batch leases at most 40 queued items for at most 900 seconds, once per profile on each capture run while items wait. An expired lease returns its items to the queue.", "lease");
+		li("A batch leases at most 40 queued items for at most 900 seconds, once per profile on each drain of a capture run while items wait, and again on a later drain only after a clean or idle lease; a profile whose lease failed waits for the next run. An expired lease returns its items to the queue.", "lease");
 		li("Records of the same kind at cosine similarity 0.92 or higher become near-duplicate review items. Neighbours below 0.80 are ignored, and related records at 0.85 or higher get a similarity link. Rules, preferences and decisions below 0.92 that share a project become possible-contradiction items.", "similarity");
 		li("A journal with at least 8,000 uncompacted characters and no update for 7 days becomes a stale-journal item. A memory with no recall and no update in 90 days becomes a stale-memory review item; stated, pinned, preference, journal and me records never do.", "stale");
 		li("Overdue means no completed batch for more than 26 hours. Lease expired means a lease ran out without the batch completing it.");
