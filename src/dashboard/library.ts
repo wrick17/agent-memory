@@ -590,6 +590,8 @@ export function libraryTab(am: Am): void {
 		});
 	};
 
+	/** A hub's (project or person) draw key: each linked record and its update time, so an edit or a new journal entry redraws it. */
+	const hubSig = (lib: J, it: J) => [...((lib.links.get(it.key) ?? new Map()) as Map<string, unknown>).keys()].map((k) => `${k}@${lib.items.get(k)?.updated ?? ""}`).sort().join("|");
 	// ---- A section: facets, a filter, the list, and the selected item's detail ----
 	const section = (kind: string, title: string, facetOf?: (it: J) => string) => (root: Node, route: Route): Node => {
 		const version = am.pageVersion, only = profileQ(route);
@@ -684,7 +686,7 @@ export function libraryTab(am: Am): void {
 				// A hub (project or person) draws again while its connections are still arriving; any other item draws once.
 				const it = lib.items.get(selected), hub = it && (it.kind === "project" || it.kind === "person");
 				// Anything else draws again when its record changes (an edit, a new journal entry), so an open pane never goes stale.
-				const sig = it ? `${it.key}:${hub ? lib.links.get(it.key)?.size ?? 0 : it.updated ?? ""}` : "";
+				const sig = it ? `${it.key}:${hub ? hubSig(lib, it) : it.updated ?? ""}` : "";
 				// Each neighbour with its relations, so a new relation to a known neighbour (supersedes after relates to) counts too.
 				const links = it ? [...(lib.links.get(it.key) ?? new Map()) as Map<string, Set<string>>].map(([k, rels]) => `${k}:${[...rels].sort().join("+")}`).sort().join("|") : "";
 				if (it && sig !== shownDetail) { shownDetail = sig; shownLinks = links; detailH = detail(detailCol, lib, it, route); }
@@ -723,7 +725,7 @@ export function libraryTab(am: Am): void {
 			const paint = () => {
 				if (version !== am.pageVersion) return;
 				const lib: J = am.library(only, paint), it = lib.items.get(selected);
-				const next = it ? `${lib.links.get(it.key)?.size ?? 0}` : lib.loading ? "" : "missing";
+				const next = it ? `${it.updated ?? ""}:${hubSig(lib, it)}` : lib.loading ? "" : "missing";
 				if (next === sig) return;
 				sig = next;
 				if (it) detail(box, lib, it, route); else if (!lib.loading) { box.replaceChildren(); note(box, "This project has no memories in the chosen profile.", "muted"); } else {
