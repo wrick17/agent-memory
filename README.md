@@ -28,7 +28,7 @@ The brief, fact synthesis and the loop guard are off in a new client. Turn them 
 
 1. **Capture.** When a session stops or ends, the client hooks redact the transcript into a short digest and upload it. The full transcript stays local.
 2. **Detect.** In a GitHub checkout, the client also sends a repo-fact report: hashes, fact keys and outcomes, never command output or paths.
-3. **Learn.** The server queues review items from digests and housekeeping rules. Each capture run leases up to 40 open items per profile, so a backlog drains run by run. The batch judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
+3. **Learn.** The server queues review items from digests and housekeeping rules. Each drain of a capture run leases up to 40 open items per profile, again on a later drain only after a clean or idle lease; a profile whose lease failed waits for the next run. The batch judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
 4. **Guide.** At the next session start, the Worker builds the brief from the repo's profile and `me`. The client injects it into the agent's context.
 5. **Measure.** `GET /api/profiles/:p/goal-metrics` reports repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
 

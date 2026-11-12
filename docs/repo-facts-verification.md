@@ -175,7 +175,7 @@ The `whole_local_history` counts in each file come from every local session, bui
 - [x] Isolated Linux install in a scratch home against the placeholder server `example.invalid`: all six fact and loop guard modules match source by SHA-256, and every default is off.
 - [x] Committed and pushed as `ebd91f0` in PR #110; all CI checks passed.
 - [x] One isolated real synthesis call, approved by the owner on 2026-11-11: passed ([details](#isolated-synthesis-call-2026-11-11)).
-- CI at `d1882bd`: all 674 Worker tests passed, but the run reported one `EnvironmentTeardownError` from a graph test file; its root cause is not established. CI now runs the Worker tests with `--no-file-parallelism --maxWorkers=1`, with no assertion, timeout or error-handling change. At `1547235`, all CI checks passed.
+- CI at `d1882bd`: all 674 Worker tests passed, but the run reported one `EnvironmentTeardownError` from a graph test file; CI then ran the Worker tests with `--no-file-parallelism --maxWorkers=1`, with no assertion, timeout or error-handling change. At `1547235`, all CI checks passed. Issue #143 later traced that teardown error to a Cloudflare Vitest plugin race (cloudflare/workers-sdk#15920); CI now runs plain `npm test`; the Vitest config applies a pinned test-only plugin patch and caps Vitest at four workers.
 - Expected log lines, not failures: 4 fake-vector log lines and the meter's negative-value validation message are intentional.
 - The first full run at `f917866` had resource failures: two 30 s timeouts, a 3,830 ms result against a 3,800 ms deadline, and a Cloudflare test pool startup timeout. They did not recur in the controlled run. Their root cause is not established.
 

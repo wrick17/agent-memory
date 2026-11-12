@@ -1327,7 +1327,7 @@ describe("restore drill", () => {
 			const h = await hold(prefix);
 			try {
 				const pending = begin();
-				for (let n = 0; n < 200 && !h.held(); n++) await new Promise((r) => setTimeout(r, 5));
+				for (const end = Date.now() + 10_000; !h.held() && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
 				expect([prefix, h.held()]).toEqual([prefix, true]);
 				const drill = await value<Drill>(admin({ op: "beginDrill", profile: "personal", request_id: `drill-race-${i}` }));
 				h.release();
@@ -1372,10 +1372,16 @@ describe("restore drill", () => {
 				inst.env = new Proxy(base, { get: (t, k) => (k === "BACKUPS" ? backups : (t as unknown as Record<string, unknown>)[k as string]) }) as Env;
 			});
 			const step = admin({ op: "drillStep", id: begun.id });
-			for (let n = 0; n < 200 && !held; n++) await new Promise((r) => setTimeout(r, 5));
+			for (const end = Date.now() + 10_000; !held && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
 			expect([outcome, held]).toEqual([outcome, true]);
 			const cleanup = admin({ op: "drillCleanup", id: begun.id });
-			await new Promise((r) => setTimeout(r, 50)); // cleanup is now waiting on the held restore
+			// Cleanup marks the drill cleaning before it waits on the held restore; read that state rather than assuming a sleep covers it.
+			let cleaning: string | undefined;
+			for (const end = Date.now() + 10_000; cleaning !== "cleaning" && Date.now() < end;) {
+				cleaning = (await value<{ drill: Drill | null }>(admin({ op: "drillStatus" }))).drill?.state;
+				if (cleaning !== "cleaning") await new Promise((r) => setTimeout(r, 10));
+			}
+			expect([outcome, cleaning]).toEqual([outcome, "cleaning"]);
 			release();
 			const [stale, cleaned] = await Promise.all([step, cleanup]);
 			// The stale reply moves nothing: the drill was cleaning, and it ends done, cleaned, with no scratch vector, then or later.

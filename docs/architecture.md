@@ -1479,7 +1479,7 @@ Owner scope, 2026-10-31: proactive PR and Jira acquisition is out of product sco
 - **Jira context (work only).** Ticket keys come from digests, branch names, commits and PR titles. Per the owner's `jira-connector` rule, only the `~/.claude` work account reaches Jira, so the run calls Claude Code headless on that account with Sonnet, a Jira-only MCP config (`--strict-mcp-config`), only the Jira read tools allowed, and every other tool disallowed. It runs from an empty directory and returns JSON for at most 20 tickets. The run validates the JSON against a schema before upload.
 - **Checkout analyses (Paid corpus only).** Once per repo per day. Section 14.
 - **Daily refresh (default on).** On the first capture run of the UTC day for a profile, the run uploads assigned open Jira tickets (work) and open PRs authored by or awaiting review from the owner (`gh search prs --author @me` and `--review-requested @me`, scoped to the profile's orgs). The server claims the profile's daily slot atomically, so two machines never both run it. `daily_refresh = false` in `~/.agent-memory/config.toml` turns it off.
-- **Maintenance batch.** Section 12: one lease per profile on every capture run while items wait.
+- **Maintenance batch.** Section 12: one lease per profile on every drain of a capture run while items wait; a profile whose lease failed waits for the next run.
 - **Spool.** Failed uploads stay in `~/.agent-memory/spool/` (at most 1,000 files or 64 MiB, the BothQ bounds) and replay on the next run. The spool holds digests and upload items only.
 
 The run exits when its steps finish. Nothing stays resident. v2 adds one scheduled entry point, a daily launchd job that `install` writes but never loads (v2 run additions above).
@@ -1620,7 +1620,7 @@ Deployed 11 Nov 2026 from PR #132. The daily batch learns two more kinds of reco
 
 ### The daily batch runs confined, or not at all
 
-The batch takes at most one lease per profile per capture run and never mixes profiles in one prompt. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
+The batch takes at most one lease per profile per drain and never mixes profiles in one prompt. A capture run drains again while new triggers arrive, so a long run leases a profile again on each drain while its previous lease in that run was clean (every item completed, none rejected) or idle; a profile whose lease failed, was discarded or threw waits for the next run, so one run never spends an item's 3 attempts. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
 
 ```toml
 # $codex_home/config.toml, written fresh for each run (a throwaway CODEX_HOME). Checked against Codex CLI 0.165.0 on
@@ -2401,7 +2401,7 @@ Added by the owner priority of 2026-10-29. It makes the existing memory availabl
 			- The per-run positive controls and the same-run rule above (every classified filesystem and network probe `denied`) stay. Runtime and config notices and unknown events still fail closed. The actual model's acceptance of the changed batch schema and a genuine scoped job-token and server flow remain separate requirements.
 			- A genuine real-model adversarial canary is supporting evidence; the model is not required to volunteer a command.
 			- Status, 2026-10-29: OPEN. The real sandbox controls and the four denial probes passed on the recorded production config. P3's stderr path passed an independent source review, the 75 local tests and an exact recorded CLI replay into a real isolated Worker that parked the item as stuck with no item operation. P1 (production provider and catalog equivalence and the effective tool exposure) is unproved, so the gate is not passed.
-		- The batch takes at most one lease per profile per capture run and never mixes profiles.
+		- The batch takes at most one lease per profile per drain, and a profile whose lease failed waits for the next run; it never mixes profiles.
 	- Cleanup: undo round-trips for every op type. Protected nodes are only flagged.
 	- Transfers:
 		- Appends during a transfer get `moving` and land in the target afterwards.

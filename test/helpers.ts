@@ -5,6 +5,7 @@ import path from "node:path";
 import { env } from "cloudflare:workers";
 import type { Principal } from "../src/account/store";
 import type { Outcome } from "../src/domain/types";
+import type { ProfileStore } from "../src/profile/store";
 import { accountStub, callTool, type ToolContext } from "../src/mcp";
 
 export const OWNER = env.OWNER_USER_ID;
@@ -56,6 +57,25 @@ export async function registered(...names: string[]) {
 		return { who, stub: env.PROFILE.get(env.PROFILE.idFromName(`${userId}:${profile}:${who.generation}`)) };
 	};
 	return { userId, account, of, ...of(refs[0]!.profile) };
+}
+
+/**
+ * Embeds a profile store's waiting cards by running its alarm in place, awaited, until the backlog stops shrinking, and leaves no
+ * alarm armed, so no background run races the caller's next reads. Returns how many active cards still wait: an earlier case can
+ * leave a generation the account gates, so callers assert the cards they need rather than an empty backlog.
+ */
+export function drainEmbeddings(stub: DurableObjectStub<ProfileStore>): Promise<number> {
+	return runInDurableObject(stub, async (instance: ProfileStore, st) => {
+		const pending = () => Number(st.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE status = 'active' AND embed_hash IS NOT card_hash").one().n);
+		await st.storage.deleteAlarm();
+		let before = pending();
+		for (let after; before > 0; before = after) {
+			await instance.alarm();
+			if ((after = pending()) >= before) break;
+		}
+		await st.storage.deleteAlarm();
+		return before;
+	});
 }
 
 /**
