@@ -430,6 +430,10 @@ describe("confined runtime", () => {
 		assert.equal(am.parseEvents(ev({ type: "turn.completed" })).kind, "no_output");
 		assert.equal(am.parseEvents(ev({ type: "item.completed", item: { type: "error", message: "Codex is ignoring 1 unrecognized configuration setting" } }, { type: "item.completed", item: { type: "agent_message", text: "{}" } })).kind, "runtime_warning");
 		assert.equal(am.parseEvents("not json").kind, "bad_events");
+		// The whole stream is read: a tool after a failure or a bad line still wins, and a notice outranks a failure.
+		assert.equal(am.parseEvents(ev({ type: "turn.failed" }, { type: "item.started", item: { type: "command_execution" } })).kind, "tool_event");
+		assert.equal(am.parseEvents(`not json\n${JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call" } })}`).kind, "tool_event");
+		assert.equal(am.parseEvents(ev({ type: "error" }, { type: "runtime.notice" })).kind, "runtime_warning");
 	});
 
 	it("is indeterminate when Codex is missing or the platform is untested", async () => {
@@ -1008,9 +1012,9 @@ describe("general confined executor", () => {
 				assert.deepEqual(JSON.parse(fs.readFileSync(schemaFile)), OPS_SCHEMA);
 				assert.equal(fs.statSync(schemaFile).mode & 0o777, 0o400);
 				if (mode === "drift") fs.writeFileSync(configFile, "changed");
-				const item = mode === "tool" ? { type: "command_execution" } : mode === "notice" ? { type: "error" }
+				const item = mode.startsWith("tool") ? { type: "command_execution" } : mode.startsWith("notice") ? { type: "error" }
 					: { type: "agent_message", text: JSON.stringify({ results: [] }) };
-				return { status: mode === "unsupported_exit" ? 1 : 0, stdout: JSON.stringify({ type: "item.completed", item }),
+				return { status: mode === "unsupported_exit" || mode.endsWith("_exit") ? 1 : 0, stdout: JSON.stringify({ type: "item.completed", item }),
 					stderr: mode.startsWith("unsupported") ? "WARN codex_core::tools::router: unsupported call: exec_command\n" : "Reading prompt from stdin...\n" };
 			} });
 		const args = { prompt: "private input", schema: OPS_SCHEMA, model: "fake-model", effort: "high" };
@@ -1020,8 +1024,12 @@ describe("general confined executor", () => {
 		mode = "notice"; assert.equal((await execute(args)).kind, "runtime_warning");
 		mode = "unsupported"; assert.equal((await execute(args)).kind, "tool_event");
 		mode = "unsupported_exit"; assert.equal((await execute(args)).kind, "tool_event");
+		// A nonzero exit never hides a tool or a notice in the events.
+		mode = "tool_exit"; assert.equal((await execute(args)).kind, "tool_event");
+		mode = "notice_exit"; assert.equal((await execute(args)).kind, "runtime_warning");
+		mode = "ok_exit"; assert.equal((await execute(args)).kind, "runtime_error");
 		mode = "drift"; assert.equal((await execute(args)).kind, "runtime_warning");
-		assert.equal((await execute(args)).kind, "runtime_warning"); assert.equal(calls, 6, "changed config cannot start another exec");
+		assert.equal((await execute(args)).kind, "runtime_warning"); assert.equal(calls, 9, "changed config cannot start another exec");
 		assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith(".schema.json")).length, 0);
 	});
 });
@@ -1527,25 +1535,25 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		assert.equal(r.results.batch.profiles.work.completed, 1, "the second drain's clean lease is the reported outcome");
 	});
 
-	it("does not lease a failed profile again in the same run, and keeps its failure in batch/last.json beside later outcomes", async () => {
+	it("leases a profile again on the next drain of the same run after a discarded lease", async () => {
 		const { asked, r } = await twoDrains(["personal", "work"], { work: [leaseOf("LW"), leaseOf("LW2")] }, async () => ({ kind: "error" }));
-		// personal first: a discarded lease stops the profiles after it in the same batch() call.
-		assert.deepEqual(asked, ["personal", "work", "personal"], "the discarded profile waits for the next run");
+		assert.deepEqual(asked, ["personal", "work", "personal", "work"], "no per-run block after a failed lease");
 		const last = JSON.parse(fs.readFileSync(path.join(am.home(), "batch", "last.json"), "utf8"));
 		assert.deepEqual([last.profiles.work?.status, last.profiles.personal?.status], ["discarded", "idle"]);
 		assert.deepEqual(r.results.batch.profiles, last.profiles);
 	});
 
-	it("does not lease a profile again in the same run after the server rejects an item, even once that lease has expired", async () => {
-		// The server keeps a rejected item (a subject in transfer) leased; leasing again after expiry would spend its attempts.
-		// The clock jumps past the lease's 900 s once the item is answered.
-		let skew = 0;
-		const complete = (name) => { if (name === "maintenance_complete") skew = 901_000; return { results: [{ item_id: 1, status: "rejected", reason: "moving", ops: [{ op: "dismiss", status: "rejected", code: "moving" }] }] }; };
-		const { asked, r } = await twoDrains(["work"], { work: [leaseOf("L1"), leaseOf("L2")] }, dismiss, { complete, clock: () => Date.now() + skew });
-		assert.deepEqual(asked, ["work"]);
-		assert.deepEqual([r.results.batch.profiles.work.rejected, r.results.batch.profiles.work.retained, r.results.batch.profiles.work.completed], [1, 1, 0]);
-		const last = JSON.parse(fs.readFileSync(path.join(am.home(), "batch", "last.json"), "utf8"));
-		assert.equal(last.profiles.work.rejected, 1, "the rejection stays in batch/last.json");
+	it("leases a profile again on the next drain after a lease with unanswered and rejected items", async () => {
+		// First drain: the model answers only on its second follow-up run, and the server rejects that answer.
+		let runs = 0, completes = 0;
+		const judge = async () => (++runs <= 2 ? { kind: "ok", part: { results: [] } } : dismiss());
+		const complete = (name) => (name === "maintenance_complete" && !completes++
+			? { results: [{ item_id: 1, status: "rejected", reason: "moving", ops: [{ op: "dismiss", status: "rejected", code: "moving" }] }] }
+			: { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] });
+		const { asked, r } = await twoDrains(["work"], { work: [leaseOf("L1"), leaseOf("L2")] }, judge, { complete });
+		assert.deepEqual(asked, ["work", "work"]);
+		assert.equal(runs, 4, "first run, 2 follow-ups (the second answers), then the next drain's run");
+		assert.deepEqual([r.results.batch.profiles.work.completed, r.results.batch.profiles.work.unanswered], [1, 0], "the second drain's lease is the reported outcome");
 	});
 
 	it("run --scheduled drains a hook that fired while its idle status report held the lock", async () => {

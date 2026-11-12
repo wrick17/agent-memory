@@ -1170,10 +1170,9 @@ function sweep(now, debounceMs) {
 /**
  * One pass of the lock holder: handle every queued trigger that is due, sleep until the next one is due, and return only when
  * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
- * trigger written meanwhile lands in a new queue file and is handled after it. Then at most one lease per batch profile;
- * `blocked` holds the profiles of this run() whose last lease was not clean (see run()).
+ * trigger written meanwhile lands in a new queue file and is handled after it. Then at most one lease per batch profile.
  */
-async function drain({ server, runner, clock, sleep, debounceMs, trigger, blocked = new Set() }, results) {
+async function drain({ server, runner, clock, sleep, debounceMs, trigger }, results) {
 	const config = loadConfig();
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
@@ -1222,14 +1221,11 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger, blocke
 		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
 		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
-		// One lease per profile per drain. A profile leases again on a later drain of this run() only after a clean or idle lease;
-		// a failed, discarded or thrown one waits for the next run(), so one run never spends an item's 3 attempts.
-		const profiles = (config.batch_profiles ?? []).filter((p) => !blocked.has(p));
+		// One lease per profile per drain, whatever the previous lease in this run() did (owner decision 2026-11-12: no throttling).
+		const profiles = config.batch_profiles ?? [];
 		if (profiles.length) {
-			for (const p of profiles) blocked.add(p);
-			const { batch, leaseClean } = await import("./batch.mjs");
+			const { batch } = await import("./batch.mjs");
 			results.batch = await batch({ runner, config, profiles, clock, trigger, earlier: results.batch });
-			for (const p of profiles) if (leaseClean(results.batch.profiles[p])) blocked.delete(p);
 		}
 		results.status = await sendStatus(config, server, clock());
 	} finally {
@@ -1292,11 +1288,10 @@ export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop"
  * crashed run left behind, no spooled batch and no batch profile configured sends its status report and returns "idle" without
  * starting the confined runtime. The server has no batch cooldown, so a configured batch profile always makes the run drain.
  * A run lives as long as triggers keep arriving (a backfill beside active sessions can keep it for an hour or more), so each
- * drain leases every batch profile whose previous lease in this run was clean or idle; a profile whose lease failed waits for
- * the next run.
+ * drain leases every batch profile again, whatever its previous lease in this run did.
  */
 export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
-	const results = {}, blocked = new Set();
+	const results = {};
 	let last = null, idle = null;
 	while (takeLock()) {
 		try {
@@ -1312,7 +1307,7 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
-			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger, blocked }, results);
+			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger }, results);
 		} finally { dropLock(); }
 		// A trigger written after the last scan (or during the idle report) saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");
@@ -1462,8 +1457,10 @@ export function confinedExec({ exec, codex, runDir, env, configFile, configSha, 
 			if (!unchanged()) return { kind: "runtime_warning" };
 			// shortcut: recognize Codex 0.165's stderr-only router diagnostic; revisit when upgrading the CLI.
 			if (r.stderr?.includes("unsupported call:")) return { kind: "tool_event" };
-			if (r.error || r.status !== 0) return { kind: "runtime_error" };
-			return parseEvents(r.stdout);
+			// The events are inspected whatever the exit: a tool or a runtime notice outranks a failed exit.
+			const events = parseEvents(typeof r.stdout === "string" ? r.stdout : "");
+			if (r.error || r.status !== 0) return { kind: events.kind === "tool_event" || events.kind === "runtime_warning" ? events.kind : "runtime_error" };
+			return events;
 		} finally { fs.rmSync(schemaFile, { force: true }); }
 	};
 }
@@ -1559,7 +1556,8 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 		let phase = "gate", init = null, reinit = false, buf = "", stderr = "", failure = null, tool = false, pending = null;
 		const fail = (kind) => {
 			if (kind === "tool_event") tool = true;
-			else failure ??= kind;
+			// A runtime notice outranks an earlier ordinary failure, as a tool outranks both.
+			else failure = kind === "runtime_warning" ? kind : failure ?? kind;
 			if (phase === "stopped") return;
 			phase = "stopped";
 			child.stdin.end();
@@ -1571,7 +1569,11 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 		const onEvent = (e) => {
 			const textOnly = e.type === "assistant" && e.parent_tool_use_id == null && Array.isArray(e.message?.content) && e.message.content.every((b) => TEXT_BLOCKS.has(b?.type));
 			if (TOOL_FRAMES.has(e.type) || (e.type === "assistant" && !textOnly)) return fail("tool_event");
-			if (phase === "stopped") return;
+			// After a failure the rest is still read, as parseEvents does: any frame a healthy run may not send is a notice, which outranks it.
+			if (phase === "stopped") {
+				if (!textOnly && !thinkingTokens(e) && !(e.type === "rate_limit_event" && e.rate_limit_info?.status === "allowed")) fail("runtime_warning");
+				return;
+			}
 			// Nothing may follow the query result: a second result, a notice or any other frame discards it.
 			if (phase === "after") return fail("runtime_warning");
 			// Claude Code 2.1.316 may announce a UI-surface render invalidation before its first init. It is a notice to UI clients
@@ -1633,7 +1635,7 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 			clearTimeout(timer);
 			if (buf.trim()) failure ??= "bad_events";
 			if (TOOL_REJECTION.test(stderr)) tool = true;
-			else if (stderr.trim()) failure ??= "runtime_warning";
+			else if (stderr.trim()) failure = "runtime_warning";
 			if (code !== 0 || signal) failure ??= "runtime_error";
 			resolve(tool ? { kind: "tool_event" } : failure ? { kind: failure } : pending ?? { kind: "runtime_error" });
 		});
@@ -1653,27 +1655,31 @@ const ENVELOPES = new Set(["thread.started", "turn.started", "turn.completed", "
 /**
  * Allowed: the known event envelopes, and within item events only reasoning and the final agent message. A tool item is a
  * tool event; an unknown envelope (a new runtime or configuration notice) or an error item is a warning that leaves the
- * range pending; unknown output fails closed.
+ * range pending; unknown output fails closed. The whole stream is read, so a tool event anywhere wins, then a warning, then
+ * the first other failure.
  */
 export function parseEvents(stdout) {
 	// usage: turn.completed's token counts, kept for the repo-fact cost log; null when the stream has none.
-	let final = null, usage = null;
+	let final = null, usage = null, warned = false, failure = null;
 	for (const line of stdout.split("\n")) {
 		if (!line.trim()) continue;
 		let e;
-		try { e = JSON.parse(line); } catch { return { kind: "bad_events" }; }
-		if (e.type === "error" || e.type === "turn.failed") return { kind: "runtime_error" };
-		if (!ENVELOPES.has(e.type)) return { kind: "runtime_warning" };
+		try { e = JSON.parse(line); } catch { failure ??= "bad_events"; continue; }
+		if (!e || typeof e !== "object" || Array.isArray(e)) { failure ??= "bad_events"; continue; }
+		if (e.type === "error" || e.type === "turn.failed") { failure ??= "runtime_error"; continue; }
+		if (!ENVELOPES.has(e.type)) { warned = true; continue; }
 		if (e.type === "turn.completed" && e.usage && typeof e.usage === "object") usage = e.usage;
 		if (!e.type.startsWith("item.")) continue;
 		const item = e.item;
-		if (!item || typeof item !== "object") return { kind: "bad_events" };
+		if (!item || typeof item !== "object") { failure ??= "bad_events"; continue; }
 		// Codex reports ignored settings as error items: the runtime is not the one the probes proved, so nothing is trusted.
-		if (item.type === "error") return { kind: "runtime_warning" };
+		if (item.type === "error") { warned = true; continue; }
 		if (item.type === "reasoning") continue;
 		if (item.type === "agent_message") { if (e.type === "item.completed") final = item.text; continue; }
 		return { kind: "tool_event" };
 	}
+	if (warned) return { kind: "runtime_warning" };
+	if (failure) return { kind: failure };
 	if (typeof final !== "string") return { kind: "no_output", usage };
 	try { return { kind: "ok", part: JSON.parse(final), usage }; } catch { return { kind: "bad_output", usage }; }
 }

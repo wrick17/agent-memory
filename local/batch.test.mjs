@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import { EventEmitter, once } from "node:events";
 import { PassThrough, Writable } from "node:stream";
@@ -14,7 +15,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-batch-test-"));
 let n = 0;
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
 const { batch, mcpJob, OPS_SCHEMA } = await import("./batch.mjs");
-const { claudeEnv, claudeExec } = await import("./agent-memory.mjs");
+const { claudeEnv, claudeExec, confinedExec } = await import("./agent-memory.mjs");
 beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
 
 const ALL_OPS = ["save", "link", "end_link", "supersede", "flag", "dismiss"];
@@ -70,7 +71,7 @@ describe("job flow", () => {
 			["maintenance_next", "personal", null, null], ["maintenance_complete", "personal", "LP", [3]]]);
 		assert.deepEqual([server.calls[0].args.limit, server.calls[0].args.lease_seconds], [40, 900]);
 		const receipt = (id, kind) => ({ item_id: id, kind, status: "done", sent: ["dismiss"], ops: [{ op: "dismiss", status: "applied" }] });
-		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, dropped_ops: 0, codes: { applied: 2 },
+		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, unanswered: 0, dropped_ops: 0, codes: { applied: 2 },
 			receipts: [receipt(1, "unlinked"), receipt(2, "near_duplicate")], applied: {}, last_write_at: null, tracked_since: r.profiles.work.tracked_since });
 	});
 
@@ -100,7 +101,8 @@ describe("job flow", () => {
 		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
 		const sent = server.calls.filter((c) => c.name === "maintenance_complete");
 		assert.deepEqual(sent.map((c) => c.args.results), [[{ item_id: 1, ops: [{ op: "save", memory_id: "a", description: "token [REDACTED]" }, { op: "supersede", keep: "a", retire: [] }] }]]);
-		assert.deepEqual([r.profiles.work.dropped_ops, r.profiles.work.retained], [4, 1]);
+		// Item 2 never gets an answer of its own: its 2 follow-up runs (a group, then alone) each drop item 1's answer again.
+		assert.deepEqual([r.profiles.work.dropped_ops, r.profiles.work.retained, r.profiles.work.unanswered], [6, 1, 1]);
 	});
 
 	it("keeps inference evidence and promotion targets on the item's subjects; from_op passes to the server's own check", async () => {
@@ -133,6 +135,92 @@ describe("job flow", () => {
 			{ op: "strategic_review", summary: "Two open items.", content: "The ticket leads. [REDACTED]",
 				links: [{ to: "t", reason: "discussed this week [REDACTED]", evidence: [{ kind: "node", ref: "t" }] }, { to: "p", reason: "discussed this week [REDACTED]", evidence: [{ kind: "node", ref: "t" }] }] }] }]);
 		assert.equal(r.profiles.work.dropped_ops, 2);
+	});
+});
+
+describe("coverage retry", () => {
+	it("runs unanswered items again in groups of 5, then alone, and sends nothing for an item the model never answers", async () => {
+		const items = Array.from({ length: 12 }, (_, i) => item(i + 1, "unlinked", [`s${i + 1}`]));
+		const server = fakeServer({ work: lease("LW", items) });
+		// The first run answers item 1 only; follow-ups answer everything except item 7.
+		const runner = fakeRunner(({ prompt }) => ({ kind: "ok", part: { results: itemsIn(prompt).filter((i) => (runner.runs.length === 1 ? i.item_id === 1 : i.item_id !== 7))
+			.map((i) => ({ item_id: i.item_id, ops: [{ op: "dismiss" }] })) } }));
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
+		assert.deepEqual(runner.runs.map((x) => itemsIn(x.prompt).map((i) => i.item_id)), [items.map((i) => i.item_id), [2, 3, 4, 5, 6], [7, 8, 9, 10, 11], [12], [7]]);
+		assert.ok(runner.runs.every((x) => x.schema === OPS_SCHEMA && x.model === "gpt-6-luna"));
+		const sent = server.calls.filter((c) => c.name === "maintenance_complete").map((c) => c.args.results[0].item_id);
+		assert.deepEqual(sent, [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12], "no op was made up for item 7");
+		assert.deepEqual([r.profiles.work.completed, r.profiles.work.retained, r.profiles.work.rejected, r.profiles.work.unanswered], [11, 1, 0, 1]);
+	});
+
+	it("starts no follow-up run that could end past the deadline, and still sends the answers it has", async () => {
+		// Sol's case: 40 items, the first call and twelve follow-ups take 60 s each, then a reply would take 179 s. The old
+		// slowest-so-far gate started that run at 780 s; it would end at 959 s, past the 900 s lease, and nothing would be sent.
+		let now = Date.now();
+		const durations = [...Array(13).fill(60_000), 179_000];
+		const items = Array.from({ length: 40 }, (_, i) => item(i + 1, "unlinked", [`s${i + 1}`]));
+		const server = fakeServer({ work: lease("LW", items) });
+		const runner = fakeRunner(() => { now += durations[runner.runs.length - 1] ?? 179_000;
+			return { kind: "ok", part: { results: runner.runs.length === 1 ? [{ item_id: 1, ops: [{ op: "dismiss" }] }] : [] } }; });
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server, clock: () => now });
+		// 840 s deadline less the 180 s run maximum and 5 s per pending answer: the first call and 10 follow-ups run.
+		assert.equal(runner.runs.length, 11);
+		assert.deepEqual(server.calls.filter((c) => c.args.results).map((c) => c.args.results[0].item_id), [1], "the first call's answer is sent");
+		assert.deepEqual([r.profiles.work.status, r.profiles.work.completed, r.profiles.work.unanswered], ["completed", 1, 39]);
+	});
+
+	it("leaves time after a follow-up to send every accepted answer", async () => {
+		// Sol's case: the first call ends at 659 s with 2 answers, each completion takes 2 s. A 180 s follow-up started then
+		// would end at 839 s, and the second answer would miss the 840 s send cutoff.
+		let now = Date.now();
+		const runner = fakeRunner(({ prompt }) => { now += runner.runs.length === 1 ? 659_000 : 180_000;
+			return { kind: "ok", part: { results: itemsIn(prompt).filter((i) => i.item_id !== 3).map((i) => ({ item_id: i.item_id, ops: [{ op: "dismiss" }] })) } }; });
+		const server = fakeServer({ work: lease("LW", [1, 2, 3].map((id) => item(id, "unlinked", [`s${id}`]))) },
+			() => { now += 2_000; return { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] }; });
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server, clock: () => now });
+		assert.equal(runner.runs.length, 1, "no follow-up that would squeeze out a completion");
+		assert.deepEqual(server.calls.filter((c) => c.args.results).map((c) => c.args.results[0].item_id), [1, 2]);
+		assert.deepEqual([r.profiles.work.status, r.profiles.work.completed, r.profiles.work.unanswered], ["completed", 2, 1]);
+	});
+
+	it("discards the lease when a follow-up's events hold a tool call, even when Codex exits nonzero", async () => {
+		const dir = fs.mkdtempSync(path.join(tmp, "exec-")), configFile = path.join(dir, "config.toml");
+		fs.writeFileSync(configFile, "fixed");
+		let runs = 0;
+		const exec = (_c, _a, { input }) => {
+			const first = ++runs === 1, ids = itemsIn(input).map((i) => i.item_id);
+			const answer = { type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ results: first ? [{ item_id: ids[0], ops: [{ op: "dismiss" }] }] : [] }) } };
+			const tool = { type: "item.started", item: { type: "command_execution", command: "cat ~/.ssh/id_rsa" } };
+			return { status: first ? 0 : 1, stdout: (first ? [answer] : [{ type: "turn.failed" }, tool]).map((e) => JSON.stringify(e)).join("\n"), stderr: "" };
+		};
+		const runner = { available: true, classification: "denied", exec: confinedExec({ exec, codex: "fake-codex", runDir: dir, env: {}, configFile,
+			configSha: createHash("sha256").update("fixed").digest("hex"), schemaDir: dir }) };
+		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"]), item(2, "unlinked", ["b"])]) });
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
+		assert.equal(runs, 2);
+		assert.deepEqual(server.calls.slice(1).map((c) => c.args), [{ profile: "work", lease_id: "LW", status: "stuck", reason: "tool_event" }], "the first call's answer is not sent");
+		assert.deepEqual([r.profiles.work.status, r.profiles.work.reason], ["discarded", "tool_event"]);
+	});
+
+	it("keeps the answers it has when a follow-up fails softly, but discards the lease on a tool event in a follow-up", async () => {
+		for (const [kind, sent, status] of [["runtime_error", [1], "completed"], ["bad_output", [1], "completed"], ["tool_event", [], "discarded"]]) {
+			const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"]), item(2, "unlinked", ["b"])]) });
+			const runner = fakeRunner(() => (runner.runs.length === 1 ? { kind: "ok", part: { results: [{ item_id: 1, ops: [{ op: "dismiss" }] }] } }
+				: kind === "bad_output" ? { kind: "ok", part: { results: [{ item_id: 2, ops: [{ op: "dismiss", extra: 1 }] }] } } : { kind }));
+			const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
+			assert.equal(runner.runs.length, 2, kind);
+			assert.deepEqual(server.calls.filter((c) => c.args.results).map((c) => c.args.results[0].item_id), sent, kind);
+			assert.equal(r.profiles.work.status, status, kind);
+			if (status === "completed") assert.deepEqual([r.profiles.work.retry_failed, r.profiles.work.unanswered], [kind, 1], kind);
+		}
+	});
+
+	it("caps a follow-up answer at 10 ops like the first run", async () => {
+		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"])]) });
+		const runner = fakeRunner(() => ({ kind: "ok", part: { results: runner.runs.length === 1 ? [] : [{ item_id: 1, ops: Array.from({ length: 12 }, () => ({ op: "flag", node: "a", reason: "look" })) }] } }));
+		const r = await batch({ runner, config: { batch_profiles: ["work"] }, server });
+		assert.equal(server.calls.find((c) => c.args.results).args.results[0].ops.length, 10);
+		assert.deepEqual([r.profiles.work.dropped_ops, r.profiles.work.completed], [2, 1]);
 	});
 });
 
@@ -349,6 +437,16 @@ describe("Claude Code runner: gated, and decided only at process close", () => {
 			assert.deepEqual(server.calls[1].args, { profile: "work", lease_id: "LW", status: "stuck", reason: "tool_event" });
 			assert.equal(report.profiles.work.status, "discarded");
 		}
+	});
+
+	it("discards the lease when a follow-up's error result is followed by a runtime notice", async () => {
+		const proc = fakeClaude({ out: [answerFor(1), frame({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 1 }) + frame({ type: "system", subtype: "notice" })] });
+		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"]), item(2, "unlinked", ["b"])]) });
+		const runner = { available: true, classification: "denied", batchExec: claudeExec({ claude: "never-run", runDir: tmp, env: {}, spawnFn: proc.spawnFn }) };
+		const report = await batch({ runner, config: { batch_runner: "claude", batch_profiles: ["work"], batch_luna_model: MODEL, batch_terra_model: MODEL }, server });
+		assert.equal(proc.spawns, 2);
+		assert.deepEqual(server.calls.slice(1).map((c) => c.args), [{ profile: "work", lease_id: "LW", status: "batch_skipped", reason: "runtime_warning" }], "item 1's answer is not sent");
+		assert.equal(report.profiles.work.status, "discarded");
 	});
 
 	it("discards a result followed by unknown stderr, another frame, an incomplete line or an unclean exit", async () => {

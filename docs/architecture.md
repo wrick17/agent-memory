@@ -1479,7 +1479,7 @@ Owner scope, 2026-10-31: proactive PR and Jira acquisition is out of product sco
 - **Jira context (work only).** Ticket keys come from digests, branch names, commits and PR titles. Per the owner's `jira-connector` rule, only the `~/.claude` work account reaches Jira, so the run calls Claude Code headless on that account with Sonnet, a Jira-only MCP config (`--strict-mcp-config`), only the Jira read tools allowed, and every other tool disallowed. It runs from an empty directory and returns JSON for at most 20 tickets. The run validates the JSON against a schema before upload.
 - **Checkout analyses (Paid corpus only).** Once per repo per day. Section 14.
 - **Daily refresh (default on).** On the first capture run of the UTC day for a profile, the run uploads assigned open Jira tickets (work) and open PRs authored by or awaiting review from the owner (`gh search prs --author @me` and `--review-requested @me`, scoped to the profile's orgs). The server claims the profile's daily slot atomically, so two machines never both run it. `daily_refresh = false` in `~/.agent-memory/config.toml` turns it off.
-- **Maintenance batch.** Section 12: one lease per profile on every drain of a capture run while items wait; a profile whose lease failed waits for the next run.
+- **Maintenance batch.** Section 12: one lease per profile on every drain of a capture run while items wait, whatever the profile's previous lease did.
 - **Spool.** Failed uploads stay in `~/.agent-memory/spool/` (at most 1,000 files or 64 MiB, the BothQ bounds) and replay on the next run. The spool holds digests and upload items only.
 
 The run exits when its steps finish. Nothing stays resident. v2 adds one scheduled entry point, a daily launchd job that `install` writes but never loads (v2 run additions above).
@@ -1620,7 +1620,9 @@ Deployed 11 Nov 2026 from PR #132. The daily batch learns two more kinds of reco
 
 ### The daily batch runs confined, or not at all
 
-The batch takes at most one lease per profile per drain and never mixes profiles in one prompt. A capture run drains again while new triggers arrive, so a long run leases a profile again on each drain while its previous lease in that run was clean (every item completed, none rejected) or idle; a profile whose lease failed, was discarded or threw waits for the next run, so one run never spends an item's 3 attempts. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
+The batch takes at most one lease per profile per drain and never mixes profiles in one prompt. A capture run drains again while new triggers arrive, so a long run leases each profile again on every drain, whatever its previous lease did (owner decision of 2026-11-12: learning runs as fast as possible, and extra Codex usage is acceptable). An item left leased by a failed lease is not leased again until that lease expires, and the server still parks an item after 3 attempts.
+
+**Coverage retry.** After the first run per model tier, items with no result, or whose ops were all dropped, run again with the same prompt, schema and checks in smaller prompts: groups of 5, then one item per run, so each such item is in at most 2 follow-up runs. A follow-up starts only while a run of the runners' 180-second timeout, plus 5 seconds per answer then pending, would still end before the send cutoff (lease end minus 60 seconds). The 5 seconds is a reserve, not a limit: job calls have no timeout, so slow completions can still miss the cutoff, and an unsent answer's item stays leased until expiry. Nothing is sent for an item the model never answered. The outcome counts such items as `unanswered`, apart from `rejected` ones; both stay leased until expiry. A follow-up that fails with a runtime error, no output or invalid output ends the retry, and the accepted answers are still sent (the outcome names it in `retry_failed`). A follow-up with a tool event, an unknown event or a changed config discards the whole lease, like the first run. Both runners read a run's whole output before classifying it: a tool event wins, then a runtime warning, then any other failure, whatever the order or exit code. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
 
 ```toml
 # $codex_home/config.toml, written fresh for each run (a throwaway CODEX_HOME). Checked against Codex CLI 0.165.0 on
@@ -1679,7 +1681,7 @@ probe_denied "/bin/cat $TMPDIR/am-probe-canary" "tmp-$nonce"
 probe_denied "/bin/ls $HOME" "Library"
 probe_denied "/usr/bin/curl -sS -v --connect-timeout 5 https://1.1.1.1/" ""   # an IP address, so DNS cannot be the cause; -v prints the denial
 [ "$(shasum -a 256 "$codex_home/config.toml")" = "$config_sha" ] || skip_batch indeterminate "config changed"
-# 2. The run itself. Luna for unlinked, stale_journal and dangling_link items; Terra for the rest.
+# 2. The run itself. Luna for unlinked, stale_journal and dangling_link items; Terra for the rest. Unanswered items run again (coverage retry).
 CODEX_HOME="$codex_home" codex exec --ephemeral --json --skip-git-repo-check -m gpt-6.1-terra -c model_reasoning_effort=high \
 	--output-schema ~/.agent-memory/schemas/maintenance-ops.json - < items.json > events.jsonl
 # 3. Detection: any item other than reasoning and the final message, including an error item for an ignored setting, discards the run.
@@ -2401,7 +2403,7 @@ Added by the owner priority of 2026-10-29. It makes the existing memory availabl
 			- The per-run positive controls and the same-run rule above (every classified filesystem and network probe `denied`) stay. Runtime and config notices and unknown events still fail closed. The actual model's acceptance of the changed batch schema and a genuine scoped job-token and server flow remain separate requirements.
 			- A genuine real-model adversarial canary is supporting evidence; the model is not required to volunteer a command.
 			- Status, 2026-10-29: OPEN. The real sandbox controls and the four denial probes passed on the recorded production config. P3's stderr path passed an independent source review, the 75 local tests and an exact recorded CLI replay into a real isolated Worker that parked the item as stuck with no item operation. P1 (production provider and catalog equivalence and the effective tool exposure) is unproved, so the gate is not passed.
-		- The batch takes at most one lease per profile per drain, and a profile whose lease failed waits for the next run; it never mixes profiles.
+		- The batch takes at most one lease per profile per drain, including after a failed lease; it never mixes profiles.
 	- Cleanup: undo round-trips for every op type. Protected nodes are only flagged.
 	- Transfers:
 		- Appends during a transfer get `moving` and land in the target afterwards.
