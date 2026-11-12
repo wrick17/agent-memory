@@ -1,4 +1,4 @@
-// The confined daily batch (section 12) with a fake confined runtime and a fake job transport: nothing is leased before the
+// The confined batch (section 12) with a fake confined runtime and a fake job transport: nothing is leased before the
 // runtime is proven, one profile per prompt, ops stay inside their item's subjects, every failure retains the work, and only
 // the job token reaches the two job tools.
 import assert from "node:assert/strict";
@@ -28,7 +28,7 @@ function fakeServer(leases, complete = () => ({ results: [{ status: "done", ops:
 	const calls = [];
 	return { calls, async call(name, args) {
 		calls.push({ name, args: structuredClone(args) });
-		return name === "maintenance_next" ? (leases[args.profile] ?? { lease_id: null, items: [], next_allowed_at: "later" }) : complete(args);
+		return name === "maintenance_next" ? (leases[args.profile] ?? { lease_id: null, items: [], next_allowed_at: null }) : complete(args);
 	} };
 }
 const fakeRunner = (judge) => { const runs = []; return { available: true, classification: "denied", runs, async exec(a) { runs.push(a); return judge(a); } }; };
@@ -72,6 +72,16 @@ describe("job flow", () => {
 		const receipt = (id, kind) => ({ item_id: id, kind, status: "done", sent: ["dismiss"], ops: [{ op: "dismiss", status: "applied" }] });
 		assert.deepEqual(r.profiles.work, { status: "completed", items: 2, completed: 2, rejected: 0, retained: 0, dropped_ops: 0, codes: { applied: 2 },
 			receipts: [receipt(1, "unlinked"), receipt(2, "near_duplicate")], applied: {}, last_write_at: null, tracked_since: r.profiles.work.tracked_since });
+	});
+
+	it("leases once per profile on every run, back to back, with the 40-item and 900 s sizing; an empty queue reports idle", async () => {
+		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"])]) });
+		for (let run = 0; run < 2; run++) await batch({ runner: fakeRunner(dismissAll), config, server });
+		const leases = server.calls.filter((c) => c.name === "maintenance_next").map((c) => [c.args.profile, c.args.limit, c.args.lease_seconds]);
+		assert.deepEqual(leases, [["work", 40, 900], ["personal", 40, 900], ["work", 40, 900], ["personal", 40, 900]]);
+		const last = JSON.parse(fs.readFileSync(path.join(process.env.AGENT_MEMORY_HOME, "batch", "last.json"), "utf8"));
+		assert.equal(last.profiles.work.status, "completed");
+		assert.deepEqual(last.profiles.personal, { status: "idle", applied: {}, last_write_at: null, tracked_since: last.profiles.personal.tracked_since });
 	});
 
 	it("sends only allowed ops on the item's own subjects, drops nulls and redacts model text", async () => {

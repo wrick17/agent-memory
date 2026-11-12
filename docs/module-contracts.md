@@ -123,7 +123,7 @@ Scoped evidence: all three reviewer assertions reproduced red on the prior fixed
 | Undo | `src/profile/undo.ts`: `inverseOf(command, before, after)` gives the inverse `WriteCommand`. `undo(storage, who, activityId, ctx)` runs it through `runWrite` with `request_id = "undo:<id>"` and the produced revision. Conflicts return `revision_conflict`, redacted rows `undo_redacted` | `activity()` in `write.ts` stores `inverseOf(...)` in `activity.undo`; `ProfileStore.undo(who, activityId, ctx)` |
 | Queue and job tools | `src/profile/maintenance.ts`: enqueue by fingerprint, `next` (lease up to 40 items, at most 900 s), `complete` (ops through `runWrite` with actor `maintenance`, each inside its item's subjects). `src/maintenance-tools.ts`: MCP `maintenance_next` and `maintenance_complete`, scope `maintenance`, job tokens only | `ProfileStore.maintenance(who, cmd)`, where `cmd` is `{op: "next"} or {op: "complete"}`; two rows in `TOOLS` |
 | Housekeeping | `src/profile/housekeeping.ts`: bounded alarm stages with cursors. Capture TTL of 90 days (to the archive), archive purge at 300 days, exact dedupe (same kind, scope and content hash), size caps | Called from `ProfileStore.alarm` after `embed` |
-| Daily batch | `local/batch.mjs`: the confined daily batch, once per profile per day, only after every probe is `denied` | Wired into the capture run after C2's lock lands |
+| Daily batch | `local/batch.mjs`: the confined batch, one lease per profile per capture run while items wait (no cooldown since 2026-11-12), only after every probe is `denied` | Wired into the capture run after C2's lock lands |
 | Tests | `test/maintenance.test.ts` (undo round trip for every op type, protected nodes only flagged, leases, TTL and purge); `local/batch.test.mjs` | |
 
 ## C5: dashboard read-only slice (approved 2026-10-29)
@@ -1121,7 +1121,7 @@ For implementation/testing through v1 freeze, the owner waived the maintenance c
 
 Account restore indexes active nodes and archived holders before rebuilding request bindings. Competing holders leave a `held_elsewhere` finding. The owner-only request diagnostic reports bounded, content-free placement evidence. The owner can recheck an unresolved Account restore only when every `request_elsewhere` finding passes the proof gate; the recheck retains prior findings and restarts reconciliation, and a separate open remains necessary. Divergent or incomplete evidence fails closed.
 
-The owner-only batch status includes `next_preview`, an observation using the normal lease selector. It reports candidate IDs, kinds, subject IDs, creation times, attempts and expired-lease flags, plus cooldown state and IDs that would become stuck. It includes no content, takes no lease and changes no queue state. Candidates may change after observation.
+The owner-only batch status includes `next_preview`, an observation using the normal lease selector. It reports candidate IDs, kinds, subject IDs, creation times, attempts and expired-lease flags, plus IDs that would become stuck. It includes no content, takes no lease and changes no queue state. Candidates may change after observation.
 
 The same owner-only status includes `last_completed_lease`, a bounded, read-only projection of stored operation outcomes. It exposes allowlisted codes and IDs, never prompts or summaries; unrecognized text is replaced with a code. The local batch report also retains per-operation outcomes for future runs. This records results without changing the queue.
 

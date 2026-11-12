@@ -23,9 +23,8 @@ function capture(storage: DurableObjectStorage, who: Who, id: string, correction
 	ingest(storage, who, { session: { client: "codex", id }, digests: [{ range_id, capture_status: "consolidated", part_id: range, sha256: sha, body }], manifests: [{ range_id, parts: [{ part_id: range, sha256: sha }] }] });
 	return String(storage.sql.exec("SELECT id FROM nodes WHERE key = ?", `session:codex:${id}`).one().id);
 }
-/** Leases every due item (past the batch cooldown) and completes each session's items: preference_signal ops per session, others dismissed. */
+/** Leases every due item and completes each session's items: preference_signal ops per session, others dismissed. */
 function batch(storage: DurableObjectStorage, who: Who, ops: (subject: string) => Record<string, unknown>[], captureOps: (subject: string) => Record<string, unknown>[] = () => [{ op: "dismiss" }]) {
-	storage.sql.exec("UPDATE cursors SET last_run_at = '2000-01-01T00:00:00.000Z' WHERE stage = 'maintenance_batch'");
 	const lease = next(storage, {});
 	return complete(storage, who, { lease_id: lease.lease_id!, results: lease.items.map((i) => ({ item_id: i.item_id,
 		ops: (i.kind === "preference_signal" ? ops(i.subjects[0]!) : i.kind === "unprocessed_capture" ? captureOps(i.subjects[0]!) : [{ op: "dismiss" }]) as never })) }, { platform: "test", userId: who.userId, deviceId: "dev-1" });
