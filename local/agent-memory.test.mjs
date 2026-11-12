@@ -1784,3 +1784,51 @@ describe("capture gaps and hook trust (#128)", () => {
 	});
 });
 
+
+describe("capture project tagging", () => {
+	const git = (...args) => assert.equal(spawnSync("git", args, { encoding: "utf8" }).status, 0, args.join(" "));
+	const checkout = (dir, remote) => { fs.mkdirSync(dir, { recursive: true }); git("init", "-q", dir); if (remote) git("-C", dir, "remote", "add", "origin", remote); return dir; };
+
+	it("derives the project key from the checkout root and the workspace from config, and skips fixtures and checkouts above the workspace", async () => {
+		const ws = fs.mkdtempSync(path.join(tmp, "ws-"));
+		const app = checkout(path.join(ws, "app"), "git@github.com:Owner/App.git"), sub = path.join(app, "src");
+		fs.mkdirSync(sub);
+		const fixture = checkout(path.join(ws, "tool", "fixtures", "web"), "https://github.com/acme/web-app");
+		const plain = path.join(ws, "notes");
+		fs.mkdirSync(plain);
+		const outer = checkout(fs.mkdtempSync(path.join(tmp, "home-repo-")), "https://github.com/me/dotfiles"), inner = path.join(outer, "Projects");
+		fs.mkdirSync(inner);
+		assert.deepEqual(await am.placeOf(sub, "git@github.com:Owner/App.git", { apps: ws }), { project: "github:owner/app", workspace: "apps" });
+		assert.deepEqual(await am.placeOf(sub, "https://user:secret@github.com/Owner/App.git/", {}), { project: "github:owner/app" });
+		assert.deepEqual(await am.placeOf(sub, "https://gitlab.com/owner/app.git", { apps: ws }), { workspace: "apps" }, "not a GitHub remote");
+		assert.deepEqual(await am.placeOf(fixture, "https://github.com/acme/web-app", {}), {}, "a checkout under fixtures is no project");
+		assert.deepEqual(await am.placeOf(plain, undefined, { apps: ws }), { workspace: "apps" }, "a workspace folder with no repo");
+		assert.deepEqual(await am.placeOf(inner, "https://github.com/me/dotfiles", { sequoia: inner }), { workspace: "sequoia" }, "the repo above the workspace root is not its project");
+		assert.deepEqual(await am.placeOf("/no/such/dir", "https://github.com/o/r", { apps: ws }), {});
+		assert.deepEqual(am.withDefaults({ capture: { workspaces: { sequoia: "~/Projects/sequioa", "Bad Name": "/x", rel: "Projects/x", apps: "/abs/apps/" } } }).capture.workspaces,
+			{ sequoia: path.join(os.homedir(), "Projects/sequioa"), apps: "/abs/apps" });
+		assert.deepEqual(am.withDefaults({}).capture, { workspaces: {} });
+	});
+
+	it("sends project and workspace on every batch of a tagged session, and an untagged session keeps the old body", async () => {
+		const ws = fs.mkdtempSync(path.join(tmp, "ws-"));
+		const app = checkout(path.join(ws, "app"), "https://github.com/Owner/App.git");
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ capture: { workspaces: { apps: ws } } }));
+		const tagged = transcript(`tag-${n}`, [claudeLine("user", "We decided to tag sessions."), claudeLine("assistant", "Done.")]);
+		const plain = transcript(`untagged-${n}`, [claudeLine("user", "We decided nothing here."), claudeLine("assistant", "Ok.")]);
+		const outside = fs.mkdtempSync(path.join(tmp, "outside-"));
+		am.hook("claude-code", JSON.stringify({ session_id: `tag-${n}`, transcript_path: tagged, cwd: app, hook_event_name: "SessionEnd" }), { spawnRun: false });
+		am.hook("claude-code", JSON.stringify({ session_id: `untagged-${n}`, transcript_path: plain, cwd: outside, hook_event_name: "SessionEnd" }), { spawnRun: false });
+		const server = fakeServer();
+		await am.run({ server, runner: keepAllRunner(), debounceMs: 0 });
+		const of = (id) => server.log.filter((b) => b.session.id === id);
+		assert.ok(of(`tag-${n}`).length >= 2, "heuristic and consolidated batches");
+		for (const b of of(`tag-${n}`)) {
+			assert.equal(b.project, "github:owner/app");
+			assert.equal(b.workspace, "apps");
+			assert.deepEqual(b.repo, { remote: "https://github.com/Owner/App.git", path: app }, "routing input unchanged");
+		}
+		assert.ok(of(`untagged-${n}`).length >= 1);
+		for (const b of of(`untagged-${n}`)) assert.ok(!("project" in b) && !("workspace" in b), "no new fields without a project or workspace");
+	});
+});

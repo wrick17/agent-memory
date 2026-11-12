@@ -16,9 +16,9 @@ export type Learning = { project: { id: string; name: string } | null; scope: st
 
 /**
  * The project the subjects' sessions link to (an upload's part_of first, then the strongest identifier link, as the sessions
- * page reads it), and the scope a lesson or decision from them takes: the project's repo name when it is a valid scope, else
- * `default`. shortcut: the repo name stands in for a project scope, since nodes carry no scope mapping; revisit if the owner
- * scopes project records some other way.
+ * page reads it), and the scope a lesson or decision from them takes: the project's repo name when it is a valid scope, else the
+ * workspace a session ran in (capture project tagging, attrs.workspace), else `default`. shortcut: the repo name stands in for a
+ * project scope, since nodes carry no scope mapping; revisit if the owner scopes project records some other way.
  */
 export function learningFor(sql: SqlStorage, subjects: string[]): Learning {
 	const p = sql.exec<{ id: string; name: string }>(`SELECT p.id, p.name FROM edges e JOIN nodes p ON p.id = e.dst
@@ -26,7 +26,10 @@ export function learningFor(sql: SqlStorage, subjects: string[]): Learning {
 		ORDER BY e.rel = 'part_of' DESC, e.weight DESC, e.id LIMIT 1`, JSON.stringify(subjects)).toArray()[0];
 	const project = p && readableNodeIds(sql, [p.id]).has(p.id) && !archiveNodeIds(sql, [p.id]).length ? p : null;
 	const repo = project?.name.split("/").pop()?.trim() ?? "";
-	const scope = repo && isScope(repo) && normalizeScope(repo) !== FACT_SCOPE ? normalizeScope(repo) : "default";
+	const workspace = project ? "" : sql.exec<{ ws: string }>(`SELECT json_extract(attrs, '$.workspace') AS ws FROM nodes WHERE id IN (SELECT value FROM json_each(?))
+		AND kind = 'session' AND json_type(attrs, '$.workspace') = 'text' ORDER BY id LIMIT 1`, JSON.stringify(subjects)).toArray()[0]?.ws ?? "";
+	const name = repo || workspace;
+	const scope = name && isScope(name) && normalizeScope(name) !== FACT_SCOPE ? normalizeScope(name) : "default";
 	return { project, scope, known: knownIn(sql, scope) };
 }
 

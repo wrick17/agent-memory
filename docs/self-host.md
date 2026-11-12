@@ -223,6 +223,20 @@ A separately installed capture client reads these keys. A config without them ke
 | `loop_guard.enabled` | `false` | Register the tool-result hooks and add one fixed note to a turn that keeps failing. No network or model call. |
 | `loop_guard.shadow` | `false` | With `loop_guard.enabled`, run the rules and log each would-fire to `~/.agent-memory/loop-guard/fires.jsonl`, but print no note. The log holds hashes, rule names and counts only. |
 
+### Capture project tagging
+
+Each captured session is tagged with the GitHub project of the folder it ran in. The client reads the checkout's root and `origin` remote with read-only git and sends the key `github:<owner>/<repo>`, in lowercase, with SSH aliases folded to github.com through `ssh -G`. The server links the session to that project node in the routed profile, and creates the node if no node has that key. Lessons and decisions that the daily batch learns from the session take the repo name as their scope and link to the project. Keys of acceptance fixtures (`am-accept*`, `fixture*`, `dashboard-smoke`) and the `bot_hq`, `bothq` and `codex` labels are skipped. A checkout under a `fixtures` folder is skipped too.
+
+Workspaces are optional folders that group repos:
+
+```json
+{ "capture": { "workspaces": { "work": "~/Projects/work", "oss": "~/Projects/oss" } } }
+```
+
+A session in a configured workspace also sends the workspace name. If the session has no project, for example one started at the workspace root, its lessons and decisions take the workspace name as their scope. A checkout that sits above the workspace root, such as a home-directory repo, is not treated as a project of that workspace. Names are lowercase letters, digits, `.`, `_` and `-`; roots start with `/` or `~/`.
+
+Deploy the Worker before the client: an older Worker refuses a batch with these fields, and the client keeps such batches spooled or pending and sends them again after the Worker is upgraded. Nothing is lost, but capture stalls until then.
+
 Deterministic fact detection follows capture and has no switch of its own: with capture installed, the client reports detector results for each completed session in a GitHub repository, whatever these settings say. Those reports hold hashes, fact keys, detector literals, injected-item outcomes, token counts and command counts, never command output or paths. The v2 server writes every statement itself. Turning `facts.synthesis` off stops only synthesis. After you change `facts.inject` or `loop_guard.enabled`, run `agent-memory install` again so the client registers the hooks.
 
 ## Profile backups and restore
