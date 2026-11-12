@@ -572,7 +572,19 @@ export function libraryTab(am: Am): void {
 		const forget = am.btn(row, "Forget…", () => {
 			forget.hidden = true;
 			const ask = el("span", row, " Move it to the archive? You can undo this. ");
-			am.btn(row, "Forget", () => am.act(`${base}/forget`, "forget it", undefined, done("Forgot")));
+			am.btn(row, "Forget", () => am.act(async () => {
+				try { return await call(`${base}/forget`, "POST"); }
+				catch (err) {
+					if ((err as Failure).code !== "size_budget" || !Number.isSafeInteger(Number(n.revision))) throw err;
+					// Too large for one write: the staged archive route forgets it in steps, bound to the revision shown.
+					const pb = `/api/profiles/${enc(it.p)}/archive/operations`;
+					let r: J = await call(pb, "POST", { action: "forget", memory_id: it.id, expected_revision: Number(n.revision), request_id: `dashboard:${crypto.randomUUID()}` });
+					for (let i = 0; (r.state === "running" || r.state === "rolling_back") && i < 200; i++)
+						r = await call(`${pb}/${enc(String(r.operation_id))}/resume`, "POST", { cursor: String(r.cursor), request_id: `dashboard:${crypto.randomUUID()}` });
+					if (r.state !== "complete") throw new Error(`the staged forget stopped while ${String(r.state)} after ${String(r.rows_done ?? 0)} rows; try again to continue`);
+					return { staged: true };
+				}
+			}, "forget it", undefined, (r) => r?.staged ? { text: `Forgot “${it.title}” in steps; Change history can restore it.` } : done("Forgot")(r)));
 			ask.setAttribute("tabindex", "-1");
 			ask.focus();
 		});

@@ -210,10 +210,11 @@ export function backupsPages(am: Am): void {
 			if (version !== am.pageVersion) return;
 			say("");
 			// The answer first: when the last backup ran and whether every store saved; its internals sit behind Details.
-			const le = s?.last_export, res = Object.values(le?.results ?? {}) as J[], bad = res.filter((v) => v && typeof v === "object" && (v.error || v.state === "failed")).length;
+			const le = s?.last_export, res = Object.values(le?.results ?? {}) as J[], bad = res.filter((v) => v && typeof v === "object" && (v.error || v.state === "failed")).length,
+				running = res.filter((v) => v && typeof v === "object" && !v.error && v.state === "running").length;
 			const lead = el("p", rec);
 			lead.setAttribute("class", "backup-lead");
-			if (le) { el("strong", lead, `Last backup ${am.when(le.at).text || recorded(le.at)}`); el("span", lead, ` · ${bad ? `${res.length - bad} of ${res.length} saved, ${bad} failed` : "everything saved"}`); }
+			if (le) { el("strong", lead, `Last backup ${am.when(le.at).text || recorded(le.at)}`); el("span", lead, ` · ${bad || running ? [`${res.length - bad - running} of ${res.length} saved`, ...(running ? [`${running} still running`] : []), ...(bad ? [`${bad} failed`] : [])].join(", ") : "everything saved"}`); }
 			else el("strong", lead, "No backup yet");
 			const r = s?.recovery;
 			if (r) {
