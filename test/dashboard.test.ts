@@ -1154,16 +1154,33 @@ describe("dashboard Audit tab and Admin pages", () => {
 describe("dashboard library: sections, detail, connections, map", () => {
 	const today = new Date().toISOString();
 	const N = (id: string, kind: string, name: string, extra: Record<string, unknown> = {}) => ({ id, kind, name, type: null, scope: null, status: "active", updated_at: today, created_at: today, ...extra });
-	const NODES = [N("p1", "project", "agent-memory", { key: "github:wrick17/agent-memory" }), N("p2", "project", "bettergit"), N("u1", "person", "Ana"),
-		N("m1", "decision", "cache-policy", { type: "project", scope: "agent-memory" }), N("l1", "rule", "Always run the tests", { type: "feedback" }),
+	// The owner's project registry is their own data: one record per profile (synthetic names only here).
+	const REG = "dashboard-project-registry";
+	const WORK_REG = { workspaces: [{ id: "labs", name: "Labs", order: 1 }, { id: "apps", name: "Apps", order: 2 }], owners: ["acme-corp"], default_workspace: "labs",
+		repos: [{ key: "acme-corp/widget-frontend", name: "widget", workspaces: ["labs", "apps"] }, { key: "acme-corp/gizmo-frontend", name: "gizmo", workspaces: ["labs"] }, { key: "acme-corp/idm-frontend", name: "idm", workspaces: ["labs", "apps"] }],
+		aliases: { labs: "ws:labs", lab: "ws:labs", apps: "ws:apps", "claude/projects-apps": "ws:apps", "claude/projects-gizmo": "acme-corp/gizmo-frontend", "claude/projects-labs-widget": "acme-corp/widget-frontend?", "ai-internal": "ws:labs?" } };
+	const PERSONAL_REG = { workspaces: [{ id: "studio", name: "Studio", order: 3 }], owners: ["jdoe"], default_workspace: "studio",
+		repos: [{ key: "jdoe/recall-engine", name: "memory", workspaces: ["studio"] }, { key: "jdoe/sketchbook", workspaces: ["studio"] }, { key: "jdoe/dotrc", workspaces: ["studio"] }, { key: "acme-corp/side-gig", workspaces: ["studio"] }],
+		aliases: { "recall-engine": "jdoe/recall-engine", sketchbook: "jdoe/sketchbook", "claude/projects-studio-sketchbook": "jdoe/sketchbook", "studio/dotrc": "jdoe/dotrc", "projects/side-gig": "acme-corp/side-gig", studio: "ws:studio?" },
+		drop: ["repo-fact", "agent-evaluation", "bot_hq", "tool-label", "codex", "tooling/codex"], not_projects: ["jdoe/attic"] };
+	const regs: Record<string, unknown> = { work: WORK_REG, personal: PERSONAL_REG };
+	const NODES = [N("p1", "project", "recall-engine", { key: "github:jdoe/recall-engine" }), N("p2", "project", "sketchbook"), N("u1", "person", "Ana"),
+		N("regw", "document", REG, { type: "reference" }),
+		N("m1", "decision", "cache-policy", { type: "project", scope: "recall-engine" }), N("l1", "rule", "Always run the tests", { type: "feedback" }),
 		N("j1", "journal", "task-journal-2026-11-12-1130-claude-code-dashboard-hill-climb", { type: "project" }), N("s1", "session", "", { key: "session:codex:abc" }),
-		N("p3", "project", "synthetic-fixture-project"), N("40e647a4-713a-5ea9-85bc-b9ddf5ec1956", "project", "Synthetic corpus acceptance project 59c5", { key: "github:Sequoia-Engineering/kernel-eureka-frontend" })];
+		N("p3", "project", "synthetic-fixture-project"), N("40e647a4-713a-5ea9-85bc-b9ddf5ec1956", "project", "Synthetic corpus acceptance project 59c5", { key: "github:Acme-Corp/eureka-frontend" })];
 	const E = (id: number, src: string, dst: string, rel: string) => ({ id, src, dst: { id: dst, readable: true }, rel });
 	const EDGES = [E(1, "u1", "p1", "works_on"), E(2, "m1", "s1", "relates_to"), E(3, "l1", "p1", "part_of"), E(4, "u1", "l1", "authored"), E(5, "p2", "u1", "relates_to"), E(6, "j1", "p1", "part_of"), E(7, "l1", "p2", "part_of")];
-	const api: Api = (path) => {
+	const api: Api = (path, _m, body) => {
 		if (path.startsWith("/api/profiles/work/graph?part=nodes")) return Response.json({ items: NODES, next_after: null, done: true, total: NODES.length });
 		if (path.startsWith("/api/profiles/work/graph?part=edges")) return Response.json({ items: EDGES, next_after: null, done: true });
+		if (path.startsWith("/api/profiles/personal/graph?part=nodes")) return Response.json({ items: [N("regp", "document", REG, { type: "reference" })], next_after: null, done: true, total: 1 });
 		if (path.startsWith("/api/profiles/personal/graph")) return Response.json({ items: [], next_after: null, done: true, total: 0 });
+		// A view of one profile finds the other profiles' registries by name (a lexical recall), then reads them.
+		if (path.endsWith("/recall") && (body as { keyword?: string })?.keyword === REG) { const p = /profiles\/([^/]+)\//.exec(path)![1]!; return Response.json({ results: regs[p] ? [{ memory_id: p === "work" ? "regw" : "regp", name: REG }] : [] }); }
+		const reg = /^\/api\/profiles\/(work|personal)\/nodes\/(regw|regp)$/.exec(path);
+		if (reg) return regs[reg[1]!] === undefined ? Response.json({ error: { code: "not_found", message: "gone" } }, { status: 404 })
+			: Response.json({ node: { id: reg[2], name: REG, kind: "document", memory_type: "reference", status: "active" }, content: { text: typeof regs[reg[1]!] === "string" ? regs[reg[1]!] : JSON.stringify(regs[reg[1]!]), complete: true }, evidence: { items: [] } });
 		if (path === "/api/profiles/work/nodes/m1") return Response.json({ node: { id: "m1", name: "cache-policy", kind: "decision", memory_type: "project", status: "active", revision: 2 },
 			content: { text: `## Why\nWe cache **reads** for \`60s\`.\n\n- one\n- two\n\n${HOSTILE} [bad](javascript:alert(1)) [docs](https://example.test/x)\n\n\`\`\`\nrm -rf <b>\n\`\`\``, complete: true },
 			evidence: { items: [{ kind: "session", ref: "codex:abc" }] }, links: [], history: { items: [] } });
@@ -1188,7 +1205,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		const row = find(b.view(), "a").find((a) => a.attrs.class === "row")!;
 		expect(text(row)).toContain("Cache policy");
 		expect(text(row)).toMatch(/Today \d\d:\d\d/);
-		expect(text(row)).toContain("Project note · memory · in your work profile"); // its scope says wrick17's repo: personal, though stored in work
+		expect(text(row)).toContain("Project note · memory · in your work profile"); // its scope names a personal-owner repo, though stored in work
 		const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
 		expect(find(detail, "h2")[0]!.textContent).toBe("Cache policy");
 		expect(text(detail)).toContain("From a Codex session");
@@ -1221,10 +1238,10 @@ describe("dashboard library: sections, detail, connections, map", () => {
 	it("shows projects as workspace groups of cards, one entity per repo, and a project's page as a hub", async () => {
 		const b = await open("#projects?profile=work");
 		const secs = find(b.view(), "section").filter((x) => x.attrs.class === "ws-sec");
-		expect(secs.map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Personal"]); // only projects memories resolve to; bettergit has only a person
+		expect(secs.map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Studio"]); // only projects memories resolve to; sketchbook has only a person
 		const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard");
-		expect(cards.map((c) => text(find(c, "strong")[0]!).trim())).toEqual(["memory", "bettergit"]); // the short name first
-		expect(text(cards[0]!)).not.toContain("agent-memory"); // the GitHub repo name stays behind the GitHub link
+		expect(cards.map((c) => text(find(c, "strong")[0]!).trim())).toEqual(["memory", "sketchbook"]); // the short name first
+		expect(text(cards[0]!)).not.toContain("recall-engine"); // the GitHub repo name stays behind the GitHub link
 		expect(text(cards[0]!)).toMatch(/1 memory · 1 learning · 1 journal/);
 		expect(text(cards[0]!)).toContain("Personal"); // the profile its GitHub owner gives, as a quiet tag
 		expect(text(b.view())).not.toMatch(/Synthetic|eureka|Show all known repos/i); // fixture projects are dropped, even with a real-looking key
@@ -1235,10 +1252,10 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		const weeks = find(detail, "figure").find((f) => f.attrs.class === "chart daily")!; // stacked day bars, as on Home
 		expect(text(find(weeks, "figcaption")[0]!)).toMatch(/1 journal.*1 memory.*1 learning.*added in the last \d+ weeks/);
 		const rel = find(detail, "figure").find((f) => f.attrs.class === "chart rel")!;
-		expect(text(rel)).toContain("bettergit");
+		expect(text(rel)).toContain("sketchbook");
 		expect(text(rel)).toContain("1 learning in common"); // the edge says how the two projects connect
 		expect(text(rel)).not.toContain("Ana"); // People is off the dashboard for now
-		expect(find(detail, "a").find((a) => a.textContent === "Open on GitHub ↗")!.attrs.href).toBe("https://github.com/wrick17/agent-memory");
+		expect(find(detail, "a").find((a) => a.textContent === "Open on GitHub ↗")!.attrs.href).toBe("https://github.com/jdoe/recall-engine");
 		expect(find(b.view(), "a").find((a) => a.textContent === "← All projects")).toBeDefined();
 	});
 
@@ -1273,8 +1290,8 @@ describe("dashboard library: sections, detail, connections, map", () => {
 	it("gives every record one display title: slug noise stripped, a thin slug title replaced by its own first sentence everywhere", async () => {
 		const b0 = await open("#home?profile=work");
 		const human = (b0.win as unknown as { __am: { human(n: string, k?: string): string } }).__am.human;
-		expect(["bettergit-010", "opus-routing-57A8CC3C", "repo-facts-privacy-signoff-2026-11-11", "task-journal-2026-11-12-1130-codex-mfe-rsdoctor"].map((n) => human(n)))
-			.toEqual(["Bettergit", "Opus routing", "Repo facts privacy signoff", "Mfe rsdoctor"]);
+		expect(["widget-010", "opus-routing-57A8CC3C", "repo-facts-privacy-signoff-2026-11-11", "task-journal-2026-11-12-1130-codex-gizmo-rsdoctor"].map((n) => human(n)))
+			.toEqual(["Widget", "Opus routing", "Repo facts privacy signoff", "Gizmo rsdoctor"]);
 		NODES.push(N("m2", "decision", "MEMORY.md", { type: "reference" }));
 		try {
 			const b = browser({ signedIn: true, hash: "#memories/work/m2?profile=work", api: (p, m, body) => p === "/api/profiles/work/nodes/m2"
@@ -1484,7 +1501,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		try {
 			const b = await openWith("#memories/work/m3?profile=work", (p, m, body) => p === "/api/profiles/work/nodes/m3"
 				? Response.json({ node: { id: "m3", name: "x", kind: "decision", status: "active", description: "Push the dynav feature branch. Then more.", source_platform: "device:main-work-personal-20261102", origin: "agent", created_at: today },
-					content: { text: "body", complete: true }, evidence: { items: [{ kind: "url", ref: "https://drafts.wrick17.com/d/3a4f026ac12360e57d7" }, { kind: "pr", ref: "https://github.com/wrick17/bettergit/pull/66" }] } })
+					content: { text: "body", complete: true }, evidence: { items: [{ kind: "url", ref: "https://drafts.example.com/d/3a4f026ac12360e57d7" }, { kind: "pr", ref: "https://github.com/jdoe/sketchbook/pull/66" }] } })
 				: api(p, m, body));
 			const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
 			expect(find(detail, "h2")[0]!.textContent).toBe("Push the dynav feature branch.");
@@ -1578,7 +1595,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 	});
 
 	it("places a record by its tagged project_key when the server sends one, and by its scope when it does not", async () => {
-		NODES.push(N("t1", "decision", "Tagged decision", { type: "project", scope: "codex", project_key: "github:sequoia-engineering/kernel-idm-frontend" }));
+		NODES.push(N("t1", "decision", "Tagged decision", { type: "project", scope: "codex", project_key: "github:acme-corp/idm-frontend" }));
 		try {
 			const b = await open("#projects?profile=work");
 			const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard").map((c) => text(find(c, "strong")[0]!).trim());
@@ -1607,56 +1624,87 @@ describe("dashboard library: sections, detail, connections, map", () => {
 			}
 		};
 		check();
-		expect(blocks().map((x) => find(x, "span")[1]!.textContent)).toEqual(expect.arrayContaining(["memory", "bettergit"]));
+		expect(blocks().map((x) => find(x, "span")[1]!.textContent)).toEqual(expect.arrayContaining(["memory", "sketchbook"]));
 		expect(blocks().some((x) => text(x).includes("Ana"))).toBe(false); // no people on the map
-		const ana = blocks().find((x) => text(x).includes("bettergit"))!;
+		const ana = blocks().find((x) => text(x).includes("sketchbook"))!;
 		find(b.view(), "div").find((d) => d.attrs.class === "blocks")!.on.click!({ target: { closest: () => ana }, preventDefault() {} } as never);
 		await settle();
 		check();
 		const side = find(b.view(), "aside").find((a) => a.attrs.class === "map-side")!;
 		expect(side.hidden).toBe(false);
-		expect(find(side, "h2")[0]!.textContent).toBe("bettergit");
+		expect(find(side, "h2")[0]!.textContent).toBe("sketchbook");
 		expect(b.win.location.hash).toBe(b.win.location.hash); // the trail is in the address once the camera settles
 	});
 
-	it("places a record by Sol's rules: explicit repo key, then a verified scope alias, then the workspace, else Unsorted", async () => {
+	it("places a record from the owner's registry: explicit repo key, then a registry alias, then the workspace, else unsorted", async () => {
 		const b = await open("#home?profile=work");
-		const am = (b.win as unknown as { __am: { placeOf(r: Record<string, unknown>): Record<string, unknown> } }).__am;
+		const am = (b.win as unknown as { __am: { placeOf(r: Record<string, unknown>): Record<string, unknown>; workspaceOrder: string[]; workspaceName(w: string): string } }).__am;
 		const at = (r: Record<string, unknown>) => { const x = am.placeOf({ profile: "work", ...r }); return [x.workspace, x.project, x.confidence]; };
-		// Explicit keys win, normalized to lowercase owner/repo; the owner decides the workspace.
-		expect(at({ kind: "project", name: "idm", key: "github:Sequoia-Engineering/kernel-idm-frontend" })).toEqual(["sequoia", "sequoia-engineering/kernel-idm-frontend", "high"]);
-		expect(at({ repo_key: "github.com/wrick17/agent-memory", scope: "sequoia" })).toEqual(["personal", "wrick17/agent-memory", "high"]);
-		expect(am.placeOf({ profile: "work", scope: "personal/dotfiles" })).toEqual({ workspace: "personal", workspaces: ["personal"], project: "wrick17/dotfiles", confidence: "high", profile: "personal" });
-		// One repo, several workspace folders: adminshell is checked out in sequoia and apps.
-		expect(am.placeOf({ profile: "work", scope: "claude/Projects-sequoia-adminshell" }).workspaces).toEqual(["sequoia", "apps"]); // the aggregator's nested checkout is still adminshell
-		// Verified aliases, including Claude's encoded roots exactly as listed (no hyphen-to-slash guessing).
-		expect(at({ scope: "claude/Projects-personal-bettergit" })).toEqual(["personal", "wrick17/bettergit", "high"]);
-		expect(at({ scope: "claude/Projects-mfe" })).toEqual(["sequoia", "sequoia-engineering/kernel-mfe-frontend", "high"]);
-		expect(at({ scope: "claude/Projects-aggregator" })).toEqual(["sequoia", "sequoia-engineering/kernel-aggregator-frontend", "high"]); // a project, not a workspace
-		expect(at({ kind: "project", name: "Bot HQ", key: "github:wrick17/bothq" })).toEqual(["personal", null, "high"]); // the owner: Bot HQ is not a project
-		expect(at({ kind: "project", name: "x", key: "github:wrick17/n5-japanese" })).toEqual(["personal", null, "high"]); // not in the registry: its workspace only
-		expect(at({ scope: "claude/Projects-sequoia-adminshell" })).toEqual(["sequoia", "sequoia-engineering/kernel-adminshell-frontend", "medium"]);
-		expect(at({ scope: "projects/spur" })).toEqual(["personal", "pratyush-poddar_seq/spur", "high"]); // checked out in the personal folder…
-		expect(am.placeOf({ profile: "personal", scope: "projects/spur" }).profile).toBe("work"); // …but its owner makes it work
+		// Both profiles' registries are read and merged, workspaces in their given order.
+		expect([am.workspaceOrder.slice(0, 3), am.workspaceName("labs")]).toEqual([["labs", "apps", "studio"], "Labs"]);
+		// Explicit keys win, normalized to lowercase owner/repo; the registry decides the workspace and the owner the profile.
+		expect(at({ kind: "project", name: "idm", key: "github:Acme-Corp/idm-frontend" })).toEqual(["labs", "acme-corp/idm-frontend", "high"]);
+		expect(at({ repo_key: "github.com/jdoe/recall-engine", scope: "labs" })).toEqual(["studio", "jdoe/recall-engine", "high"]);
+		expect(am.placeOf({ profile: "work", scope: "studio/dotrc" })).toEqual({ workspace: "studio", workspaces: ["studio"], project: "jdoe/dotrc", confidence: "high", profile: "personal" });
+		// One repo, several workspace folders.
+		expect(am.placeOf({ profile: "work", scope: "claude/Projects-labs-widget" }).workspaces).toEqual(["labs", "apps"]);
+		expect(at({ scope: "claude/Projects-labs-widget" })).toEqual(["labs", "acme-corp/widget-frontend", "medium"]);
+		expect(at({ scope: "claude/Projects-gizmo" })).toEqual(["labs", "acme-corp/gizmo-frontend", "high"]);
+		expect(at({ kind: "project", name: "Attic", key: "github:jdoe/attic" })).toEqual(["studio", null, "high"]); // ruled out: not a project
+		expect(at({ kind: "project", name: "x", key: "github:jdoe/unlisted" })).toEqual(["studio", null, "high"]); // not in the registry: its workspace only
+		expect(at({ scope: "projects/side-gig" })).toEqual(["studio", "acme-corp/side-gig", "high"]); // checked out in the personal folder…
+		expect(am.placeOf({ profile: "personal", scope: "projects/side-gig" }).profile).toBe("work"); // …but its owner makes it work
 		// Workspace-only aliases: a workspace with no project.
-		expect(at({ scope: "sequoia" })).toEqual(["sequoia", null, "high"]);
-		expect(at({ scope: "Sequioa" })).toEqual(["sequoia", null, "high"]);
-		expect(at({ scope: "claude/Projects-apps" })).toEqual(["apps", null, "high"]); // apps is its own workspace folder
-		expect(at({ scope: "apps" })).toEqual(["apps", null, "high"]);
-		expect(at({ scope: "personal" })).toEqual(["personal", null, "medium"]);
-		// Counterexamples: never a project.
-		for (const scope of ["bot_hq", "claude/Projects-bot-hq", "bothq/unscoped", "codex", "tooling/codex", "tooling/t3-code", "default", "", "repo-fact", "agent-evaluation", "am-accept-refs-20261101-59c5", "fixture/v1-cutover-20261102", "dashboard-smoke"])
+		expect(at({ scope: "labs" })).toEqual(["labs", null, "high"]);
+		expect(at({ scope: "Lab" })).toEqual(["labs", null, "high"]);
+		expect(at({ scope: "claude/Projects-apps" })).toEqual(["apps", null, "high"]);
+		expect(at({ scope: "studio" })).toEqual(["studio", null, "medium"]);
+		// Never a project: the registry's drop list, the generic empty scopes and this repo's own acceptance fixtures.
+		for (const scope of ["bot_hq", "tool-label", "codex", "tooling/codex", "default", "", "repo-fact", "agent-evaluation", "am-accept-refs-20261101-59c5", "fixture/v1-cutover-20261102", "dashboard-smoke"])
 			expect([scope, am.placeOf({ profile: "work", scope }).project, am.placeOf({ profile: "work", scope }).workspace]).toEqual([scope, null, null]);
-		expect(am.placeOf({ profile: "work", kind: "project", id: "40e647a4-713a-5ea9-85bc-b9ddf5ec1956", key: "github:Sequoia-Engineering/kernel-eureka-frontend" }).drop).toBe(true); // a fixture, before its real-looking key
-		// Capture-tagged sessions (project_key, workspace): the strongest signal when present, normalized through the registry…
-		expect(at({ scope: "sequoia", project_key: "github:Sequoia-Engineering/kernel-idm-frontend" })).toEqual(["sequoia", "sequoia-engineering/kernel-idm-frontend", "high"]);
-		expect(at({ scope: "bot_hq", project_key: "github:wrick17/bettergit" })).toEqual(["personal", "wrick17/bettergit", "high"]);
-		expect(at({ project_key: "github:someone/unknown-repo" })).toEqual(["personal", null, "high"]); // not in the registry: its workspace only
+		expect(am.placeOf({ profile: "work", kind: "project", id: "40e647a4-713a-5ea9-85bc-b9ddf5ec1956", key: "github:Acme-Corp/eureka-frontend" }).drop).toBe(true); // a fixture, before its real-looking key
+		// Capture-tagged records (project_key, workspace): the strongest signal when present, normalized through the registry…
+		expect(at({ scope: "labs", project_key: "github:Acme-Corp/idm-frontend" })).toEqual(["labs", "acme-corp/idm-frontend", "high"]);
+		expect(at({ scope: "bot_hq", project_key: "github:jdoe/sketchbook" })).toEqual(["studio", "jdoe/sketchbook", "high"]);
+		expect(at({ project_key: "github:someone/unknown-repo" })).toEqual(["labs", null, "high"]); // not in the registry: this profile's default workspace
 		expect(at({ project_key: null, workspace: "apps", scope: "default" })).toEqual(["apps", null, "high"]);
-		// …and a server that does not send them yet falls back to the scope rules unchanged.
-		expect(at({ scope: "claude/Projects-mfe", project_key: undefined, workspace: undefined })).toEqual(["sequoia", "sequoia-engineering/kernel-mfe-frontend", "high"]);
+		expect(at({ project_key: null, workspace: "elsewhere" })).toEqual([null, null, null]); // a workspace no registry names
+		// …and without tags the scope rules apply unchanged.
+		expect(at({ scope: "claude/Projects-gizmo", project_key: undefined, workspace: undefined })).toEqual(["labs", "acme-corp/gizmo-frontend", "high"]);
 		expect(at({ scope: "codex", project_key: null, workspace: null })).toEqual([null, null, null]);
-		// Unverified histories stay Unsorted rather than guessed: f1 is not f1-replay, browser-mcp needs its own evidence.
-		for (const scope of ["projects/f1", "projects/browser-mcp", "projects/n5", "task-train/japan-hotels", "travel/japan-2027"]) expect(at({ scope })).toEqual([null, null, null]);
+		for (const scope of ["projects/f1", "projects/unknown", "travel/2027"]) expect(at({ scope })).toEqual([null, null, null]);
+	});
+
+	it("skips bad registry entries and keeps the good ones, never showing the stored text", async () => {
+		const saved = regs.work;
+		regs.work = { ...WORK_REG, workspaces: [...WORK_REG.workspaces, { id: "Bad Id!" }, 7, null], repos: [...WORK_REG.repos, { key: "<img src=x onerror=alert(1)>" }, { key: "no-slash" }, "acme-corp/raw"],
+			aliases: { ...WORK_REG.aliases, hostile: "javascript:alert(1)", "": "ws:labs", nested: { to: "x" } }, owners: [{}, "acme-corp"], drop: [3, "  "] };
+		try {
+			const b = await open("#projects?profile=work");
+			const am = (b.win as unknown as { __am: { placeOf(r: Record<string, unknown>): Record<string, unknown>; workspaceOrder: string[] } }).__am;
+			expect(am.workspaceOrder.slice(0, 3)).toEqual(["labs", "apps", "studio"]);
+			expect(am.placeOf({ profile: "work", scope: "hostile" }).project).toBeNull();
+			expect(am.placeOf({ profile: "work", scope: "claude/projects-gizmo" }).project).toBe("acme-corp/gizmo-frontend"); // the good entries still apply
+			expect(find(b.view(), "img")).toEqual([]);
+			expect(text(b.view())).not.toMatch(/onerror|javascript:/);
+			regs.work = "{ not json";
+			const c = await open("#projects?profile=work");
+			expect(text(c.view())).toContain("memory"); // a registry that is not JSON counts as none: the personal one still places records
+		} finally { regs.work = saved; }
+	});
+
+	it("works with no registry at all: capture tags and GitHub keys place records, nothing else is guessed", async () => {
+		const saved = { ...regs };
+		delete regs.work; delete regs.personal;
+		try {
+			const b = await open("#projects?profile=work");
+			const am = (b.win as unknown as { __am: { placeOf(r: Record<string, unknown>): Record<string, unknown> } }).__am;
+			expect(am.placeOf({ profile: "work", project_key: "github:Acme-Corp/Widget" })).toMatchObject({ project: "acme-corp/widget", workspace: "work", profile: "work" }); // any key is a project
+			expect(am.placeOf({ profile: "personal", workspace: "labs" })).toMatchObject({ workspace: "labs", project: null }); // any tagged workspace
+			expect(am.placeOf({ profile: "work", scope: "github.com/jdoe/sketchbook" })).toMatchObject({ project: "jdoe/sketchbook" });
+			expect(am.placeOf({ profile: "work", scope: "recall-engine" }).project).toBeNull(); // aliases are the registry's: none here
+			const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard").map((c) => text(find(c, "strong")[0]!).trim());
+			expect(cards).toContain("recall-engine"); // the project node's own key, named after its repo
+		} finally { Object.assign(regs, saved); }
 	});
 });

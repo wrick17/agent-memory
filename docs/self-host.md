@@ -235,6 +235,20 @@ Workspaces are optional folders that group repos:
 
 A session in a configured workspace also sends the workspace name. If the session has no project, for example one started at the workspace root, its lessons and decisions take the workspace name as their scope. A checkout that sits above the workspace root, such as a home-directory repo, is not treated as a project of that workspace. Names are lowercase letters, digits, `.`, `_` and `-`; roots start with `/` or `~/`.
 
+The dashboard's Projects page and Map group records by project and workspace. You can name your projects in a project registry: in each profile, save a memory named `dashboard-project-registry` (type `reference`) whose text is JSON, and edit that memory to change it. The dashboard reads it when it loads, merges the registries of all profiles, skips any entry it cannot read, and never shows the text itself. Without a registry, the tags above and GitHub keys still place records. The shape:
+
+```json
+{ "workspaces": [{ "id": "labs", "name": "Labs", "order": 1 }],
+  "owners": ["acme-corp"],
+  "default_workspace": "labs",
+  "repos": [{ "key": "acme-corp/widget", "name": "widget", "workspaces": ["labs"] }],
+  "aliases": { "widget-app": "acme-corp/widget", "lab": "ws:labs", "old-name": "acme-corp/widget?" },
+  "drop": ["tool-label"],
+  "not_projects": ["acme-corp/notes"] }
+```
+
+Workspaces and owners belong to the profile that holds the record: a repo whose GitHub owner is listed there shows that profile's tag. With a registry, only its `repos` are projects; a key it does not list shows only its workspace. `aliases` map a record's scope to a repo or, with `ws:`, to a workspace; a trailing `?` marks the mapping as likely rather than certain. `drop` lists scopes that never name a project.
+
 Deploy the Worker before the client: an older Worker refuses a batch with these fields, and the client keeps such batches spooled or pending and sends them again after the Worker is upgraded. Nothing is lost, but capture stalls until then.
 
 Deterministic fact detection follows capture and has no switch of its own: with capture installed, the client reports detector results for each completed session in a GitHub repository, whatever these settings say. Those reports hold hashes, fact keys, detector literals, injected-item outcomes, token counts and command counts, never command output or paths. The v2 server writes every statement itself. Turning `facts.synthesis` off stops only synthesis. After you change `facts.inject` or `loop_guard.enabled`, run `agent-memory install` again so the client registers the hooks.

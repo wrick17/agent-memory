@@ -741,7 +741,7 @@ export function shell(win: any): void {
 		pageVersion: 0, pageButtons: [], pageMsg: undefined, shown: undefined, statusEl: undefined,
 		// Set by the part that owns each.
 		api: null!, drafts: null!, whatIf: null!, whatIfEdits: null!, draftFromWhatIf: null!, graphs: null!, graphOf: null!, pump: null!,
-		moves: null!, sendMove: null!, moveView: null!, copyBack: null!, COPY_MAX: 0, library: null!, when: null!, time: null!, human: (s: string) => s, title: (it: J) => String(it?.title ?? ""), settleTitle: () => undefined, itemHref: null!, placeOf: null!, workspaceName: (w: string) => w, workspaceOrder: [], setSync: (st: { state: string; at: string | null }) => paintSync(st), daily: null!, fitWeeks: (_b: Node, w: number) => w, bars: null!, facets: null!, related: null!, detail: null!, md: null!,
+		moves: null!, sendMove: null!, moveView: null!, copyBack: null!, COPY_MAX: 0, library: null!, when: null!, time: null!, human: (s: string) => s, title: (it: J) => String(it?.title ?? ""), settleTitle: () => undefined, itemHref: null!, placeOf: null!, workspaceName: (w: string) => w, workspaceProfile: (w: string) => w, workspaceOrder: [], setSync: (st: { state: string; at: string | null }) => paintSync(st), daily: null!, fitWeeks: (_b: Node, w: number) => w, bars: null!, facets: null!, related: null!, detail: null!, md: null!,
 	};
 	win.__am = am;
 }

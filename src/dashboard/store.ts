@@ -107,6 +107,7 @@ export function storeTab(am: Am): void {
 				return [`${p.name}:${p.generation ?? ""}`, g] as const;
 			}));
 			for (const [k, g] of fresh) { detached.delete(g); graphs.set(k, g); }
+			regRead.clear(); // the registry is read again with the fresh graphs
 			lastSync = new Date().toISOString();
 			cache = null;
 			fire();
@@ -146,7 +147,7 @@ export function storeTab(am: Am): void {
 	const AGENTS: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
 	const cap = (t: string) => `${t.charAt(0).toUpperCase()}${t.slice(1)}`;
 	const UUIDISH = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
-	/** A slug's words, without the dates, hex ids and version numbers in it ("bettergit-010" → "bettergit"; "opus-routing-57A8CC3C" → "opus routing"). */
+	/** A slug's words, without the dates, hex ids and version numbers in it ("widget-010" → "widget"; "opus-routing-57A8CC3C" → "opus routing"). */
 	const words = (slug: string) => {
 		const all = slug.split(/[-_\s]+/).filter(Boolean), kept = all.filter((w) => !/^\d+$/.test(w) && !/^v?\d+(\.\d+)+$/i.test(w) && !(/^[0-9a-f]{4,}$/i.test(w) && /\d/.test(w)));
 		return (kept.length ? kept : all).join(" ").trim();
@@ -167,7 +168,7 @@ export function storeTab(am: Am): void {
 	};
 
 	// ---- One display title per record ----
-	// A title made from a slug that leaves under three words, or shouts in capitals, says little ("Bettergit", "MEMORY"): it is
+	// A title made from a slug that leaves under three words, or shouts in capitals, says little ("Widget", "MEMORY"): it is
 	// replaced by the first sentence of the record's own text, read once and kept in this browser, so every page and every load
 	// shows the same title. am.title fills a DOM node and updates it when the better title arrives.
 	const TITLES = "am.titles.v4", kept = new Map<string, [string, string]>(); // record key -> [updated, title]
@@ -209,62 +210,112 @@ export function storeTab(am: Am): void {
 		return it.title;
 	};
 
-	// ---- Projects: the owner's registry (scratchpad projects-map, 2026-11-12) ----
-	// A project is a normalized GitHub owner/repo. Its workspace and profile come from the owner: Sequoia (work) for the Sequoia
-	// owners, Personal for every other owner. shortcut: a static registry seeded from the disk inventory; it cannot see new repos,
-	// renames or other machines. Upgrade to an owner setting on the server when the owner wants it maintained in one place.
-	const WORK_OWNERS = ["sequoia-engineering", "sequoia-us", "pratyush-poddar_seq"];
+	// ---- Projects: the owner's registry, read from their own memory ----
+	// A project is a normalized GitHub owner/repo. Which repos are projects, their short names, the workspaces (folders) holding
+	// them, scope aliases and what is never a project are the owner's data, not code: each profile may hold one memory named
+	// REGISTRY (a reference document whose text is JSON, shape below). The dashboard reads it with the record read it already
+	// uses, validates every entry (stored data: bad entries are skipped, never rendered as HTML) and merges the profiles'
+	// registries. With none at all, capture tags (project_key, workspace) and GitHub keys in scopes still place records.
+	//   { "workspaces": [{ "id": "labs", "name": "Labs", "order": 1 }],  // they belong to this record's profile; "order" sorts them
+	//     "owners": ["acme-corp"],                               // GitHub owners whose repos belong to this record's profile
+	//     "default_workspace": "labs",                           // where this profile's unlisted repos go
+	//     "repos": [{ "key": "acme-corp/widget", "name": "widget", "workspaces": ["labs"] }],
+	//     "aliases": { "widget": "acme-corp/widget", "labs": "ws:labs", "old-scope": "acme-corp/widget?" },  // "?" = medium confidence
+	//     "drop": ["tool-label"], "not_projects": ["acme-corp/notes"] }
+	const REGISTRY = "dashboard-project-registry";
+	type Reg = { ws: Map<string, { name: string; profile: string }>; order: string[]; owners: Map<string, string>; repos: Map<string, { alias: string; homes: string[]; profile: string }>;
+		scopes: Map<string, string>; drop: Set<string>; notProjects: Set<string>; defaults: Map<string, string> };
+	const blankReg = (): Reg => ({ ws: new Map(), order: [], owners: new Map(), repos: new Map(), scopes: new Map(), drop: new Set(["", "default"]), notProjects: new Set(), defaults: new Map() });
+	let reg = blankReg();
+	const parsed = new Map<string, J>(); // profile -> its registry JSON, as read
+	const WS_ID = /^[a-z0-9][a-z0-9_-]{0,39}$/, REPO_KEY = /^[a-z0-9_.-]{1,100}\/[a-z0-9_.-]{1,100}$/;
+	const short = (v: unknown, max: number) => (typeof v === "string" && v.trim() && v.length <= max ? v.trim() : null);
+	/** Builds the merged registry from every profile's JSON, skipping anything malformed. Profiles merge in name order. */
+	const rebuildReg = () => {
+		const next = blankReg(), rank = new Map<string, number>();
+		for (const [profile, raw] of [...parsed].sort((x, y) => x[0].localeCompare(y[0]))) {
+			if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+			for (const w of Array.isArray(raw.workspaces) ? raw.workspaces : []) {
+				const id = short(w?.id, 40)?.toLowerCase();
+				if (!id || !WS_ID.test(id) || next.ws.has(id)) continue;
+				next.ws.set(id, { name: short(w?.name, 40) ?? id, profile });
+				next.order.push(id);
+				rank.set(id, typeof w?.order === "number" && Number.isFinite(w.order) ? w.order : 1e6 + next.order.length);
+			}
+			for (const o of Array.isArray(raw.owners) ? raw.owners : []) { const k = short(o, 100)?.toLowerCase(); if (k && /^[a-z0-9_.-]+$/.test(k) && !next.owners.has(k)) next.owners.set(k, profile); }
+			const dw = short(raw.default_workspace, 40)?.toLowerCase();
+			if (dw && WS_ID.test(dw)) next.defaults.set(profile, dw);
+			for (const r of Array.isArray(raw.repos) ? raw.repos : []) {
+				const key = short(r?.key, 201)?.toLowerCase();
+				if (!key || !REPO_KEY.test(key) || next.repos.has(key)) continue;
+				const homes = (Array.isArray(r?.workspaces) ? r.workspaces : []).map((x: unknown) => short(x, 40)?.toLowerCase()).filter((x: string | undefined): x is string => !!x && WS_ID.test(x));
+				next.repos.set(key, { alias: short(r?.name, 40) ?? "", homes, profile });
+			}
+			if (raw.aliases && typeof raw.aliases === "object" && !Array.isArray(raw.aliases))
+				for (const [k, v] of Object.entries(raw.aliases as Record<string, unknown>)) {
+					const scope = short(k, 160)?.toLowerCase(), to = short(v, 210)?.toLowerCase();
+					if (scope && to && /^(ws:[a-z0-9][a-z0-9_-]{0,39}|[a-z0-9_.-]{1,100}\/[a-z0-9_.-]{1,100})\??$/.test(to) && !next.scopes.has(scope)) next.scopes.set(scope, to);
+				}
+			for (const d of Array.isArray(raw.drop) ? raw.drop : []) { const k = short(d, 160)?.toLowerCase(); if (k) next.drop.add(k); }
+			for (const d of Array.isArray(raw.not_projects) ? raw.not_projects : []) { const k = short(d, 201)?.toLowerCase(); if (k && REPO_KEY.test(k)) next.notProjects.add(k); }
+		}
+		next.order.sort((x, y) => rank.get(x)! - rank.get(y)!);
+		reg = next;
+		WS_ORDER.splice(0, WS_ORDER.length, ...reg.order);
+	};
 	/**
-	 * Every known repo: its key, its short local name (adminshell for kernel-adminshell-frontend; "" when the same) and the
-	 * workspace folders holding a checkout of it, from Sol's disk inventory. A repo in several workspaces is still one project.
-	 * Workspaces are folders: sequoia (~/Projects/sequioa), apps (~/Projects/apps) and personal (~/Projects/personal, plus
-	 * ~/dotfiles). Standalone Sequoia-org repos outside them (aggregator, mfe, platform, rules, the boilerplate backup) sit in
-	 * the work-org workspace, sequoia. A checkout nested inside another repo (aggregator/adminshell) is still that repo.
-	 * To extend: add a [key, short name, workspaces] row here, and any scope or encoded-root alias to SCOPES below.
+	 * Each active profile's registry record, read once per library generation: found by name in that profile's graph when the
+	 * page loads it (no extra request), else by a lexical recall for the name (a read; profiles this view does not load still
+	 * own repos and workspaces it shows). Its text is read through the node read, every page of it.
 	 */
-	const SA = ["sequoia", "apps"];
-	const REPOS: [string, string, string[]][] = [["agent360dk/browser-mcp", "", ["personal"]], ["octocat/hello-world", "", ["personal"]], ["pratyush-poddar_seq/spur", "", ["personal"]],
-		["sequoia-engineering/analytics-all-frontend", "analytics", SA], ["sequoia-engineering/benefitos-benefits-frontend", "px", SA], ["sequoia-engineering/benefitos-broker-frontend", "broker", SA],
-		["sequoia-engineering/benefitos-wellbeing-frontend", "wellbeing", SA], ["sequoia-engineering/cloud-all-frontend", "cloud", SA], ["sequoia-engineering/compos-planning-frontend", "planning", SA],
-		["sequoia-engineering/compos-totalrewards-frontend", "tr", SA], ["sequoia-engineering/ec_ainative_cursorrules_internal", "rules", ["sequoia"]],
-		["sequoia-engineering/kernel-adminshell-frontend", "adminshell", SA], ["sequoia-engineering/kernel-aggregator-frontend", "aggregator", ["sequoia"]],
-		["sequoia-engineering/kernel-all-frontend", "kernel", SA], ["sequoia-engineering/kernel-bolierplate-frontend", "boilerplate", ["sequoia"]], ["sequoia-engineering/kernel-eureka-frontend", "eureka", SA],
-		["sequoia-engineering/kernel-idm-frontend", "idm", SA], ["sequoia-engineering/kernel-mfe-frontend", "mfe", ["sequoia"]], ["sequoia-engineering/kernel-platform-frontend", "platform", ["sequoia"]],
-		["sequoia-engineering/people-hcm-frontend", "hcm", ["sequoia"]], ["sequoia-engineering/sequoiaai-all-frontend", "ai", SA], ["sequoia-engineering/serviceos-s1service-frontend", "uwp", SA],
-		["wrick17/agent-memory", "memory", ["personal"]], ["wrick17/aurio", "", ["personal"]], ["wrick17/beamhook", "", ["personal"]], ["wrick17/better-source-control", "", ["personal"]],
-		["wrick17/bettergit", "", ["personal"]], ["wrick17/codex-stats", "", ["personal"]], ["wrick17/cursor-metrics", "cursor", ["personal"]], ["wrick17/dotfiles", "", ["personal"]],
-		["wrick17/f1-replay", "", ["personal"]], ["wrick17/github-auto-approve", "", ["personal"]], ["wrick17/plex-tracker", "", ["personal"]], ["wrick17/postplan", "", ["personal"]],
-		["wrick17/relaunch-app", "restart-app", ["personal"]]];
-	const ALIAS = new Map(REPOS.map(([k, a]) => [k, a]));
-	const HOMES = new Map(REPOS.map(([k, , w]) => [k, w]));
-	/**
-	 * Exact scope aliases (lowercased): a repo key, or a workspace with no project ("ws:sequoia"). A trailing "?" marks medium
-	 * confidence: it still maps, flagged. Claude's encoded roots are listed one by one; hyphens are never turned into slashes.
-	 */
-	const SCOPES: Record<string, string> = {
-		"agent-memory": "wrick17/agent-memory", "tooling/agent-memory": "wrick17/agent-memory", "repo/agent-memory": "wrick17/agent-memory", "claude/projects-memory": "wrick17/agent-memory",
-		bettergit: "wrick17/bettergit", "personal/bettergit": "wrick17/bettergit", "projects/bettergit": "wrick17/bettergit", "claude/projects-personal-bettergit": "wrick17/bettergit",
-		"personal/dotfiles": "wrick17/dotfiles", "tooling/dotfiles": "wrick17/dotfiles", "claude/dotfiles": "wrick17/dotfiles",
-		"claude/projects-mfe": "sequoia-engineering/kernel-mfe-frontend", "claude/projects-aggregator": "sequoia-engineering/kernel-aggregator-frontend",
-		"projects/spur": "pratyush-poddar_seq/spur", "claude/projects-sequoia-adminshell": "sequoia-engineering/kernel-adminshell-frontend?",
-		"claude/projects-platform-packages-packages": "sequoia-engineering/kernel-platform-frontend?",
-		sequoia: "ws:sequoia", sequioa: "ws:sequoia", apps: "ws:apps", "claude/projects-apps": "ws:apps", "claude/projects-sequioa": "ws:sequoia",
-		"claude/projects-packages": "ws:sequoia?", "claude/projects-peopleloop-pl": "ws:sequoia?", "ai-internal": "ws:sequoia?", personal: "ws:personal?" };
-	/** Never a project: storage and tool labels, archives and empty scopes. The records stay in their sections. */
-	// The owner, 2026-11-12: "bothq, codex, am accept* etc are not projects" (overrides the report's Bot HQ fallback).
-	const DROP = new Set(["", "default", "repo-fact", "agent-evaluation", "bothq/unscoped", "bot_hq", "bothq", "claude/projects-bot-hq", "codex", "tooling/codex", "tooling/t3-code", "dashboard-smoke"]);
-	const NOT_PROJECTS = new Set(["wrick17/bothq"]);
-	const FIXTURE_NODES = new Set(["40e647a4-713a-5ea9-85bc-b9ddf5ec1956", "aae69dd8-26c3-5f3a-97f4-fd419ac2141c"]);
-	const fixture = (s: string) => /^am-accept-|^fixture\//.test(s) || s === "dashboard-smoke";
-	const profileOf = (key: string) => (WORK_OWNERS.includes(key.split("/")[0]!) ? "work" : "personal");
-	const WS: Record<string, string> = { sequoia: "Sequoia", apps: "Apps", personal: "Personal" };
-	const WS_ORDER = ["sequoia", "apps", "personal"];
+	const regRead = new Set<string>();
+	const readRegistry = (p: Profile, g: Graph | null) => {
+		if (regRead.has(p.name)) return;
+		let id: string | null = null;
+		if (g) {
+			const node = [...g.nodes.values()].find((n) => n.name === REGISTRY && n.status === "active");
+			if (!node && !g.parts.nodes.done) return; // look again once the graph has every record
+			id = node?.id ?? "";
+		}
+		regRead.add(p.name);
+		void (async () => {
+			try {
+				if (id === null) {
+					const r: J = await call(`/api/profiles/${enc(p.name)}/recall`, "POST", { keyword: REGISTRY, type: "reference", limit: 5, channels: ["lexical"], count_hits: false });
+					id = (Array.isArray(r?.results) ? r.results : []).find((x: J) => x?.name === REGISTRY)?.memory_id ?? "";
+				}
+				if (!id) { parsed.delete(p.name); return; }
+				const base = `/api/profiles/${enc(p.name)}/nodes/${enc(String(id))}`, r: J = await call(base);
+				let text = typeof r?.content?.text === "string" ? r.content.text : "";
+				if (r?.content?.complete === false) {
+					text = "";
+					let cursor: string | null = null;
+					for (let i = 0; i < 20; i++) { const page: J = await call(`${base}?content=all${cursor ? `&cursor=${enc(cursor)}` : ""}`); text += String(page?.content?.content ?? ""); cursor = typeof page?.content?.cursor === "string" ? page.content.cursor : null; if (!cursor) break; }
+				}
+				let raw: J = null;
+				try { raw = JSON.parse(text); } catch { raw = null; } // not JSON: as if this profile had no registry
+				if (raw && typeof raw === "object" && !Array.isArray(raw)) parsed.set(p.name, raw); else parsed.delete(p.name);
+			} catch { parsed.delete(p.name); } // unreadable: places fall back to the generic rules
+			finally { rebuildReg(); cache = null; fire(); }
+		})();
+	};
+	/** The profile a repo belongs to: its owner's registry, else the registry listing it, else the caller's fallback. */
+	const profileOf = (key: string, fallback: string) => reg.owners.get(key.split("/")[0]!) ?? reg.repos.get(key)?.profile ?? fallback;
+	/** A workspace seen only in a capture tag or a profile (no registry names it) still shows, named after itself. */
+	const ensureWs = (id: string, profile: string) => {
+		if (reg.ws.has(id)) return id;
+		reg.ws.set(id, { name: `${id.charAt(0).toUpperCase()}${id.slice(1)}`, profile });
+		if (!WS_ORDER.includes(id)) WS_ORDER.push(id);
+		return id;
+	};
+	const wsProfile = (w: string) => reg.ws.get(w)?.profile ?? w;
+	const WS_ORDER: string[] = [];
 	/** A GitHub key from a project key ("github:Owner/Repo"), a repo key ("github.com/owner/repo") or a GitHub URL; null otherwise. */
 	const githubKey = (value: string): string | null => {
 		let s = value.trim();
 		if (s.startsWith("github:")) s = s.slice(7);
 		else if (/^https?:\/\//i.test(s)) { try { const u = new URL(s); if (u.hostname.toLowerCase() !== "github.com") return null; s = u.pathname.slice(1); } catch { return null; } }
-		else if (/^git@(github\.com|personal):/i.test(s)) s = s.replace(/^git@[^:]+:/, "");
+		else if (/^git@github\.com:/i.test(s)) s = s.replace(/^git@[^:]+:/, "");
 		else if (/^github\.com\//i.test(s)) s = s.slice(11);
 		else return null;
 		s = s.replace(/\/$/, "").replace(/\.git$/i, "");
@@ -272,36 +323,36 @@ export function storeTab(am: Am): void {
 		return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
 	};
 	type Place = { workspace: string | null; project: string | null; confidence: "high" | "medium" | null; profile: string | null; drop?: boolean; workspaces?: string[] };
-	const homeOf = (key: string) => HOMES.get(key) ?? [profileOf(key) === "work" ? "sequoia" : "personal"];
+	/** The workspaces holding a repo: the registry's, else the profile's default, else a workspace named after the profile. */
+	const homeOf = (key: string, profile: string) => { const h = reg.repos.get(key)?.homes ?? []; return h.length ? h : [ensureWs(reg.defaults.get(profile) ?? profile, profile)]; };
+	const FIXTURE_NODES = new Set(["40e647a4-713a-5ea9-85bc-b9ddf5ec1956", "aae69dd8-26c3-5f3a-97f4-fd419ac2141c"]); // this repo's own acceptance fixtures
+	const fixture = (s: string) => /^am-accept-|^fixture\//.test(s) || s === "dashboard-smoke";
 	/**
-	 * Where a record belongs, in Sol's order: an explicit repo key (a project node's key), then the verified scope alias, then the
-	 * workspace-only alias (project null, shown as Workspace-wide), then nothing (Unsorted, never a made-up project). Fixtures and
-	 * storage or tool labels are dropped from project discovery. Mentions of GitHub links in text are never used.
+	 * Where a record belongs: a capture-tagged project_key, a repo key or a project node's own key; then a tagged workspace;
+	 * then a registry alias of its scope (or a GitHub key written as the scope); else nothing (never a made-up project).
+	 * With a registry, only its repos are projects (any other key names only its workspace); with none, any GitHub key is.
 	 */
 	const placeOf = (r: { profile: string; scope?: string | null; name?: string | null; key?: string | null; kind?: string; id?: string; repo_key?: string | null;
 		project_key?: string | null; workspace?: string | null }): Place => {
 		const none: Place = { workspace: null, project: null, confidence: null, profile: null };
 		const scope = String(r.kind === "project" ? r.name ?? "" : r.scope ?? "").trim().toLowerCase();
 		if ((r.id && FIXTURE_NODES.has(r.id)) || fixture(scope) || /synthetic|am-accept/i.test(String(r.name ?? "")) && r.kind === "project") return { ...none, drop: true };
-		// A capture-tagged session's project_key is the strongest signal (servers before that feature send none), then a repo key,
-		// then a project node's own key.
+		const project = (key: string, confidence: "high" | "medium"): Place => {
+			const profile = profileOf(key, r.profile), homes = homeOf(key, profile);
+			if ((reg.repos.size && !reg.repos.has(key)) || reg.notProjects.has(key)) return { workspace: homes[0]!, project: null, confidence, profile };
+			return { workspace: homes[0]!, workspaces: homes, project: key, confidence, profile };
+		};
 		const explicit = githubKey(String(r.project_key ?? "")) ?? githubKey(String(r.repo_key ?? "")) ?? githubKey(String(r.key ?? ""));
-		if (explicit) {
-			if (/synthetic|am-accept|fixture/.test(explicit)) return { ...none, drop: true };
-			const w = profileOf(explicit) === "work" ? "sequoia" : "personal";
-			// Only repos in the registry are projects; any other key (or one the owner ruled out) says only its workspace.
-			if (!ALIAS.has(explicit) || NOT_PROJECTS.has(explicit)) return { workspace: w, project: null, confidence: "high", profile: profileOf(explicit) };
-			return { workspace: homeOf(explicit)[0]!, workspaces: homeOf(explicit), project: explicit, confidence: "high", profile: profileOf(explicit) };
-		}
-		// A tagged session with no repo still names its workspace folder.
-		const wsName = String(r.workspace ?? "").trim().toLowerCase(), wsId = wsName === "sequioa" ? "sequoia" : wsName;
-		if (wsId && WS[wsId]) return { workspace: wsId, project: null, confidence: "high", profile: wsId === "personal" ? "personal" : "work" };
-		if (DROP.has(scope)) return { ...none, drop: true };
-		const hit = SCOPES[scope] ?? (r.kind === "project" ? SCOPES[scope.replace(/\s+/g, "-")] : undefined);
-		if (!hit) return none;
+		if (explicit) return /synthetic|am-accept|fixture/.test(explicit) ? { ...none, drop: true } : project(explicit, "high");
+		// A tagged record with no repo still names its workspace folder (a known one, or any name when there is no registry).
+		const wsId = String(r.workspace ?? "").trim().toLowerCase();
+		if (wsId && WS_ID.test(wsId) && (reg.order.includes(wsId) || !reg.order.length)) { ensureWs(wsId, r.profile); return { workspace: wsId, project: null, confidence: "high", profile: wsProfile(wsId) }; }
+		if (reg.drop.has(scope)) return { ...none, drop: true };
+		const hit = reg.scopes.get(scope) ?? (r.kind === "project" ? reg.scopes.get(scope.replace(/\s+/g, "-")) : undefined);
+		if (!hit) { const k = githubKey(scope); return k ? project(k, "high") : none; }
 		const medium = hit.endsWith("?"), v = medium ? hit.slice(0, -1) : hit;
-		if (v.startsWith("ws:")) { const w = v.slice(3); return { workspace: w, project: null, confidence: medium ? "medium" : "high", profile: w === "personal" ? "personal" : "work" }; }
-		return { workspace: homeOf(v)[0]!, workspaces: homeOf(v), project: v, confidence: medium ? "medium" : "high", profile: profileOf(v) };
+		if (v.startsWith("ws:")) { const w = v.slice(3); if (!reg.ws.has(w)) return none; return { workspace: w, project: null, confidence: medium ? "medium" : "high", profile: wsProfile(w) }; }
+		return project(v, medium ? "medium" : "high");
 	};
 
 	// ---- The library: what the pages list and connect ----
@@ -327,6 +378,8 @@ export function storeTab(am: Am): void {
 		if (onChange) { subs.clear(); subs.add(onChange); }
 		// A part that failed after its retries waits for the refresh (or Retry), so a paint never restarts it in a loop.
 		const gs = ps.map((p) => { const g = graphOf(p); if (!g.loading && !(g.parts.nodes.done && g.parts.edges.done) && !g.parts.nodes.error && !g.parts.edges.error && !g.missing) void pump(p, g); return [p, g] as const; });
+		// The owner's project registry: from each loaded graph, and by name for the other real profiles.
+		for (const q of am.active()) if (q.name !== "test" || only === "test") readRegistry(q, gs.find(([x]) => x.name === q.name)?.[1] ?? null);
 		const stamp = `${only}|${gs.map(([p, g]) => `${p.name}:${g.nodes.size}:${g.edges.size}`).join(",")}`;
 		if (cache?.stamp === stamp) return { ...cache.lib, loading: gs.some(([, g]) => g.loading), errors: gs.flatMap(([p, g]) => (["nodes", "edges"] as const).flatMap((k) => g.parts[k].error ? [`${p.name}: ${g.parts[k].error}`] : [])) };
 		const items = new Map<string, Item>(), links = new Map<string, Map<string, Set<string>>>();
@@ -336,17 +389,18 @@ export function storeTab(am: Am): void {
 		};
 		// One project item per GitHub key, across stored profiles; one Workspace-wide item per workspace. Every known repo exists,
 		// so "Show all known repos" can list the ones with nothing in memory yet.
-		const projectItem = (key: string): string => {
-			const k = `${profileOf(key)}/gh:${key}`; // the same profile/id shape as every item, so its address resolves
-			// Humans know a repo by its short local name (adminshell); the GitHub repo name is the secondary line.
-			if (!items.has(k)) items.set(k, { key: k, p: profileOf(key), id: `gh:${key}`, kind: "project", raw: "project", type: null, name: key, title: ALIAS.get(key) || key.split("/")[1]!, scope: null,
-				created: null, updated: null, origin: null, agent: null, pinned: false, virtual: true, workspace: homeOf(key)[0], workspaces: homeOf(key),
-				alias: ALIAS.get(key) || undefined, url: `https://github.com/${key}`, known: ALIAS.has(key) });
+		const projectItem = (key: string, fallback: string): string => {
+			const p = profileOf(key, fallback), homes = homeOf(key, p), alias = reg.repos.get(key)?.alias;
+			const k = `${p}/gh:${key}`; // the same profile/id shape as every item, so its address resolves
+			// Humans know a repo by its short local name; the GitHub repo name is behind the GitHub link.
+			if (!items.has(k)) items.set(k, { key: k, p, id: `gh:${key}`, kind: "project", raw: "project", type: null, name: key, title: alias || key.split("/")[1]!, scope: null,
+				created: null, updated: null, origin: null, agent: null, pinned: false, virtual: true, workspace: homes[0], workspaces: homes,
+				alias: alias || undefined, url: `https://github.com/${key}`, known: reg.repos.has(key) });
 			return k;
 		};
 		const wideItem = (w: string): string => {
-			const k = `${w === "personal" ? "personal" : "work"}/ws:${w}`;
-			if (!items.has(k)) items.set(k, { key: k, p: w === "personal" ? "personal" : "work", id: `ws:${w}`, kind: "project", raw: "project", type: null, name: WS[w] ?? w, title: "Workspace-wide",
+			const k = `${wsProfile(w)}/ws:${w}`;
+			if (!items.has(k)) items.set(k, { key: k, p: wsProfile(w), id: `ws:${w}`, kind: "project", raw: "project", type: null, name: reg.ws.get(w)?.name ?? w, title: "Workspace-wide",
 				scope: null, created: null, updated: null, origin: null, agent: null, pinned: false, virtual: true, workspace: w, wide: true });
 			return k;
 		};
@@ -354,13 +408,13 @@ export function storeTab(am: Am): void {
 		for (const [p, g] of gs) {
 			const projOfNode = new Map<string, () => string>(); // project node id -> makes (once) the project item it stands for
 			for (const n of g.nodes.values()) {
-				if (n.status !== "active") continue;
+				if (n.status !== "active" || n.name === REGISTRY) continue; // the registry is settings, not a memory to list
 				const kind = kindOf(n);
 				if (!kind) continue;
 				if (kind === "project") {
 					const at = placeOf({ profile: p.name, kind: "project", name: n.name, key: n.key, id: n.id });
 					const proj = at.project, ws = at.workspace;
-					if (proj) projOfNode.set(n.id, () => projectItem(proj));
+					if (proj) projOfNode.set(n.id, () => projectItem(proj, p.name));
 					else if (ws) projOfNode.set(n.id, () => wideItem(ws));
 					continue; // project nodes become registry projects, never projects of their own
 				}
@@ -390,7 +444,7 @@ export function storeTab(am: Am): void {
 				if (linked.length === 1) derived = items.get(linked[0]!)!.p;
 				else if (linked.length === 0) {
 					const at = placeOf({ profile: p.name, scope: it.scope, kind: it.kind, project_key: it.projectKey, workspace: it.tagWorkspace });
-					if (at.project) target = projectItem(at.project); else if (at.workspace) target = wideItem(at.workspace);
+					if (at.project) target = projectItem(at.project, p.name); else if (at.workspace) target = wideItem(at.workspace);
 					medium = at.confidence === "medium";
 					derived = at.profile;
 				}
@@ -428,5 +482,5 @@ export function storeTab(am: Am): void {
 	// People have no page for now (the owner removed the tab); a person shows only as a plain, unlinked chip.
 	const TABS: Record<string, string> = { memory: "memories", learning: "learnings", journal: "journals", project: "projects" };
 	const href = (it: Item, profile?: string | null) => TABS[it.kind] ? `#${TABS[it.kind]}/${enc(it.p)}/${enc(it.id)}${profile ? `?profile=${enc(profile)}` : ""}` : "";
-	Object.assign(am, { graphs, graphOf, pump, library, resync: () => { am.setSync?.({ state: "loading", at: lastSync }); void resync(); }, when, time, human, title, settleTitle: settle, itemHref: href, placeOf, workspaceName: (w: string) => WS[w] ?? w, workspaceOrder: WS_ORDER });
+	Object.assign(am, { graphs, graphOf, pump, library, resync: () => { am.setSync?.({ state: "loading", at: lastSync }); void resync(); }, when, time, human, title, settleTitle: settle, itemHref: href, placeOf, workspaceName: (w: string) => reg.ws.get(w)?.name ?? w, workspaceProfile: wsProfile, workspaceOrder: WS_ORDER });
 }

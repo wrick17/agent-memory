@@ -156,6 +156,7 @@ export type Am = {
 	itemHref: (it: J, profile?: string | null) => string;
 	placeOf: (r: { profile: string; scope?: string | null; name?: string | null; key?: string | null; kind?: string; id?: string; repo_key?: string | null; project_key?: string | null; workspace?: string | null }) => { workspace: string | null; project: string | null; confidence: "high" | "medium" | null; profile: string | null; drop?: boolean; workspaces?: string[] }; // the one project rule (store.ts)
 	workspaceName: (w: string) => string;
+	workspaceProfile: (w: string) => string; // the profile a workspace belongs to (its registry's)
 	setSync: (st: { state: string; at: string | null }) => void; // shell.ts: the header's live dot
 	workspaceOrder: string[];
 	// charts.ts: charts with one question each, and one item's connection graph.

@@ -19,8 +19,9 @@ export function libraryTab(am: Am): void {
 	 * their own, fixed per name so Rule is the same colour everywhere. Three validated hues (s1 blue, s2 orange, s3 aqua; see
 	 * style.ts) cover every page's sub-types today; anything rarer is s0, neutral grey, and always carries its text label.
 	 */
-	const SUB: Record<string, number> = { Rule: 1, Preference: 2, Reference: 1, "Project note": 2, "How-to": 3, Codex: 1, "Claude Code": 2, sequoia: 1, personal: 2, apps: 3 };
-	const subOf = (name: string) => `s${SUB[name] ?? 0}`;
+	const SUB: Record<string, number> = { Rule: 1, Preference: 2, Reference: 1, "Project note": 2, "How-to": 3, Codex: 1, "Claude Code": 2 };
+	// Workspaces come from the owner's registry: the first three in its order take the three hues, any further one the neutral.
+	const subOf = (name: string) => { const w = am.workspaceOrder.indexOf(name); return `s${SUB[name] ?? (w >= 0 && w < 3 ? w + 1 : 0)}`; };
 	const TABS_OF: Record<string, string> = { memory: "memories", learning: "learnings", journal: "journals" };
 	const facetName = (it: J) => it.kind === "journal" ? it.agent ?? "Other agent" : typeOf(it);
 	const count = (n: number, kind: string) => `${n.toLocaleString()} ${n === 1 ? NAMES[kind]?.[0] ?? kind : (NAMES[kind]?.[1] ?? `${kind}s`).toLowerCase()}`;
@@ -726,7 +727,7 @@ export function libraryTab(am: Am): void {
 			if (version !== am.pageVersion) return;
 			const lib: J = am.library(only, paint), deg = (it: J) => lib.links.get(it.key)?.size ?? 0;
 			const real = (lib.list.project as J[]).filter((it) => !it.wide && deg(it) > 0);
-			const wideOf = (w: string) => lib.items.get(`${w === "personal" ? "personal" : "work"}/ws:${w}`);
+			const wideOf = (w: string) => lib.items.get(`${am.workspaceProfile(w)}/ws:${w}`);
 			const groups = am.workspaceOrder.map((w) => ({ w, list: real.filter((it) => (it.workspaces ?? [it.workspace]).includes(w)).sort((a, b) => deg(b) - deg(a)), wide: wideOf(w) }))
 				.filter((g) => g.list.length || (g.wide && deg(g.wide)));
 			// The header counts each project once; a repo checked out in two workspaces shows in both groups, marked "also in".
