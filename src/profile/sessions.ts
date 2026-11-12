@@ -12,8 +12,8 @@ const ACTIVE_MS = 30 * 60_000;
 const LIMIT = 50, LIMIT_MAX = 100, PRODUCED_MAX = 200;
 // shortcut: a detail returns at most this many events (counts still give the totals); add event paging if sessions outgrow it.
 const EVENTS_MAX = 5_000;
-type NodeRow = { id: string; key: string; attrs: string; created_at: string; last_upload: string; project: string | null };
-type Attrs = { device_id?: unknown; first_at?: unknown; ended?: unknown; files_changed?: unknown };
+type NodeRow = { id: string; key: string; attrs: string; created_at: string; last_upload: string; project: string | null; project_key: string | null };
+type Attrs = { device_id?: unknown; first_at?: unknown; ended?: unknown; files_changed?: unknown; workspace?: unknown };
 
 // The project the session's digests link to: an upload's part_of link first, then the strongest identifier link.
 const PROJECT = `(SELECT e.dst FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = n.id AND e.dst_profile = '' AND e.ended_at IS NULL
@@ -35,7 +35,8 @@ export const CURRENT_PART = `t.part = 'capture' AND t.lane = 'capture' AND t.liv
 	AND t.capture_part IS NOT 'manifest' AND (t.capture_status = 'heuristic' OR (NOT EXISTS (SELECT 1 FROM texts h
 		WHERE h.node_id = t.node_id AND h.part = 'capture' AND h.range_id = t.range_id AND h.capture_status = 'heuristic' AND h.capture_part = '-' AND h.live = 1)
 		AND coalesce(${manifestListed}, 1) > 0))`;
-const SELECT = `SELECT n.id, n.key, n.attrs, n.created_at, ${UPLOAD} AS last_upload, ${PROJECT} AS project FROM nodes n`;
+const SELECT = `SELECT n.id, n.key, n.attrs, n.created_at, ${UPLOAD} AS last_upload, ${PROJECT} AS project,
+	(SELECT pk.key FROM nodes pk WHERE pk.id = ${PROJECT}) AS project_key FROM nodes n`;
 
 /**
  * The digest parts that describe a session now (CURRENT_PART), in transcript order. Ranges order by start offset (first upload
@@ -82,6 +83,9 @@ function toRow(sql: SqlStorage, n: NodeRow, now: number): { row: SessionRow; par
 			id: n.id, client: client as Client, session: rest.join(":"),
 			device: typeof attrs.device_id === "string" ? attrs.device_id : null,
 			project: n.project,
+			// The project node's key as stored (`github:<owner>/<repo>`; capture tagging writes it lowercase), and the capture workspace.
+			project_key: n.project_key,
+			workspace: typeof attrs.workspace === "string" ? attrs.workspace : null,
 			// first_at is written when v2 creates the node; an older node was created by its first upload too.
 			first_upload_at: typeof attrs.first_at === "string" ? attrs.first_at : n.created_at,
 			last_upload_at: n.last_upload,

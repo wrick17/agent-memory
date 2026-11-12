@@ -1,6 +1,6 @@
 // ProfileStore: one SQLite Durable Object per (user, profile, generation). The only path to a profile's storage.
 import { DurableObject } from "cloudflare:workers";
-import { Fail, fail, ok, type FactReport, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
+import { Fail, fail, ok, type FactReport, type KnowledgeArgs, type Outcome, type ReadQuery, type RecallPage, type UploadArgs, type WriteCommand, type WriteContext } from "../domain/types";
 import { factEfficiency, factHealth, factPruneStep, factScrubStep, heldFacts, injectableFacts, listFacts, renderFactBlock, type FactListQuery } from "./facts";
 import { requestHash } from "../domain/ids";
 import { migrate, nextSeq } from "../storage";
@@ -8,7 +8,7 @@ import { EMBED_MODEL, embedStep, embeddingsOn, namespaceOf, SEMANTIC_MS, vectorI
 import { goalMetrics } from "./metrics";
 import { briefRead, candidates, filterIds, fuse, get, inventory, lexicalChannels, markers, type BriefQuery } from "./read";
 export { BRIEF_LIMITS, ME_MERGE_KINDS, MIN_FUSED_SCORE, meMergeable, projectScopes, scopedRulesFirst, type BriefItem, type BriefQuery } from "./read";
-import { captureState, ingest, type IngestBatch, type ItemResult } from "./capture";
+import { captureProjectKey, captureState, ingest, sessionKey, type IngestBatch, type ItemResult } from "./capture";
 import { expandLinks, explore, timeline, trace } from "./graph";
 import { board } from "./board";
 import { similarStep } from "./similar";
@@ -35,7 +35,7 @@ import { restorable } from "../compat";
 import { HAS_VECTOR, runWrite, writeIds, type Who } from "./write";
 import { dueTransfers, nextTransferAlarm, RESUME_MS, transferStep, type TransferOut, type TransferStep } from "./transfer";
 import { assertOpen, purgeOrigin, type WipeOut, type WipeStep } from "./wipe";
-import { commitKey, naturalRequest, putMarker, uploadKey } from "./work-upload";
+import { commitKey, naturalRequest, putMarker, uploadKey, uploadTerms } from "./work-upload";
 import { ackPart, assertRefreshOpen, installMirror, markRegistered, partCheck, progress, receiptSeq, sealPlan, terminal, type Binding, type PartMeta, type PartReply, type Parts, type Payload, type Terminal, type TerminalReply } from "./daily-proof";
 import { driveTransfer, resumeTransfer, transferPorts } from "../transfer";
 import { applyRows, exportStore, exportTables, readChunk, readManifest } from "../backup";
@@ -98,6 +98,11 @@ export interface RestoredPage {
 }
 /** The account or the local closed marker refused this generation during an alarm; `retry` when it was an account recovery. */
 class Stopped { constructor(readonly retry: boolean) {} }
+
+/** profile_meta key prefix of a capture-created project still owed its account registration (linkProject). */
+const REGISTER = "capture-register:";
+/** Rows one link pass drains, so a lasting account failure never makes every capture retry an unbounded backlog. */
+const REGISTER_BATCH = 20;
 
 export class ProfileStore extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -590,9 +595,79 @@ export class ProfileStore extends DurableObject<Env> {
 			await this.access(who);
 			this.bind(who);
 			const out = this.metered(ingest(this.ctx.storage, who, batch));
+			// Best effort after the digests are held: a failed link never fails the capture, and the session's next batch retries it.
+			try { await this.linkProject(who, batch); } catch (e) { if (!(e instanceof Fail)) console.error("capture project link failed", e); }
 			if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 60_000);
 			return ok(out);
 		} catch (e) { if (e instanceof Fail) return { ok: false, error: e.failure }; throw e; }
+	}
+
+	/**
+	 * Project tagging: the captured session's part_of link to the GitHub project its checkout belongs to, through record_knowledge's
+	 * write (activity, undo) as actor index. The project node is created only when no node carries the key (GitHub keys match
+	 * case-insensitively) and is never rewritten here: the command is planned again after the last await, right before the
+	 * synchronous write, so a project the owner created meanwhile is linked, not overwritten. A work project's name guards me first,
+	 * as a work upload's does. Nothing is written once the session already has a current part_of link to it, so most batches cost one
+	 * read. The request id is stable per profile, session and key, so a retried batch replays. A fixture or malformed key, or a key
+	 * held by another kind, links nothing. A created project's account registration is a durable obligation (REGISTER rows), retried
+	 * on every later batch until it succeeds, without holding up the digests.
+	 */
+	private async linkProject(who: Who, batch: IngestBatch): Promise<void> {
+		try { await this.registerPending(who); } catch (e) { if (!(e instanceof Fail)) console.error("capture project registration failed", e); }
+		const key = captureProjectKey(batch.project), sql = this.ctx.storage.sql;
+		if (!key || who.profile === "me") return;
+		const repo = key.slice("github:".length), node = { kind: "project" as const, key, name: repo };
+		const plan = () => {
+			const session = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND kind = 'session' AND status = 'active'", sessionKey(batch.session)).toArray()[0]?.id;
+			const project = sql.exec<{ id: string; kind: string }>("SELECT id, kind FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved' ORDER BY rowid LIMIT 1", key).toArray()[0];
+			if (!session || (project && project.kind !== "project")) return null;
+			if (project && sql.exec("SELECT 1 FROM edges WHERE src = ? AND rel = 'part_of' AND dst = ? AND dst_profile = '' AND ended_at IS NULL", session, project.id).toArray().length) return null;
+			const args: KnowledgeArgs = { request_id: `capture-project:${who.profile}:${session}:${key}`, ...(project ? {} : { nodes: [node] }),
+				edges: [{ from: { id: session }, rel: "part_of", to: project ? { id: project.id } : { ref: 0 }, reason: "Captured session ran in a checkout of this GitHub repository",
+					evidence: [{ kind: "session", ref: sessionKey(batch.session), note: "client-reported git origin of the session's working directory" }] }] };
+			return { args, creates: !project };
+		};
+		const first = plan();
+		if (!first) return;
+		const created = writeIds(who, { op: "knowledge", args: { nodes: [node] } });
+		if (first.creates && who.profile === "work") {
+			const added = await (this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(who.userId)) as unknown as Pick<import("../account/store").AccountStore, "admin">)
+				.admin({ op: "addSensitiveTerms", terms: uploadTerms(repo, []) });
+			if (!added.ok) throw new Fail(added.error);
+		}
+		await this.access(who, first.creates ? created : []);
+		// No await from here to the write. A project that disappeared meanwhile had no terms or access check; the next batch plans again.
+		const now = plan();
+		if (!now || (now.creates && !first.creates)) return;
+		// Outside runWrite's transaction: a row whose write then rolls back names no active node, and the next drain clears it.
+		// Each obligation gets a fresh value (time, nonce), so a drain that began before it can never acknowledge it.
+		if (now.creates) sql.exec("INSERT INTO profile_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			`${REGISTER}${created[0]}`, `${new Date().toISOString()} ${crypto.randomUUID()}`);
+		const out = this.metered(runWrite(this.ctx.storage, who, { op: "knowledge", args: now.args }, { actor: "index", platform: "capture", routedBy: "capture", userId: who.userId,
+			payloadHash: requestHash("knowledge", now.args as unknown as Record<string, unknown>) }));
+		if (now.creates) await this.registerPending(who);
+		if (out.embedDue && embeddingsOn(this.env) && ((await this.ctx.storage.getAlarm()) ?? Infinity) > Date.now() + 1_000) await this.ctx.storage.setAlarm(Date.now());
+	}
+
+	/**
+	 * Registers the projects capture tagging created (REGISTER rows), oldest first and at most REGISTER_BATCH per pass. Rows naming no
+	 * active node (a rolled-back write, an undone project) are cleared before any await. After the account call, only the exact rows
+	 * drained are cleared, by key and value, so an obligation written meanwhile for the same node stays. A wiped profile or record
+	 * clears the drained rows; any other failure keeps them for the next batch.
+	 */
+	private async registerPending(who: Who): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		const rows = sql.exec<{ key: string; value: string }>("SELECT key, value FROM profile_meta WHERE key >= ? AND key < ? ORDER BY value LIMIT ?",
+			REGISTER, `${REGISTER}~`, REGISTER_BATCH).toArray();
+		if (!rows.length) return;
+		const idOf = (r: { key: string }) => r.key.slice(REGISTER.length);
+		const active = new Set(sql.exec<{ id: string }>("SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?)) AND status = 'active'", JSON.stringify(rows.map(idOf))).toArray().map((r) => r.id));
+		const clear = (list: typeof rows) => { for (const r of list) sql.exec("DELETE FROM profile_meta WHERE key = ? AND value = ?", r.key, r.value); };
+		clear(rows.filter((r) => !active.has(idOf(r))));
+		const live = rows.filter((r) => active.has(idOf(r)));
+		if (!live.length) return;
+		try { await this.register(who, live.map(idOf)); } catch (e) { if (e instanceof Fail && e.failure.code === "profile_wiped") clear(live); throw e; }
+		clear(live);
 	}
 
 	/**

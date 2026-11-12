@@ -4,6 +4,8 @@
 	"session": "fixture-session-1",
 	"device": "dev_fixture_mac",
 	"project": "00000000-0000-5000-8000-0000000000b1",
+	"project_key": "github:example-org/example-app",
+	"workspace": "example",
 	"first_upload_at": "2026-11-02T08:41:00Z",
 	"last_upload_at": "2026-11-02T09:12:00Z",
 	"status": "active",

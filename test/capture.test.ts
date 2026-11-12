@@ -4,8 +4,9 @@ import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { RecallHit } from "../src/domain/types";
 import { sha256 } from "../src/domain/ids";
-import { call, contextFor, deviceToken, outcome } from "./helpers";
-import { ingest, type IngestBatch } from "../src/profile/capture";
+import { call, contextFor, deviceToken, OWNER, outcome } from "./helpers";
+import { captureProjectKey, ingest, type IngestBatch } from "../src/profile/capture";
+import { learningFor } from "../src/profile/lessons";
 import { runWrite } from "../src/profile/write";
 import { listSessions, sessionDetail } from "../src/profile/sessions";
 import { mergeSessions, parseSessionsCursor } from "../src/sessions";
@@ -412,7 +413,7 @@ describe("sessions (S1)", () => {
 	});
 
 	it("keeps rows of a profile that the merged page did not show", () => {
-		const row = (id: string, at: string): SessionRow => ({ id, client: "codex", session: id, device: null, project: null, first_upload_at: at, last_upload_at: at, status: "completed", first_ask: null,
+		const row = (id: string, at: string): SessionRow => ({ id, client: "codex", session: id, device: null, project: null, project_key: null, workspace: null, first_upload_at: at, last_upload_at: at, status: "completed", first_ask: null,
 			counts: { asks: 0, decisions: 0, corrections: 0, outcomes: 0, parts: 0, files_changed: null } });
 		const page = mergeSessions([{ profile: "work", page: { rows: [row("a", "2026-11-03T00:00:00.000Z")], next_cursor: null } },
 			{ profile: "personal", page: { rows: [row("b", "2026-11-01T00:00:00.000Z")], next_cursor: null } }], 1);
@@ -421,5 +422,172 @@ describe("sessions (S1)", () => {
 		expect(cursors.work).toBe("end");
 		expect(cursors.personal).not.toBe("end");
 		expect(mergeSessions([{ profile: "work", page: { rows: [], next_cursor: null } }], 5).next_cursor).toBeNull();
+	});
+});
+
+describe("capture project tagging", () => {
+	const nodeOf = (id: string) => sha256(`session:codex:${id}`).slice(0, 32);
+	const heuristic = (id: string, start: number) => part("-", digest(), "heuristic", `codex:${id}:0a1b2c3d:${start}-${start + 100}`);
+	const inProfile = async <T>(profile: string, fn: (sql: SqlStorage) => T) => {
+		const ref = (await contextFor()).account.profiles.find((p) => p.profile === profile)!;
+		return runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${profile}:${ref.generation}`)), (_i, s) => fn(s.storage.sql));
+	};
+
+	it("normalizes project keys and refuses fixtures and malformed keys", () => {
+		expect(captureProjectKey("github:Owner/Repo.git")).toBe("github:owner/repo");
+		expect(captureProjectKey(" github:wrick17/agent-memory ")).toBe("github:wrick17/agent-memory");
+		expect(captureProjectKey("github:wrick17/test-utils")).toBe("github:wrick17/test-utils");
+		for (const bad of ["github:am-accept-refs-59c5/synthetic-repo", "github:wrick17/am-accept-x", "github:fixture/v1", "github:o/dashboard-smoke", "github:wrick17/bothq",
+			"github:openai/codex", "github.com/owner/repo", "github:owner", "github:owner/repo/extra", "github:-bad/repo", "github:o/..", undefined, ""]) expect(captureProjectKey(bad)).toBeNull();
+	});
+
+	it("links a session to its project once, creates the node only when absent, and its lessons and decisions inherit it", async () => {
+		const { token } = await deviceToken("capture-tag", ["ingest"], ["test"], "test");
+		const id = "thr_tag1", s = { client: "codex" as const, id };
+		const first = await post(token, "/v1/ingest", { session: s, repo: { remote: "git@github.com:Owner-X/Repo.One.git", path: "/w/repo" }, project: "github:Owner-X/Repo.One", workspace: "Apps", digests: [heuristic(id, 0)] });
+		expect(first.status).toBe(200);
+		expect((await post(token, "/v1/ingest", { session: s, project: "github:owner-x/repo.one", workspace: "apps", digests: [heuristic(id, 100)] })).status).toBe(200);
+		await inProfile("test", (sql) => {
+			const project = sql.exec<{ id: string; key: string; name: string; kind: string }>("SELECT id, key, name, kind FROM nodes WHERE key = 'github:owner-x/repo.one'").toArray();
+			expect(project).toEqual([expect.objectContaining({ key: "github:owner-x/repo.one", name: "owner-x/repo.one", kind: "project" })]);
+			expect(sql.exec("SELECT rel, basis, actor FROM edges WHERE src = ? AND dst = ?", nodeOf(id), project[0]!.id).toArray()).toEqual([{ rel: "part_of", basis: "judgment", actor: "index" }]);
+			expect(sql.exec<{ n: number }>("SELECT count(*) AS n FROM activity WHERE op = 'knowledge' AND targets LIKE ?", `%${project[0]!.id}%`).one().n).toBe(1);
+			const row = listSessions(sql, { project: "github:owner-x/repo.one" }).rows;
+			expect(row).toEqual([expect.objectContaining({ id: nodeOf(id), project: project[0]!.id, project_key: "github:owner-x/repo.one", workspace: "apps" })]);
+			expect(sessionDetail(sql, nodeOf(id))!.produced).toEqual([]);
+			const learned = learningFor(sql, [nodeOf(id)]);
+			expect([learned.project?.id, learned.scope]).toEqual([project[0]!.id, "repo.one"]);
+		});
+	});
+
+	it("reuses an existing project node without rewriting it, and skips a fixture key", async () => {
+		const c = await contextFor();
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:Acme/Widget", name: "Widget", description: "Owner's own text." }] });
+		const { token } = await deviceToken("capture-tag2", ["ingest"], ["test"], "test");
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_tag2" }, project: "github:acme/widget", digests: [heuristic("thr_tag2", 0)] });
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_tag3" }, project: "github:am-accept-refs-59c5/synthetic-repo", digests: [heuristic("thr_tag3", 0)] });
+		await inProfile("test", (sql) => {
+			expect(sql.exec("SELECT name, description, revision FROM nodes WHERE key = 'github:Acme/Widget'").toArray()).toEqual([{ name: "Widget", description: "Owner's own text.", revision: 1 }]);
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_tag2"))).toMatchObject({ project_key: "github:Acme/Widget", workspace: null });
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_tag3"))).toMatchObject({ project: null, project_key: null });
+			expect(sql.exec("SELECT 1 FROM nodes WHERE key LIKE 'github:am-accept%' COLLATE NOCASE").toArray()).toEqual([]);
+		});
+	});
+
+	type Store = { ingest(who: unknown, batch: IngestBatch): Promise<{ ok: boolean }>; access(who: unknown, ids?: string[]): Promise<void>; register(who: unknown, ids: string[]): Promise<void> };
+	const onStore = async <T>(profile: string, fn: (store: Store, storage: DurableObjectStorage, who: { userId: string; profile: string; generation: string }) => Promise<T> | T) => {
+		const ref = (await contextFor()).account.profiles.find((p) => p.profile === profile)!;
+		const who = { userId: ref.userId, profile, generation: ref.generation };
+		return runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${profile}:${ref.generation}`)), (i, st) => fn(i as unknown as Store, st.storage, who));
+	};
+	const batchOf = (id: string, project: string, start = 0): IngestBatch => ({ session: { client: "codex", id }, project, digests: [heuristic(id, start)], manifests: [] });
+
+	it("links an owner's project created while the link awaited the account, without overwriting it or adding a second one", async () => {
+		await onStore("test", async (store, storage, who) => {
+			const access = store.access.bind(store);
+			store.access = async (w, ids = []) => {
+				await access(w, ids);
+				// The owner's record_knowledge lands during the link's account call, under another key casing.
+				if (ids.length) runWrite(storage, who, { op: "knowledge", args: { nodes: [{ kind: "project", key: "github:Race/Repo", name: "Race Repo", description: "Owner's text." }] } },
+					{ actor: "owner", platform: "test", routedBy: "test", userId: who.userId, payloadHash: "owner-race" });
+			};
+			try { expect((await store.ingest(who, batchOf("thr_race", "github:race/repo"))).ok).toBe(true); } finally { store.access = access; }
+			const sql = storage.sql;
+			expect(sql.exec("SELECT key, name, description, revision FROM nodes WHERE key = 'github:race/repo' COLLATE NOCASE").toArray())
+				.toEqual([{ key: "github:Race/Repo", name: "Race Repo", description: "Owner's text.", revision: 1 }]);
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_race"))).toMatchObject({ project_key: "github:Race/Repo" });
+			expect(sql.exec("SELECT 1 FROM profile_meta WHERE key LIKE 'capture-register:%'").toArray()).toEqual([]);
+		});
+	});
+
+	it("retries a created project's registration on a later batch after it failed past the commit", async () => {
+		const indexed = (id: string) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, st) => st.storage.sql.exec("SELECT profile FROM node_index WHERE node_id = ?", id).toArray());
+		const project = await onStore("test", async (store, storage, who) => {
+			const register = store.register.bind(store);
+			store.register = async () => { throw new Error("account unavailable"); };
+			try { expect((await store.ingest(who, batchOf("thr_reg", "github:owner/registered"))).ok).toBe(true); } finally { store.register = register; }
+			const id = storage.sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'github:owner/registered'").one().id;
+			expect(storage.sql.exec<{ value: string }>("SELECT value FROM profile_meta WHERE key = ?", `capture-register:${id}`).one().value).toMatch(/^\d{4}-\d\d-\d\dT\S+Z [0-9a-f-]{36}$/);
+			return id;
+		});
+		expect(await indexed(project)).toEqual([]);
+		// The session's edge already exists, so this batch links nothing; the obligation is retried anyway.
+		await onStore("test", (store, _st, who) => store.ingest(who, batchOf("thr_reg", "github:owner/registered", 100)));
+		expect(await indexed(project)).toEqual([{ profile: "test" }]);
+		expect(await inProfile("test", (sql) => sql.exec("SELECT 1 FROM profile_meta WHERE key LIKE 'capture-register:%'").toArray())).toEqual([]);
+	});
+
+	it("never lets a drain that began earlier clear an obligation written while it awaited the account", async () => {
+		const indexed = (id: string) => runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, st) => st.storage.sql.exec("SELECT profile FROM node_index WHERE node_id = ?", id).toArray());
+		const pending = (storage: DurableObjectStorage) => storage.sql.exec<{ key: string; value: string }>("SELECT key, value FROM profile_meta WHERE key LIKE 'capture-register:%' ORDER BY key").toArray();
+		const x = await onStore("test", async (store, storage, who) => {
+			const register = store.register.bind(store), sql = storage.sql;
+			const keyOf = (k: string) => sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ?", k).one().id;
+			store.register = async () => { throw new Error("account unavailable"); };
+			try {
+				// X and Y are created, and both registrations fail. Undo removes X but leaves its row.
+				await store.ingest(who, batchOf("thr_x1", "github:owner/stale-x"));
+				await store.ingest(who, batchOf("thr_y", "github:owner/stale-y"));
+				const xId = keyOf("github:owner/stale-x"), yId = keyOf("github:owner/stale-y");
+				const undo = sql.exec<{ id: number }>("SELECT id FROM activity WHERE op = 'knowledge' AND targets LIKE ? ORDER BY id DESC LIMIT 1", `%${xId}%`).one().id;
+				runWrite(storage, who, { op: "undo", args: { activity_id: undo, request_id: "undo-stale-x" } }, { actor: "owner", platform: "test", routedBy: "test", userId: who.userId, payloadHash: "undo-stale-x" });
+				expect(pending(storage).map((r) => r.key)).toEqual([`capture-register:${xId}`, `capture-register:${yId}`].sort());
+				// Capture A drains Y. While it awaits the account, capture B recreates X for another session, and B's registration fails.
+				let calls = 0;
+				store.register = async (w, ids) => {
+					if (++calls > 1) throw new Error("account unavailable");
+					expect(ids).toEqual([yId]);
+					expect(pending(storage).map((r) => r.key)).toEqual([`capture-register:${yId}`]);
+					await store.ingest(who, batchOf("thr_x2", "github:owner/stale-x"));
+					expect(sql.exec("SELECT status FROM nodes WHERE id = ?", xId).toArray()).toEqual([{ status: "active" }]);
+					return register(w, ids);
+				};
+				await store.ingest(who, { session: { client: "codex", id: "thr_a" }, digests: [heuristic("thr_a", 0)], manifests: [] });
+				expect(calls).toBeGreaterThan(1);
+				expect(pending(storage).map((r) => r.key)).toEqual([`capture-register:${xId}`]);
+				return xId;
+			} finally { store.register = register; }
+		});
+		expect(await indexed(x)).toEqual([]);
+		await onStore("test", (store, _st, who) => store.ingest(who, { session: { client: "codex", id: "thr_a" }, digests: [heuristic("thr_a", 100)], manifests: [] }));
+		expect(await indexed(x)).toEqual([{ profile: "test" }]);
+		expect(await inProfile("test", (sql) => sql.exec("SELECT 1 FROM profile_meta WHERE key LIKE 'capture-register:%'").toArray())).toEqual([]);
+	});
+
+	it("undoes a tagging link and its new project, keeps the undo on the session's next batch, and never links across profiles or into me", async () => {
+		const { token } = await deviceToken("capture-tag5", ["ingest"], ["test", "work", "me"], "test");
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_undo" }, project: "github:owner/undone", digests: [heuristic("thr_undo", 0)] });
+		await onStore("test", (_s, storage, who) => {
+			const sql = storage.sql, activity = sql.exec<{ id: number }>("SELECT id FROM activity WHERE op = 'knowledge' ORDER BY id DESC LIMIT 1").one().id;
+			runWrite(storage, who, { op: "undo", args: { activity_id: activity, request_id: "undo-capture-tag" } }, { actor: "owner", platform: "test", routedBy: "test", userId: who.userId, payloadHash: "undo-capture-tag" });
+			expect(sql.exec("SELECT 1 FROM nodes WHERE key = 'github:owner/undone' AND status = 'active'").toArray()).toEqual([]);
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_undo"))).toMatchObject({ project: null, project_key: null });
+		});
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_undo" }, project: "github:owner/undone", digests: [heuristic("thr_undo", 100)] });
+		expect(await inProfile("test", (sql) => listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_undo"))?.project)).toBeNull();
+		// The same key in work gets work's own project; no edge points into another profile.
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_cross" }, profile: "work", project: "github:acme/widget", digests: [heuristic("thr_cross", 0)] });
+		await inProfile("work", (sql) => {
+			const id = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = 'github:acme/widget'").one().id;
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_cross"))?.project).toBe(id);
+			expect(sql.exec("SELECT 1 FROM edges WHERE dst_profile <> ''").toArray()).toEqual([]);
+		});
+		const me = await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_me" }, profile: "me", project: "github:owner/app", digests: [heuristic("thr_me", 0)] });
+		expect(me.status).toBe(403);
+	});
+
+	it("keeps an old client's batch untagged, gives a workspace-only session the workspace scope, and guards me with a new work project", async () => {
+		const { token } = await deviceToken("capture-tag4", ["ingest"], ["test", "work"], "test");
+		expect((await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_old" }, repo: { remote: "https://github.com/o/r", path: "/w" }, digests: [heuristic("thr_old", 0)] })).status).toBe(200);
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_ws" }, workspace: "sequoia", digests: [heuristic("thr_ws", 0)] });
+		expect((await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_work" }, profile: "work", project: "github:sequoia-engineering/kernel-tag-frontend", digests: [heuristic("thr_work", 0)] })).data.profile).toBe("work");
+		await inProfile("test", (sql) => {
+			expect(listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_old"))).toMatchObject({ project: null, project_key: null, workspace: null });
+			expect(learningFor(sql, [nodeOf("thr_old")]).scope).toBe("default");
+			expect(learningFor(sql, [nodeOf("thr_ws")])).toMatchObject({ project: null, scope: "sequoia" });
+		});
+		expect(await inProfile("work", (sql) => listSessions(sql, { limit: 100 }).rows.find((r) => r.id === nodeOf("thr_work"))?.project_key)).toBe("github:sequoia-engineering/kernel-tag-frontend");
+		expect(await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => s.storage.sql.exec<{ term: string }>("SELECT term FROM sensitive_terms WHERE term LIKE '%kernel-tag-frontend%'").toArray().map((r) => r.term)))
+			.toEqual(expect.arrayContaining(["sequoia-engineering/kernel-tag-frontend"]));
 	});
 });
