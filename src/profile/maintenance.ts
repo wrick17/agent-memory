@@ -23,7 +23,6 @@ import { settleSessions } from "./guidance";
 export const MAX_ITEMS = 40;
 export const MAX_LEASE_S = 900;
 export const MAX_OPS = 10;
-export const BATCH_GAP_MS = 20 * 3_600_000;
 const MAX_ATTEMPTS = 3;
 export const ALLOWED_OPS = ["save", "compact", "link", "end_link", "supersede", "flag", "dismiss"] as const;
 /** Each item kind's ops: inference reads correction or capture digests; promotion also takes a preference a similarity pair names. */
@@ -117,8 +116,9 @@ const LEASE_REQUEST = "lease_request:";
 type LeaseRequest = { request_id: string; hash: string; lease_id: string; lease_until: string };
 
 /**
- * Leases up to 40 open items for at most 900 s, at most once per profile in 20 hours. Expired leases go back to the queue
- * first (stuck after 3 attempts). Each item carries its subjects' cards, a passage of up to 1,200 characters and current edges.
+ * Leases up to 40 open items for at most 900 s, whenever open items exist (no cooldown since 2026-11-12: one lease per profile per
+ * run, so the queue drains run by run). Expired leases go back to the queue
+ * first; any item at 3 attempts, expired or released, is parked as stuck instead (with no cooldown, this bounds every re-lease). Each item carries its subjects' cards, a passage of up to 1,200 characters and current edges.
  * With a request_id, the lease and its binding commit together: a repeat of the same request returns that lease and its items
  * still leased, takes no attempt and moves no clock; once the lease expired it returns lease_id null, reason lease_expired.
  * The same id with other arguments is refused. Without a request_id (v1 runners) nothing is bound.
@@ -133,12 +133,10 @@ export function next(storage: DurableObjectStorage, q: { kinds?: string[]; limit
 		const bound = q.request_id === undefined ? undefined : leaseRequest(sql, q.request_id);
 		if (bound && bound.request_id === q.request_id) {
 			if (bound.hash !== hash) throw Fail.of("idempotency_mismatch", "this request_id already leased with other arguments", { reason: "request_mismatch" });
-			if (Date.parse(bound.lease_until) < now) return { lease_id: null, items: [], next_allowed_at: cooldownUntil(sql, now), reason: "lease_expired" as const };
+			if (Date.parse(bound.lease_until) < now) return { lease_id: null, items: [], next_allowed_at: null, reason: "lease_expired" as const };
 			const still = sql.exec<LeaseRow>("SELECT id, kind, subjects, created_at FROM maintenance WHERE lease_id = ? AND state = 'leased' ORDER BY created_at, id", bound.lease_id).toArray();
 			return { lease_id: bound.lease_id, lease_until: bound.lease_until, items: still.map((i) => leasedItem(sql, i)), replayed: true };
 		}
-		const gated = cooldownUntil(sql, now);
-		if (gated) return { lease_id: null, items: [], next_allowed_at: gated };
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), iso);
 		release(tx);
 		const items = selectNext(sql, iso, q.kinds, limit);
@@ -176,12 +174,6 @@ function leaseRequest(sql: SqlStorage, requestId: string): LeaseRequest | undefi
 	} catch { return undefined; }
 }
 
-/** The 20-hour gate: when the next lease is allowed, or null when a lease may run now. */
-function cooldownUntil(sql: SqlStorage, now: number): string | null {
-	const last = sql.exec<{ last_run_at: string | null }>("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").toArray()[0]?.last_run_at;
-	return last && now - Date.parse(last) < BATCH_GAP_MS ? new Date(Date.parse(last) + BATCH_GAP_MS).toISOString() : null;
-}
-
 /**
  * The items a lease at `iso` takes, in lease order: open items and the expired leases release() reopens. After release() the
  * second clause matches nothing, so next() and the owner's preview share this one selection.
@@ -189,34 +181,32 @@ function cooldownUntil(sql: SqlStorage, now: number): string | null {
 function selectNext(sql: SqlStorage, iso: string, kinds: string[] | undefined, limit: number) {
 	const k = kinds?.length ? JSON.stringify(kinds) : null;
 	return sql.exec<{ id: number; kind: string; subjects: string; created_at: string; attempts: number; state: string }>(`SELECT id, kind, subjects, created_at, attempts, state
-		FROM maintenance WHERE (state = 'open' OR (state = 'leased' AND lease_until < ? AND attempts < ?))
-		AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, iso, MAX_ATTEMPTS, k, k, limit).toArray();
+		FROM maintenance WHERE attempts < ? AND (state = 'open' OR (state = 'leased' AND lease_until < ?))
+		AND (? IS NULL OR kind IN (SELECT value FROM json_each(?))) ORDER BY created_at, id LIMIT ?`, MAX_ATTEMPTS, iso, k, k, limit).toArray();
 }
 
 /**
  * The owner's read-only observation of the next normal lease (maintenance_next with no kind filter and the full limit), as
- * of observed_at. It takes no lease and changes no item, attempt, cursor or clock. While the cooldown holds, the candidates
- * are what a lease would select at observed_at, not what may be leased now. Ids, kinds, dates and counts only.
+ * of observed_at. It takes no lease and changes no item, attempt, cursor or clock. Ids, kinds, dates and counts only.
  */
 export function nextPreview(sql: SqlStorage) {
-	const now = Date.now(), iso = new Date(now).toISOString(), until = cooldownUntil(sql, now);
+	const iso = new Date().toISOString();
 	const candidates = selectNext(sql, iso, undefined, MAX_ITEMS);
-	// release()'s other effect: an expired lease at the attempt cap parks as stuck instead of reopening.
-	const park = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE state = 'leased' AND lease_until < ? AND attempts >= ? ORDER BY id", iso, MAX_ATTEMPTS).toArray();
+	// release()'s other effect: an expired lease or open item at the attempt cap parks as stuck instead of being leased.
+	const park = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE ((state = 'leased' AND lease_until < ?) OR state = 'open') AND attempts >= ? ORDER BY id", iso, MAX_ATTEMPTS).toArray();
 	return {
 		observation: "not_a_lease" as const, lease_id: null, observed_at: iso,
-		cooldown: until ? { status: "gated" as const, next_allowed_at: until } : { status: "open" as const, next_allowed_at: null },
-		leasable_now: !until && candidates.length > 0,
+		leasable_now: candidates.length > 0,
 		candidates: candidates.map((r) => ({ item_id: r.id, kind: r.kind, created_at: r.created_at, attempts: r.attempts,
 			expired_lease: r.state === "leased", subjects: JSON.parse(r.subjects) as string[] })),
 		parks_as_stuck: park.map((r) => r.id),
 	};
 }
 
-/** Expired leases return to the queue; an item that keeps expiring is parked as stuck. */
+/** Expired leases return to the queue; an item at the attempt cap, expired or reopened by an older release, is parked as stuck. */
 function release(tx: BudgetTx): void {
 	tx.run(`UPDATE maintenance SET state = CASE WHEN attempts >= ? THEN 'stuck' ELSE 'open' END, lease_id = NULL, lease_until = NULL, seq = ?
-		WHERE state = 'leased' AND lease_until < ?`, MAX_ATTEMPTS, tx.seq, tx.now);
+		WHERE (state = 'leased' AND lease_until < ?) OR (state = 'open' AND attempts >= ?)`, MAX_ATTEMPTS, tx.seq, tx.now, MAX_ATTEMPTS);
 }
 
 function context(sql: SqlStorage, subjects: string[], kind: string) {
@@ -364,8 +354,9 @@ export function finishBatch(storage: DurableObjectStorage, c: { lease_id?: strin
 		const ids = sql.exec<{ id: number }>("SELECT id FROM maintenance WHERE lease_id = ? AND state = 'leased' ORDER BY id LIMIT 40", c.lease_id).toArray().map((r) => r.id);
 		if (!ids.length) return { status: c.status, released: 0 };
 		const tx = new BudgetTx(sql, nextSeq(sql, "profile_meta"), new Date().toISOString());
-		tx.run("UPDATE maintenance SET state = ?, lease_id = NULL, lease_until = NULL, outcome = ?, seq = ? WHERE id IN (SELECT value FROM json_each(?))",
-			c.status === "stuck" ? "stuck" : "open", JSON.stringify({ status: c.status, reason: c.reason }), tx.seq, JSON.stringify(ids));
+		// A released item at the attempt cap parks as stuck, as an expired lease does: a discarded batch never re-leases it forever.
+		tx.run("UPDATE maintenance SET state = CASE WHEN ? OR attempts >= ? THEN 'stuck' ELSE 'open' END, lease_id = NULL, lease_until = NULL, outcome = ?, seq = ? WHERE id IN (SELECT value FROM json_each(?))",
+			c.status === "stuck" ? 1 : 0, MAX_ATTEMPTS, JSON.stringify({ status: c.status, reason: c.reason }), tx.seq, JSON.stringify(ids));
 		tx.run("INSERT INTO activity (at, actor, device_id, op, summary, targets, seq) VALUES (?, 'maintenance', ?, ?, ?, '[]', ?)",
 			tx.now, job.deviceId ?? null, c.status, c.reason, tx.seq);
 		tx.run(`INSERT INTO cursors (stage, due_at, last_run_at, last_error, stats) VALUES ('batch_status', 0, ?, ?, ?)

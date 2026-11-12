@@ -10,7 +10,7 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 - **Separate profiles.** `work`, `personal` and `me` never share a database. The agent picks the profile; storage never guesses from the content. Recall reads the chosen profile plus `me`.
 - **Linked knowledge.** Decisions carry their reasons and evidence, and records link to projects, people and work items. Agents can ask why something was decided, follow a path between records or read a timeline.
 - **Search that works without AI.** Recall uses exact names and full-text search. Semantic search with Workers AI is optional.
-- **Learning from every session.** The local client turns each finished session into a short redacted digest, with Claude Code sub-agents captured as their own sessions. A daily batch reads the digests and records lessons, decisions and preferences. Full transcripts never leave your machine.
+- **Learning from every session.** The local client turns each finished session into a short redacted digest, with Claude Code sub-agents captured as their own sessions. A batch on each capture run reads the digests and records lessons, decisions and preferences. Full transcripts never leave your machine.
 - **Sessions tagged by project.** Each captured session links to the GitHub project of the folder it ran in, and to an optional workspace. Lessons and decisions learned from the session inherit that project. See [capture project tagging](docs/self-host.md#capture-project-tagging).
 - **Guidance while agents work.** Each session starts with a brief of at most 400 tokens: repo facts, the open journal, project rules and decisions, and your `me` preferences. The loop guard adds one short note when a turn keeps failing the same way.
 - **Repo facts.** The client spots repeatable command failures in a GitHub repo, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction.
@@ -28,7 +28,7 @@ The brief, fact synthesis and the loop guard are off in a new client. Turn them 
 
 1. **Capture.** When a session stops or ends, the client hooks redact the transcript into a short digest and upload it. The full transcript stays local.
 2. **Detect.** In a GitHub checkout, the client also sends a repo-fact report: hashes, fact keys and outcomes, never command output or paths.
-3. **Learn.** The server queues review items from digests and housekeeping rules. The batch leases them at most once a day per profile, judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
+3. **Learn.** The server queues review items from digests and housekeeping rules. Each drain of a capture run leases up to 40 open items per profile, again on a later drain only after a clean or idle lease; a profile whose lease failed waits for the next run. The batch judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
 4. **Guide.** At the next session start, the Worker builds the brief from the repo's profile and `me`. The client injects it into the agent's context.
 5. **Measure.** The dashboard's **Goals** tab tracks repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
 
@@ -42,7 +42,7 @@ The brief, fact synthesis and the loop guard are off in a new client. Turn them 
 | R2 | Cloudflare | Nightly encrypted exports and the identity ledger. |
 | Vectorize and Workers AI | Cloudflare, optional | Semantic recall. Lexical recall works without them. |
 | `agent-memory` client | Each machine | Hooks for capture, the brief and the loop guard; local replay; `doctor` and `status`. |
-| Daily batch | Each machine | Runs after a session ends or on a schedule. Turns leased review items into lessons, decisions and preferences with your Codex CLI. |
+| Batch | Each machine | Runs after a session ends or on a schedule, while review items wait. Turns leased review items into lessons, decisions and preferences with your Codex CLI. |
 
 The full design is in [architecture](docs/architecture.md).
 
@@ -114,7 +114,7 @@ For a machine without a browser, see [headless machines](docs/self-host.md#headl
 - Automatic capture uploads only short, redacted digests, never the full transcript. A digest can contain short excerpts. What an agent saves on purpose is stored as written.
 - `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
 - Repo-fact reports carry hashes, fact keys, short detector literals, outcomes and token counts, never command output or paths.
-- Fact synthesis (`facts.synthesis`) and the daily batch send redacted digests to the Codex CLI on your own Codex subscription.
+- Fact synthesis (`facts.synthesis`) and the batch send redacted digests to the Codex CLI on your own Codex subscription.
 - The server never calls GitHub or Jira and holds no credentials for them.
 
 ## Learn more

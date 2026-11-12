@@ -288,7 +288,7 @@ describe("protection and the maintenance queue", () => {
 		expect(mayChange({ origin: "stated", pinned: 1 }, "agent", "me")).toBeNull();
 	});
 
-	it("leases at most 40 items for at most 900 s once in 20 hours, confines ops to subjects and flags protected nodes", async () => {
+	it("leases at most 40 items for at most 900 s with no cooldown, confines ops to subjects and flags protected nodes", async () => {
 		await inStore((storage, who) => {
 			const sql = storage.sql;
 			const a = wired(storage, who, save({ name: "Keep this", content: "same" }));
@@ -301,7 +301,11 @@ describe("protection and the maintenance queue", () => {
 			const lease = next(storage, { limit: 100, lease_seconds: 5000 });
 			expect(lease.items).toHaveLength(40);
 			expect(Date.parse(lease.lease_until!) - Date.now()).toBeLessThanOrEqual(900_000);
-			expect(next(storage, {})).toMatchObject({ lease_id: null, items: [], next_allowed_at: expect.any(String) });
+			// No cooldown: the next lease at once takes the rest, still within the caps.
+			const rest = next(storage, { limit: 100, lease_seconds: 5000 });
+			expect(rest.items).toHaveLength(5);
+			expect(Date.parse(rest.lease_until!) - Date.now()).toBeLessThanOrEqual(900_000);
+			expect(next(storage, {})).toEqual({ lease_id: null, items: [], next_allowed_at: null });
 			const item = lease.items.find((i) => i.kind === "near_duplicate")!;
 			const job = { platform: "test", userId: USER };
 			const stated = sql.exec("SELECT * FROM nodes WHERE id = ?", b.memory_id as string).one();
@@ -330,7 +334,7 @@ describe("protection and the maintenance queue", () => {
 		});
 	});
 
-	it("previews exactly the next normal lease (expired reopen, stuck park, cooldown) without leasing or changing anything", async () => {
+	it("previews exactly the next normal lease (expired reopen, stuck park, no cooldown) without leasing or changing anything", async () => {
 		await inStore((storage) => {
 			const sql = storage.sql, T0 = Date.parse("2026-11-02T00:00:00.000Z");
 			vi.useFakeTimers({ toFake: ["Date"] });
@@ -355,7 +359,7 @@ describe("protection and the maintenance queue", () => {
 
 				const p = nextPreview(sql);
 				expect(snapshot()).toEqual(before);
-				expect(p).toMatchObject({ observation: "not_a_lease", lease_id: null, observed_at: new Date(T0).toISOString(), cooldown: { status: "open", next_allowed_at: null }, leasable_now: true, parks_as_stuck: [cap] });
+				expect(p).toMatchObject({ observation: "not_a_lease", lease_id: null, observed_at: new Date(T0).toISOString(), leasable_now: true, parks_as_stuck: [cap] });
 				expect(p.candidates.map((c) => c.item_id)).toEqual(expected);
 				expect(p.candidates.find((c) => c.item_id === reopen)).toEqual({ item_id: reopen, kind: KINDS[(reopen - 1) % KINDS.length], created_at: "2026-09-01T00:00:00.000Z",
 					attempts: 1, expired_lease: true, subjects: [`missing-${reopen - 1}`] });
@@ -369,19 +373,19 @@ describe("protection and the maintenance queue", () => {
 				expect(sql.exec("SELECT state FROM maintenance WHERE id = ?", cap).one().state).toBe("stuck");
 				expect(sql.exec("SELECT state, attempts FROM maintenance WHERE id = ?", reopen).one()).toEqual({ state: "leased", attempts: 2 });
 
-				// Inside the cooldown the preview reports the gate and names candidates, never as leasable now; next() agrees and leases nothing.
-				vi.setSystemTime(T0 + 3_600_000);
-				const gatedBefore = snapshot(), g = nextPreview(sql);
-				expect(snapshot()).toEqual(gatedBefore);
-				expect(g).toMatchObject({ lease_id: null, cooldown: { status: "gated", next_allowed_at: new Date(T0 + 20 * 3_600_000).toISOString() }, leasable_now: false });
-				expect(g.candidates.length).toBeGreaterThan(0);
-				expect(next(storage, {})).toEqual({ lease_id: null, items: [], next_allowed_at: g.cooldown.next_allowed_at });
-				expect(snapshot()).toEqual(gatedBefore);
+				// No cooldown: a minute later the preview is still leasable and the next lease takes the remaining open items at once.
+				vi.setSystemTime(T0 + 60_000);
+				const rest = nextPreview(sql);
+				expect(rest).not.toHaveProperty("cooldown");
+				expect(rest).toMatchObject({ lease_id: null, leasable_now: true, parks_as_stuck: [] });
+				expect(rest.candidates.map((c) => c.expired_lease)).toEqual([false, false, false, false, false]);
+				const second = next(storage, {});
+				expect(second.items.map((i) => i.item_id)).toEqual(rest.candidates.map((c) => c.item_id));
 
-				// After the cooldown the first lease and the held lease have expired: they come back as expired leases, and the next lease matches again.
-				vi.setSystemTime(T0 + 20 * 3_600_000);
-				const later = nextPreview(sql), expired = new Set([...lease.items.map((i) => i.item_id), held]);
-				expect(later).toMatchObject({ cooldown: { status: "open" }, leasable_now: true, parks_as_stuck: [] });
+				// Once both leases and the held lease have expired they come back as expired leases, and the next lease matches again.
+				vi.setSystemTime(T0 + 3_600_000);
+				const later = nextPreview(sql), expired = new Set([...lease.items, ...second.items].map((i) => i.item_id).concat(held));
+				expect(later).toMatchObject({ leasable_now: true, parks_as_stuck: [] });
 				for (const c of later.candidates) expect([c.item_id, c.expired_lease]).toEqual([c.item_id, expired.has(c.item_id)]);
 				expect(later.candidates.some((c) => c.item_id === held)).toBe(true);
 				expect(next(storage, {}).items.map((i) => i.item_id)).toEqual(later.candidates.map((c) => c.item_id));
@@ -1954,8 +1958,6 @@ it("leases an ingest-queued session capture with its current digest part, never 
 	expect((await res.json() as { results: { status: string }[] }).results.map((r) => r.status)).toEqual(["stored", "stored", "stored"]);
 	const node = sha256(`session:claude-code:${id}`).slice(0, 32);
 	const who = owner.account.profiles.find((p) => p.profile === profile)!, stub = env.PROFILE.get(env.PROFILE.idFromName(`${who.userId}:${profile}:${who.generation}`));
-	// This file shares profile storage: an earlier test leased this profile, so its 20-hour batch gate is reset for this lease.
-	await runInDurableObject(stub, (_i, s) => { s.storage.sql.exec("DELETE FROM cursors WHERE stage = 'maintenance_batch'"); });
 	try {
 		const lease = await call<{ lease_id: string | null; items: { kind: string; subjects: string[]; allowed_ops: string[]; context: { nodes: { id: string; passage: string }[] } }[] }>(
 			await contextFor(devicePrincipal(job.token)), "maintenance_next", { profile, kinds: ["unprocessed_capture", "preference_signal"] });
@@ -2277,7 +2279,6 @@ describe("Weekly strategic review", () => {
 			const sql = s.storage.sql, past = (ms: number) => new Date(Date.now() - ms).toISOString();
 			sql.exec("UPDATE maintenance SET state = 'leased', done_at = NULL, outcome = NULL, lease_until = ? WHERE id = ?", past(1_000), item.item_id);
 			sql.exec("DELETE FROM cursors WHERE stage LIKE 'outbox:%'");
-			sql.exec("UPDATE cursors SET last_run_at = ? WHERE stage = 'maintenance_batch'", past(21 * 3_600_000));
 			await s.storage.deleteAlarm();
 		});
 		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(OWNER)), (_i, s) => s.storage.sql.exec("DELETE FROM node_index WHERE node_id = ?", id));
@@ -2372,7 +2373,6 @@ describe("Weekly strategic review", () => {
    else runWrite(s.storage,r.who,{op:"owner",args:{memory_id:created,action:"forget"}},{...owner,payloadHash:"forget"});
    expect(s.storage.sql.exec("SELECT count(*) AS n FROM nodes WHERE id=?",created).one().n).toBe(0);
    s.storage.sql.exec("UPDATE maintenance SET lease_until=? WHERE id=?",new Date(Date.now()-1000).toISOString(),item.item_id);
-   s.storage.sql.exec("UPDATE cursors SET last_run_at=? WHERE stage='maintenance_batch'",new Date(Date.now()-21*3600000).toISOString());
    await s.storage.deleteAlarm();
   });
   const again=await job<Lease>(r.token,"maintenance_next",{profile:r.name});
@@ -2443,28 +2443,41 @@ describe("v2 M1: replay-safe leases, stale records, eval suggestions and recall 
 			expect(again.items.map((i) => i.item_id)).toEqual(first.items.map((i) => i.item_id));
 			expect(sql.exec("SELECT attempts FROM maintenance ORDER BY id").toArray().map((r) => r.attempts)).toEqual([1, 1]);
 			expect(sql.exec("SELECT last_run_at FROM cursors WHERE stage = 'maintenance_batch'").one().last_run_at).toBe(clock);
-			// A v1 runner without an id is gated as before; the same id with other arguments is refused.
-			expect(next(storage, { lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], next_allowed_at: expect.any(String) });
+			// A v1 runner without an id is not gated: it finds nothing open (both items are leased), with next_allowed_at null.
+			// The same id with other arguments is refused.
+			expect(next(storage, { lease_seconds: 60 })).toEqual({ lease_id: null, items: [], next_allowed_at: null });
 			expect(() => next(storage, { request_id: "run-1", lease_seconds: 30 })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "idempotency_mismatch" }) }));
 			// Only items still leased come back once one is completed.
 			complete(storage, who, { lease_id: first.lease_id!, results: [{ item_id: first.items[0]!.item_id, ops: [{ op: "dismiss" }] }] }, job);
 			expect(next(storage, { request_id: "run-1", lease_seconds: 60 }).items.map((i) => i.item_id)).toEqual([first.items[1]!.item_id]);
 			sql.exec("UPDATE profile_meta SET value = json_set(value, '$.lease_until', ?) WHERE key LIKE 'lease\\_request%' ESCAPE '\\'", new Date(Date.now() - 60_000).toISOString());
 			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
-			// A later run's lease keeps run-1's binding: a delayed run-1 retry, past both gates, still finds it expired, and with other
+			// A later run's lease keeps run-1's binding: a delayed run-1 retry, past its lease, still finds it expired, and with other
 			// arguments is still refused; it never becomes a new run.
-			const past = () => sql.exec("UPDATE cursors SET last_run_at = ? WHERE stage = 'maintenance_batch'", new Date(Date.now() - 21 * 3_600_000).toISOString());
 			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
-			past();
 			const second = next(storage, { request_id: "run-2", lease_seconds: 60 });
 			expect(second.lease_id).toEqual(expect.any(String));
 			sql.exec("UPDATE maintenance SET lease_until = '2000-01-01T00:00:00.000Z' WHERE state = 'leased'");
-			past();
 			const attempts = () => sql.exec("SELECT attempts FROM maintenance ORDER BY id").toArray().map((r) => r.attempts);
 			const before = attempts();
 			expect(next(storage, { request_id: "run-1", lease_seconds: 60 })).toMatchObject({ lease_id: null, items: [], reason: "lease_expired" });
 			expect(() => next(storage, { request_id: "run-1", lease_seconds: 30 })).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: "idempotency_mismatch" }) }));
 			expect(attempts()).toEqual(before);
+		});
+	});
+
+	it("parks an item discarded three times as stuck instead of leasing it a fourth time", async () => {
+		await inStore((storage) => {
+			const sql = storage.sql;
+			enqueue(storage, [{ kind: "unlinked", subjects: ["poison"] }]);
+			for (let n = 1; n <= 3; n++) {
+				const lease = next(storage, {});
+				expect(lease.items.map((i) => i.subjects)).toEqual([["poison"]]);
+				finishBatch(storage, { lease_id: lease.lease_id!, status: "batch_skipped", reason: "bad_output" }, job);
+				expect(sql.exec("SELECT state, attempts FROM maintenance").one()).toEqual({ state: n < 3 ? "open" : "stuck", attempts: n });
+			}
+			expect(next(storage, {})).toEqual({ lease_id: null, items: [], next_allowed_at: null });
+			expect(nextPreview(sql)).toMatchObject({ leasable_now: false, candidates: [], parks_as_stuck: [] });
 		});
 	});
 

@@ -7,7 +7,7 @@ import { normalizeName, normalizeScope, sha256 } from "../domain/ids";
 import { Fail, type MemoryKind, type MemoryType, type RecallHit, type Step } from "../domain/types";
 import { captureText, findNode, readContent, relationships, type NodeRow, type Who } from "./write";
 import { captureState, manifestListed, parseRange, sessionKey } from "./capture";
-import { BATCH_GAP_MS, batchStatus } from "./maintenance";
+import { batchStatus } from "./maintenance";
 import { projectKey } from "./work-upload";
 import { normalizeRemote } from "../routing";
 import { injectableFacts } from "./facts";
@@ -684,10 +684,10 @@ const RANGES_MAX = 2_000;
 
 /**
  * GET /v1/markers (sections 7 and 10), read-only: the repo's marker, the session's stored capture ranges with the cursors they
- * acknowledge per transcript epoch, and the daily batch slot. A cursor counts only a run of stored ranges from 0 with no gap, so a
- * read never acknowledges a range the server does not hold. The daily refresh slot is not recorded here yet, so it reads null.
+ * acknowledge per transcript epoch, and the batch's last lease. A cursor counts only a run of stored ranges from 0 with no gap, so a
+ * read never acknowledges a range the server does not hold. The daily refresh slot is not recorded here yet, so it reads null; the batch has no cooldown since 2026-11-12, so its next_allowed_at reads null (kept for older clients).
  */
-export function markers(sql: SqlStorage, q: { repo: string | null; session?: { client: "claude-code" | "codex"; id: string } }, now = Date.now()) {
+export function markers(sql: SqlStorage, q: { repo: string | null; session?: { client: "claude-code" | "codex"; id: string } }) {
 	const marker = q.repo ? sql.exec<{ head: string | null; uploaded_at: string | null }>("SELECT head, uploaded_at FROM markers WHERE repo = ?", projectKey(q.repo)).toArray()[0] ?? null : null;
 	let captures = null;
 	if (q.session) {
@@ -710,6 +710,5 @@ export function markers(sql: SqlStorage, q: { repo: string | null; session?: { c
 			acknowledged: Object.fromEntries([...epochs].map(([epoch, list]) => [epoch, { digested_to: tiled(list.filter((r) => r.heuristic || r.consolidated)), consolidated_to: tiled(list.filter((r) => r.consolidated)) }])),
 		};
 	}
-	const last = batchStatus(sql).last_lease_at, until = last ? Date.parse(last) + BATCH_GAP_MS : 0;
-	return { repo: q.repo, marker, captures, daily: { batch: { last_lease_at: last, next_allowed_at: until > now ? new Date(until).toISOString() : null }, refresh: null } };
+	return { repo: q.repo, marker, captures, daily: { batch: { last_lease_at: batchStatus(sql).last_lease_at, next_allowed_at: null }, refresh: null } };
 }

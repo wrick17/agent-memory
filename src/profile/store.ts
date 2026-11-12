@@ -43,7 +43,6 @@ import { recoveryCopy, settleFacts, settleStep, undoPreflight, type RecoveryCopy
 
 // The profile module's public surface: callers outside src/profile import only from here.
 export { embeddingsOn, SEMANTIC_MS } from "./index";
-export { BATCH_GAP_MS } from "./maintenance";
 export { corpusFiles, corpusFilesSql } from "./insights";
 export { APPEND_MAX, NOTE_MAX } from "./write";
 export { factRoute, REPO_KEY, SESSION_REF } from "./facts";

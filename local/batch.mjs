@@ -1,4 +1,4 @@
-// The confined daily maintenance batch (section 12), run inside the capture run that holds the machine lock. It reuses that
+// The confined maintenance batch (section 12), run inside each capture run that holds the machine lock. It reuses that
 // run's confined runtime, so nothing is leased unless this run's positive controls passed and every probe was `denied`.
 // Per profile: lease through the job token's `maintenance_next`, judge the items in `codex exec` (one profile per prompt,
 // items on stdin), then send each item's ops through `maintenance_complete`. Anything that fails leaves the items leased;
@@ -216,7 +216,7 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 	const asked = clock();
 	const lease = await call(server, "maintenance_next", { profile, limit: LEASE.limit, lease_seconds: LEASE.seconds, request_id: requestId },
 		{ clock, sleep, leaseEnd: asked + LEASE.seconds * 1000 });
-	if (!lease.lease_id) return lease.reason === "lease_expired" ? { status: "lease_expired", next_allowed_at: lease.next_allowed_at ?? null } : { status: "idle", next_allowed_at: lease.next_allowed_at ?? null };
+	if (!lease.lease_id) return { status: lease.reason === "lease_expired" ? "lease_expired" : "idle" };
 	const leaseEnd = Date.parse(lease.lease_until), replayed = lease.replayed === true ? { replayed: true } : {};
 	const job = (args) => call(server, "maintenance_complete", { profile, lease_id: lease.lease_id, ...args }, { clock, sleep, leaseEnd });
 	const skipped = async (reason, fatal = false) => {
@@ -250,13 +250,14 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 		if (clock() > deadline) { outcome.status = "lease_short"; break; }
 		try {
 			const r = await job({ results: [{ item_id: itemId, ops: sent }] });
-			const ops = r.results?.[0]?.ops ?? [];
+			const res = r.results?.[0], ops = res?.ops ?? [];
 			for (const o of ops) outcome.codes[o.code ?? o.status] = (outcome.codes[o.code ?? o.status] ?? 0) + 1;
 			for (const o of ops) if (o?.status === "applied" && o.op !== "dismiss") outcome.applied[asCode(o.op)] = (outcome.applied[asCode(o.op)] ?? 0) + 1;
-			outcome.receipts.push({ item_id: itemId, kind: asCode(kindOf.get(itemId)), status: asCode(r.results?.[0]?.status), ...(r.results?.[0]?.replayed === true ? { replayed: true } : {}),
+			outcome.receipts.push({ item_id: itemId, kind: asCode(kindOf.get(itemId)), status: asCode(res?.status), ...(res?.replayed === true ? { replayed: true } : {}),
 				sent: sent.map((o) => asCode(o.op)), ops: ops.map(opReceipt) });
-			outcome.completed++;
-			outcome.retained--;
+			// The server settles an item only as done or dismissed; any other item status (rejected: moving, too_many_ops,
+			// not_in_lease) leaves it leased until expiry, when it returns with one attempt spent. Op refusals inside a settled item close it.
+			if (res?.status === "done" || res?.status === "dismissed") { outcome.completed++; outcome.retained--; } else outcome.rejected++;
 		} catch (e) {
 			// An expired lease returned every item to the queue; a refused item stays leased until then.
 			if (e.code === "lease_expired") { outcome.status = "lease_expired"; break; }
@@ -269,13 +270,15 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 }
 
 /**
- * The daily batch for the configured profiles, at most once per profile per day (the server's 20-hour gate). `runner` is the
+ * The batch for the configured profiles: one lease per profile per call, whenever it has open items (no cooldown since 2026-11-12;
+ * the next drain or run takes the rest). `earlier` is this run's previous report: its profiles not batched now keep their outcome
+ * in batch/last.json. `runner` is the
  * capture run's confined runtime: without `available` (a failed control or a probe that was not `denied`) nothing is leased, no
  * model runs, and each profile only reports its content-free skip reason. `trigger` is what started the run: "hook" (a client
  * hook) or "scheduled" (`run --scheduled`). The outcome, codes and counts only, goes to batch/last.json (mode 600).
  */
 export async function batch({ runner, config = loadConfig(), server = mcpJob(config), profiles = config.batch_profiles ?? [], clock = Date.now,
-	sleep = (ms) => new Promise((r) => setTimeout(r, ms)), trigger = "hook" } = {}) {
+	sleep = (ms) => new Promise((r) => setTimeout(r, ms)), trigger = "hook", earlier = null } = {}) {
 	if (trigger !== "hook" && trigger !== "scheduled") throw new Error("trigger is hook or scheduled");
 	const report = { at: new Date(clock()).toISOString(), trigger, runtime: runner?.classification ?? "unavailable", profiles: {} };
 	const run = crypto.randomUUID();
@@ -303,9 +306,13 @@ export async function batch({ runner, config = loadConfig(), server = mcpJob(con
 	}
 	const file = path.join(home(), "batch", "last.json");
 	learningClock(report, readLast(file));
+	report.profiles = { ...earlier?.profiles, ...report.profiles };
 	writePrivate(file, JSON.stringify(report));
 	return report;
 }
+
+/** A lease that may be followed by another in the same run: none was open, or the server settled every leased item (none rejected or retained). */
+export const leaseClean = (r) => r?.status === "idle" || (r?.status === "completed" && r.rejected === 0 && r.retained === 0);
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
 /** The previous run's report, or null when missing or unreadable (a damaged file never stops the batch). */
