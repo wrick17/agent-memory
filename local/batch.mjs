@@ -16,6 +16,15 @@ const LUNA_KINDS = new Set(["unlinked", "stale_journal", "dangling_link", "stale
 const MAX_OPS = 10;
 /** No model run starts, and no result is sent, with less than this left on the lease. */
 const LEASE_MARGIN_MS = 60_000;
+/**
+ * Coverage retry: items the model left without a usable result go round again, first in groups of 5, then one per call, so each
+ * is in at most 2 follow-up runs. A follow-up starts only while a run of RUN_MAX_MS, the runners' own timeout (confinedExec and
+ * claudeExec in agent-memory.mjs), plus SEND_MS for each answer then pending, would still end before the send loop's deadline.
+ */
+const RETRY_GROUPS = [5, 1];
+const RUN_MAX_MS = 180_000, SEND_MS = 5_000;
+/** Failures of a follow-up run that only end the retry; any other kind (a tool, an unknown event, a changed config) discards the lease. */
+const RETRY_SOFT = new Set(["runtime_error", "no_output", "bad_output"]);
 /** Waits before the 1st, 2nd and 3rd retry of a job call. */
 const RETRY_DELAYS_MS = [2_000, 4_000, 8_000];
 /** The server's suggest_eval_case bounds (src/profile/maintenance.ts), checked here so an out-of-bounds op is never sent. */
@@ -231,20 +240,41 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 		[lease.items.filter((i) => !LUNA_KINDS.has(i.kind)), config.batch_terra_model || "gpt-6.1-terra", "high"],
 	];
 	const results = new Map();
-	let dropped = 0;
-	for (const [items, model, effort] of tiers) {
-		if (!items.length) continue;
-		if (clock() > deadline) return skipped("lease_short");
+	let dropped = 0, retryFailed;
+	// One model run over some of a tier's items; returns the discard reason, or nothing once its usable ops are in `results`.
+	const judge = async (items, model, effort) => {
 		const out = await execOf(runner, config)({ prompt: promptFor(items), schema: OPS_SCHEMA, model, effort });
 		// Any tool, error or unknown event, or unusable output, discards the whole lease: the runtime is not the proven one.
-		if (out?.kind !== "ok") return skipped(out?.kind ?? "no_result", true);
-		if (!validOutput(out.part, OPS_SCHEMA)) return skipped("bad_output", true);
+		if (out?.kind !== "ok") return out?.kind ?? "no_result";
+		if (!validOutput(out.part, OPS_SCHEMA)) return "bad_output";
 		const c = confine(items, out.part);
 		for (const [k, v] of c.results) results.set(k, v);
 		dropped += c.dropped;
+	};
+	for (const [items, model, effort] of tiers) {
+		if (!items.length) continue;
+		if (clock() > deadline) return skipped("lease_short");
+		const fatal = await judge(items, model, effort);
+		if (fatal) return skipped(fatal, true);
 	}
-	// applied: ops the server applied, by op name (dismiss is no write), for doctor's no-learning warning.
-	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, dropped_ops: dropped, ...replayed, codes: {}, applied: {}, receipts: [] };
+	// Items with no result or no usable op run again in smaller prompts; only the model's own answers are ever sent. A skipped or
+	// softly failed follow-up ends the retry and the answers already accepted are still sent.
+	retry: for (const size of RETRY_GROUPS) {
+		for (const [items, model, effort] of tiers) {
+			const missing = items.filter((i) => !results.has(i.item_id));
+			for (let n = 0; n < missing.length; n += size) {
+				const group = missing.slice(n, n + size);
+				// shortcut: SEND_MS is a reserve, not a limit; slower job calls can still miss the cutoff and leave an answer leased until expiry, as before this retry. Upgrade with a timeout on job calls.
+				if (clock() + RUN_MAX_MS + SEND_MS * (results.size + group.length) > deadline) break retry;
+				const failed = await judge(group, model, effort);
+				if (failed && !RETRY_SOFT.has(failed)) return skipped(failed, true);
+				if (failed) { retryFailed = failed; break retry; }
+			}
+		}
+	}
+	// applied: ops the server applied, by op name (dismiss is no write), for doctor's no-learning warning. unanswered: items the
+	// model gave no usable op even after the coverage retry; like rejected ones they stay leased until expiry.
+	const outcome = { status: "completed", items: lease.items.length, completed: 0, rejected: 0, retained: lease.items.length, unanswered: lease.items.length - results.size, dropped_ops: dropped, ...(retryFailed ? { retry_failed: retryFailed } : {}), ...replayed, codes: {}, applied: {}, receipts: [] };
 	const kindOf = new Map(lease.items.map((i) => [i.item_id, i.kind]));
 	for (const [itemId, sent] of results) {
 		if (clock() > deadline) { outcome.status = "lease_short"; break; }
@@ -310,9 +340,6 @@ export async function batch({ runner, config = loadConfig(), server = mcpJob(con
 	writePrivate(file, JSON.stringify(report));
 	return report;
 }
-
-/** A lease that may be followed by another in the same run: none was open, or the server settled every leased item (none rejected or retained). */
-export const leaseClean = (r) => r?.status === "idle" || (r?.status === "completed" && r.rejected === 0 && r.retained === 0);
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
 /** The previous run's report, or null when missing or unreadable (a damaged file never stops the batch). */
