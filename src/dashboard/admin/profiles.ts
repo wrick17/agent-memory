@@ -7,15 +7,15 @@ export function profilesPages(am: Am): void {
 	const chip = (parent: Node, text: string, cls = "") => el("span", parent, text).setAttribute("class", `chip${cls ? ` ${cls}` : ""}`);
 	const batchRow = (p: string): [string, string, boolean?] => {
 		const b = am.batches.get(p);
-		if (!b || b instanceof Error) return ["Daily batch", `Unavailable${b ? `: ${b.message}` : ""}`, true];
+		if (!b || b instanceof Error) return ["Batch", `Unavailable${b ? `: ${b.message}` : ""}`, true];
 		const s = b.last_status;
 		const last = s ? `last ${s.status === "stuck" ? "parked" : "skipped"} ${day(s.at)} (${s.reason ?? "no reason"})` : "no skip or park recorded";
-		return ["Daily batch", `Last lease ${day(b.last_lease_at)}; ${last}`];
+		return ["Batch", `Last lease ${day(b.last_lease_at)}; ${last}`];
 	};
 
 	const home = (view: Node) => {
 		const h = el("h2", view, "Profiles"), version = am.pageVersion;
-		intro(view, "Profiles", "profiles", "Each profile's status, devices, daily batch and recent changes. Open one for its devices and its pages.");
+		intro(view, "Profiles", "profiles", "Each profile's status, devices, batch and recent changes. Open one for its devices and its pages.");
 		// Account-wide facts from bounded reads: the recovery status (with the last export) and the first page of the review list.
 		const acct = el("dl", view);
 		acct.setAttribute("aria-label", "Account summary");

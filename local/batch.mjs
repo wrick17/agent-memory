@@ -1,4 +1,4 @@
-// The confined daily maintenance batch (section 12), run inside the capture run that holds the machine lock. It reuses that
+// The confined maintenance batch (section 12), run inside each capture run that holds the machine lock. It reuses that
 // run's confined runtime, so nothing is leased unless this run's positive controls passed and every probe was `denied`.
 // Per profile: lease through the job token's `maintenance_next`, judge the items in `codex exec` (one profile per prompt,
 // items on stdin), then send each item's ops through `maintenance_complete`. Anything that fails leaves the items leased;
@@ -216,7 +216,7 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 	const asked = clock();
 	const lease = await call(server, "maintenance_next", { profile, limit: LEASE.limit, lease_seconds: LEASE.seconds, request_id: requestId },
 		{ clock, sleep, leaseEnd: asked + LEASE.seconds * 1000 });
-	if (!lease.lease_id) return lease.reason === "lease_expired" ? { status: "lease_expired", next_allowed_at: lease.next_allowed_at ?? null } : { status: "idle", next_allowed_at: lease.next_allowed_at ?? null };
+	if (!lease.lease_id) return { status: lease.reason === "lease_expired" ? "lease_expired" : "idle" };
 	const leaseEnd = Date.parse(lease.lease_until), replayed = lease.replayed === true ? { replayed: true } : {};
 	const job = (args) => call(server, "maintenance_complete", { profile, lease_id: lease.lease_id, ...args }, { clock, sleep, leaseEnd });
 	const skipped = async (reason, fatal = false) => {
@@ -269,7 +269,8 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 }
 
 /**
- * The daily batch for the configured profiles, at most once per profile per day (the server's 20-hour gate). `runner` is the
+ * The batch for the configured profiles: one lease per profile per run, whenever it has open items (no cooldown since 2026-11-12;
+ * the next run takes the rest, so a run never holds the machine lock for long). `runner` is the
  * capture run's confined runtime: without `available` (a failed control or a probe that was not `denied`) nothing is leased, no
  * model runs, and each profile only reports its content-free skip reason. `trigger` is what started the run: "hook" (a client
  * hook) or "scheduled" (`run --scheduled`). The outcome, codes and counts only, goes to batch/last.json (mode 600).

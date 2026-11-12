@@ -1,7 +1,7 @@
 // health (H1): the deterministic cron health_sweep and its reads. It never calls a model and never changes records.
 // Health rows outlive a profile wipe, so every detail is a fixed template filled only with ids, counts and times.
 import { listClientStatus } from "./client-status";
-import { BATCH_GAP_MS, SEMANTIC_MS } from "./profile/store";
+import { SEMANTIC_MS } from "./profile/store";
 import type { ClientStatusBody, ClientStatusRow, ConsolidationRow, HealthCheck, HealthCheckId, HealthReport, LeaseFacts, ProfileSnapshotPart, SweepInput, Verdict } from "./viewer/types";
 
 const HOUR = 3_600_000;
@@ -14,19 +14,17 @@ export function leaseFacts(sql: SqlStorage, now: string): LeaseFacts {
 		max(CASE WHEN lease_until >= ? THEN lease_until END) AS open_until FROM maintenance WHERE state = 'leased'`, now, now).one();
 	// Work waiting for a batch: open items and expired leases, which the next lease takes back.
 	const waiting = sql.exec<{ since: string | null }>("SELECT min(created_at) AS since FROM maintenance WHERE state = 'open' OR (state = 'leased' AND lease_until < ?)", now).one().since;
-	const lastLease = sql.exec<{ at: string | null }>("SELECT max(last_run_at) AS at FROM cursors WHERE stage = 'maintenance_batch'").one().at;
 	const skip = sql.exec<{ last_run_at: string | null; stats: string | null }>("SELECT last_run_at, stats FROM cursors WHERE stage = 'batch_status'").toArray()[0];
 	const skipStatus = skip?.stats ? (JSON.parse(skip.stats) as { status?: unknown }).status : undefined;
 	// The newer of the last completed item and the last recorded skip or park decides the outcome.
 	const skipped = (skipStatus === "batch_skipped" || skipStatus === "stuck") && skip?.last_run_at && (!done || skip.last_run_at > done) ? skipStatus : null;
-	const gate = lastLease ? new Date(Date.parse(lastLease) + BATCH_GAP_MS).toISOString() : null;
 	return {
 		last_completed_at: done,
 		last_outcome: skipped ?? (done ? "completed" : null),
 		expired_leases: leases.expired,
 		open_lease_until: leases.open_until,
-		// When the next lease may take waiting work: when work started waiting, or the 20-hour gate's end if later. Null when nothing waits.
-		next_due_at: waiting && gate && gate > waiting ? gate : waiting,
+		// When work started waiting: the next run's lease takes it (no cooldown since 2026-11-12). Null when nothing waits.
+		next_due_at: waiting,
 	};
 }
 

@@ -177,9 +177,9 @@ describe("dashboard", () => {
 		expect(text(cards[0]!)).not.toMatch(/Records 0|Open work 0/);
 		expect(text(b.view())).toContain("Last backup Taken 30 Oct");
 		expect(text(b.view())).toContain("Waiting in Review 1 migrated records, 1 stopped moves");
-		// The daily batch row shows the server's batch_status as text; a failed read marks only its own card.
-		expect(text(cards[1]!)).toContain("Daily batch Last lease never; last skipped 29 Oct (probe_indeterminate)");
-		expect(text(cards[0]!)).toContain("Daily batch Unavailable: profile store unreachable");
+		// The batch row shows the server's batch_status as text; a failed read marks only its own card.
+		expect(text(cards[1]!)).toContain("Batch Last lease never; last skipped 29 Oct (probe_indeterminate)");
+		expect(text(cards[0]!)).toContain("Batch Unavailable: profile store unreachable");
 		expect(text(cards[1]!)).not.toContain("Unavailable");
 	});
 
