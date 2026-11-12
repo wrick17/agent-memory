@@ -1444,7 +1444,7 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		} finally { process.env.HOME = saved; }
 	});
 
-	it("run --scheduled with nothing queued or due sends its status and returns without a runner, and a batch lease within 20 hours is not due", async () => {
+	it("run --scheduled with nothing queued and no batch profile sends its status and returns without a runner", async () => {
 		const reports = [], server = { ...fakeServer(), status: async (b) => { reports.push(b); } };
 		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [] }));
 		const idle = await am.run({ server, runner: { available: false, run() { throw new Error("no runner"); } }, trigger: "scheduled" });
@@ -1454,9 +1454,8 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		assert.deepEqual(launchctlCalls, process.platform === "darwin" ? [["print", `gui/${process.getuid()}/com.agent-memory.batch.test`]] : []);
 		assert.deepEqual(Object.keys(reports[0]).sort(), ["clients", "hooks", "inject", "last_digest_at", "launchd_loaded", "missing_sources", "oldest_pending_at",
 			"oldest_spool_at", "pending_ranges", "refused_since_last", "spool_bytes", "spool_files", "stuck_ranges"]);
-		am.writePrivate(path.join(am.home(), "batch", "last.json"), JSON.stringify({ at: new Date().toISOString(), profiles: { work: { status: "completed" } } }));
-		assert.equal(am.batchDue({ batch_profiles: ["work"] }), false);
-		assert.equal(am.batchDue({ batch_profiles: ["work", "personal"] }), true);
+		// The batch has no cooldown: a configured batch profile makes every scheduled run drain, so there is no due check to export.
+		assert.equal(am.batchDue, undefined);
 	});
 
 	it("run --scheduled recovers a trigger a crashed run left claimed, instead of returning idle", async () => {
@@ -1470,6 +1469,26 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		assert.equal(r.results["claude-code-stranded.json"].status, "done");
 		assert.ok(server.log.some((b) => b.session.id === "stranded"), "the stranded session was captured");
 		assert.deepEqual(fs.readdirSync(path.join(am.home(), "claimed")), []);
+	});
+
+	it("leases each batch profile once per run: a hook that fires during the batch is captured by a second drain without a second lease", async () => {
+		const first = transcript("first", [claudeLine("user", "We decided to batch once per run.")]), late = transcript("during", [claudeLine("user", "We decided to capture the late hook.")]);
+		const tokenFile = path.join(am.home(), "job-token");
+		am.writePrivate(tokenFile, "job");
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: ["work"], server: "https://memory.example.invalid", token_file: tokenFile }));
+		am.hook("claude-code", JSON.stringify({ session_id: "first", transcript_path: first, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
+		const leases = [], real = globalThis.fetch;
+		globalThis.fetch = async (_url, init = {}) => {
+			const { name, arguments: args } = JSON.parse(init.body).params;
+			if (name === "maintenance_next" && leases.push(args.profile) === 1) am.hook("claude-code", JSON.stringify({ session_id: "during", transcript_path: late, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
+			return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ lease_id: null, items: [], next_allowed_at: null }) }] } }), { status: 200 });
+		};
+		const server = { ...fakeServer(), status: async () => {} }, runner = Object.assign(keepAllRunner(), { classification: "denied", exec: async () => { throw new Error("no model call"); } });
+		try {
+			const r = await am.run({ server, runner, debounceMs: 0 });
+			assert.equal(r.results["claude-code-during.json"].status, "done", "the hook that fired during the batch was drained");
+		} finally { globalThis.fetch = real; }
+		assert.deepEqual(leases, ["work"]);
 	});
 
 	it("run --scheduled drains a hook that fired while its idle status report held the lock", async () => {

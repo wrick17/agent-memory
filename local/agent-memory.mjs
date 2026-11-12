@@ -1169,7 +1169,7 @@ function sweep(now, debounceMs) {
  * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
  * trigger written meanwhile lands in a new queue file and is handled after it.
  */
-async function drain({ server, runner, clock, sleep, debounceMs, trigger }, results) {
+async function drain({ server, runner, clock, sleep, debounceMs, trigger, batched = new Set() }, results) {
 	const config = loadConfig();
 	server ??= httpServer(config);
 	runner ??= await confinedRunner(config).catch(() => null);
@@ -1218,9 +1218,12 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
 		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
-		if (config.batch_profiles?.length) {
+		// One batch per profile per run(): a later drain of the same run (a hook that fired meanwhile) captures but never leases again.
+		const profiles = (config.batch_profiles ?? []).filter((p) => !batched.has(p));
+		if (profiles.length) {
+			for (const p of profiles) batched.add(p);
 			const { batch } = await import("./batch.mjs");
-			results.batch = await batch({ runner, config, clock, trigger });
+			results.batch = await batch({ runner, config, profiles, clock, trigger });
 		}
 		results.status = await sendStatus(config, server, clock());
 	} finally {
@@ -1278,29 +1281,13 @@ export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop"
 	...(config.loop_guard?.enabled === true ? (client ? loopEventsOf(client) : ["claude-code", "codex"].flatMap(loopEventsOf)) : [])])];
 
 /**
- * Whether a configured profile may get a batch lease now. The server allows one lease per profile every 20 hours (BATCH_GAP_MS in
- * src/profile/maintenance.ts); batch/last.json shows when this machine last took one, or the gate time the server last returned.
- * Anything else, including a skipped or failed batch, counts as due.
- */
-export function batchDue(config = loadConfig(), now = Date.now()) {
-	const last = readJson(path.join(home(), "batch", "last.json"), null);
-	const at = Date.parse(last?.at ?? "");
-	return (config.batch_profiles ?? []).some((p) => {
-		const r = last?.profiles?.[p];
-		if (r?.status === "idle") return !(Date.parse(r.next_allowed_at ?? "") > now);
-		const leased = ["completed", "lease_short", "lease_expired", "discarded"].includes(r?.status);
-		return !(leased && now - at < 20 * 3_600_000);
-	});
-}
-
-/**
  * The detached run: one at a time per machine. It stays until every queued trigger is handled, then exits. trigger is "hook"
  * (a client hook started it) or "scheduled" (`run --scheduled` from launchd). A scheduled run with no queued trigger, no claim a
- * crashed run left behind, no spooled batch and no batch due sends its status report and returns "idle" without starting the
- * confined runtime.
+ * crashed run left behind, no spooled batch and no batch profile configured sends its status report and returns "idle" without
+ * starting the confined runtime. The server has no batch cooldown, so a configured batch profile always makes the run drain.
  */
 export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
-	const results = {};
+	const results = {}, batched = new Set();
 	let last = null, idle = null;
 	while (takeLock()) {
 		try {
@@ -1312,11 +1299,11 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 				const synth = await import("./facts-synth.mjs").then((m) => m.synthDue(config, clock()), () => false);
 				// A fact report saved but not yet accepted is retried by any run, whatever the synthesis switch says.
 				const reports = await import("./facts-client.mjs").then((m) => m.hasPending(), () => false);
-				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !batchDue(config, clock()) && !synth && !reports) {
+				if (!starts(qdir).length && !queued(qdir).length && !retained && !spooled && !config.batch_profiles?.length && !synth && !reports) {
 					idle = { status: "idle", trigger, results: { status: await sendStatus(config, server, clock()) } };
 				}
 			}
-			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger }, results);
+			if (!idle) last = await drain({ server, runner, clock, sleep, debounceMs, trigger, batched }, results);
 		} finally { dropLock(); }
 		// A trigger written after the last scan (or during the idle report) saw the lock and started no run of its own: take the lock back for it.
 		const qdir = path.join(home(), "queue");

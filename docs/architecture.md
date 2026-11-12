@@ -22,7 +22,7 @@ v2 status, 2026-11-04: the behaviour in the [v2 summary](#v2-summary-2026-11-04)
 | Embeddings | Workers AI `@cf/qwen/qwen3-embedding-0.6b` into Vectorize from day one, one namespace per (user, profile, generation), with generation-qualified vector ids, so a generation can only replace or delete its own vectors. Generation ids are random and reserved in an R2 ledger that no restore rolls back, so no restore or drill reuses one. Vectorize is a rebuildable index: after any restore the profile re-embeds from stored text. Switchable off for FTS5-only recall. |
 | Auth | Clerk is the OAuth authorization server. The Worker verifies JWTs locally against Clerk's published signing keys, cached. Revocable device tokens for headless machines and the local run. |
 | Capture | `Stop` after each turn is the main trigger, debounced and deduplicated by session id plus transcript position. `SessionEnd` and a `SessionStart` sweep recover anything missed. The detached run reads the complete new transcript locally and uploads only bounded, redacted digests per immutable input range: first a keyword-based heuristic digest, then consolidated digest parts from a local model pass over the complete range in the confined runtime, each part bounded and covering one source subrange. Whole messages never leave the machine. A range counts as captured only when every part and a completeness manifest that tiles the range are stored; until then it stays `pending` with its text kept locally. v2 adds `PreCompact` capture, a daily scheduled run and a content-free status report (section 10). |
-| Cleanup | Agents consolidate inline at task end and in a daily batch (`codex exec`: Luna for mechanical work, Terra for judgment). The batch runs in a confined runtime: tools off, and a sandbox profile with no reads of home, temp or mounted folders and no network. Classified probes with known inputs prove the denial before every run. Any other probe result skips the batch, and its queue waits for inline work. The server only computes which records need attention, and runs TTL, purge, exact dedupe and size caps, all logged with undo. |
+| Cleanup | Agents consolidate inline at task end and in a batch on each capture run while review items wait (`codex exec`: Luna for mechanical work, Terra for judgment). The batch runs in a confined runtime: tools off, and a sandbox profile with no reads of home, temp or mounted folders and no network. Classified probes with known inputs prove the denial before every run. Any other probe result skips the batch, and its queue waits for inline work. The server only computes which records need attention, and runs TTL, purge, exact dedupe and size caps, all logged with undo. |
 | Profiles and `me` | Profiles separate default project context and let the owner wipe `work` on its own. Default recall reads the routed profile and `me`. Real links may cross profiles and keep their endpoint, reason and evidence through moves; the owner can explore them explicitly, and a scoped token sees only an opaque id for a target it cannot read. The calling agent selects the profile. Storage checks only that the named profile is active and allowed, and never classifies content as work or personal or reroutes an explicit choice (issue #3). Nothing enters `me` unless the caller selects it, and a guard on every path into `me` refuses other people and personal contact fields. Moves use a fenced transfer protocol. |
 | Wipe | An owner-only wipe of a profile (built for `work`) closes it, deletes its stores, vectors, corpus, exports and migration-archive part, and purges every work-origin copy in other profiles by provenance. The only survivors are accepted company-free `me` preferences and opaque backlinks. A permanent tombstone stops any restore or import from bringing it back. |
 | Retention | Unused captures archived after 90 days. Archive purged after 300 days. |
@@ -148,7 +148,7 @@ The replacement must serve several machines and three agent clients at once, kee
 3. **Profiles separate context and allow deletion.** Profiles keep each project context's defaults apart and let the owner wipe `work` on its own. Default recall reads only the routed profile and `me`. Real links may cross profiles, and a scoped device token never sees a target it cannot read. Colleagues live only in `work`.
 4. **No agency on the server, and no GitHub or Jira.** The server never edits or deletes by judgment, never syncs, and holds no GitHub or Jira credentials.
 5. **BothQ stays the system of record until cutover.** Nothing writes to both systems.
-6. **Nothing recurring on the owner's machine** beyond what runs while agents run. Capture hooks are inherent to agent use, and the daily batch rides on the first capture run of the day.
+6. **Nothing recurring on the owner's machine** beyond what runs while agents run. Capture hooks are inherent to agent use, and the batch rides on every capture run while review items wait. Owner decision, 2026-11-12: the 20-hour cooldown is gone so a backlog, such as a historical backfill, drains faster. The model cost is local Codex usage; the per-lease limits below are batch sizing, not a rate limit.
 
 BothQ contracts carried over: UUID5 stable ids that survive renames and moves; snapshot revisions for save, update, retire and supersede, and delta revisions for append; `request_id` stores the operation, payload hash and result, and reuse with a different payload returns `idempotency_mismatch`; `expected_revision` returns `revision_conflict` on mismatch; `supersedes` retires older records atomically; procedural memories need an objective and ordered steps; captures never appear in ordinary recall; recall uses exact and literal boosts, full text, vectors, RRF k=60, 700-character passages, and a token cost of JSON length divided by 4; redaction runs before persistence. Section 7 lists every place the tools differ from BothQ.
 
@@ -324,7 +324,9 @@ Content-Type: application/json
   "marker": { "head": "9f2c1ab", "as_of": "2026-10-28T11:40:00Z" } }
 ```
 
-### The daily maintenance batch
+### The maintenance batch
+
+Each capture run that reaches the batch takes one lease per configured profile whenever open items exist: up to 40 items for up to 900 seconds, at most 10 ops per item and 3 attempts per item. There is no cooldown since 2026-11-12 (owner decision, for faster catch-up); the next run takes the rest, so no run holds the machine lock for long and capture keeps flowing. An empty lease returns `next_allowed_at: null`, kept for older runners.
 
 ```json
 { "name": "maintenance_next", "arguments": { "profile": "work", "limit": 20 } }
@@ -1008,7 +1010,7 @@ Graph reads have work budgets, not only output caps: `explore` reads at most 200
 
 | Tool | Input | Output | Contract |
 |---|---|---|---|
-| `maintenance_next` | `profile`, `kinds`, `limit` (up to 40), `lease_seconds` (up to 900) | `lease_id`, `lease_until`, `items[]` with `kind`, `subjects`, `context` (passages, current edges, candidate pairs) and `allowed_ops`; or an empty list with `next_allowed_at` | Leases open items. Returns nothing if this profile already ran a batch in the last 20 hours. An expired lease returns its items to the queue. |
+| `maintenance_next` | `profile`, `kinds`, `limit` (up to 40), `lease_seconds` (up to 900) | `lease_id`, `lease_until`, `items[]` with `kind`, `subjects`, `context` (passages, current edges, candidate pairs) and `allowed_ops`; or an empty list with `next_allowed_at: null` | Leases open items whenever any exist; there is no cooldown (2026-11-12). An expired lease returns its items to the queue. |
 | `maintenance_complete` | `lease_id`, `results[]` of `{item_id, ops[], outcome}` | per item `applied`, `flagged`, `rejected` with reasons | Ops are `save`, `link`, `end_link`, `supersede`, `compact`, `infer_preference`, `promote_to_me`, `flag`, `dismiss`, and, since PR #132, `record_lesson` and `record_decision` ([lessons and decisions](#lessons-and-decisions-from-digests-126)). Each op must stay within its item's subjects. Ops go through the normal write path with actor `maintenance`. Changes to protected nodes become flags. `promote_to_me` must carry `company_free: true` and passes the `me` guard. |
 
 `/v1/ingest` (scope `ingest`) takes the upload shown in section 2. `GET /v1/markers?repo=` returns the repo marker, the capture cursors the server has acknowledged, and the daily-slot flags. Both are REST for shell-friendliness. They build the same `WriteCommand` values the MCP tools build.
@@ -1272,7 +1274,7 @@ A lone string argument shows as its bare value only when redaction would leave i
 - **Session facts.** After a `SessionEnd`, ingest batches carry `session.ended: true`, and the flag stays set. They also carry `session.files_changed`, the number of distinct files the session edited. The CLI counts them locally from Claude Code Edit, Write, MultiEdit and NotebookEdit calls and from Codex apply_patch headers and file-change events. It keeps only hashes of the paths and uploads only the number.
 - **Status report.** Each run ends with `POST /v1/status`: counts, times, booleans, hook names and client versions. It sends no paths, session ids or text. Against an older Worker the report fails quietly and capture continues.
 - **Daily job.** On macOS, `install` writes a launchd plist and prints its `launchctl bootstrap` command. It never loads the job. The job runs the installing Node binary with the installed CLI and sets `AGENT_MEMORY_HOME` and the installer's `PATH`, because launchd passes on neither. A home other than `~/.agent-memory` gets the label `com.agent-memory.batch.test`, so a test job never replaces the everyday one.
-- **Scheduled run.** `run --scheduled` takes the machine lock. When nothing is queued, claimed by a crashed run or spooled, and no profile is due for a batch, it sends the status report, releases the lock and checks the queue again. It returns `idle` only when nothing is left. Otherwise it recovers crashed claims, drains captures and runs the batch, even on a day with no sessions.
+- **Scheduled run.** `run --scheduled` takes the machine lock. When nothing is queued, claimed by a crashed run or spooled, and no batch profile is configured, it sends the status report, releases the lock and checks the queue again. It returns `idle` only when nothing is left. Otherwise it recovers crashed claims, drains captures and runs the batch, even on a day with no sessions.
 - **Claim safety.** When a claimed trigger goes back to the queue, only `EEXIST` counts as a newer trigger. Any other link error, such as `ENOSPC`, keeps the claim and fails the run, and the next run's recovery requeues it.
 - **Batch transport.** A job call that fails to connect or gets a reply cut off mid-body is retried up to three times, after 2, 4 and 8 seconds, within the lease. The arguments never change, and the lease, item and index ids make a retry apply nothing twice. A 4xx, a tool error or a bad reply is final.
 - **Diagnostics.** `agent-memory doctor` checks the token files, the hooks, the launchd job, the spool, local capture state and `whoami`, one line each with a fix. It is read-only, prints no token and never loads the job. `agent-memory backfill [--client claude-code|codex] [--since 30d]` queues triggers for retained transcripts whose cursor is behind. It reads file sizes, prefix hashes and a session's cwd, never message text.
@@ -1465,7 +1467,7 @@ flowchart TD
 	U --> R{"First capture run today for this profile?"}
 	R -->|yes| F["Daily refresh: assigned Jira tickets, open PRs"]
 	F --> Q
-	R -->|no| Q{"Daily batch due for this profile?"}
+	R -->|no| Q{"Batch profiles configured?"}
 	Q -->|yes| B["maintenance_next, locked-down codex exec (Luna, Terra), maintenance_complete"]
 	Q -->|no| E["Exit"]
 	B --> E
@@ -1477,7 +1479,7 @@ Owner scope, 2026-10-31: proactive PR and Jira acquisition is out of product sco
 - **Jira context (work only).** Ticket keys come from digests, branch names, commits and PR titles. Per the owner's `jira-connector` rule, only the `~/.claude` work account reaches Jira, so the run calls Claude Code headless on that account with Sonnet, a Jira-only MCP config (`--strict-mcp-config`), only the Jira read tools allowed, and every other tool disallowed. It runs from an empty directory and returns JSON for at most 20 tickets. The run validates the JSON against a schema before upload.
 - **Checkout analyses (Paid corpus only).** Once per repo per day. Section 14.
 - **Daily refresh (default on).** On the first capture run of the UTC day for a profile, the run uploads assigned open Jira tickets (work) and open PRs authored by or awaiting review from the owner (`gh search prs --author @me` and `--review-requested @me`, scoped to the profile's orgs). The server claims the profile's daily slot atomically, so two machines never both run it. `daily_refresh = false` in `~/.agent-memory/config.toml` turns it off.
-- **Daily maintenance batch.** Section 12.
+- **Maintenance batch.** Section 12: one lease per profile on every capture run while items wait.
 - **Spool.** Failed uploads stay in `~/.agent-memory/spool/` (at most 1,000 files or 64 MiB, the BothQ bounds) and replay on the next run. The spool holds digests and upload items only.
 
 The run exits when its steps finish. Nothing stays resident. v2 adds one scheduled entry point, a daily launchd job that `install` writes but never loads (v2 run additions above).
@@ -1618,7 +1620,7 @@ Deployed 11 Nov 2026 from PR #132. The daily batch learns two more kinds of reco
 
 ### The daily batch runs confined, or not at all
 
-The batch takes at most one lease per profile per day and never mixes profiles in one prompt. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
+The batch takes at most one lease per profile per capture run and never mixes profiles in one prompt. Captured text is untrusted, so the model that reads it must be unable to reach anything else. Rejecting tool events after a run is too late: a file read by a tool has already entered the model's context. So the runtime is confined before the model starts, the confinement is proved by probes on every run, and the batch is skipped when the proof fails.
 
 ```toml
 # $codex_home/config.toml, written fresh for each run (a throwaway CODEX_HOME). Checked against Codex CLI 0.165.0 on
@@ -2399,7 +2401,7 @@ Added by the owner priority of 2026-10-29. It makes the existing memory availabl
 			- The per-run positive controls and the same-run rule above (every classified filesystem and network probe `denied`) stay. Runtime and config notices and unknown events still fail closed. The actual model's acceptance of the changed batch schema and a genuine scoped job-token and server flow remain separate requirements.
 			- A genuine real-model adversarial canary is supporting evidence; the model is not required to volunteer a command.
 			- Status, 2026-10-29: OPEN. The real sandbox controls and the four denial probes passed on the recorded production config. P3's stderr path passed an independent source review, the 75 local tests and an exact recorded CLI replay into a real isolated Worker that parked the item as stuck with no item operation. P1 (production provider and catalog equivalence and the effective tool exposure) is unproved, so the gate is not passed.
-		- The batch runs at most once per profile per day and never mixes profiles.
+		- The batch takes at most one lease per profile per capture run and never mixes profiles.
 	- Cleanup: undo round-trips for every op type. Protected nodes are only flagged.
 	- Transfers:
 		- Appends during a transfer get `moving` and land in the target afterwards.

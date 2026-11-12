@@ -681,7 +681,7 @@ describe("owner API", () => {
 		expect(shown.status).toBe(200);
 		expect(shown.body).toMatchObject({ last_status: { status: "batch_skipped", reason: "probe_indeterminate", items: 0 } });
 		// The owner's read-only preview of the next normal lease rides on the same owner-only route; a skip leased nothing.
-		expect(shown.body.next_preview).toMatchObject({ observation: "not_a_lease", lease_id: null, cooldown: { status: "open", next_allowed_at: null }, parks_as_stuck: [] });
+		expect(shown.body.next_preview).toMatchObject({ observation: "not_a_lease", lease_id: null, parks_as_stuck: [] });
 		expect(shown.body.last_lease_at).toBeNull();
 		const reader = (await deviceToken(`batch-preview-reader-${Date.now()}`, ["read"], ["work"], "work")).token;
 		expect((await get("/api/profiles/work/batch", reader)).status).toBe(403);
