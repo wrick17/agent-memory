@@ -262,7 +262,15 @@ export function mapTab(am: Am): void {
 			moveTo(fitTo({ x: x0 - 40, y: y0 - 40, w: x1 - x0 + 80, h: Math.min(y1 - y0, 1100) + 80 }, MIN_ZOOM));
 		};
 		const unselect = () => { open.pop(); side.hidden = true; if (open.length) select(open.at(-1)!, true); else { draw(); moveTo(fitTo(bounds, MIN_ZOOM)); } };
+		/** What the open panel shows: the record's update time and each linked record's, or the listed small ones. */
+		const detailSigOf = (key: string) => {
+			const it = lib.items.get(key), other = top.find((t) => t.key === key && t.other);
+			const linked = [...((lib.links.get(key) ?? new Map()) as Map<string, unknown>).keys()].map((k) => `${k}@${lib.items.get(k)?.updated ?? ""}`).sort().join("|");
+			return `${key}:${it?.updated ?? ""}:${linked}:${other ? other.other.map((o: J) => `${o.key}@${o.updated ?? ""}`).join("|") : ""}`;
+		};
+		let detailSig = "";
 		const showDetail = (key: string) => {
+			detailSig = detailSigOf(key);
 			const it = lib.items.get(key), other = top.find((t) => t.key === key && t.other);
 			side.hidden = false;
 			if (other) {
@@ -413,6 +421,9 @@ export function mapTab(am: Am): void {
 				else if (known) select(last, true);
 				else { cam = fitTo(bounds, MIN_ZOOM); apply(); }
 			} else if (!placed) { cam = fitTo(bounds, MIN_ZOOM); apply(); }
+			// A refresh that changed the open record or its links redraws the panel beside the canvas.
+			const last = open.at(-1);
+			if (last && !side.hidden && !lib.loading && detailSigOf(last) !== detailSig) showDetail(last);
 		};
 		paint();
 		return h;

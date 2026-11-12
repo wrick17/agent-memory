@@ -107,11 +107,12 @@ export function shell(win: any): void {
 		const route = win.location.hash, version = am.pageVersion;
 		for (const b of am.pageButtons) b.disabled = true;
 		if (am.pageMsg) am.pageMsg.textContent = `Working: ${what}…`;
-		let out: { text: string; undo?: string };
-		try { out = done(await (typeof path === "string" ? call(path, "POST", data) : path())); } catch (err) { out = { text: `Could not ${what}: ${why(err)}.` }; }
+		let out: { text: string; undo?: string }, ok = false;
+		try { out = done(await (typeof path === "string" ? call(path, "POST", data) : path())); ok = true; } catch (err) { out = { text: `Could not ${what}: ${why(err)}.` }; }
 		acting = false;
 		outcomes.set(route, out);
 		if (version === am.pageVersion) { render(false); am.pageMsg?.focus(); }
+		if (ok) am.resync?.(); // the write changed the records: read the library again so lists and pages show it
 	};
 	const undoOf = (profile: string, r: J) => Number.isSafeInteger(r?.activity_id) && r.activity_id > 0 ? `/api/profiles/${enc(profile)}/activity/${r.activity_id}/undo` : undefined;
 	/** The page's status line, showing the last outcome on this page and its Undo. */

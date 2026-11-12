@@ -92,10 +92,10 @@ export function storeTab(am: Am): void {
 
 	// ---- Live: the library reads itself again every two minutes while the tab is visible and online. A fresh read fills
 	// beside the shown one and replaces it whole, so nothing flickers; the header dot says live, paused or failed. ----
-	let lastSync: string | null = null, syncing = false, syncStarted = false;
+	let lastSync: string | null = null, syncing = false, syncStarted = false, again = false;
 	const visible = () => am.doc.visibilityState !== "hidden" && win.navigator?.onLine !== false;
 	const resync = async () => {
-		if (syncing) return;
+		if (syncing) { again = true; return; } // a write landed mid-read: read once more after this one
 		if (!visible()) { am.setSync?.({ state: "paused", at: lastSync }); return; }
 		syncing = true;
 		try {
@@ -114,6 +114,7 @@ export function storeTab(am: Am): void {
 			am.setSync?.({ state: "live", at: lastSync });
 		} catch { am.setSync?.({ state: "error", at: lastSync }); }
 		syncing = false;
+		if (again) { again = false; void resync(); }
 	};
 	const startSync = () => {
 		if (syncStarted) return;
