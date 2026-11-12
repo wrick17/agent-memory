@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { launchdLabel, loadCommand, plist, plistPath } from "./launchd.mjs";
 
-export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024, sweep: 64 };
+export const LIMITS = { part: 8192, sub: 32768, floor: 2048, ask: 160, item: 280, attempts: 3, spoolFiles: 1000, spoolBytes: 64 * 1024 * 1024, sweep: 64, digests: 64 };
 const DEBOUNCE_MS = 45_000, DEBOUNCE_MAX_MS = 600_000, PENDING_SOURCE_DAYS = 7, EPOCH_BYTES = 4096;
 const CLIENTS = new Set(["claude-code", "codex"]);
 // The consolidation rules' revision. A range stuck under an older revision is retried once by the sweep, then stamped.
@@ -1026,10 +1026,13 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 		try {
 			const session = sessionOf();
 			const fresh = result.parts.filter((p) => !p.remote);
-			if (fresh.length) {
-				const up = await server.ingest({ session, ...where, digests: fresh.map((p) => ({ range_id: id, capture_status: "consolidated", part_id: p.part_id, sha256: p.sha256, body: p.body })), manifests: [] });
-				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { Object.assign(r, { status: "stuck", reason: up.find((x) => x.status === "refused")?.reason, digest_rev: DIGEST_REV }); outcomes[id] = "stuck"; tally.refused++; continue; }
+			// The server caps one batch at LIMITS.digests (src/api.ts ingestSchema); a rerun adopts parts an earlier batch stored.
+			let refusedPart = false;
+			for (let i = 0; i < fresh.length && !refusedPart; i += LIMITS.digests) {
+				const up = await server.ingest({ session, ...where, digests: fresh.slice(i, i + LIMITS.digests).map((p) => ({ range_id: id, capture_status: "consolidated", part_id: p.part_id, sha256: p.sha256, body: p.body })), manifests: [] });
+				if (!up.every((x) => x.status === "stored" || x.status === "replayed")) { refusedPart = true; Object.assign(r, { status: "stuck", reason: up.find((x) => x.status === "refused")?.reason, digest_rev: DIGEST_REV }); outcomes[id] = "stuck"; tally.refused++; }
 			}
+			if (refusedPart) continue;
 			const m = await server.ingest({ session, ...where, digests: [], manifests: [{ range_id: id, parts: result.parts.map(({ part_id, sha256 }) => ({ part_id, sha256 })) }] });
 			if (m[0]?.status !== "stored" && m[0]?.status !== "replayed") { r.reason = m[0]?.reason; outcomes[id] = "pending"; continue; }
 		} catch (e) { if (refusedBy(e)) refuse(id, r, e); else outcomes[id] = "offline"; continue; }

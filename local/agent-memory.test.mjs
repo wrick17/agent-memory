@@ -326,6 +326,21 @@ describe("capture protocol", () => {
 		assert.equal(r.consolidated_to, fs.statSync(f).size);
 	});
 
+	it("uploads a range with more parts than one batch allows in batches the server accepts", async () => {
+		const f = transcript("many-parts", Array.from({ length: 260 }, (_, i) => claudeLine("user", `Rule ${i}: keep \`m-${i}\` on. ${"pad ".repeat(2200)}`)));
+		const server = fakeServer(), realIngest = server.ingest, sizes = [];
+		server.ingest = async (batch) => {
+			sizes.push(batch.digests.length);
+			if (batch.digests.length > am.LIMITS.digests) throw Object.assign(new Error("HTTP 400"), { status: 400 });
+			return realIngest(batch);
+		};
+		const r = await am.processSession(trigger("claude-code", "sess-many", f), { server, runner: keepAllRunner() });
+		assert.ok(server.parts.size > am.LIMITS.digests, `${server.parts.size} parts`);
+		assert.ok(sizes.every((x) => x <= am.LIMITS.digests));
+		assert.equal(r.consolidated_to, fs.statSync(f).size);
+		assert.ok(Object.values(r.outcomes).every((o) => o === "consolidated"));
+	});
+
 	it("settles a session the server refuses (HTTP 403): nothing spooled or retried, no local text kept, and replay goes past it", async () => {
 		const server = fakeServer(), ingest = server.ingest, state = server.state;
 		const deny = () => Promise.reject(Object.assign(new Error("HTTP 403"), { status: 403 }));
