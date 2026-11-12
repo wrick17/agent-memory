@@ -10,7 +10,8 @@ import { settingsMain } from "../src/settings";
 import wranglerConfig from "../wrangler.jsonc?raw";
 import { listExports } from "../src/backup";
 import { nextSeq } from "../src/storage";
-import { call, contextFor, deviceToken, outcome, registered } from "./helpers";
+import type { ProfileStore } from "../src/profile/store";
+import { call, contextFor, deviceToken, drainEmbeddings, outcome, registered } from "./helpers";
 
 let keys: CryptoKeyPair;
 const KID = "test-key-1";
@@ -1183,8 +1184,13 @@ describe("owner page reads", () => {
 	});
 });
 
-it("staged archive owner transport preserves start replay bytes, exposes status, binds refusals and hands large Undo to the same operation",async()=>{
+it("staged archive owner transport preserves start replay bytes, exposes status, binds refusals and hands large Undo to the same operation",async({onTestFinished})=>{
 	const c=await contextFor(),tag=crypto.randomUUID();
+	// This case drives the cursor by HTTP, and a background alarm resuming the same operation would make its cursor stale (409).
+	// The alarm transport has its own tests, so this instance's alarm is paused here and restored afterwards.
+	const archiveRef=c.account.profiles.find(p=>p.profile==="personal")!;
+	const alarm=await runInDurableObject(env.PROFILE.get(env.PROFILE.idFromName(`${archiveRef.userId}:personal:${archiveRef.generation}`)),(instance:ProfileStore)=>vi.spyOn(instance,"alarm").mockResolvedValue());
+	onTestFinished(()=>{alarm.mockRestore();});
 	const saved=await call<{memory_id:string}>(c,"save_memory",{name:`staged owner ${tag}`,type:"reference",description:"synthetic",content:"owner transport body",profile:"personal"});
 	serveJwks();const token=await jwt({aud:undefined,scope:undefined,azp:env.DASHBOARD_ORIGIN}),origin=new URL(env.RESOURCE_URL).origin;
 	const http=async(path:string,method="GET",body?:unknown,t=token)=>{const r=await exports.default.fetch(new Request(origin+path,{method,headers:{authorization:`Bearer ${t}`,"content-type":"application/json"},...(body===undefined?{}:{body:JSON.stringify(body)})}));return {status:r.status,body:await r.json() as any};};
@@ -1499,23 +1505,16 @@ describe("v2 health vector count (#11)", () => {
 		const vectors = async () => ((await (await exports.default.fetch(new Request(`${origin}/api/health`, { headers: { authorization: `Bearer ${session}` } }))).json()) as { search: { vectors: number } }).search.vectors;
 		const c = await contextFor(), ref = c.account.profiles.find((p) => p.profile === "test")!, tag = crypto.randomUUID().slice(0, 8);
 		// The total covers every profile of the account, and earlier cases leave memories waiting to embed. An alarm firing inside
-		// the comparison (this case's own writes arm the test profile's) would embed them and move the total. Every due alarm runs
-		// to completion first, until the stores are quiet, so only the two writes below are compared; the comparison stays exact.
-		// An alarm the runtime has already started holds no stored alarm, so each profile is first evicted, which waits for its
-		// in-flight work to drain, before its stored alarm is read.
+		// the comparison (this case's own writes arm the test profile's) would embed them and move the total. Each profile is first
+		// evicted, which waits for an alarm already running to drain; then its waiting cards are embedded in place and no alarm is
+		// left armed, so only the two writes below are compared and the comparison stays exact. Background scheduling is not under
+		// test here.
 		const stubs = c.account.profiles.map((r) => env.PROFILE.get(env.PROFILE.idFromName(`${r.userId}:${r.profile}:${r.generation}`)));
 		const quiet = async () => {
-			for (let pass = 0; pass < 10; pass++) {
-				let ran = false;
-				for (const stub of stubs) for (let i = 0; i < 20; i++) {
-					if (i === 0) await evictDurableObject(stub).catch(() => undefined); // rejects only when the object is not running
-					const at = await runInDurableObject(stub, (_i, st) => st.storage.getAlarm());
-					if (at === null || at > Date.now() + 30_000) break;
-					ran = (await runDurableObjectAlarm(stub)) || ran;
-				}
-				if (!ran) return;
+			for (const stub of stubs) {
+				await evictDurableObject(stub).catch(() => undefined); // rejects only when the object is not running
+				await drainEmbeddings(stub);
 			}
-			throw new Error("the stores did not quiesce");
 		};
 		await quiet();
 		const before = await vectors();

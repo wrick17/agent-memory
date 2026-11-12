@@ -3,13 +3,14 @@
 // on the lexical, vector and hybrid channels, and scores them with local/eval-score.mjs, the CLI's scorer. It fails when lexical
 // recall_all_at_k drops below the recorded baseline. `npm run eval:baseline` records the baselines; they only rise.
 // Synthetic records and the fake bag-of-words embeddings of test/fakes.js: no live provider, and not a semantic-quality result.
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { expect, inject, it } from "vitest";
 // @ts-expect-error local/ is plain JavaScript without declarations; this is the CLI's own scorer
 import { casesOf, runCases, runSummary } from "../local/eval-score.mjs";
+import worker from "../src/worker";
 import fixture from "./fixtures/eval/synthetic-cases.json";
-import { call, contextFor, deviceToken } from "./helpers";
+import { call, contextFor, deviceToken, drainEmbeddings } from "./helpers";
 
 const PROFILE = "personal", K = 5, CHANNEL_NAMES = ["lexical", "vector", "hybrid"] as const;
 const SOURCE = "synthetic fixture test/fixtures/eval/synthetic-cases.json with the fake embeddings of test/fakes.js; not a live provider or semantic-quality result";
@@ -21,13 +22,12 @@ it("scores the synthetic cases on all three channels, counts no recall hits, and
 	for (const m of fixture.memories) ids.set(m.name, (await call<{ memory_id: string }>(owner, "save_memory", { ...m, profile: PROFILE })).memory_id);
 	const ref = owner.account.profiles.find((p) => p.profile === PROFILE)!;
 	const stub = env.PROFILE.get(env.PROFILE.idFromName(`${ref.userId}:${ref.profile}:${ref.generation}`));
-	// Each alarm embeds at most 16 cards and re-arms while more are due, so one alarm can leave some of the 24 unindexed, and vector
-	// or hybrid scoring would record false misses. Run alarms until every fixture card is embedded; an alarm already in flight reports
-	// ran: false, so wait briefly for it. Bounded, and asserted before any scoring.
-	const unembedded = () => runInDurableObject(stub, (_i, s) => [...ids.values()].filter((id) =>
+	// Each alarm embeds at most 16 cards, so one alarm can leave some of the 24 unindexed, and vector or hybrid scoring would record
+	// false misses. Every fixture card is embedded first, by awaited alarm runs, and asserted before any scoring.
+	await drainEmbeddings(stub);
+	const unembedded = await runInDurableObject(stub, (_i, s) => [...ids.values()].filter((id) =>
 		!s.storage.sql.exec("SELECT 1 FROM nodes WHERE id = ? AND status = 'active' AND embed_hash = card_hash", id).toArray().length));
-	for (let i = 0; i < 50 && (await unembedded()).length; i++) if (!(await runDurableObjectAlarm(stub))) await new Promise((r) => setTimeout(r, 20));
-	expect(await unembedded(), "fixture cards still waiting for an embedding").toEqual([]);
+	expect(unembedded, "fixture cards still waiting for an embedding").toEqual([]);
 	const idOf = (name: string) => {
 		const id = ids.get(name);
 		if (!id) throw new Error(`the fixture names no record called ${name}`);
@@ -38,9 +38,11 @@ it("scores the synthetic cases on all three channels, counts no recall hits, and
 		: { ...c, expected: { source_top1: { hosted_memory_id: idOf(c.expected.source_top1.hosted_memory_id) } } })) }, "synthetic-cases.json");
 
 	const { token } = await deviceToken("eval-synthetic-reader", ["read"], [PROFILE], PROFILE);
-	const recall = async (body: object) => {
-		const r = await exports.default.fetch(new Request(new URL("/v1/recall", env.RESOURCE_URL), {
-			method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) }));
+	// With an execution context, the request goes to the handler directly, so the caller can await the hits it records after replying.
+	const recall = async (body: object, exec?: ExecutionContext) => {
+		const req = new Request(new URL("/v1/recall", env.RESOURCE_URL), {
+			method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+		const r = exec ? await worker.fetch(req as Parameters<typeof worker.fetch>[0], env, exec) : await exports.default.fetch(req);
 		if (!r.ok) throw new Error(`POST /v1/recall: HTTP ${r.status} ${await r.text()}`);
 		return r.json() as Promise<{ results: { memory_id: string }[] }>;
 	};
@@ -57,13 +59,11 @@ it("scores the synthetic cases on all three channels, counts no recall hits, and
 		summaries[channels] = { ...runSummary(report, PROFILE), source: SOURCE };
 	}
 	// One counted recall afterwards: once its hits land, recall_daily holds exactly its own rows, so the eval runs added none.
-	const control = await recall({ keyword: "Moonbeam", profile: PROFILE, limit: K });
+	const exec = createExecutionContext();
+	const control = await recall({ keyword: "Moonbeam", profile: PROFILE, limit: K }, exec);
 	expect(control.results.length).toBeGreaterThan(0);
-	let after = before;
-	for (let i = 0; i < 50 && after.daily === before.daily; i++) {
-		await new Promise((r) => setTimeout(r, 100));
-		after = await hits();
-	}
+	await waitOnExecutionContext(exec);
+	const after = await hits();
 	expect(before).toEqual({ daily: "[]", totals: "[]" });
 	expect((JSON.parse(after.daily) as [string, string, number][]).map(([id, , n]) => [id, n]).sort())
 		.toEqual(control.results.map((r) => [r.memory_id, 1]).sort());

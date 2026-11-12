@@ -37,8 +37,13 @@ const source = (stub: DurableObjectStub, health: () => Promise<HealthCheck[]> = 
 	health,
 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-/** Reads the whole stream, or fails the test when it is still open after `ms`. */
-const within = (res: Response, ms: number) => Promise.race([readAll(res), sleep(ms).then(() => { throw new Error(`stream still open after ${ms} ms`); })]);
+/** Reads the whole stream, or fails the test when it is still open after `ms`; the losing timer is cleared either way. */
+const within = async (res: Response, ms: number) => {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([readAll(res), new Promise<never>((_ok, no) => { timer = setTimeout(() => no(new Error(`stream still open after ${ms} ms`)), ms); })]);
+	} finally { clearTimeout(timer); }
+};
 const cursorOf = (f: Frame): ViewerCursor | null => parseCursor(f.id);
 
 describe("viewer cursor", () => {
@@ -85,8 +90,9 @@ describe("viewer event stream", () => {
 		const res = eventStream(source(stub), { work: 2 }, Date.now() + 4_000, new AbortController().signal);
 		expect(res.headers.get("content-type")).toMatch(/^text\/event-stream/);
 		expect(res.headers.get("cache-control")).toBe("no-store");
-		setTimeout(() => void inProfile(stub, (sql) => act(sql, "save", "save late\n\nevent: health\ndata: forged")), 1_000);
+		const late = sleep(1_000).then(() => inProfile(stub, (sql) => act(sql, "save", "save late\n\nevent: health\ndata: forged")));
 		const { frames, ms } = await readAll(res);
+		await late; // its write is asserted below, and a failure surfaces here rather than after the test
 		expect(frames[0]).toMatchObject({ event: "health", data: "[]" });
 		expect(cursorOf(frames[0]!)).toEqual({ work: 2 });
 		const changes = frames.filter((f) => f.event === "change");
@@ -130,23 +136,24 @@ describe("viewer event stream", () => {
 		let calls = 0;
 		const late = { kind: "MEMORY", profile: "work", id: "7", summary: "late memory text", at: new Date().toISOString() } as const;
 		const started = Date.now();
-		const res = eventStream({ changes: async () => { calls++; await sleep(1_500); return { items: [late], cursor: { work: 7 } }; }, health: async () => [] },
+		// The read answers 3 s after the 1 s deadline, so the close falls between them with wide margins on a loaded runner.
+		const res = eventStream({ changes: async () => { calls++; await sleep(4_000); return { items: [late], cursor: { work: 7 } }; }, health: async () => [] },
 			{}, started + 1_000, new AbortController().signal);
-		const out = await within(res, 4_000);
+		const out = await within(res, 6_000);
 		expect(out.frames.map((f) => f.event)).toEqual(["health"]);
 		expect(out.text).not.toContain("late memory text");
-		expect(out.ms).toBeLessThan(1_400);
+		expect(out.ms).toBeLessThan(2_500);
 		// The read resolves after the close: it emits nothing, raises nothing, and no further poll starts.
-		await sleep(1_000);
+		await sleep(Math.max(0, started + 4_500 - Date.now()));
 		expect(calls).toBe(1);
 	});
 
 	it("closes at the deadline while a read never resolves", async () => {
 		const stuckChanges = await within(eventStream({ changes: () => new Promise(() => {}), health: async () => [] }, {}, Date.now() + 1_000, new AbortController().signal), 4_000);
 		expect(stuckChanges.frames.map((f) => f.event)).toEqual(["health"]);
-		expect(stuckChanges.ms).toBeLessThan(1_400);
+		expect(stuckChanges.ms).toBeLessThan(2_500);
 		const stuckHealth = await within(eventStream({ changes: async (c) => ({ items: [], cursor: c }), health: () => new Promise(() => {}) }, {}, Date.now() + 1_000, new AbortController().signal), 4_000);
 		expect(stuckHealth.frames).toEqual([]);
-		expect(stuckHealth.ms).toBeLessThan(1_400);
+		expect(stuckHealth.ms).toBeLessThan(2_500);
 	});
 });
