@@ -1527,6 +1527,26 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		} finally { EDGES.pop(); }
 	});
 
+	it("updates a Linked chip when a later read adds another relation to the same neighbour", async () => {
+		let second = false;
+		EDGES.push(E(8, "m1", "l1", "relates_to"));
+		try {
+			const b = await openWith("#memories/work/m1?profile=work", (p, m, body) => {
+				if (p.startsWith("/api/profiles/work/graph?part=edges")) return Response.json({ items: second ? [...EDGES, E(9, "m1", "l1", "supersedes")] : EDGES, next_after: null, done: true });
+				return api(p, m, body);
+			});
+			const detail = () => find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!, h2 = find(detail(), "h2")[0]!;
+			const linked = () => text(find(detail(), "div").filter((d) => d.attrs.class === "conn-group").find((g) => text(g).trim().startsWith("Linked"))!);
+			expect(linked()).toContain("related Always run the tests");
+			expect(linked()).not.toContain("replaces");
+			second = true; // the refresh reads the edges again and finds a second relation to the same learning
+			(b.win as unknown as { __am: { resync(): void } }).__am.resync();
+			for (let i = 0; i < 40; i++) await settle();
+			expect(linked()).toContain("replaces");
+			expect(find(detail(), "h2")[0]).toBe(h2); // only Connections redrawn
+		} finally { EDGES.pop(); }
+	});
+
 	it("bins and labels days by calendar date across a daylight-saving change", async () => {
 		const b = await open("#home?profile=work");
 		const am = (b.win as unknown as { __am: { daily(parent: El, series: { label: string; kind: string; dates: string[] }[], weeks: number): El } }).__am;

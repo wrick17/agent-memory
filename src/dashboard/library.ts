@@ -588,7 +588,7 @@ export function libraryTab(am: Am): void {
 		const ul = cls(el("ul", listCol), "rows");
 		ul.setAttribute("data-list", "");
 		const pages = el("div", listCol), status = cls(el("p", listCol), "muted");
-		let facet = route.query.type ?? "", shownDetail = "", shownLinks = -1, detailH: Node | null = null;
+		let facet = route.query.type ?? "", shownDetail = "", shownLinks = "", detailH: Node | null = null;
 		const paint = () => {
 			if (version !== am.pageVersion) return;
 			const lib: J = am.library(only, paint);
@@ -659,7 +659,8 @@ export function libraryTab(am: Am): void {
 				// A hub (project or person) draws again while its connections are still arriving; any other item draws once.
 				const it = lib.items.get(selected), hub = it && (it.kind === "project" || it.kind === "person");
 				const sig = it ? `${it.key}:${hub ? lib.links.get(it.key)?.size ?? 0 : ""}` : "";
-				const links = it ? lib.links.get(it.key)?.size ?? 0 : 0;
+				// Each neighbour with its relations, so a new relation to a known neighbour (supersedes after relates to) counts too.
+				const links = it ? [...(lib.links.get(it.key) ?? new Map()) as Map<string, Set<string>>].map(([k, rels]) => `${k}:${[...rels].sort().join("+")}`).sort().join("|") : "";
 				if (it && sig !== shownDetail) { shownDetail = sig; shownLinks = links; detailH = detail(detailCol, lib, it, route); }
 				else if (it && !hub && links !== shownLinks) { shownLinks = links; (detailCol as J).__refreshConn?.(lib); } // links arrived after the record
 				else if (!it && !lib.loading && shownDetail !== "missing") { shownDetail = "missing"; detailCol.replaceChildren(); note(detailCol, "This item is not in the chosen profile.", "muted"); am.pageStatus(detailCol); }
