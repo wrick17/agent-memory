@@ -873,6 +873,30 @@ export function queueTrigger({ client, session, transcript_path, cwd = null, cli
 export const safeRemote = (remote) => (typeof remote === "string"
 	? remote.replace(/^(https?:\/\/)[^\s/@]*@/i, "$1").replace(/^([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+):[^\s/@]*@/i, "$1@") : remote);
 
+const WORKSPACE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+const within = (dir, root) => dir === root || dir.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+
+/**
+ * Where a session ran, for project tagging: the GitHub project key (`github:<owner>/<repo>`, lowercase, SSH aliases folded by
+ * facts.mjs repoKey) of the checkout holding cwd, and the name of the configured workspace (capture.workspaces) holding it, each
+ * only when known. Read-only git. A checkout above the workspace root (a home-directory repo) is not one of its projects, and a
+ * checkout under a `fixtures` folder is a test fixture, not a project.
+ */
+export async function placeOf(cwd, remote, workspaces = {}) {
+	if (typeof cwd !== "string" || !path.isAbsolute(cwd) || !fs.existsSync(cwd)) return {};
+	const dir = real(cwd);
+	const ws = Object.entries(workspaces).map(([name, root]) => [name, real(root)]).filter(([, root]) => within(dir, root)).sort((a, b) => b[1].length - a[1].length)[0];
+	let project = null;
+	const top = remote ? spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5000 }) : null;
+	const root = top?.status === 0 ? real(top.stdout.trim()) : "";
+	if (root && (!ws || within(root, ws[1])) && !root.split(path.sep).includes("fixtures")) {
+		const key = (await import("./facts.mjs")).repoKey(remote);
+		project = key ? `github:${key.slice("github.com/".length)}` : null;
+	}
+	return { ...(project ? { project } : {}), ...(ws ? { workspace: ws[0] } : {}) };
+}
+
 /** The repo identity the server routes by: the origin remote from local git (credentials removed), and the session's working directory. */
 export function repoOf(cwd) {
 	if (!cwd || !fs.existsSync(cwd)) return null;
@@ -891,7 +915,8 @@ export async function processSession(t, { server, runner, now = Date.now() }) {
 	const save = () => writePrivate(file, JSON.stringify(st));
 	const pendingDir = path.join(home(), "pending");
 	const repo = repoOf(t.cwd);
-	const where = repo ? { repo } : {};
+	// project and workspace are optional batch fields (project tagging); an older server refuses them, so deploy the Worker first.
+	const where = { ...(repo ? { repo } : {}), ...(await placeOf(t.cwd, repo?.remote, loadConfig().capture.workspaces).catch(() => ({}))) };
 	// Sticky once a SessionEnd trigger is handled. files are hashes of the distinct edited paths, kept here only for the count.
 	if (t.ended === true || t.event === "SessionEnd") st.ended = true;
 	// v2 session fields are sent only when set, so a session with neither sends a v1 body.
@@ -1070,7 +1095,7 @@ const PROFILE_RE = /^[a-z][a-z0-9-]{0,11}$/;
  * unless facts.inject is true.
  */
 export const configDefaults = () => ({ batch_hour: 4, read_token_file: path.join(home(), "read-token"), inject: { enabled: false, profile: null, max_tokens: 600, timeout_ms: 1500 },
-	loop_guard: { enabled: false, shadow: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null } });
+	loop_guard: { enabled: false, shadow: false }, facts: { inject: false, profile: null, timeout_ms: 1500, synthesis: false, synthesis_rates: null }, capture: { workspaces: {} } });
 const posInt = (v, d, max) => (Number.isInteger(v) && v > 0 && v <= max ? v : d);
 
 /** The raw config with the v2 defaults filled in. Every other key is returned as written; invalid v2 values fall back to defaults. */
@@ -1090,7 +1115,11 @@ export function withDefaults(raw) {
 			// Synthesis is off unless facts.synthesis is true; synthesis_rates (USD per million input, cached input and output tokens) only prices the cost log.
 			synthesis: c.facts?.synthesis === true,
 			synthesis_rates: ["input", "cached_input", "output"].every((k) => typeof c.facts?.synthesis_rates?.[k] === "number" && c.facts.synthesis_rates[k] >= 0)
-				? { input: c.facts.synthesis_rates.input, cached_input: c.facts.synthesis_rates.cached_input, output: c.facts.synthesis_rates.output } : null } };
+				? { input: c.facts.synthesis_rates.input, cached_input: c.facts.synthesis_rates.cached_input, output: c.facts.synthesis_rates.output } : null },
+		// Project tagging: capture.workspaces names the folders that group repos ({"work": "~/Projects/work"}); an invalid entry is dropped.
+		capture: { workspaces: Object.fromEntries(Object.entries(c.capture?.workspaces && typeof c.capture.workspaces === "object" ? c.capture.workspaces : {})
+			.filter(([name, root]) => WORKSPACE_RE.test(name) && typeof root === "string" && /^(?:~\/|\/)/.test(root))
+			.map(([name, root]) => [name, root.startsWith("~/") ? path.join(os.homedir(), root.slice(2)) : path.resolve(root)])) } };
 }
 
 export function loadConfig() {

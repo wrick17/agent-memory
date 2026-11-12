@@ -71,6 +71,8 @@ const ingestSchema = z.object({
 		ended: z.boolean().optional(), files_changed: z.number().int().min(0).max(100_000).optional() }).strict(),
 	repo: z.object({ remote: z.string().max(512).optional(), path: z.string().max(1024).optional() }).strict().optional(),
 	profile: z.string().regex(PROFILE_NAME).optional(),
+	// Project tagging: the client's `github:<owner>/<repo>` key and workspace name. Loose here, so a value the store skips never refuses the digests.
+	project: z.string().max(200).optional(), workspace: z.string().max(128).optional(),
 	digests: z.array(z.object({ range_id: rangeId, capture_status: z.enum(["heuristic", "consolidated"]), part_id: z.string().max(64),
 		sha256: z.string().regex(/^[0-9a-f]{64}$/), body: z.string().max(16_384) }).strict()).max(64).default([]),
 	manifests: z.array(z.object({ range_id: rangeId, parts: z.array(z.object({ part_id: z.string().max(64), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict()).min(1).max(512) }).strict()).max(16).default([]),
@@ -110,6 +112,8 @@ const workSchema = workObject.refine((v) => v.session || (!v.digests.length && !
 	.refine((v) => (!v.prs.length && !v.tickets.length) || v.as_of, { path: ["as_of"], message: "PR and ticket snapshots need as_of" })
 	.refine((v) => !v.tickets.length || v.profile === "work", { path: ["profile"], message: "Jira tickets go only to profile \"work\", named explicitly" });
 
+const placeArgs = (i: { project?: string; workspace?: string }) => ({ ...(i.project ? { project: i.project } : {}), ...(i.workspace ? { workspace: i.workspace } : {}) });
+
 /**
  * Capture upload and recovery for the job-scoped device token (scope `ingest`), routed like any write and never to `me`.
  * Only bounded digests and manifests are accepted: the strict body schema has no field for a raw transcript record, and every string is bounded.
@@ -134,7 +138,7 @@ async function capture(request: Request, env: Env, path: "/v1/ingest" | "/v1/cap
 	const ref = ctx.value.profiles.find((p) => p.profile === route.value.profile)!;
 	if (work) return workUpload(env, ctx.value, ref, route.value.routedBy, input);
 	const res = path === "/v1/ingest"
-		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [],
+		? await profileStub(env, ref).ingest(ref, { session: input.session!, digests: input.digests ?? [], manifests: input.manifests ?? [], ...placeArgs(input),
 			...(ctx.value.caller.deviceId ? { device_id: ctx.value.caller.deviceId } : {}) })
 		: await profileStub(env, ref).captureState(ref, input.range_ids);
 	return res.ok ? json({ profile: route.value.profile, routed_by: route.value.routedBy, ...(path === "/v1/ingest" ? { results: res.value } : { ranges: res.value }) }) : json({ error: res.error }, 400);
@@ -149,7 +153,7 @@ async function workUpload(env: Env, account: AccountContext, ref: ProfileRef, ro
 	if (!repo && (input.commits?.length || input.prs?.length || input.marker || !tickets.length)) return json({ error: { code: "validation", message: "commits, PRs and markers need repo.remote on github.com", details: { reason: "unsupported_remote" } } }, 400);
 	if (tickets.length && ref.profile !== "work") return json({ error: { code: "forbidden", message: "Jira tickets go only to the work profile" } }, 403);
 	// #12: the session's device is the authenticated token's, never a body field.
-	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [],
+	const results = input.session ? await profileStub(env, ref).ingest(ref, { session: input.session, digests: input.digests ?? [], manifests: input.manifests ?? [], ...placeArgs(input),
 		...(account.caller.deviceId ? { device_id: account.caller.deviceId } : {}) }) : ok([]);
 	if (!results.ok) return json({ error: results.error }, 400);
 	if (input.marker && results.value.some((r) => r.status !== "stored" && r.status !== "replayed")) return json({ profile: ref.profile, routed_by: routedBy, results: results.value, commits: [], marker: { status: "refused", reason: "capture_not_held" } });

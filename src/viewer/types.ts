@@ -136,6 +136,8 @@ export interface SessionRow {
 	id: string; client: Client; session: string;
 	device: string | null;  // attrs.device_id from the ingest token; null for sessions stored before v2
 	project: string | null; // the project node the digests link to
+	project_key: string | null; // that project node's key, `github:<owner>/<repo>` for a GitHub project; null without a project or key
+	workspace: string | null; // capture project tagging: the workspace the session ran in (client capture.workspaces); null when none
 	first_upload_at: string; last_upload_at: string; // upload times, not the session's own start and end
 	status: "active" | "completed"; first_ask: string | null;
 	// files_changed: the runner's cumulative count of distinct files edited in the session (session.files_changed on ingest,

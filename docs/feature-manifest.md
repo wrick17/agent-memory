@@ -394,3 +394,15 @@ Known limits:
 - Switches: `facts.inject`, `facts.synthesis`, `loop_guard.enabled` and `loop_guard.shadow` are off by default in the client. Deterministic fact reports still follow capture with no switch. `facts.profile` is no longer read by the v2 client.
 - Rollout: Worker first (it accepts v1 and v2 reports), then the client. v1 acceptance ends only after `doctor` shows no `facts_v1_pending` on every device.
 - Docs: [architecture, repo facts](architecture.md#repo-facts), [loop guard](architecture.md#loop-guard), [module contracts](module-contracts.md#repo-facts-v2-and-forever-context-modules-2026-11-11), [self-host settings](self-host.md#repo-facts-and-loop-guard-settings).
+
+### Capture project tagging, 2026-11-12
+
+Source on branch `feat/capture-project-tagging`; not merged, deployed or reviewed yet.
+
+- Client (`processSession`, so live capture and `backfill` both): `placeOf` sends the optional batch fields `project` (`github:<owner>/<repo>`, from `git rev-parse --show-toplevel` and the origin remote through `facts.mjs` `repoKey`) and `workspace` (a `capture.workspaces` name). `repo {remote, path}` and routing are unchanged.
+- Worker: `/v1/ingest` accepts both fields as optional. Old clients send neither and are unaffected. After the digests are stored, `ProfileStore.linkProject` writes `session part_of project` through the `knowledge` write as actor `index`, with activity and undo and the request id `capture-project:<profile>:<session node>:<key>`. It creates the project node only when no node has that key (case-insensitive match), never rewrites an existing node, and adds a new work project's name to the `me` guard terms. The command is planned again after the last account call and right before the synchronous write, so a project the owner creates meanwhile, under any key casing, is linked rather than overwritten or duplicated. A created project's account registration is kept as a `capture-register:<node id>` row in `profile_meta` and retried on every later batch until it succeeds; it never holds back the digests. A link failure never fails the capture. Fixture and malformed keys are skipped. The workspace is stored as session `attrs.workspace`.
+- Learning: `learningFor` already scoped lessons and decisions to the session's `part_of` project and linked them with `relates_to`. A session with no project now uses its workspace as the scope.
+- Read: session rows add `project_key` (the project node's key) and `workspace`. `project` is still the node id.
+- No schema migration and no rewrite of existing records. Sessions captured before this change stay unlinked until a separate, staged backfill.
+- Rollout: Worker first, then the client. An older Worker refuses the new fields with HTTP 400. The client keeps those batches spooled or pending and retries them, so capture stalls but loses nothing until the Worker is upgraded.
+- Limits: the workspace exists only as a session attribute, not as a node. Maintenance writes no journals, so journals have no project link from this change. MCP tools are unchanged.

@@ -2,7 +2,7 @@ import { assertArchiveEndpoints } from "./archive-fence";
 // Capture digests (section 10): immutable digest parts and the completeness manifest, stored on the session's node in the
 // capture lane, outside ordinary recall. A range counts as consolidated only once its manifest tiles it with stored parts.
 import { z } from "zod";
-import { canonicalJson, sha256 } from "../domain/ids";
+import { canonicalJson, isScope, normalizeScope, sha256 } from "../domain/ids";
 import { redactText } from "../domain/redact";
 import { nextSeq } from "../storage";
 import { Fail } from "../domain/types";
@@ -29,6 +29,19 @@ export interface Manifest { range_id: string; parts: { part_id: string; sha256: 
 export interface IngestBatch {
 	session: { client: "claude-code" | "codex"; id: string; ended?: boolean; files_changed?: number };
 	digests: DigestPart[]; manifests: Manifest[]; device_id?: string;
+	/** Project tagging, both optional (older clients send neither): the checkout's `github:<owner>/<repo>` key and the workspace name. */
+	project?: string; workspace?: string;
+}
+
+// The GitHub owner and repo patterns facts.mjs repoKey normalizes to, lowercase.
+const PROJECT_KEY = /^github:([a-z0-9][a-z0-9-]{0,38})\/((?!\.{1,2}$)[a-z0-9._-]{1,100})$/;
+// Acceptance and smoke fixtures, and runtime labels that are not projects. Exact or anchored, so a real repo named test-utils still counts.
+const NOT_PROJECT = /^(?:am-accept.*|fixtures?(?:[-_.].*)?|dashboard-smoke|bot_hq|bothq|codex)$/;
+
+/** A captured session's project key when it is a well-formed, non-fixture GitHub key, lowercased; else null (the link is skipped). */
+export function captureProjectKey(raw: string | undefined): string | null {
+	const m = PROJECT_KEY.exec(raw?.trim().toLowerCase().replace(/\.git$/, "") ?? "");
+	return m && !NOT_PROJECT.test(m[1]!) && !NOT_PROJECT.test(m[2]!) ? `github:${m[1]}/${m[2]}` : null;
 }
 export type ItemResult = { range_id: string; part_id: string; status: "stored" | "replayed" | "refused"; reason?: string };
 
@@ -213,6 +226,8 @@ function sessionMeta(storage: DurableObjectStorage, batch: IngestBatch, stored: 
 		if (batch.device_id && (stored || typeof attrs.device_id !== "string")) next.device_id = batch.device_id;
 		if (s.ended === true) next.ended = true;
 		if (s.files_changed !== undefined && !(typeof attrs.files_changed === "number" && attrs.files_changed >= s.files_changed)) next.files_changed = s.files_changed;
+		// The workspace the session ran in, as a scope name; an invalid one is skipped. The latest batch's value wins.
+		if (batch.workspace && isScope(batch.workspace)) next.workspace = normalizeScope(batch.workspace);
 		const text = JSON.stringify(next);
 		if (text !== JSON.stringify(attrs)) sql.exec("UPDATE nodes SET attrs = ?, seq = ? WHERE id = ?", text, nextSeq(sql, "profile_meta"), node.id);
 	});
