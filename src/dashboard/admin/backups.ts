@@ -3,7 +3,7 @@
 import type { Am, Failure, J, Node } from "../am";
 
 export function backupsPages(am: Am): void {
-	const { act, active, btn, call, choose, el, enc, facts, input, intro, link, note, pageStatus, recorded, render, why } = am;
+	const { act, active, btn, call, choose, el, enc, facts, input, intro, note, pageStatus, recorded, render, why } = am;
 
 	// The restore drill (section 18): a profile's newest export restored into a scratch generation that never becomes live, and the
 	// account's newest export checked without being applied. The account stays open. Begin keeps its exact body, request id included,
@@ -183,8 +183,7 @@ export function backupsPages(am: Am): void {
 	let lastPit: { id: string; profile: string } | null = null; // the point-in-time restore last opened in this tab, to reverse by its id
 	const backupsPage = (view: Node) => {
 		const version = am.pageVersion, h = el("h2", view, "Backups and recovery");
-		intro(view, "Backups and recovery", "backups", "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days. Devices and routes stay in Settings.");
-		link(el("p", view), "/settings", "Open Settings");
+		intro(view, "Backups and recovery", "backups", "Restore uses the server's encrypted exports, or a profile's own point-in-time history of the last 30 days.");
 		const { say } = pageStatus(view);
 		const rec = el("section", view);
 		rec.setAttribute("aria-label", "Recovery status");
@@ -210,6 +209,12 @@ export function backupsPages(am: Am): void {
 			try { s = await call("/api/recovery"); } catch (err) { if (version === am.pageVersion) say(`Could not read recovery status: ${why(err)}`); return; }
 			if (version !== am.pageVersion) return;
 			say("");
+			// The answer first: when the last backup ran and whether every store saved; its internals sit behind Details.
+			const le = s?.last_export, res = Object.values(le?.results ?? {}) as J[], bad = res.filter((v) => v && typeof v === "object" && (v.error || v.state === "failed")).length;
+			const lead = el("p", rec);
+			lead.setAttribute("class", "backup-lead");
+			if (le) { el("strong", lead, `Last backup ${am.when(le.at).text || recorded(le.at)}`); el("span", lead, ` · ${bad ? `${res.length - bad} of ${res.length} saved, ${bad} failed` : "everything saved"}`); }
+			else el("strong", lead, "No backup yet");
 			const r = s?.recovery;
 			if (r) {
 				const account = r.kind === "account";
@@ -240,12 +245,8 @@ export function backupsPages(am: Am): void {
 					const ab = el("div", rec);
 					confirmBox(ab, account ? "Abort rolls the account back to its state before this restore, step by step; choose Abort again while it is rolling back." : "Abort discards the restored copy and reopens the account unchanged.", "abort", "Abort", () => act("/api/recovery/abort", "abort the recovery", shownId, stepDone));
 				}
-			} else {
-				el("h3", rec, "No recovery is open");
-				el("p", rec, "The account is open.");
-			}
-			el("h3", rec, "Last export");
-			if (s?.last_export) { el("p", rec, `Taken ${recorded(s.last_export.at)}`); results(rec, s.last_export.results); } else el("p", rec, "No export recorded yet.");
+			} else el("p", rec, "No recovery is open; the account is open.");
+			if (le) { const d = el("details", rec); el("summary", d, "Details of the last backup"); el("p", d, `Taken ${am.when(le.at).full || recorded(le.at)}`); results(d, le.results); }
 			const list = await fresh;
 			if (version !== am.pageVersion) return;
 			if (Array.isArray(list)) am.profiles = list;

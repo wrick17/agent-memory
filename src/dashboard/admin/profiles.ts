@@ -64,7 +64,7 @@ export function profilesPages(am: Am): void {
 				if (g?.parts.nodes.done) {
 					const all = [...g.nodes.values()], kind = (k: string) => all.filter((n) => n.kind === k);
 					say(sum, "Projects, people, decisions", `${kind("project").length} projects, ${kind("person").length} people, ${kind("decision").filter((n) => n.updated && Date.parse(n.updated) >= month).length} decisions changed in the last 30 days`);
-				} else say(sum, "Projects, people, decisions", "Counted once its graph is open in this tab", true);
+				} else say(sum, "Projects, people, decisions", "Shown after you open this profile’s graph", true);
 				say(sum, "Open work", failed(board) ?? `${recorded(board.status === "fulfilled" ? board.value?.total : null)} items (uploaded work only)`, board.status === "rejected");
 				const items: J[] = act.status === "fulfilled" && Array.isArray(act.value?.items) ? act.value.items : [];
 				say(sum, "Recent changes", failed(act) ?? (items.map((a) => `${day(String(a.at))} ${recorded(a.op)} by ${recorded(a.actor)}`).join("; ") || "None"), act.status === "rejected");
@@ -92,7 +92,7 @@ export function profilesPages(am: Am): void {
 			}
 		} else el("p", devs, "No device may use this profile.");
 		const more = el("p", devs);
-		link(more, "/settings", "Add or revoke devices in Settings");
+		link(more, "#/devices", "Add or revoke devices");
 		if (p.status !== "active") return h;
 		// #/activity/NAME opens Audit with this profile chosen; the other old routes open their pages.
 		const go = el("section", view);

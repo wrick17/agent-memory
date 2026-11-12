@@ -21,7 +21,7 @@ import type { FeedItem, HealthCheck, Snapshot } from "../viewer/types";
 export type J = any;
 
 /** The slice of a DOM element the dashboard uses. */
-export type Node = { appendChild(n: unknown): void; replaceChildren(): void; textContent: string; setAttribute(k: string, v: string): void; focus(): void;
+export type Node = { appendChild(n: unknown): void; replaceChildren(): void; textContent: string; setAttribute(k: string, v: string): void; focus(options?: { preventScroll?: boolean }): void;
 	addEventListener(type: string, f: (event: { preventDefault(): void }) => void): void; disabled: boolean; hidden: boolean; value: string; checked: boolean };
 
 export type Failure = Error & { code?: string; status?: number; reason?: string };
@@ -44,6 +44,7 @@ export type TabDef = {
 	label: string;
 	key: string; // g then this letter jumps here
 	count?: (s: Pick<Snapshot, "counts">) => number | null; // the nav count, read only from a loaded snapshot; null shows none
+	hidden?: boolean; // routable, but not listed in the nav (Replay opens from a session)
 	/** Builds the tab inside `root` (already empty). Return the heading to focus after navigation. */
 	render: (root: Node, route: Route) => Node | void;
 	/**
@@ -85,7 +86,8 @@ export type Draft = { memory_id?: string; expected_revision?: number; recordName
 export type WhatIf = { name: string; target: string; targetName: string };
 export type Move = { source: string; id: string; name: string; to: string; body: Record<string, unknown>; state: "sent" | "unknown" | "done" | "aborted" | "refused" | "progress"; text: string };
 export type GNode = { id: string; name: string; kind: string; label: string | null; type: string | null; scope: string | null; status: string; updated: string | null;
-	group: string; seq: number; x: number; y: number; deg: number; opaque: number; flagged: boolean };
+	group: string; seq: number; x: number; y: number; deg: number; opaque: number; flagged: boolean; created?: string | null; key?: string | null; origin?: string | null;
+	projectKey?: string | null; workspace?: string | null };
 export type GEdge = { id: string; a: string; b: string; rel: string };
 export type Phase = { next: string | null; total: number | null; done: boolean; error: string | null };
 export type Graph = { nodes: Map<string, GNode>; edges: Map<string, GEdge>; groups: Map<string, string[]>; pending: Map<string, GEdge[]>; opaque: number;
@@ -99,7 +101,7 @@ export type Am = {
 	/** Owner API call with the Clerk session token; throws a Failure on a non-2xx answer. */
 	call: (path: string, method?: string, data?: unknown) => Promise<J>;
 	/** A fresh Clerk session token, for the event stream's Authorization header. Never shown or copied. */
-	token: () => Promise<string>;
+	token: (fresh?: boolean) => Promise<string>; // fresh: skip Clerk's cache (the live stream lasts until the token's exp)
 
 	// Loaded by boot() before the first render.
 	profiles: Profile[];
@@ -143,6 +145,32 @@ export type Am = {
 	mcpCurl: (tool: string, args: Record<string, unknown>) => string; // the same tools/call over HTTP to /mcp, with $AGENT_MEMORY_TOKEN
 	empty: (root: Node, text: string, command?: string) => void; // what fills this page and the command that does it
 	loading: (root: Node, rows?: number) => Node; // skeleton rows; replaceChildren() on it when data arrives
+	// store.ts: the library of memories, learnings, journals, people and projects with their links; dates and human titles.
+	library: (only: string | null, onChange?: () => void) => J;
+	when: (iso: unknown) => { text: string; full: string };
+	time: (parent: Node, iso: unknown) => Node;
+	human: (name: string, kind?: string) => string;
+	/** The one display title of a library item; given a node, writes it there and keeps it current. */
+	title: (it: J, into?: Node) => string;
+	settleTitle: (it: J, text: string) => void;
+	itemHref: (it: J, profile?: string | null) => string;
+	placeOf: (r: { profile: string; scope?: string | null; name?: string | null; key?: string | null; kind?: string; id?: string; repo_key?: string | null; project_key?: string | null; workspace?: string | null }) => { workspace: string | null; project: string | null; confidence: "high" | "medium" | null; profile: string | null; drop?: boolean; workspaces?: string[] }; // the one project rule (store.ts)
+	workspaceName: (w: string) => string;
+	setSync: (st: { state: string; at: string | null }) => void; // shell.ts: the header's live dot
+	workspaceOrder: string[];
+	// charts.ts: charts with one question each, and one item's connection graph.
+	daily: (parent: Node, series: { label: string; kind: string; dates: (string | null)[] }[], weeks?: number, caption?: string) => Node;
+	fitWeeks: (box: Node, weeks: number) => number; // the weeks a container can show as day bars at least 2 px wide (else 4)
+	bars: (parent: Node, rows: { label: string; value: number; href?: string; sub?: string }[], unit: string) => Node;
+	facets: (parent: Node, rows: { id: string; label: string; value: number; kind?: string }[], current: string, pick: (id: string) => void, all?: number) => Node;
+	related: (parent: Node, center: { title: string; kind: string }, rows: { title: string; kind: string; href: string; label: string; weight: number }[], cap?: number) => Node;
+	detail: (box: Node, lib: J, it: J, route: Route) => Node; // library.ts: one item's content and connections
+	md: (parent: Node, text: string) => Node; // library.ts: safe minimal markdown, DOM nodes only
+	pager: <T>(holder: Node, items: T[], draw: (it: T) => void, step?: number, key?: string) => void; // infinite scroll in pages; key keeps how far it got
+	autoMore: (button: Node) => void; // a next-page button that presses itself when scrolled into view
+	onLeave: (f: () => void) => () => void; // runs f before the next page replaces this one; the returned function runs it now
+	observe: (target: Node, onSeen: (stop: () => void) => void, margin: string) => (() => void) | null; // an IntersectionObserver stopped on leaving
+	resync?: () => void; // reads the library again now (the header's Retry)
 
 	/**
 	 * Runs fn for the chosen profile (`only`, from route.query.profile) or, when only is null, for every active profile in

@@ -15,7 +15,6 @@ import { commitArgs, prArgs, repoNamespace, ticketArgs, TITLE_MAX, uploadTerms, 
 import type { PartMeta, Parts, Payload, ProfileStore } from "./profile/store";
 import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routing";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
-import { SETTINGS_HTML, SETTINGS_JS } from "./settings";
 import { deviceV2, factRepoSchema, ownerV2 } from "./v2-api";
 import { factRoute, SESSION_REF } from "./profile/store";
 
@@ -777,14 +776,10 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 	if (url.pathname === "/v1/import/audit" && request.method === "GET") return importAudit(request, env);
 	if (url.pathname === "/v1/import/review" && (request.method === "GET" || request.method === "POST")) return importReview(request, env);
 	if (url.pathname === "/v1/markers" && request.method === "GET") return markersRead(request, env);
-	if (url.pathname === "/settings" && request.method === "GET") {
-		return new Response(SETTINGS_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
-	}
-	if (url.pathname === "/settings.js" && request.method === "GET") {
-		return new Response(SETTINGS_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
-	}
-	// The dashboard shell and script are public, as /settings is; every data route below stays behind owner(). The site root
-	// serves the same shell, and /app stays as an alias.
+	// The old Settings page is retired; its devices live in the dashboard (#/devices), so old links land there.
+	if (url.pathname === "/settings" && request.method === "GET") return new Response(null, { status: 302, headers: { location: "/#/devices", "cache-control": "no-store" } });
+	// The dashboard shell and script are public; every data route below stays behind owner(). The site root serves the same
+	// shell, and /app stays as an alias.
 	if ((url.pathname === "/" || url.pathname === "/app") && request.method === "GET") {
 		return new Response(DASHBOARD_HTML(env), { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": CSP(env), "cache-control": "no-store" } });
 	}

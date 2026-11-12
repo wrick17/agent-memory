@@ -23,6 +23,8 @@ export function glossary(am: Am): void {
 		about: { term: "About you", text: "Preferences and rules about you, stated or inferred with evidence. Pin, forget or undo them here." },
 		backups: { term: "Backups and recovery", text: "Exports of each profile, the restore drill, and recovery after a restore." },
 
+		manage: { term: "Manage", text: "The owner's tools in one place: writing and review, backups, moves and wipes, devices, profiles and routing." },
+		devices: { term: "Devices and tokens", text: "The machines and tokens that can read and write your memory. Create one per machine; revoke one you no longer use." },
 		// Tabs.
 		overview: { term: "Overview", text: "Counts across every profile, health at a glance, recent sessions and the live feed of changes. A link with ?profile= narrows the lists and health to that profile; the totals stay for every profile and say so." },
 		health: { term: "Health", text: "Checks on capture, search, consolidation and backups, each OK, WARN or FAIL." },

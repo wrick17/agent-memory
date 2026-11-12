@@ -158,7 +158,7 @@ Adding a connection alone does not switch ordinary memory callers or install cap
 
 A machine without a browser uses a device token instead of OAuth sign-in. Use these steps on that machine in place of the commands above.
 
-1. In any browser, sign in at `<public_url>/settings` and create a device with only the scopes and profiles that machine needs. Settings shows the token once.
+1. In any browser, sign in to the dashboard at `<public_url>`, open Settings (⚙) › Devices and tokens (`<public_url>/#/devices`; the old `/settings` address redirects there), and create a device with only the permissions and profiles that machine needs. The page shows the token once.
 2. On the headless machine, store the token in a private file. Paste it at the hidden prompt and press Enter:
 
 	```sh

@@ -1,9 +1,8 @@
 // The dashboard's browser half against a stand-in DOM and ClerkJS: what it fetches, what it shows, and what it refuses to invent.
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { DASHBOARD_HTML, DASHBOARD_JS, dashboardMain } from "../src/dashboard";
-import REPLAY_PLAYER from "../local/replay-player.js";
-import { call, contextFor, deviceToken } from "./helpers";
+import { DASHBOARD_HTML, dashboardMain } from "../src/dashboard";
+import { deviceToken } from "./helpers";
 
 type El = { tag: string; tagName: string; textContent: string; value: string; hidden: boolean; disabled: boolean; checked: boolean; children: El[]; attrs: Record<string, string>; focused?: boolean;
 	on: Record<string, (event?: { preventDefault(): void }) => unknown>; appendChild(c: El): void; replaceChildren(): void; setAttribute(k: string, v: string): void; focus(): void;
@@ -55,7 +54,6 @@ const SNAPSHOT = { at: "2026-11-04T10:00:00.000Z", version: "9f2c4e1a-0000-4000-
 	usage: { recalls_today: 1, recall_tokens_today: 10, writes_today: 2, storage_bytes: 1024, storage_limit: 10 * 1024 ** 3, vectors: 9 },
 	health: { verdict: "ok", checks: [] }, recent_sessions: [], feed: [], layers: [],
 	flags: [{ id: "embeddings", state: "on", tabs: ["memories"], how: "" }, { id: "inject", state: "off", tabs: ["sessions"], how: "Run agent-memory install --inject." }] };
-const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
 type Api = (path: string, method: string, body?: unknown) => Response | undefined | Promise<Response | undefined>;
 function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles?: unknown[]; api?: Api; storage?: Map<string, string> } = {}) {
@@ -72,7 +70,7 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 		mountSignIn(target: unknown) { seen.mounted = target; },
 	};
 	const win = {
-		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag),
+		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make("div", true)), createElement: (tag: string) => make(tag), body: make("body"),
 			documentElement: html, addEventListener(type: string, f: (event?: unknown) => void) { listeners[`doc:${type}`] = f; } },
 		location: { hash: o.hash ?? "", origin: "https://memory.example" },
 		// As in a browser, replaceState changes the address without a hashchange event.
@@ -103,53 +101,31 @@ function browser(o: { signedIn?: boolean; hash?: string; fail?: number; profiles
 	return { win, els, seen, listeners, go, key, html, storage, timers, view: () => els.view! };
 }
 
-// About you fixtures: owner-model items as the server sends them, and a gate to answer a request later.
-const ABOUT_PROFILES = [{ name: "me", generation: "cccc", status: "active", created_at: "2026-10-28T09:00:00Z" }, ...PROFILES,
-	{ name: "old", generation: "dddd", status: "wiped", created_at: "2026-10-28T12:00:00Z" }];
-const pref = (id: string, extra: Record<string, unknown> = {}) => ({ id, name: `Pref ${id}`, description: "", origin: "stated", pinned: false, flagged: null,
-	revision: 1, updated_at: "2026-10-29T08:00:00Z", source_profile: null, links: 0, evidence: [], evidence_truncated: false, evidence_missing: false, ...extra });
 const gate = () => { let open!: () => void; const wait = new Promise<void>((r) => { open = r; }); return { wait, open }; };
 const settle = () => new Promise((r) => setTimeout(r, 10));
 const click = (e: El) => { if (!e.disabled) e.on.click!(); }; // a browser fires no click on a disabled button
 const button = (root: El, label: string) => find(root, "button").find((b) => b.textContent === label)!;
 const status = (b: ReturnType<typeof browser>) => find(b.view(), "p").find((p) => p.attrs.role === "status")!;
 const BOARD_DATE = "2026-10-29T12:00:00.000Z";
-const workItem = (name: string, extra: Record<string, unknown> = {}) => ({ kind: "ticket", name, key: null, priority: null, due: null,
-	score: 16, reasons: [{ term: "priority", points: 16, text: "No recognized priority (+16)." }], stale: false, last_activity_at: BOARD_DATE,
-	blocked_by: [], blocks: [], unrecognized: [], ...extra });
 const workBoard = (extra: Record<string, unknown> = {}) => ({ as_of: BOARD_DATE, covers_only_uploaded_data: true,
 	items: [], total: 0, truncated: false, without_state: 0, review: null, budget: { exhausted: false, skipped: 0 }, ...extra });
-const submitDate = (b: ReturnType<typeof browser>, value: string) => {
-	const input = find(b.view(), "input")[0]!;
-	input.value = value;
-	input.on.input!();
-	find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
-};
 
-// Every route the dashboard served before the split, and the heading it opened with under the default fixtures. Only the site root
-// changed: it opens the registered Overview tab.
+// Every address and the heading it opens with under the default fixtures. Old addresses of removed pages open their new place.
 const ROUTES: [string, string][] = [
-	["", "Overview"], ["#/", "Overview"], ["#/profiles", "Profiles"], ["#/profiles/work", "Profile: work"],
-	["#/profiles/nobody", "No profile named nobody"], ["#/work", "Work: work"], ["#/work/personal", "Work: personal"],
-	["#/about", "About you: personal"], ["#/about/work", "About you: work"], ["#/memories", "Memories: work"],
-	["#/memories/personal", "Memories: personal"], ["#/memory/work/r1", "Memory"], ["#/graph/work", "Knowledge graph: work"],
-	["#/graph/work/r1", "Knowledge graph: work"], ["#/map/work", "Map: work"], ["#/draft", "Write: work"], ["#/draft/work", "Write: work"],
-	["#/activity/work", "Audit: work"], ["#/timeline/work", "Timeline: work"], ["#/journals/work", "Journals: work"],
-	["#/path/work", "Path finder: work"], ["#/review/work", "Review: work"], ["#/move/work/r1", "Move a record"], ["#/copy/work/r1", "Save a copy"],
-	["#/backups", "Backups and recovery"], ["#/routing", "Routing"], ["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"],
-	["#/graph/nobody", "No active profile named nobody"]];
-// The shell's nav: each group's label and its links. Only pages that exist today; Admin holds the rest, as the static nav did.
-const navOf = (b: ReturnType<typeof browser>) => b.els.nav!.children.map((g) => [g.tag === "details" ? find(g, "summary")[0]!.textContent : g.attrs["aria-label"] ?? null,
-	find(g, "a").map((a) => `${a.textContent} ${a.attrs.href}`)]);
-const NAV = ["Graph #/", "Memories #/memories", "Write #/draft", "Activity #/activity", "Timeline #/timeline", "Journals #/journals", "Paths #/path", "Work #/work",
-	"About you #/about", "Review #/review", "Backups #/backups", "Profiles #/profiles", "Routing #/routing", "Moves #/move", "Wipe #/wipe", "Settings /settings"];
+	["", "Home"], ["#/", "Home"], ["#/profiles", "Profiles"], ["#/profiles/work", "Profile: work"], ["#/profiles/nobody", "No profile named nobody"],
+	["#/memories", "Memories"], ["#/memory/work/r1", "Memories"], ["#/graph/work", "Map"], ["#/about", "Learnings"], ["#/journals/work", "Journals"],
+	["#/draft", "Write: work"], ["#/draft/work", "Write: work"], ["#/activity/work", "Change history: work"], ["#/review/work", "Review: work"],
+	["#/move/work/r1", "Move a record"], ["#/copy/work/r1", "Save a copy"], ["#/backups", "Backups and recovery"], ["#/routing", "Routing"],
+	["#/wipe", "Wipe a profile"], ["#/wipe/work", "Wipe profile: work"], ["#/manage", "Settings"], ["#overview", "Home"], ["#sessions", "Home"], ["#people", "Home"]];
+// The nav: the sections, flat. The owner tools sit behind the Settings gear.
+const navOf = (b: ReturnType<typeof browser>) => find(b.els.nav!, "a").map((a) => `${a.textContent} ${a.attrs.href}`);
+const NAV = ["Home #home", "Memories #memories", "Learnings #learnings", "Journals #journals", "Projects #projects", "Map #map"];
 
-// The shell's nav: Graph and Memories, the activity log as Audit, and every other page under Admin in the plan's order (with Map).
-// The registered Memories and Audit tabs take the built-in entries' places; Overview stands alone, before the groups.
-const GROUPED_NAV = [[null, ["Overview #overview"]], ["Memory", ["Graph #/graph", "Memories #memories", "Lessons #lessons", "Facts #facts", "Crystals #crystals"]], ["Work", ["Sessions #sessions", "Actions #actions", "Replay #replay"]],
-	["Insight", ["Activity #activity", "Profile #profile", "Goals #goals"]], ["System", ["Health #health", "Audit #audit"]],
-	["Admin", ["Write #/draft", "Paths #/path", "Map #/map", "Timeline #/timeline", "Journals #/journals", "Review #/review", "Backups and recovery #/backups",
-		"Routing #/routing", "Profiles #/profiles", "Moves #/move", "Wipe #/wipe", "Work #/work", "About you #/about", "Settings /settings"]]];
+// The newer pages: fixtures shaped like the owner reads and writes they call.
+const typeIn = (e: El, value: string) => { e.value = value; e.on.input?.(); };
+const submit = (root: El, i = 0) => find(root, "form")[i]!.on.submit!({ preventDefault() {} });
+const byId = (root: El, id: string) => find(root, "input").concat(find(root, "textarea"), find(root, "select")).find((e) => e.attrs.id === id)!;
+const HOSTILE = "<img src=x onerror=alert(1)>";
 
 describe("dashboard", () => {
 	it("mounts sign-in and fetches nothing until the owner signs in", async () => {
@@ -175,31 +151,34 @@ describe("dashboard", () => {
 		} });
 		await dashboardMain(b.win);
 		for (let i = 0; i < 4; i++) await settle();
-		expect(b.seen.fetched.sort()).toEqual(["/api/devices", "/api/profiles", "/api/profiles/personal/activity?limit=3", "/api/profiles/personal/batch", "/api/profiles/personal/board?limit=1",
+		// The header's live library loads the whole graph in the background on every page, owner tools included.
+		const library = (p: string) => /\/graph\?part=(nodes|edges)$/.test(p);
+		expect(b.seen.fetched.filter(library).sort()).toEqual(["/api/profiles/personal/graph?part=edges", "/api/profiles/personal/graph?part=nodes", "/api/profiles/work/graph?part=edges", "/api/profiles/work/graph?part=nodes"]);
+		expect(b.seen.fetched.filter((p) => !library(p)).sort()).toEqual(["/api/devices", "/api/profiles", "/api/profiles/personal/activity?limit=3", "/api/profiles/personal/batch", "/api/profiles/personal/board?limit=1",
 			"/api/profiles/personal/graph?part=nodes&limit=1", "/api/profiles/work/activity?limit=3", "/api/profiles/work/batch", "/api/profiles/work/board?limit=1", "/api/profiles/work/graph?part=nodes&limit=1",
 			"/api/recovery", "/api/review?limit=100"]);
-		expect(b.seen.auth).toEqual(Array(12).fill("Bearer session-token"));
+		expect(b.seen.auth).toEqual(Array(16).fill("Bearer session-token"));
 		expect(b.seen.posted).toEqual([]);
-		expect(b.els.status!.textContent).toBe("Signed in.");
+		expect(b.els.status!.hidden).toBe(true); // nothing to say once signed in
 		expect(b.view().hidden).toBe(false);
 		const cards = find(b.view(), "section");
 		expect(cards.map((c) => find(c, "a")[0]!.attrs.href)).toEqual(["#/profiles/personal", "#/profiles/work"]);
 		// work: laptop is active and defaults to it; old-box is revoked, so it does not count as active.
-		expect(text(cards[1]!)).toContain("Active devices 1 Default for 1 device(s) Last use by its devices 2026-10-29");
+		expect(text(cards[1]!)).toContain("Active devices 1 Default for 1 device(s) Last use by its devices 29 Oct");
 		// Bounded reads only: a counted total, an uncountable one and a failed one each say so; nothing becomes a made-up zero.
 		expect(text(cards[1]!)).toContain("Records 1,377");
 		expect(text(cards[1]!)).toContain("Open work 4 items (uploaded work only)");
-		expect(text(cards[1]!)).toContain("Recent changes 2026-10-30 save by agent");
+		expect(text(cards[1]!)).toContain("Recent changes 30 Oct save by agent");
 		expect(text(cards[1]!)).not.toContain(HOSTILE);
-		expect(text(cards[1]!)).toContain("Projects, people, decisions Counted once its graph is open in this tab");
+		expect(text(cards[1]!)).toContain("Projects, people, decisions Shown after you open this profile’s graph");
 		expect(text(cards[1]!)).toContain("Storage used Not available");
 		expect(text(cards[0]!)).toContain("Records Too many to count in one read");
 		expect(text(cards[0]!)).toContain("Open work Could not read: board unreachable");
 		expect(text(cards[0]!)).not.toMatch(/Records 0|Open work 0/);
-		expect(text(b.view())).toContain("Last backup Taken 2026-10-30");
+		expect(text(b.view())).toContain("Last backup Taken 30 Oct");
 		expect(text(b.view())).toContain("Waiting in Review 1 migrated records, 1 stopped moves");
 		// The daily batch row shows the server's batch_status as text; a failed read marks only its own card.
-		expect(text(cards[1]!)).toContain("Daily batch Last lease never; last skipped 2026-10-29 (probe_indeterminate)");
+		expect(text(cards[1]!)).toContain("Daily batch Last lease never; last skipped 29 Oct (probe_indeterminate)");
 		expect(text(cards[0]!)).toContain("Daily batch Unavailable: profile store unreachable");
 		expect(text(cards[1]!)).not.toContain("Unavailable");
 	});
@@ -208,10 +187,10 @@ describe("dashboard", () => {
 		const b = browser({ signedIn: true, hash: "#/profiles/work" });
 		await dashboardMain(b.win);
 		const rows = find(b.view(), "tr").slice(1).map(text);
-		expect(rows).toEqual(["laptop token read, write yes 2026-10-29 active", "old-box token read no never revoked"]);
+		expect(rows).toEqual(["laptop token read, write yes 29 Oct active", "old-box token read no never revoked"]);
 		b.win.location.hash = "#/profiles/personal";
 		b.listeners.hashchange!();
-		expect(find(b.view(), "tr").slice(1).map(text)).toEqual(["laptop token read, write no 2026-10-29 active"]);
+		expect(find(b.view(), "tr").slice(1).map(text)).toEqual(["laptop token read, write no 29 Oct active"]);
 		expect(find(b.view(), "h2")[0]!.focused).toBe(true);
 	});
 
@@ -228,21 +207,16 @@ describe("dashboard", () => {
 	it("serves every existing page from the split parts through the served /app.js, at its old route, under the unchanged nav", async () => {
 		// The pages now live in separate serialized parts; one that used anything but `am` and browser globals fails here.
 		const nav = /<nav[^>]*aria-label="Dashboard">(.*?)<\/nav>/.exec(DASHBOARD_HTML(env))![1]!;
-		expect([...nav.matchAll(/<a href="([^"]+)">([^<]+)<\/a>/g)].map((m) => `${m[2]} ${m[1]}`)).toEqual(NAV);
+		expect([...nav.matchAll(/<a href="([^"]+)">([^<]+)<\/a>/g)].map((m) => `${m[2]} ${m[1]}`)).toEqual(NAV); // the static nav, before the script runs
 		const response = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/app.js`)), script = await response.text();
-		// The shared replay player's exact bytes come right after the directive, before any part runs.
-		expect(script.startsWith(`"use strict";\n${REPLAY_PLAYER}\nvar __name = (fn) => fn;\n`)).toBe(true);
+		expect(script.startsWith(`"use strict";\nvar __name = (fn) => fn;\n`)).toBe(true);
 		const b = browser({ signedIn: true, hash: "#/profiles" });
 		new Function("window", script)(b.win);
-		// In a browser globalThis is window; here the player's global lands on the test's globalThis.
-		const g = globalThis as unknown as { amReplayPlayer?: { mount: unknown } };
-		expect(typeof g.amReplayPlayer?.mount).toBe("function");
-		delete g.amReplayPlayer;
 		await settle();
 		const seen: [string, string][] = [];
 		for (const [hash] of ROUTES) { b.go(hash); await settle(); seen.push([hash, find(b.view(), "h2")[0]?.textContent ?? ""]); }
 		expect(seen).toEqual(ROUTES);
-		expect(navOf(b)).toEqual(GROUPED_NAV); // the shell replaces the static nav with the same pages, grouped
+		expect(navOf(b)).toEqual(NAV); // the shell draws the same sections
 	});
 
 	it("reports an API refusal instead of showing an empty dashboard", async () => {
@@ -254,77 +228,68 @@ describe("dashboard", () => {
 });
 
 describe("dashboard shell", () => {
-	it("groups only today's pages, marks the current one, and opens the newer deep links on today's pages", async () => {
+	it("lists the sections flat, marks the current one, keeps the owner tools behind Settings, and sends old addresses to their new place", async () => {
 		const b = browser({ signedIn: true, hash: "#/memory/work/r1" });
 		await dashboardMain(b.win);
-		expect(navOf(b)).toEqual(GROUPED_NAV);
+		expect(navOf(b)).toEqual(NAV);
 		const current = () => find(b.els.nav!, "a").filter((a) => a.attrs["aria-current"] === "page").map((a) => a.textContent);
+		const gear = () => find(b.els.tools!, "button").find((a) => a.attrs["aria-label"] === "Settings")!;
+		expect(b.win.location.hash).toBe("#memories/work/r1"); // an old record address opens the record in Memories
 		expect(current()).toEqual(["Memories"]);
-		expect(text(b.els.nav!)).not.toMatch(/Live|features/i);
-		b.go("#memories/r1?profile=personal");
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: personal"); // the Memories tab: the list with r1's detail panel
-		expect(b.seen.fetched).toContain("/api/profiles/personal/nodes/r1");
-		expect(current()).toEqual(["Memories"]);
+		expect(text(b.els.nav!)).not.toMatch(/Live|features|Audit|Graph|Sessions/i);
 		b.go("#audit");
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Audit"); // the Audit tab
-		expect(current()).toEqual(["Audit"]);
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Change history"); // reachable, but not in the nav
+		expect([current(), gear().attrs["aria-current"]]).toEqual([[], "page"]);
 		b.go("#memories?profile=nobody");
 		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: no active profile named nobody"); // the shell refuses it before the tab reads
-		expect(text(b.view())).toContain("Nothing was read.");
 		b.go("#/backups");
-		expect(current()).toEqual(["Backups and recovery"]);
-		expect(b.els.nav!.children.at(-1)!.attrs.class).toBe("navgroup current");
-		// The registered Overview tab opens at the site root; Graph's link and #/graph/NAME still open the graph.
-		for (const [hash, heading, mark] of [["", "Overview", "Overview"], ["#/", "Overview", "Overview"], ["#/graph", "Knowledge graph: work", "Graph"],
-			["#/graph/personal", "Knowledge graph: personal", "Graph"]]) {
+		expect(gear().attrs["aria-current"]).toBe("page");
+		// The gear opens a small menu of the same tools; the #/manage page stays as a fallback.
+		const menu = find(b.els.tools!, "div").find((d) => d.attrs.class === "gear-menu")!;
+		expect(menu.hidden).toBe(true);
+		click(gear());
+		expect([menu.hidden, gear().attrs["aria-expanded"]]).toEqual([false, "true"]);
+		expect(find(menu, "a").map((a) => a.attrs.href)).toEqual(["#/draft", "#/review", "#audit", "#/backups", "#/move", "#/wipe", "#/devices", "#/profiles", "#/routing"]);
+		expect(b.key("Escape", null)).toBe(true);
+		expect(menu.hidden).toBe(true);
+		b.go("#/manage");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Settings");
+		expect(find(b.view(), "a").map((a) => a.attrs.href)).toEqual(["#/draft", "#/review", "#audit", "#/backups", "#/move", "#/wipe", "#/devices", "#/profiles", "#/routing"]);
+		for (const [hash, heading, mark] of [["", "Home", "Home"], ["#/", "Home", "Home"], ["#/graph", "Map", "Map"], ["#graph?profile=work", "Map", "Map"], ["#lessons", "Learnings", "Learnings"]]) {
 			b.go(hash!);
 			expect([find(b.view(), "h2")[0]!.textContent, current()]).toEqual([heading, [mark]]);
 		}
-		expect(find(b.els.nav!, "a").find((a) => a.textContent === "Graph")!.attrs.href).toBe("#/graph");
 	});
 
-	it("takes g then a letter, / for search, ? for the glossary and Esc, but not while typing", async () => {
-		const b = browser({ signedIn: true, hash: "#/memories" });
+	it("takes g then a letter, / for search and Esc, but not while typing", async () => {
+		const b = browser({ signedIn: true, hash: "#memories" });
 		await dashboardMain(b.win);
 		const search = find(b.view(), "input").find((i) => i.attrs.type === "search")!;
 		expect(b.key("/", null)).toBe(true);
 		expect(active).toBe(search);
-		expect(b.key("g", search)).toBe(false); // typing in the search box
-		expect(b.key("u", search)).toBe(false);
-		expect(b.win.location.hash).toBe("#/memories");
+		expect(b.key("g", search)).toBe(false); // typing in the filter box
+		expect(b.key("l", search)).toBe(false);
+		expect(b.win.location.hash).toBe("#memories");
 		b.key("g", null);
-		expect(b.key("u", null)).toBe(true);
-		expect(b.win.location.hash).toBe("#audit"); // the Audit tab's own link
-		expect(b.key("?", null)).toBe(true);
-		expect(b.els.gloss!.hidden).toBe(false);
-		expect(find(b.els.gloss!, "dt").map((d) => d.textContent)).toEqual(expect.arrayContaining(["Graph", "Memories", "Audit", "Undo", "g, then a letter"]));
-		expect(text(b.els.gloss!)).toContain("Open a page: g Graph, o Overview, m Memories, l Lessons, f Facts, c Crystals, s Sessions, a Actions, r Replay, v Activity, p Profile, t Goals, h Health, u Audit.");
-		expect(b.key("Escape", null)).toBe(true);
-		expect(b.els.gloss!.hidden).toBe(true);
+		expect(b.key("l", null)).toBe(true);
+		expect(b.win.location.hash).toBe("#learnings");
 		const am = (b.win as unknown as { __am: { help(p: El, t: string): void; el(t: string): El } }).__am, box = am.el("p");
-		am.help(box, "undo");
-		const tip = find(box, "span")[1]!, q = find(box, "button")[0]!;
-		click(q);
-		expect([tip.hidden, q.attrs["aria-expanded"]]).toEqual([false, "true"]);
-		expect(b.key("Escape", search)).toBe(true); // Esc works even while typing
-		expect([tip.hidden, q.attrs["aria-expanded"]]).toEqual([true, "false"]);
-		am.help(box, "no-such-term");
-		expect(find(box, "button")).toHaveLength(1);
+		am.help(box, "undo"); // no "?" box: the explanation is a tooltip on the label
+		expect([find(box, "button"), box.attrs.title]).toEqual([[], expect.stringContaining("")]);
 	});
 
 	it("follows the system theme until the owner picks one, and keeps the pick", async () => {
 		const plain = browser({ signedIn: true });
 		await dashboardMain(plain.win);
 		expect(plain.html.attrs["data-theme"]).toBeUndefined();
-		const b = browser({ signedIn: true, hash: "#/graph", storage: new Map([["am.theme", "dark"]]) });
+		const b = browser({ signedIn: true, hash: "#home", storage: new Map([["am.theme", "dark"]]) });
 		await dashboardMain(b.win);
 		expect(b.html.attrs["data-theme"]).toBe("dark");
 		const toggle = find(b.els.tools!, "button").find((x) => x.attrs["aria-label"]?.startsWith("Use the"))!;
-		expect([toggle.textContent, toggle.attrs["aria-label"]]).toEqual(["Light", "Use the light theme"]);
+		expect([toggle.textContent, toggle.attrs["aria-label"]]).toEqual(["☀", "Use the light theme"]);
 		click(toggle);
-		expect([b.html.attrs["data-theme"], b.storage.get("am.theme"), toggle.textContent]).toEqual(["light", "light", "Dark"]);
-		expect(text(b.els.tools!)).not.toMatch(/live|features|version|all profiles/i);
+		expect([b.html.attrs["data-theme"], b.storage.get("am.theme"), toggle.textContent]).toEqual(["light", "light", "☾"]);
+		expect(text(b.els.tools!)).not.toMatch(/live|features|version/i);
 	});
 
 	it("copies commands with the token as a variable: the owner's for /api, a device token for /mcp, and the MCP form the Worker serves", async () => {
@@ -349,444 +314,7 @@ describe("dashboard shell", () => {
 	});
 });
 
-describe("dashboard live chrome", () => {
-	it("shows no numbers, version or live state until the data client reports them, then only what it reported", async () => {
-		const refused = browser({ signedIn: true, api: (path) => path === "/api/viewer/snapshot" ? Response.json({ error: { code: "not_found", message: "no snapshot" } }, { status: 404 }) : undefined });
-		await dashboardMain(refused.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const tools = (b: ReturnType<typeof browser>) => text(b.els.tools!);
-		expect([refused.els.pause!.hidden, refused.els.pause!.textContent]).toEqual([false, "Live updates paused. No numbers have loaded yet."]);
-		expect(tools(refused)).toContain("Paused");
-		expect(tools(refused)).not.toMatch(/features|live\b/i);
-		expect([refused.els.ver!.textContent, find(refused.els.foot!, "span")[0]!.textContent]).toEqual(["", ""]);
-		expect(refused.seen.viewer).toEqual(["/api/viewer/snapshot"]); // read only after sign-in
-		expect(refused.timers).toEqual([1000]); // one retry, scheduled, not run
-
-		let stream!: ReadableStreamDefaultController<Uint8Array>;
-		const frame = `event: change\ndata: ${JSON.stringify({ kind: "MEMORY", profile: "work", id: "r1", summary: "Saved a memory", at: SNAPSHOT.at })}\nid: 1\n\n`;
-		const b = browser({ signedIn: true, api: (path) => path.startsWith("/api/viewer/events?cursor=c1") ? new Response(new ReadableStream<Uint8Array>({
-			start(c) { stream = c; c.enqueue(new TextEncoder().encode(frame)); } }), { headers: { "content-type": "text/event-stream" } }) : undefined });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		expect(b.seen.viewer).toEqual(["/api/viewer/snapshot", "/api/viewer/events?cursor=c1"]);
-		expect(b.els.ver!.textContent).toBe("9f2c4e1a");
-		expect(b.els.pause!.hidden).toBe(true);
-		const chips = find(b.els.tools!, "span").filter((x) => x.attrs.class?.startsWith("chip"));
-		expect(chips.map((x) => [x.textContent, x.attrs.class, x.hidden])).toEqual([["Live", "chip c-ok", false]]);
-		expect(find(b.els.foot!, "span")[0]!.textContent).toMatch(new RegExp(`^Agent Memory ${SNAPSHOT.version} · full sync ${hhmm(SNAPSHOT.at)}, live since \\d\\d:\\d\\d$`));
-		const features = find(b.els.tools!, "button").find((x) => x.textContent === "1 of 2 features on")!;
-		click(features);
-		expect(text(b.els.features!)).toContain("Prompt injection");
-		expect(text(b.els.features!)).toContain("To turn it on: Run agent-memory install --inject.");
-		expect(text(b.els.features!)).toContain("Affects: Memories.");
-		// A tab registered with a count shows the snapshot's number, labelled as covering every profile; built-in pages show none.
-		const am = (b.win as unknown as { __am: { tab(d: unknown): void; render(f: boolean): void; el(t: string, p?: El, x?: string): El } }).__am;
-		am.tab({ id: "probe", group: "memory", label: "Probe", key: "q", count: (s: typeof SNAPSHOT) => s.counts.lessons, render: (root: El) => am.el("h2", root, "Probe") });
-		am.render(false);
-		expect(find(b.els.nav!, "a").map((a) => text(a).replace(/\s+/g, " "))).toEqual(expect.arrayContaining(["Graph", "Memories 12 across all profiles", "Probe 7 across all profiles", "Audit"]));
-		b.listeners.pagehide!(); // the client lets go of its connection before the test closes the stream
-		stream.close();
-	});
-});
-
-describe("dashboard Work", () => {
-	it("renders the existing board result through the serialized served app", async () => {
-		const ctx = await contextFor(), key = `jira:WORK-${Date.now()}`;
-		await call(ctx, "record_knowledge", { profile: "work", nodes: [
-			{ kind: "ticket", key, name: "Repair search", attrs: { state: "open", priority: "High", assignee_is_owner: true } },
-		] });
-		const board = await call(ctx, "work_board", { profile: "work", as_of: "2040-01-01T00:00:00.000Z" });
-		const b = browser({ signedIn: true, hash: "#/work", api: (path) => path.includes("/board?") ? Response.json(board) : undefined });
-		const response = await exports.default.fetch(new Request(`${new URL(env.RESOURCE_URL).origin}/app.js`));
-		expect(response.status).toBe(200);
-		const script = await response.text();
-		new Function("window", script)(b.win);
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Work: work");
-		expect(text(b.view())).toContain("2040-01-01T00:00:00.000Z");
-		expect(text(b.view())).toContain("Repair search");
-		expect(text(b.view())).toContain("Priority High (+30).");
-		expect(text(b.view())).toContain("Assigned to the owner (+15).");
-		expect(b.seen.fetched.filter((p) => p.includes("/board"))).toEqual(["/api/profiles/work/board?limit=50"]);
-	});
-
-	it("keeps server order, reasons, exact dates, review and opaque refs as text, and expands only on a click", async () => {
-		const hostile = "<img src=x onerror=alert(1)>", requests: string[] = [];
-		const b = browser({ signedIn: true, hash: "#/work", profiles: ABOUT_PROFILES, api: (path) => {
-			if (!path.includes("/board?")) return;
-			requests.push(path);
-			return Response.json(workBoard({ items: [workItem(hostile, { kind: "bug", key: "jira:KP-42", priority: "P1", due: "tomorrow", score: -4, stale: true,
-				last_activity_at: "2026-09-01T08:09:10.111Z", unrecognized: ["priority", "due"],
-				reasons: [{ term: "blocked", points: -20, text: hostile }, { term: "priority", points: 16, text: "Fallback" }],
-				blocked_by: [{ id: "opaque/42", readable: false, name: "SECRET foreign name" }], blocks: [{ id: "n1", name: "Sibling", kind: "feature" }] }),
-				workItem("Second despite larger score", { score: 999 })], total: 90, truncated: true, without_state: 3,
-				budget: { exhausted: true, stopped: "candidates", skipped: 12 },
-				review: { name: hostile, description: "javascript:alert(1)", recorded_at: "2026-10-01T00:12:34.000Z", age_days: 28 } }));
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		const content = text(b.view());
-		expect(find(b.view(), "h4").map((h) => h.textContent)).toEqual([hostile, "Second despite larger score", hostile]);
-		expect(content).toContain("Score -4 Stale Yes Last activity 2026-09-01T08:09:10.111Z");
-		expect(content).toContain(`blocked: -20 points. ${hostile}`);
-		expect(content).toContain("Unreadable item: opaque/42");
-		expect(content).not.toContain("SECRET foreign name");
-		expect(content).toContain("feature: Sibling (n1)");
-		expect(content).toContain("Unrecognized fields: priority, due");
-		expect(content).toContain("Recorded 2026-10-01T00:12:34.000Z Age at as of 28 days");
-		expect(content).toContain("12 items were skipped");
-		expect(content).toContain("3 uploaded items have no recognized");
-		expect(content).toContain("latest upload");
-		expect(find(b.view(), "img")).toEqual([]);
-		expect(find(find(b.view(), "section")[0]!, "a")).toEqual([]);
-		expect(find(b.view(), "details")).toHaveLength(2);
-		const nav = find(b.view(), "nav")[0]!;
-		expect(find(nav, "a").map((a) => a.attrs.href)).toEqual(["#/work/me", "#/work/personal", "#/work/work"]);
-		expect(status(b).attrs["aria-live"]).toBe("polite");
-		expect(requests).toHaveLength(1);
-		click(button(b.view(), "Show up to 200 items"));
-		await settle();
-		expect(requests.at(-1)).toBe(`/api/profiles/work/board?limit=200&as_of=${encodeURIComponent(BOARD_DATE)}`);
-		expect(button(b.view(), "Show up to 200 items").hidden).toBe(true);
-		expect(text(b.view())).toContain("display limit"); // a larger read still does not promise completeness
-		expect(active).toBe(status(b));
-		expect(b.seen.posted).toEqual([]);
-		expect(b.seen.fetched.some((p) => p.includes("session-token") || p.includes("opaque"))).toBe(false);
-	});
-
-	it("requires a known active profile, choosing explicitly if work is unavailable, and encodes names and dates", async () => {
-		const profiles = [{ ...PROFILES[0]!, name: "odd/&?" }, { ...PROFILES[1]!, status: "wiped" }];
-		const b = browser({ signedIn: true, hash: "#/work", profiles, api: (path) => path.includes("/board?") ? Response.json(workBoard()) : undefined });
-		await dashboardMain(b.win);
-		expect(text(b.view())).toContain("Choose an active profile for Work");
-		expect(b.seen.fetched.some((p) => p.includes("/board"))).toBe(false);
-		b.go("#/work/work");
-		expect(text(b.view())).toContain("No active profile named work");
-		b.go("#/work/%3Cscript%3E");
-		expect(text(b.view())).toContain("No active profile named <script>");
-		b.go("#/work/%E0%A4%A");
-		expect(text(b.view())).toContain("No active profile named %E0%A4%A");
-		expect(b.seen.fetched.some((p) => p.includes("/board"))).toBe(false);
-		b.go("#/work/odd%2F%26%3F");
-		await settle();
-		expect(b.seen.fetched.at(-1)).toBe("/api/profiles/odd%2F%26%3F/board?limit=50");
-		expect(text(b.view())).toContain("No open items in the uploaded data read");
-		expect(text(b.view())).toContain("No strategic review recorded");
-		const date = "2026-10-29T13:30:00+01:30";
-		submitDate(b, date);
-		await settle();
-		expect(b.seen.fetched.at(-1)).toBe(`/api/profiles/odd%2F%26%3F/board?limit=50&as_of=${encodeURIComponent(date)}`);
-		expect(find(b.view(), "label")[0]!.attrs.for).toBe(find(b.view(), "input")[0]!.attrs.id);
-		expect(text(b.view())).toContain("Z for UTC or an explicit offset");
-		expect(text(b.view())).toContain(`As of ${BOARD_DATE}`); // actual returned instant, not the requested label
-	});
-
-	it("isolates pending dates, profile changes, navigation and late failures without stealing focus", async () => {
-		const oldDate = gate(), failure = gate(), edited = gate(), profileReply = gate();
-		const b = browser({ signedIn: true, hash: "#/work/work", profiles: ABOUT_PROFILES, api: async (path) => {
-			if (!path.includes("/board?")) return;
-			if (path.includes("as_of=first")) { await oldDate.wait; return Response.json(workBoard({ as_of: "OLD-DATE", items: [workItem("Old item")] })); }
-			if (path.includes("as_of=fail")) { await failure.wait; return Response.json({ error: { message: "SQL private detail" } }, { status: 503 }); }
-			if (path.includes("as_of=edited")) { await edited.wait; return Response.json(workBoard({ as_of: "EDITED-DATE" })); }
-			if (path.includes("as_of=profile")) { await profileReply.wait; return Response.json(workBoard({ items: [workItem("Late personal item")] })); }
-			return Response.json(workBoard({ items: [workItem(path.includes("/personal/") ? "Personal item" : "Current item")] }));
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		submitDate(b, "first");
-		expect(status(b).textContent).toBe("Loading work board…");
-		expect(text(b.view())).not.toContain(BOARD_DATE);
-		submitDate(b, "second");
-		await settle();
-		const focus = active;
-		oldDate.open();
-		await settle();
-		expect(text(b.view())).not.toContain("OLD-DATE");
-		expect(active).toBe(focus);
-		submitDate(b, "edited");
-		const input = find(b.view(), "input")[0]!;
-		input.value = "not submitted";
-		input.on.input!(); input.focus();
-		edited.open();
-		await settle();
-		expect(status(b).textContent).toContain("Date changed");
-		expect(text(b.view())).not.toContain("EDITED-DATE");
-		expect(active).toBe(input);
-		submitDate(b, "fail");
-		b.go("#/work/personal");
-		await settle();
-		const heading = active;
-		failure.open();
-		await settle();
-		expect(text(b.view())).toContain("Personal item");
-		expect(text(b.view())).not.toContain("Could not load");
-		expect(active).toBe(heading);
-		submitDate(b, "profile");
-		b.go("#/profiles/work");
-		const profileHeading = active;
-		profileReply.open();
-		await settle();
-		expect(text(b.view())).not.toContain("Late personal item");
-		expect(active).toBe(profileHeading);
-		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/work/work");
-		expect(DASHBOARD_HTML(env)).toContain('<a href="#/work">Work</a>');
-	});
-
-	it("shows safe refusals and missing coverage honestly, removing earlier data on every request", async () => {
-		let response = Response.json(workBoard({ items: [workItem("Previous item")] }));
-		const b = browser({ signedIn: true, hash: "#/work", api: (path) => path.includes("/board?") ? response.clone() : undefined });
-		await dashboardMain(b.win);
-		await settle();
-		for (const [code, message] of [[400, "Check the ISO date"], [403, "Access was refused"], [404, "no longer available"], [409, "temporarily busy"], [503, "temporarily unavailable"]] as const) {
-			response = Response.json({ error: { message: "SELECT private FROM secret" } }, { status: code });
-			submitDate(b, "bad");
-			await settle();
-			expect(status(b).textContent).toContain(message);
-			expect(text(b.view())).not.toContain("Previous item");
-			expect(text(b.view())).not.toContain(BOARD_DATE);
-			expect(text(b.view())).not.toContain("SELECT");
-		}
-		// Store refusals use HTTP 400 in the existing route; their codes still explain the actual refusal.
-		for (const [code, message] of [["busy", "temporarily busy"], ["profile_wiped", "no longer available"]]) {
-			response = Response.json({ error: { code, message: "private detail" } }, { status: 400 });
-			submitDate(b, "");
-			await settle();
-			expect(status(b).textContent).toContain(message!);
-		}
-		response = Response.json({ as_of: BOARD_DATE, items: [workItem("Unknowns", { score: null, stale: null, last_activity_at: null })] });
-		submitDate(b, "");
-		await settle();
-		expect(text(b.view())).toContain("Score Not recorded Stale Not recorded Last activity Not recorded");
-		expect(text(b.view())).toContain("Read completeness was not reported");
-		expect(text(b.view())).toContain("evaluated count unavailable");
-		expect(text(b.view())).toContain("Strategic review information was not reported");
-		expect(text(b.view())).not.toContain("0 uploaded items");
-	});
-});
-
-describe("dashboard About you", () => {
-	it("opens me by default, keeps the server's order and labels, and pages with the server's cursor", async () => {
-		const cursor = '[0,0,"2026-10-29T08:00:00Z","id/&?=x"]';
-		const b = browser({ signedIn: true, hash: "#/about", profiles: ABOUT_PROFILES, api: (path) => {
-			if (path === "/api/profiles/me/owner-model?limit=50") return Response.json({ next_after: cursor, items: [
-				pref("s1", { name: "Short answers", description: "Prefers terse replies.", pinned: true, evidence: [{ kind: "memory", ref: "n:abc", note: "said in chat" }] }),
-				pref("i1", { name: "<img src=x onerror=alert(1)>", origin: "inferred", flagged: "protected: stated", evidence_missing: true }),
-				pref("a1", { name: "Tabs", origin: "agent", source_profile: "work", evidence_truncated: true,
-					evidence: Array.from({ length: 10 }, (_, i) => ({ kind: "file", ref: `javascript:alert(${i})`, note: null })) }),
-			] });
-			if (path === `/api/profiles/me/owner-model?limit=50&after=${encodeURIComponent(cursor)}`) return Response.json({ next_after: null, items: [pref("i2", { origin: "inferred" })] });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("About you: me");
-		// The switch lists active profiles only and marks the one on screen.
-		const links = find(find(b.view(), "nav")[0]!, "a");
-		expect(links.map((a) => [a.attrs.href, a.attrs["aria-current"]])).toEqual([["#/about/me", "page"], ["#/about/personal", undefined], ["#/about/work", undefined]]);
-		const items = () => find(find(b.view(), "ul")[0]!, "li").filter((li) => find(li, "h3").length);
-		expect(items().map((li) => find(li, "h3")[0]!.textContent)).toEqual(["Short answers", "<img src=x onerror=alert(1)>", "Tabs"]);
-		const [s1, i1, a1] = items().map(text);
-		expect(s1).toContain("Prefers terse replies. Origin Stated Pinned yes Flagged no Source profile this profile Updated 2026-10-29 Evidence: memory: n:abc (said in chat)");
-		expect(i1).toContain("Origin Inferred Pinned no Flagged protected: stated");
-		expect(i1).toContain("No evidence is recorded for this inferred preference.");
-		expect(a1).toContain("Origin Recorded as agent, not stated");
-		expect(a1).toContain("Source profile work");
-		expect(a1).toContain("Showing the first 10 evidence pointers; more exist.");
-		// Untrusted names and refs stay text: no element or link is made from them.
-		expect(find(b.view(), "img")).toEqual([]);
-		expect(find(find(b.view(), "ul")[0]!, "a")).toEqual([]);
-		expect(status(b).textContent).toBe("Showing 3 preferences; more are available.");
-		const more = button(b.view(), "Load more");
-		expect(more.hidden).toBe(false);
-		click(more);
-		await settle();
-		expect(b.seen.fetched.at(-1)).toBe(`/api/profiles/me/owner-model?limit=50&after=${encodeURIComponent(cursor)}`);
-		expect(items().map((li) => find(li, "h3")[0]!.textContent)).toEqual(["Short answers", "<img src=x onerror=alert(1)>", "Tabs", "Pref i2"]);
-		expect(more.hidden).toBe(true);
-		expect(status(b).textContent).toBe("Showing 4 preferences.");
-		expect(active).toBe(status(b));
-		expect(b.seen.auth.every((a) => a === "Bearer session-token")).toBe(true);
-		expect(b.seen.fetched.some((p) => p.includes("session-token"))).toBe(false);
-		// Reachable from the shell and the profile page, focus moves on navigation, and the served script carries the page.
-		b.go("#/profiles/work");
-		expect(find(b.view(), "a").map((a) => a.attrs.href)).toContain("#/about/work");
-		expect(DASHBOARD_HTML(env)).toContain('<a href="#/about">About you</a>');
-		expect(DASHBOARD_JS).toContain("/owner-model?limit=50");
-	});
-
-	it("pins once per click, shows the server's answer with Undo, shows a conflict, and confirms Forget", async () => {
-		const pin = gate();
-		const b = browser({ signedIn: true, hash: "#/about/me", profiles: ABOUT_PROFILES, api: async (path, method) => {
-			if (path.startsWith("/api/profiles/me/owner-model")) return Response.json({ next_after: null, items: [pref("n/1", { name: "Dark mode" })] });
-			if (method !== "POST") return undefined;
-			if (path === "/api/profiles/me/nodes/n%2F1/pin") { await pin.wait; return Response.json({ ok: true, action: "pinned", memory_id: "n/1", activity_id: 41 }); }
-			if (path === "/api/profiles/me/activity/41/undo") return Response.json({ error: { code: "revision_conflict", message: "expected revision 2, found 3" } }, { status: 409 });
-			if (path === "/api/profiles/me/nodes/n%2F1/forget") return Response.json({ error: { code: "not_found", message: "no node 'n/1' in this profile" } }, { status: 404 });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		const pinButton = button(b.view(), "Pin");
-		expect([pinButton.attrs.type, pinButton.attrs["aria-label"]]).toEqual(["button", "Pin Dark mode"]);
-		click(pinButton);
-		expect(status(b).textContent).toBe("Working: pin “Dark mode”…");
-		// Every write control waits; a glossary ? beside the intro is not a write, so it stays usable.
-		expect(find(b.view(), "button").filter((x) => x.textContent !== "Load more" && x.attrs.class !== "help").every((x) => x.disabled)).toBe(true);
-		click(pinButton); // a second press while the first is in flight sends nothing
-		pin.open();
-		await settle();
-		expect(b.seen.posted).toEqual(["/api/profiles/me/nodes/n%2F1/pin"]);
-		// Success is the server's own answer, then the list is read again.
-		expect(b.seen.fetched.filter((p) => p.includes("owner-model"))).toHaveLength(2);
-		expect(status(b).textContent).toBe("Done: pinned “Dark mode”. Showing 1 preference.");
-		expect(active).toBe(status(b));
-		click(button(b.view(), "Undo last change"));
-		await settle();
-		expect(b.seen.posted.at(-1)).toBe("/api/profiles/me/activity/41/undo");
-		expect(status(b).textContent).toContain("Could not undo the last change: it changed since; review it by hand (revision_conflict).");
-		expect(button(b.view(), "Undo last change")).toBeDefined(); // still there for the owner to try by hand
-		const forget = button(b.view(), "Forget");
-		click(forget);
-		const ask = find(b.view(), "span").find((x) => x.textContent.startsWith("Forget “"))!; // not the intro's spans
-		expect(ask.textContent).toBe("Forget “Dark mode”? It moves to the archive and leaves this list; Undo brings it back. ");
-		expect(active).toBe(ask);
-		click(button(b.view(), "Cancel"));
-		expect(active).toBe(button(b.view(), "Forget"));
-		click(button(b.view(), "Forget"));
-		click(button(b.view(), "Forget it"));
-		await settle();
-		expect(b.seen.posted.at(-1)).toBe("/api/profiles/me/nodes/n%2F1/forget");
-		expect(status(b).textContent).toContain("Could not forget “Dark mode”: no node 'n/1' in this profile (not_found).");
-		expect(b.seen.posted).toHaveLength(3);
-	});
-
-	it("drops an answer for a profile that is no longer on screen, and keeps its outcome and Undo for when the owner returns", async () => {
-		const late = gate(), pin = gate();
-		const b = browser({ signedIn: true, hash: "#/about/work", profiles: ABOUT_PROFILES, api: async (path, method) => {
-			if (path.includes("/board?")) return Response.json(workBoard());
-			if (path.startsWith("/api/profiles/work/owner-model")) { await late.wait; return Response.json({ next_after: null, items: [pref("w1", { name: "Work pref" })] }); }
-			if (path.startsWith("/api/profiles/me/owner-model")) return Response.json({ next_after: null, items: [pref("m1", { name: "Me pref" })] });
-			if (path.startsWith("/api/profiles/personal/owner-model")) return Response.json({ next_after: null, items: [] });
-			if (method === "POST" && path === "/api/profiles/me/nodes/m1/pin") { await pin.wait; return Response.json({ ok: true, action: "pinned", activity_id: 7 }); }
-		} });
-		await dashboardMain(b.win);
-		b.go("#/about/me");
-		await settle();
-		late.open();
-		await settle();
-		expect(text(b.view())).toContain("Me pref");
-		expect(text(b.view())).not.toContain("Work pref");
-		expect(find(b.view(), "h2")[0]!.focused).toBe(true);
-		click(button(b.view(), "Pin"));
-		b.go("#/work/work");
-		await settle();
-		const reads = b.seen.fetched.length;
-		pin.open();
-		await settle();
-		expect(status(b).textContent).toBe("Showing 0 ranked open items of 0 evaluated.");
-		expect(b.seen.fetched).toHaveLength(reads); // no reload of me behind the Work page
-		b.go("#/about/me");
-		await settle();
-		expect(status(b).textContent).toBe("Done: pinned “Me pref”. Showing 1 preference.");
-		expect(button(b.view(), "Undo last change").disabled).toBe(false);
-	});
-
-	it("keeps a committed action outcome visible while its refresh loads or fails", async () => {
-		const refresh = gate();
-		let reads = 0;
-		const b = browser({ signedIn: true, hash: "#/about/me", profiles: ABOUT_PROFILES, api: async (path, method) => {
-			if (path === "/api/profiles/me/nodes/p1/pin" && method === "POST") return Response.json({ action: "pinned", activity_id: 333 });
-			if (path.startsWith("/api/profiles/me/owner-model")) {
-				if (++reads === 1) return Response.json({ next_after: null, items: [pref("p1", { name: "Short answers" })] });
-				await refresh.wait;
-				return Response.json({ error: { message: "synthetic store unavailable" } }, { status: 503 });
-			}
-			if (path.includes("/owner-model")) return Response.json({ next_after: null, items: [] });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		click(button(b.view(), "Pin"));
-		await settle();
-		expect(status(b).textContent).toContain("Done: pinned “Short answers”.");
-		expect(status(b).textContent).toContain("Loading preferences…");
-		expect(button(b.view(), "Undo last change")).toBeDefined();
-		refresh.open();
-		await settle();
-		expect(status(b).textContent).toContain("Done: pinned “Short answers”.");
-		expect(status(b).textContent).toContain("Could not load preferences: synthetic store unavailable");
-		expect(active).toBe(status(b));
-		b.go("#/about/personal");
-		b.go("#/about/me");
-		await settle();
-		expect(status(b).textContent).toContain("Done: pinned “Short answers”.");
-		expect(status(b).textContent).toContain("Could not load preferences: synthetic store unavailable");
-		expect(button(b.view(), "Undo last change").disabled).toBe(false);
-		expect(b.seen.posted).toEqual(["/api/profiles/me/nodes/p1/pin"]);
-	});
-
-	it("reads only active profiles, falls back from me, and shows a refused read without inventing records", async () => {
-		const b = browser({ signedIn: true, hash: "#/about/old", profiles: ABOUT_PROFILES });
-		await dashboardMain(b.win);
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("No active profile named old");
-		const noMe = browser({ signedIn: true, hash: "#/about", api: (path) => path.includes("owner-model")
-			? Response.json({ error: { code: "not_found", message: "profile 'personal' is not active" } }, { status: 404 }) : undefined });
-		await dashboardMain(noMe.win);
-		await settle();
-		expect(find(noMe.view(), "h2")[0]!.textContent).toBe("About you: personal");
-		expect(status(noMe).textContent).toBe("Could not load preferences: profile 'personal' is not active");
-		expect(find(noMe.view(), "h3")).toEqual([]);
-		const retry = button(noMe.view(), "Try again");
-		expect(retry.hidden).toBe(false);
-		click(retry);
-		await settle();
-		expect(noMe.seen.fetched.filter((p) => p.includes("owner-model"))).toEqual(Array(2).fill("/api/profiles/personal/owner-model?limit=50"));
-		expect(b.seen.fetched.some((p) => p.includes("owner-model"))).toBe(false);
-	});
-});
-
-// The newer pages: fixtures shaped like the owner reads and writes they call.
-const typeIn = (e: El, value: string) => { e.value = value; e.on.input?.(); };
-const submit = (root: El, i = 0) => find(root, "form")[i]!.on.submit!({ preventDefault() {} });
-const byId = (root: El, id: string) => find(root, "input").concat(find(root, "textarea"), find(root, "select")).find((e) => e.attrs.id === id)!;
-const HOSTILE = "<img src=x onerror=alert(1)>";
-const entity = (extra: Record<string, unknown> = {}) => ({ id: "m1", as_of: null,
-	node: { id: "m1", kind: "decision", memory_type: "project", scope: null, name: HOSTILE, status: "active", origin: "stated", revision: 3, created_at: "2026-10-01T00:00:00Z",
-		updated_at: "2026-10-30T00:00:00Z", pinned: false, flagged: null, source_profile: null, description: "Why we chose it", truncated: [] },
-	content: { text: "Line one\nLine two", chars: 18, complete: true }, evidence: { items: [{ kind: "url", ref: "https://example.test", note: null }], truncated: false },
-	links: [{ id: 1, rel: "relates_to", direction: "out", reason: "same area", other: { id: "x9", readable: false } }], budget: { exhausted: false },
-	history: { items: [{ revision: 3, op: "updated", at: "2026-10-30T00:00:00Z", actor: "agent" }], next_before: 3 }, ...extra });
-
 describe("dashboard memories and drafts", () => {
-	it("lists with the server's cursor, opens a record as text with history, and pins it with Undo", async () => {
-		const b = browser({ signedIn: true, hash: "#/memories", api: (path, method, body) => {
-			if (path === "/api/profiles/work/recall") return Response.json((body as { cursor?: string }).cursor
-				? { results: [], next_cursor: null, truncated: false } : { results: [{ memory_id: "m1", profile: "work", name: HOSTILE, type: "project", passage: "p" }], next_cursor: "c1", truncated: true });
-			if (path === "/api/profiles/work/nodes/m1") return Response.json(entity());
-			if (path === "/api/profiles/work/nodes/m1?before=3") return Response.json({ history: { items: [{ revision: 2, op: "created", at: "2026-10-01T00:00:00Z", actor: "owner" }], next_before: null } });
-			if (path === "/api/profiles/work/nodes/m1/pin" && method === "POST") return Response.json({ action: "pinned", activity_id: 41 });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Memories: work"); // work is the default over the first active profile
-		expect(b.seen.bodies[0]).toEqual({ limit: 25 });
-		expect(find(b.view(), "a").find((a) => a.textContent === HOSTILE)!.attrs.href).toBe("#/memory/work/m1");
-		expect(find(b.view(), "img")).toEqual([]);
-		click(button(b.view(), "Load more"));
-		await settle();
-		expect(b.seen.bodies[1]).toEqual({ limit: 25, cursor: "c1" });
-		b.go("#/memory/work/m1");
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe(`Memory: ${HOSTILE}`);
-		expect(text(b.view())).toContain("Line one\nLine two");
-		expect(text(b.view())).toContain("a record not readable in this profile");
-		click(button(b.view(), "Older revisions"));
-		await settle();
-		expect(find(b.view(), "tr").slice(1).map(text)).toEqual(["3 updated 2026-10-30T00:00:00Z agent", "2 created 2026-10-01T00:00:00Z owner"]);
-		click(button(b.view(), "Pin"));
-		await settle();
-		expect(status(b).textContent).toContain(`Done: pinned “${HOSTILE}”.`);
-		expect(button(b.view(), "Undo last change")).toBeDefined();
-		expect(b.seen.posted).toEqual(["/api/profiles/work/recall", "/api/profiles/work/recall", "/api/profiles/work/nodes/m1/pin"]);
-	});
-
 	it("saves a draft only after a preview and an explicit Save, invalidates the preview on change, and keeps a refusal visible", async () => {
 		let answer: Response = Response.json({ error: { code: "validation", message: "synthetic refusal" } }, { status: 400 });
 		const b = browser({ signedIn: true, hash: "#/draft/work", api: (path) => path === "/api/profiles/work/save" ? answer : undefined });
@@ -839,15 +367,6 @@ describe("dashboard memories and drafts", () => {
 		expect(byId(b.view(), "draft-name").value).toBe("Retry control");
 		expect(button(b.view(), "Save").disabled).toBe(false); // the same preview stays ready; nothing was retried by itself
 		expect(b.seen.posted).toHaveLength(1);
-		b.go("#/map/work");
-		await settle();
-		click(find(b.view(), "button").find((e) => e.attrs.class === "node")!);
-		typeIn(byId(b.view(), "whatif-name"), "A different draft");
-		submit(b.view(), 1);
-		await settle();
-		click(button(b.view(), "Make a draft"));
-		expect(text(b.view())).toContain("There is an unsaved draft in this profile");
-		expect(b.seen.posted).toHaveLength(1);
 		b.go("#/draft/work");
 		expect(byId(b.view(), "draft-name").value).toBe("Retry control");
 		expect(byId(b.view(), "draft-desc").value).toBe("Description");
@@ -858,85 +377,6 @@ describe("dashboard memories and drafts", () => {
 		expect(second).toEqual(first);
 		expect(status(b).textContent).toContain("Saved: created “Retry control”, revision 1.");
 		expect(byId(b.view(), "draft-name").value).toBe("");
-	});
-
-	it("renames a record from Edit as a draft: new_name only when changed, with its revision, and a fresh request id only for a changed body", async () => {
-		let saves = 0;
-		const b = browser({ signedIn: true, hash: "#/memory/work/m1", api: (path, method, body) => {
-			if (path === "/api/profiles/work/nodes/m1") return Response.json(entity());
-			if (path === "/api/profiles/work/save" && method === "POST") {
-				if (++saves === 1) throw new Error("response lost after commit");
-				return Response.json({ ok: true, action: "updated", memory_id: "m1", name: (body as { new_name?: string }).new_name, revision: 4 });
-			}
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		click(button(b.view(), "Edit as a draft"));
-		b.go("#/draft/work");
-		const name = byId(b.view(), "draft-name");
-		expect([name.value, name.disabled, byId(b.view(), "draft-type").disabled, byId(b.view(), "draft-scope").disabled]).toEqual([HOSTILE, false, true, true]);
-		submit(b.view());
-		expect(text(b.view())).toContain("Name unchanged");
-		typeIn(byId(b.view(), "draft-name"), "");
-		expect(button(b.view(), "Save").disabled).toBe(true); // a changed name needs a new preview
-		submit(b.view());
-		expect(status(b).textContent).toBe("Give the memory a name.");
-		typeIn(byId(b.view(), "draft-name"), "  Use SQLite ");
-		submit(b.view());
-		expect(text(b.view())).toContain(`Renamed from “${HOSTILE}” to “Use SQLite”`);
-		click(button(b.view(), "Save"));
-		await settle();
-		expect(status(b).textContent).toContain("response lost after commit");
-		b.go("#/draft/work"); // the draft survives a re-render and still knows the record's own name
-		expect(text(b.view())).toContain(`Editing “${HOSTILE}” at revision 3`);
-		submit(b.view());
-		click(button(b.view(), "Save"));
-		await settle();
-		const [first, second] = b.seen.bodies as Record<string, unknown>[];
-		expect(first).toMatchObject({ memory_id: "m1", expected_revision: 3, new_name: "Use SQLite", description: "Why we chose it", content: "Line one\nLine two" });
-		expect(first).not.toHaveProperty("name");
-		expect(second).toEqual(first); // the unchanged retry replays under the same request id
-		expect(status(b).textContent).toContain("Saved: updated “Use SQLite”, revision 4.");
-		b.go("#/memory/work/m1");
-		await settle();
-		click(button(b.view(), "Edit as a draft"));
-		b.go("#/draft/work");
-		typeIn(byId(b.view(), "draft-desc"), "A changed summary");
-		submit(b.view());
-		click(button(b.view(), "Save"));
-		await settle();
-		const third = b.seen.bodies[2] as Record<string, unknown>;
-		expect(third).not.toHaveProperty("new_name"); // an unchanged name is not sent
-		expect(third).toMatchObject({ memory_id: "m1", expected_revision: 3, description: "A changed summary" });
-		expect(third.request_id).not.toBe(first!.request_id);
-		expect(b.seen.posted).toEqual(Array(3).fill("/api/profiles/work/save"));
-	});
-
-	it("draws the map's readable records as buttons, states partial and opaque coverage, and keeps what-if items local until a draft is saved", async () => {
-		const map = { center: null, starts: ["p1"], depth: 1, nodes: [{ id: "p1", kind: "project", name: "Agent Memory", status: "active" }, { id: "c1", kind: "component", name: HOSTILE, status: "active" }],
-			links: [{ id: 1, rel: "part_of", reason: "lives in it", from: { id: "c1", readable: true }, to: { id: "p1", readable: true } }, { id: 2, rel: "relates_to", from: { id: "p1", readable: true }, to: { id: "zz", readable: false } }],
-			truncated: true, limits: { nodes: 300 } };
-		const b = browser({ signedIn: true, hash: "#/map/work", api: (path) => path.startsWith("/api/profiles/work/map?") ? Response.json(map) : undefined });
-		await dashboardMain(b.win);
-		await settle();
-		expect(b.seen.fetched).toContain("/api/profiles/work/map?depth=1");
-		expect(text(b.view())).toContain("Partial map");
-		expect(text(b.view())).toContain("1 link leads to records not readable in this profile");
-		const nodes = find(b.view(), "button").filter((e) => e.attrs.class === "node");
-		expect(nodes.map((n) => n.attrs["aria-label"])).toEqual(["project: Agent Memory", `component: ${HOSTILE}`]);
-		click(nodes[0]!);
-		expect(nodes[0]!.attrs["aria-pressed"]).toBe("true");
-		expect(text(b.view())).toContain(`From ${HOSTILE} — part_of: lives in it`);
-		typeIn(byId(b.view(), "whatif-name"), "Try Postgres");
-		submit(b.view(), 1);
-		await settle();
-		expect(text(b.view())).toContain("What-if: Try Postgres");
-		expect(b.seen.posted).toEqual([]);
-		click(button(b.view(), "Make a draft"));
-		b.go("#/draft/work");
-		expect(byId(b.view(), "draft-name").value).toBe("Try Postgres");
-		expect(text(b.view())).toContain("Adds a “relates to” link to “Agent Memory”");
-		expect(b.seen.posted).toEqual([]);
 	});
 
 	it("shows an open recovery with its consequences, and steps, aborts or begins a restore only after typed confirmation", async () => {
@@ -1257,409 +697,6 @@ describe("dashboard memories and drafts", () => {
 		click(button(b.view(), "Abort"));
 		await many();
 		expect(b.seen.posted).toEqual(["/api/recovery/conflicts/resolve", "/api/recovery/conflicts/resolve", "/api/recovery/step", "/api/recovery/open", "/api/recovery/open", "/api/recovery/abort"]);
-	});
-});
-
-describe("dashboard timeline, journals and paths", () => {
-	it("reads an explicit timeline window for active work, links named records, states a cut window, and drops a stale answer", async () => {
-		const late = gate();
-		let calls = 0;
-		const b = browser({ signedIn: true, hash: "#/timeline", api: async (path) => {
-			if (!path.startsWith("/api/profiles/work/timeline?")) return;
-			if (++calls === 3) { await late.wait; return Response.json({ node: null, events: [{ at: "2026-10-30T00:00:00Z", event: "activity:save", summary: "stale answer" }], truncated: false }); }
-			return Response.json({ node: null, truncated: true, events: [
-				{ at: "2026-10-29T00:00:00Z", event: "activity:save", node_id: null, actor: "agent", summary: HOSTILE, targets: ["m1"] },
-				{ at: "2026-10-30T00:00:00Z", event: "revision:legacy_snapshot", node_id: "n1", revision: 1, kind: "document", name: "Imported note", actor: "migration" }] });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Timeline: work");
-		const first = b.seen.fetched.find((x) => x.includes("/timeline?"))!;
-		const q = new URL(first, "https://x").searchParams;
-		expect([q.get("limit"), Date.parse(q.get("to")!) - Date.parse(q.get("from")!)]).toEqual(["100", 7 * 86_400_000]);
-		expect(text(b.view())).toContain(`Change: save by agent ${HOSTILE}`);
-		expect(find(b.view(), "img")).toEqual([]);
-		expect(find(b.view(), "a").find((a) => a.textContent === "document: Imported note")!.attrs.href).toBe("#/memory/work/n1");
-		expect(text(b.view())).toContain("Only the earliest events of this window are shown");
-		click(button(b.view(), "Show up to 500 events"));
-		await settle();
-		expect(b.seen.fetched.filter((x) => x.includes("/timeline?")).at(-1)).toContain("limit=100".replace("100", "500"));
-		submit(b.view());
-		typeIn(byId(b.view(), "tl-from"), "2026-10-01T00:00:00Z");
-		late.open();
-		await settle();
-		expect(text(b.view())).not.toContain("stale answer");
-		expect(status(b).textContent).toBe("Window changed. Choose Show timeline to load it.");
-	});
-
-	it("pages journals, reads one journal's entries as text with compaction and part markers, and pages its entries", async () => {
-		const b = browser({ signedIn: true, hash: "#/journals", api: (path) => {
-			if (path === "/api/profiles/work/journals?limit=50") return Response.json({ items: [{ id: "j1", name: HOSTILE, scope: "repo", updated_at: "2026-10-30T00:00:00Z", latest_entry_seq: 3, compacted_through: 1, pinned: false }], next_after: null });
-			if (path === "/api/profiles/work/journals?id=j1&limit=25") return Response.json({ journal: { id: "j1", name: "Build log", scope: "repo", status: "active", revision: 4, compacted_through: 1 },
-				summary: { body: "Summary <b>text</b>", complete: true }, compactions: [{ revision: 3, at: "2026-10-29T00:00:00Z", actor: "agent", from_seq: 1, through_seq: 1 }], compactions_more: false,
-				entries: [{ entry_seq: 1, body: HOSTILE, created_at: "2026-10-28T00:00:00Z", actor: "agent", current: false, complete: true }, { entry_seq: 2, body: "two", created_at: "2026-10-29T00:00:00Z", actor: "agent", current: true, complete: false }], next_after: 2 });
-			if (path === "/api/profiles/work/journals?id=j1&limit=25&entries_after=2") return Response.json({ journal: {}, entries: [{ entry_seq: 3, body: "three", created_at: "2026-10-30T00:00:00Z", actor: "agent", current: true, complete: true }], next_after: null });
-		} });
-		await dashboardMain(b.win);
-		await settle();
-		expect(find(b.view(), "a").find((a) => a.textContent === HOSTILE)!.attrs.href).toBe("#/journals/work/j1");
-		expect(status(b).textContent).toBe("Showing 1 journal.");
-		b.go("#/journals/work/j1");
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Journal: Build log");
-		expect(text(b.view())).toContain("Summary <b>text</b>");
-		expect(text(b.view())).toContain(`· 2026-10-28T00:00:00Z · agent ${HOSTILE} Compacted into the summary.`);
-		expect(text(b.view())).toContain("Only this entry's first part is shown");
-		expect(find(b.view(), "img").concat(find(b.view(), "b"))).toEqual([]);
-		click(button(b.view(), "Later entries"));
-		await settle();
-		expect(text(b.view())).toContain("Entry 3");
-		expect(status(b).textContent).toBe("Showing 3 entries.");
-		expect(button(b.view(), "Later entries").hidden).toBe(true);
-		expect(b.seen.posted).toEqual([]);
-	});
-
-	it("finds paths from the server's answer only, shows unreadable ends truthfully, and ignores an answer after the profile changed", async () => {
-		const late = gate();
-		const answer = { mode: "path", max_depth: 4, from: { id: "a1", kind: "project", name: "Start", profile: "work" }, to: { id: "b2", kind: "decision", name: "Goal", profile: "work" },
-			paths: [{ length: 2, edges: [{ rel: "depends_on", reason: "needs it", from: { id: "a1", kind: "project", name: "Start", profile: "work" }, to: { id: "x9", readable: false } },
-				{ rel: "relates_to", from: { id: "x9", readable: false }, to: { id: "b2", profile: "me", readable: true } }] }], budget: { exhausted: true } };
-		let calls = 0;
-		const b = browser({ signedIn: true, hash: "#/path/work/a1", api: async (path) => {
-			if (!path.startsWith("/api/profiles/work/path?")) return;
-			if (++calls === 2) await late.wait;
-			return Response.json(answer);
-		} });
-		await dashboardMain(b.win);
-		expect(byId(b.view(), "path-from").value).toBe("a1");
-		typeIn(byId(b.view(), "path-to"), "b2");
-		submit(b.view());
-		await settle();
-		// Only the path read: no extra lookups of names or ends.
-		expect(b.seen.fetched.filter((x) => x.startsWith("/api/profiles/") && !x.endsWith("/batch"))).toEqual(["/api/profiles/work/path?from=a1&to=b2&max_depth=4"]);
-		expect(text(b.view()).replace(/\s+/g, " ")).toContain("From project: Start to decision: Goal");
-		expect(text(b.view()).replace(/\s+/g, " ")).toContain("project: Start — depends_on → a record not readable here needs it");
-		expect(text(b.view()).replace(/\s+/g, " ")).toContain("a record not readable here — relates_to → a record in another profile, not read");
-		expect(text(b.view())).toContain("The search stopped at its read budget");
-		expect(find(b.view(), "a").find((a) => a.textContent === "decision: Goal")!.attrs.href).toBe("#/memory/work/b2");
-		submit(b.view());
-		b.go("#/path/personal");
-		const focused = active;
-		late.open();
-		await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Path finder: personal");
-		expect(text(b.view())).not.toContain("Start");
-		expect(active).toBe(focused);
-	});
-});
-
-describe("dashboard knowledge graph", () => {
-	// The zoom buttons show + and −; their accessible names say Zoom in and Zoom out.
-	const named = (root: El, label: string) => find(root, "button").find((x) => x.attrs["aria-label"] === label)!;
-	// A realistic metadata-only library: 1,374 memories of every type, two entities, and links of every kind the read can send.
-	const TYPES = ["project", "feedback", "reference", "user", "procedural"];
-	const nodes = [...Array.from({ length: 1374 }, (_, i) => ({ id: `r${i}`, kind: i % 7 ? "document" : "decision", type: TYPES[i % 5], scope: i % 3 ? "repo-a" : null,
-		name: i === 1000 ? HOSTILE : `Record ${i}`, status: "active", updated_at: "2026-10-30T00:00:00Z" })),
-		{ id: "p1", kind: "project", type: null, name: "Agent Memory", status: "active" }, { id: "u1", kind: "person", type: null, name: "Owner", status: "active" },
-		{ id: "old", kind: "document", type: "reference", name: "Retired note", status: "retired" }];
-	const at = (src: string, dst: string, readable = true) => ({ src, dst: { id: dst, readable } });
-	const edges = [{ id: 1, rel: "part_of", ...at("r1", "p1") }, { id: 2, rel: "authored", ...at("u1", "r1") }, { id: 3, rel: "relates_to", ...at("r2", "far", false) },
-		{ id: 4, rel: "relates_to", ...at("r3", "never-sent") }];
-	// The whole-graph read: server page sizes (1,000 nodes, 2,000 edges), an opaque next_after, total only on a first nodes page.
-	const pageOf = (part: "nodes" | "edges", items: unknown[], path: string, changed = false) => {
-		const start = Number(new URL(path, "https://x").searchParams.get("after") ?? 0), size = part === "nodes" ? 1000 : 2000, next = start + size < items.length ? String(start + size) : null;
-		return Response.json({ part, items: items.slice(start, start + size), next_after: next, done: !next, changed, ...(part === "nodes" && !start ? { total: items.length } : {}), limits: { items: size, bytes: 524288 } });
-	};
-	const graphApi = (extra?: Api): Api => async (path, method, body) => {
-		const r = await extra?.(path, method, body);
-		if (r) return r;
-		if (path.startsWith("/api/profiles/work/graph?part=nodes")) return pageOf("nodes", nodes, path);
-		if (path.startsWith("/api/profiles/work/graph?part=edges")) return pageOf("edges", edges, path);
-	};
-	const loaded = async (b: ReturnType<typeof browser>) => {
-		for (let i = 0; i < 40; i++) { await settle(); const t = status(b)?.textContent ?? ""; if (t.includes("records") && !t.includes("loading…")) return; }
-		throw new Error("the graph did not finish loading");
-	};
-
-	it("opens active work's whole graph at the root, pages metadata to the server's totals, draws every record and only real links", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
-		const started = performance.now();
-		await dashboardMain(b.win);
-		await loaded(b);
-		const elapsed = performance.now() - started;
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Knowledge graph: work");
-		expect(b.seen.fetched.filter((x) => x.includes("/graph?")).sort()).toEqual(["/api/profiles/work/graph?part=edges", "/api/profiles/work/graph?part=nodes",
-			"/api/profiles/work/graph?part=nodes&after=1000"]);
-		// A link to a record the server never listed waits instead of inventing an end; the opaque one is counted, not drawn.
-		expect(status(b).textContent).toBe("1,377 of 1,377 records loaded · 2 links · 1 links lead to records not readable in this profile · 1 links wait for records that were not listed.");
-		expect(b.seen.fetched.some((x) => x.includes("/recall") || x.includes("/map?"))).toBe(false);
-		await settle();
-		const canvas = find(b.view(), "canvas")[0]!;
-		expect(Number(canvas.attrs["data-drawn"])).toBe(1376); // fitted: every active record is in view; the retired one waits for its toggle
-		expect(text(b.view())).toContain("Include retired and superseded records (1)");
-		expect(text(find(b.view(), "ul").find((u) => u.attrs.class === "legend")!)).toContain("Project memories (275)");
-		expect(elapsed).toBeLessThan(3000);
-		// Search finds records among all loaded ones, lists at most 50 as buttons, and a hostile name stays text.
-		typeIn(byId(b.view(), "graph-q"), "record 1");
-		expect(text(b.view())).toContain("matches; the first 50 are listed.");
-		expect(find(find(b.view(), "ul").find((u) => u.attrs.class === "matches")!, "button")).toHaveLength(50);
-		typeIn(byId(b.view(), "graph-q"), "onerror");
-		expect(button(b.view(), HOSTILE)).toBeDefined();
-		expect(find(b.view(), "img")).toEqual([]);
-		// Hiding a group removes it from the drawing.
-		const box = find(b.view(), "input").find((e) => e.attrs.type === "checkbox" && text(find(b.view(), "label").find((l) => l.children.includes(e))!).includes("Feedback"))!;
-		box.checked = false;
-		box.on.change!();
-		await settle();
-		expect(Number(canvas.attrs["data-drawn"])).toBe(1376 - 275);
-	});
-
-	it("reads a selected record's detail only on selection, shows its real links, and drops a slower earlier selection", async () => {
-		const slow = gate();
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi(async (path) => {
-			if (path === "/api/profiles/work/nodes/r1") { await slow.wait; return Response.json({ node: { name: "Record 1", description: "late detail" }, history: { items: [] } }); }
-			if (path === "/api/profiles/work/nodes/u1") return Response.json({ node: { name: "Owner", description: "The owner" }, history: { items: [{ revision: 1, op: "saved", at: "2026-10-01T00:00:00Z", actor: "agent" }] } });
-		}) });
-		await dashboardMain(b.win);
-		await loaded(b);
-		expect(b.seen.fetched.some((x) => x.includes("/nodes/"))).toBe(false);
-		typeIn(byId(b.view(), "graph-q"), "Record 1");
-		click(button(b.view(), "Record 1"));
-		// Relations show a direction arrow with a hidden Outgoing or Incoming label, the relation, a kind glyph and the record.
-		expect(text(b.view()).replace(/\s+/g, " ")).toMatch(/→ Outgoing part_of \S+ Agent Memory/);
-		expect(text(b.view()).replace(/\s+/g, " ")).toMatch(/← Incoming authored \S+ Owner/);
-		click(button(b.view(), "Owner"));
-		await settle();
-		slow.open();
-		await settle();
-		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Owner");
-		expect(text(b.view())).toContain("The owner");
-		expect(text(b.view())).not.toContain("late detail");
-		typeIn(byId(b.view(), "graph-q"), "Record 13");
-		click(button(b.view(), "Record 13"));
-		await settle();
-		expect(text(b.view())).toContain("No links: this record stands alone.");
-		expect(b.seen.posted).toEqual([]);
-	});
-
-	it("says plainly when the server has no whole-graph read, without a fallback read", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: (path) => path.includes("/graph?") ? Response.json({ error: "not_found" }, { status: 404 }) : undefined });
-		await dashboardMain(b.win);
-		await settle();
-		expect(status(b).textContent).toContain("This server does not offer the whole-graph read yet");
-		expect(b.seen.fetched.filter((x) => x.startsWith("/api/profiles/work/")).sort()).toEqual(["/api/profiles/work/batch", "/api/profiles/work/graph?part=edges", "/api/profiles/work/graph?part=nodes"]);
-		expect(b.seen.fetched.some((x) => x.includes("/recall") || x.includes("/map?"))).toBe(false);
-	});
-
-	it("offers a fresh walk when the profile changed during loading, and replaces the cached graph", async () => {
-		let changed = true;
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", edges, path, changed) : undefined) });
-		await dashboardMain(b.win);
-		await loaded(b);
-		expect(status(b).textContent).toContain("The profile changed while loading; reload for a fresh graph.");
-		changed = false;
-		click(button(b.view(), "Reload graph"));
-		await loaded(b);
-		expect(status(b).textContent).not.toContain("changed while loading");
-		expect(b.seen.fetched.filter((x) => x === "/api/profiles/work/graph?part=nodes")).toHaveLength(2);
-	});
-
-	it("resizes the backing canvas on a height-only change and keeps headings and the selected label inside a narrow canvas without overlap", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
-		await dashboardMain(b.win);
-		await loaded(b);
-		await settle();
-		const canvas = find(b.view(), "canvas")[0]! as El & { width: number; height: number; clientWidth: number; clientHeight: number; ctx: Ctx };
-		expect([canvas.width, canvas.height]).toEqual([800, 560]);
-		canvas.clientHeight = 420;
-		b.listeners.resize!();
-		await settle();
-		expect([canvas.width, canvas.height]).toEqual([800, 420]);
-		canvas.clientWidth = 390;
-		b.listeners.resize!();
-		typeIn(byId(b.view(), "graph-q"), "Record 1");
-		click(button(b.view(), "Record 1"));
-		canvas.ctx.texts = [];
-		click(named(b.view(), "Zoom out"));
-		await settle();
-		const texts = canvas.ctx.texts, inside = (t: Ctx["texts"][number]) => t.x >= 0 && t.x + t.w <= 390 && t.y >= 0 && t.y <= 420;
-		const headings = texts.filter((t) => t.font.startsWith("600"));
-		expect(headings.length).toBeGreaterThan(0);
-		expect(texts.every(inside)).toBe(true);
-		for (const [i, a] of texts.entries()) for (const c of texts.slice(i + 1)) expect(a.x + a.w <= c.x || c.x + c.w <= a.x || a.y <= c.y - 14 || c.y <= a.y - 14).toBe(true);
-		expect(texts.some((t) => t.t === "Record 1")).toBe(true);
-	});
-
-	it("draws every record into one cached dot layer as a path per colour, so a pan stamps one bitmap and a zoom redraws the layer once", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
-		const made: (El & { ctx: Ctx })[] = [], create = b.win.document.createElement;
-		b.win.document.createElement = (tag: string) => { const e = create(tag) as El & { ctx: Ctx }; if (tag === "canvas") made.push(e); return e; };
-		await dashboardMain(b.win);
-		await loaded(b);
-		await settle();
-		const [screen, dotLayer] = made;
-		expect(made).toHaveLength(2); // the visible canvas and its one dot layer, reused
-		const stamped = screen!.ctx.images;
-		// The last layer drawing held every active record in one fill per kind shape (five): the 1,374 memories are circles (arcs),
-		// the project and the person are drawn as other shapes.
-		dotLayer!.ctx.arcs = 0; dotLayer!.ctx.fills = 0;
-		click(button(b.view(), "Fit"));
-		click(named(b.view(), "Zoom in"));
-		await settle();
-		expect([dotLayer!.ctx.arcs, dotLayer!.ctx.fills]).toEqual([1374, 5]);
-		expect(screen!.attrs["data-drawn"]).toBe("1376");
-		// A pan stamps the layer once and draws no record on the visible canvas, nor redraws the layer.
-		const before = { layer: dotLayer!.ctx.arcs, screen: screen!.ctx.arcs, images: screen!.ctx.images };
-		screen!.on.keydown!({ key: "ArrowLeft", preventDefault() {} } as never);
-		await settle();
-		expect([dotLayer!.ctx.arcs - before.layer, screen!.ctx.arcs - before.screen, screen!.ctx.images - before.images]).toEqual([0, 0, 1]);
-		expect(stamped).toBeGreaterThan(0);
-	});
-
-	it("colours canvas text to 4.5:1 against the canvas's actual background in dark and light, read once, not per frame", async () => {
-		const lum = (c: number[]) => c.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }).reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i]!, 0);
-		const rgb = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
-		for (const [surface, dark] of [[[26, 28, 29], true], [[251, 252, 253], false]] as const) {
-			let reads = 0;
-			const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
-			// A forced dark page: the canvas's computed background, whatever the colour-scheme media query says.
-			Object.assign(b.win, { getComputedStyle: (e: El) => { reads++; return { backgroundColor: e.tag === "canvas" ? `rgb(${surface.join(", ")})` : "rgba(0, 0, 0, 0)" }; } });
-			await dashboardMain(b.win);
-			await loaded(b);
-			typeIn(byId(b.view(), "graph-q"), "Record 1");
-			click(button(b.view(), "Record 1"));
-			const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
-			canvas.ctx.texts = [];
-			click(button(b.view(), "Fit"));
-			await settle();
-			const texts = canvas.ctx.texts;
-			expect(texts.some((t) => t.t === "Record 1") && texts.some((t) => t.font.startsWith("600"))).toBe(true);
-			for (const t of texts) {
-				const [x, y] = [lum(rgb(t.color)), lum([...surface])].sort((p, q) => q - p);
-				expect((x! + 0.05) / (y! + 0.05)).toBeGreaterThanOrEqual(4.5);
-			}
-			expect(canvas.ctx.fillStyles).toContain(dark ? "#5b9ee9" : "#2a78d6"); // the memory hue in each theme
-			const before = reads;
-			for (const key of ["ArrowLeft", "ArrowUp", "ArrowRight"]) { canvas.on.keydown!({ key, preventDefault() {} } as never); await settle(); }
-			expect(reads).toBe(before); // frames read no computed style
-		}
-	});
-
-	it("draws an unsaved what-if apart from the saved graph, compares only loaded facts, resets, keeps it to its profile and sends nothing", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi((path) => path === "/api/profiles/work/nodes/r13" ? Response.json({ node: { name: "Record 13" }, history: { items: [] } }) : undefined) });
-		await dashboardMain(b.win);
-		await loaded(b);
-		const saved = status(b).textContent;
-		typeIn(byId(b.view(), "graph-q"), "Record 13");
-		click(button(b.view(), "Record 13"));
-		const whatIfForm = () => find(b.view(), "form").find((f) => find(f, "input").some((i) => i.attrs.id === "graph-whatif"))!;
-		typeIn(byId(b.view(), "graph-whatif"), "Try caching");
-		whatIfForm().on.submit!({ preventDefault() {} });
-		const flat = () => text(b.view()).replace(/\s+/g, " ");
-		expect(flat()).toContain("What-if (not saved)");
-		expect(flat()).toContain("Records 1,377 saved → 1,378 with what-if Links 2 → 3 Records with links 3 → 5");
-		expect(flat()).toContain("Try caching, linked to “Record 13” (its links 0 → 1)");
-		expect(status(b).textContent).toBe(saved); // the saved graph's own counts do not move
-		const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
-		canvas.ctx.texts = [];
-		click(named(b.view(), "Zoom in"));
-		await settle();
-		expect(canvas.ctx.texts.some((x) => x.t === "What-if: Try caching")).toBe(true);
-		// Another profile's graph shows none of it; back in work it is still there, in this tab only.
-		b.go("#/graph/personal");
-		await settle();
-		expect(flat()).not.toContain("Try caching");
-		b.go("#/graph/work");
-		await settle();
-		expect(flat()).toContain("Try caching, linked to “Record 13”");
-		click(button(b.view(), "Clear all what-if items"));
-		expect(flat()).not.toContain("What-if (not saved)");
-		canvas.ctx.texts = [];
-		const now = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
-		now.ctx.texts = [];
-		click(named(b.view(), "Zoom in"));
-		await settle();
-		expect(now.ctx.texts.some((x) => x.t.startsWith("What-if"))).toBe(false);
-		expect(b.seen.posted).toEqual([]);
-		expect(b.seen.fetched.some((x) => x.includes("/save") || x.includes("/move") || x.includes("/review"))).toBe(false);
-	});
-
-	it("tries unsaved link and record changes between loaded records, counts their impact, restores and resets, keeps them to the profile, never drafts or sends them", async () => {
-		const b = browser({ signedIn: true, hash: "#/graph", api: graphApi() });
-		await dashboardMain(b.win);
-		await loaded(b);
-		const saved = status(b).textContent, flat = () => text(b.view()).replace(/\s+/g, " ");
-		const labelled = (l: string) => find(b.view(), "button").find((x) => x.attrs["aria-label"] === l)!;
-		const pick = (name: string) => { typeIn(byId(b.view(), "graph-q"), name); click(button(b.view(), name)); };
-		// Add a link between two loaded records: pick one end, then the other.
-		pick("Record 13");
-		click(button(b.view(), "Link to another record (what-if)…"));
-		pick("Record 14");
-		click(button(b.view(), "Link to “Record 13” (what-if)"));
-		expect(flat()).toContain("Records 1,377 saved → 1,377 with what-if Links 2 → 3 Records with links 3 → 5");
-		expect(flat()).toContain("Added link: “Record 13” and “Record 14”");
-		// Remove a loaded record with its loaded link, and one saved link of another record.
-		pick("Owner");
-		click(button(b.view(), "Remove this record (what-if)"));
-		expect(button(b.view(), "Restore this record (what-if)")).toBeDefined();
-		const canvas = find(b.view(), "canvas")[0]! as El & { ctx: Ctx };
-		canvas.ctx.texts = [];
-		await settle();
-		expect(canvas.ctx.texts.some((x) => x.t === "Removed: Owner")).toBe(true);
-		pick("Record 1");
-		click(labelled("Remove the link part_of with Agent Memory, not saved"));
-		expect(flat()).toContain("Records 1,377 saved → 1,376 with what-if Links 2 → 1 Records with links 3 → 2");
-		expect(flat()).toContain("Removed link: “Record 1” part_of “Agent Memory”");
-		expect(flat()).toContain("Removed record: “Owner” and its 1 loaded link");
-		expect(button(b.view(), "Make a draft")).toBeUndefined(); // link and record changes never become a draft
-		expect(status(b).textContent).toBe(saved); // the saved graph's own counts do not move
-		click(labelled("Restore Owner"));
-		expect(flat()).toContain("Records 1,377 saved → 1,377 with what-if Links 2 → 2 Records with links 3 → 4");
-		// Another profile shows none of it; back in work it is still there, then a reset clears it and the record's own buttons follow.
-		b.go("#/graph/personal");
-		await settle();
-		expect(flat()).not.toContain("What-if (not saved)");
-		b.go("#/graph/work");
-		await settle();
-		expect(flat()).toContain("Added link: “Record 13” and “Record 14”");
-		pick("Record 1");
-		expect(labelled("Restore the link part_of with Agent Memory, not saved")).toBeDefined();
-		click(button(b.view(), "Clear all what-if items"));
-		expect(flat()).not.toContain("What-if (not saved)");
-		expect(labelled("Remove the link part_of with Agent Memory, not saved")).toBeDefined();
-		expect(b.seen.posted).toEqual([]);
-		expect(b.seen.fetched.some((x) => /\/(save|move|review|delete|wipe|forget)/.test(x))).toBe(false);
-	});
-
-	it("fills a deep-linked record's linked projects and memories once the graph has loaded", async () => {
-		const more = [...edges, { id: 5, rel: "relates_to", ...at("r1", "r5") }];
-		const b = browser({ signedIn: true, hash: "#graph/r1?profile=work", api: graphApi((path) => path.startsWith("/api/profiles/work/graph?part=edges") ? pageOf("edges", more, path) : undefined) });
-		await dashboardMain(b.win);
-		await loaded(b);
-		await settle();
-		const panel = text(b.view()).replace(/\s+/g, " ");
-		expect(panel).toContain("Projects: Agent Memory");
-		expect(panel).not.toContain("none linked");
-		expect(find(b.view(), "button").some((x) => x.attrs["aria-label"]?.startsWith("Select Record 5,"))).toBe(true); // the linked memory
-		expect(panel).not.toContain("No linked memories");
-	});
-
-	it("queues only memories with no link when a link to another profile arrives before its record", async () => {
-		const nodesHeld = gate();
-		const mem = (id: string) => ({ id, kind: "document", type: "feedback", name: `Memory ${id}`, status: "active" });
-		const b = browser({ signedIn: true, hash: "#/graph", api: async (path) => {
-			if (path.startsWith("/api/profiles/work/graph?part=edges")) return pageOf("edges", [{ id: 1, rel: "relates_to", ...at("m1", "far", false) }], path);
-			if (path.startsWith("/api/profiles/work/graph?part=nodes")) { await nodesHeld.wait; return pageOf("nodes", [mem("m1"), mem("m2")], path); }
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle(); // the edges page lands first; m1 is not loaded yet
-		nodesHeld.open();
-		await loaded(b);
-		click(button(b.view(), "Queue link maintenance"));
-		expect(text(b.view())).toContain("Queue 1 unlinked active memory for link maintenance?");
-		click(button(b.view(), "Queue 1")); // only m2: m1's one link goes to a record in another profile
-		await settle();
-		expect(b.seen.bodies.at(-1)).toEqual({ kind: "unlinked", ids: ["m2"] });
 	});
 });
 
@@ -1999,8 +1036,8 @@ describe("dashboard profile choice", () => {
 		am.tab({ id: "solo", group: "work", label: "Solo", key: "z", profiles: "one", render: (root: El, r: Route) => { seen.push(r); return am.el("h2", root, "Solo"); } });
 		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!, h2 = () => find(b.view(), "h2")[0]!.textContent;
 		const hrefs = () => find(b.view(), "a").map((a) => `${a.textContent} ${a.attrs.href}`);
-		b.go("#/memories");
-		expect(pick.hidden).toBe(true); // old routes keep their own path profile
+		b.go("#/backups");
+		expect(pick.hidden).toBe(false); // the same header everywhere: an owner tool keeps the switcher, which leads back Home
 
 		b.go("#probe");
 		expect([h2(), seen.at(-1)!.query.profile, pick.hidden, pick.value]).toEqual(["Probe", undefined, false, ""]); // no query is All
@@ -2045,406 +1082,6 @@ describe("dashboard profile choice", () => {
 	});
 });
 
-describe("dashboard Sessions and Replay tabs", () => {
-	const session = (id: string, profile: string, ask: string) => ({ id, profile, session: `${id}-${profile}`, client: "codex", status: "complete", first_ask: ask,
-		events: [{ kind: "ask", text: ask, at: "2026-11-04T10:00:00Z" }], counts: {}, first_upload_at: "2026-11-04T10:00:00Z", last_upload_at: "2026-11-04T10:00:00Z" });
-
-	it("keeps the newest selection when two profiles' reads of the same session id answer out of order", async () => {
-		const g = { personal: gate(), work: gate() } as Record<string, ReturnType<typeof gate>>;
-		const b = browser({ signedIn: true, hash: "#sessions", api: async (path) => {
-			if (path.startsWith("/api/sessions?")) return Response.json({ rows: [session("s1", "personal", "Personal ask"), session("s1", "work", "Work ask")], next_cursor: null });
-			const m = /^\/api\/profiles\/(\w+)\/sessions\/s1$/.exec(path);
-			if (m) { await g[m[1]!]!.wait; return Response.json(session("s1", m[1]!, m[1] === "work" ? "Work ask" : "Personal ask")); }
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const rowOf = (pf: string) => find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes(` ${pf} · `))!;
-		rowOf("personal").on.click!();
-		rowOf("work").on.click!();
-		g.work!.open();
-		for (let i = 0; i < 2; i++) await settle();
-		g.personal!.open(); // the older selection answers last
-		for (let i = 0; i < 2; i++) await settle();
-		const panel = find(b.view(), "section").find((x) => x.attrs["aria-label"] === "Session detail")!;
-		expect(find(panel, "h3")[0]!.textContent).toBe("Work ask");
-		expect(text(panel)).toContain(" work · ");
-	});
-
-	it("plays only the session opened last when an earlier one answers late, and leaves no player running", async () => {
-		const g = { a: gate(), b: gate() } as Record<string, ReturnType<typeof gate>>;
-		const b = browser({ signedIn: true, hash: "#replay?profile=work", api: async (path) => {
-			if (path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows: [session("a", "work", "Session A"), session("b", "work", "Session B")], next_cursor: null });
-			const m = /^\/api\/profiles\/work\/sessions\/(a|b)$/.exec(path);
-			if (m) { await g[m[1]!]!.wait; return Response.json(session(m[1]!, "work", `Session ${m[1]!.toUpperCase()}`)); }
-		} });
-		const mounted: string[] = [], destroyed: string[] = [];
-		Object.assign(b.win, { amReplayPlayer: { mount: (_box: El, events: { text: string }[]) => { const t = events[0]!.text; mounted.push(t); return { destroy: () => { destroyed.push(t); } }; } } });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const pick = find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!, form = find(b.view(), "form")[0]!;
-		pick.value = "0"; form.on.submit!({ preventDefault() {} });
-		pick.value = "1"; form.on.submit!({ preventDefault() {} });
-		g.b!.open();
-		for (let i = 0; i < 2; i++) await settle();
-		g.a!.open(); // A answers after B
-		for (let i = 0; i < 2; i++) await settle();
-		expect(mounted).toEqual(["Session B"]);
-		expect(destroyed).toEqual([]);
-		expect(find(b.view(), "h3").map((x) => x.textContent)).toContain("Session B");
-		expect(find(b.view(), "h3").map((x) => x.textContent)).not.toContain("Session A");
-	});
-
-	it("keeps the open session when the header picker changes profile, in Sessions and in Replay", async () => {
-		const rows = [session("a", "work", "Session A"), session("b", "work", "Session B")];
-		const b = browser({ signedIn: true, hash: "#sessions", api: (path) => {
-			if (path.startsWith("/api/sessions?") || path.startsWith("/api/profiles/work/sessions?")) return Response.json({ rows, next_cursor: null });
-			const m = /^\/api\/profiles\/(\w+)\/sessions\/(a|b)$/.exec(path);
-			if (m) return Response.json(session(m[2]!, m[1]!, `Session ${m[2]!.toUpperCase()}`));
-		} });
-		Object.assign(b.win, { amReplayPlayer: { mount: () => ({ destroy() {} }) } });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
-		find(b.view(), "button").find((x) => x.attrs.class === "row" && text(x).includes("Session B"))!.on.click!();
-		await settle();
-		pick.value = "personal";
-		pick.on.change!();
-		expect(b.win.location.hash).toBe("#sessions/b?profile=personal"); // B stays open, now asked of personal
-		b.go("#replay?profile=work");
-		for (let i = 0; i < 3; i++) await settle();
-		find(b.view(), "select").find((x) => x.attrs.id === "replay-session")!.value = "1";
-		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} });
-		await settle();
-		pick.value = "personal";
-		pick.on.change!();
-		expect(b.win.location.hash).toBe("#replay/b?profile=personal");
-	});
-});
-
-describe("dashboard Activity tab", () => {
-	it("shows the day picked last when an earlier day's read answers late, and keeps each day's own answer", async () => {
-		const iso = (t: number) => new Date(t).toISOString().slice(0, 10), dayB = iso(Date.now()), dayA = iso(Date.now() - 86_400_000);
-		const g: Record<string, ReturnType<typeof gate>> = { [dayA]: gate(), [dayB]: gate() };
-		const summary = (from: string, to: string, note: string) => ({ from, to, active_days: 2, sessions: 1, observations: 2, busiest_day: dayB,
-			days: [{ day: dayA, count: 1 }, { day: dayB, count: 1 }], kinds: { asks: 2, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [],
-			busiest_sessions: [], latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] });
-		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: async (path) => {
-			const u = new URL(path, "https://x");
-			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
-			const from = u.searchParams.get("from")!, to = u.searchParams.get("to")!;
-			if (from !== to) return Response.json(summary(from, to, "the whole year"));
-			await g[from]!.wait;
-			return Response.json(summary(from, to, `asked on ${from}`));
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const day = (d: string) => find(b.view(), "button").find((x) => x.attrs["data-day"] === d)!;
-		day(dayA).on.click!();
-		day(dayB).on.click!();
-		g[dayB]!.open();
-		for (let i = 0; i < 2; i++) await settle();
-		g[dayA]!.open(); // the older pick answers last
-		for (let i = 0; i < 2; i++) await settle();
-		expect(text(b.view())).toContain(`What agents did on ${dayB}`);
-		expect(text(b.view())).toContain(`asked on ${dayB}`);
-		expect(text(b.view())).not.toContain(`asked on ${dayA}`);
-		day(dayA).on.click!(); // A's own answer was kept for A
-		for (let i = 0; i < 2; i++) await settle();
-		expect(text(b.view())).toContain(`asked on ${dayA}`);
-		expect(text(b.view())).not.toContain(`asked on ${dayB}`);
-	});
-
-	// One profile's year as the activity-summary route answers it; `extra` replaces fields.
-	const year = (from: string, to: string, extra: Record<string, unknown> = {}) => ({ from, to, active_days: 0, sessions: 0, observations: 0, busiest_day: null, days: [],
-		kinds: { asks: 0, decisions: 0, corrections: 0, commits: 0, tests: 0, prs: 0 }, top_files: [], busiest_sessions: [], latest: [], ...extra });
-	const yearApi: (extra?: Record<string, unknown>) => Api = (extra) => (path) => {
-		const u = new URL(path, "https://x");
-		if (u.pathname === "/api/profiles/work/activity-summary") return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, extra));
-	};
-
-	it("moves through the heatmap by date: Up and Down a day, Left and Right a week, Home and End to the first and last day", async () => {
-		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ observations: 1, sessions: 1, active_days: 1 }) });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const cells = find(b.view(), "button").filter((x) => x.attrs["data-day"]), days = cells.map((x) => x.attrs["data-day"]!).sort();
-		const cell = (d: string) => cells.find((x) => x.attrs["data-day"] === d)!, table = find(b.view(), "table")[0]!;
-		const press = (key: string, from: string) => { table.on.keydown!({ key, target: cell(from), preventDefault() {} } as never); return active?.attrs["data-day"]; };
-		const last = days.at(-1)!, back = (n: number) => days[days.length - 1 - n];
-		let at = last; // the roving stop: today
-		const seen = ["ArrowUp", "ArrowLeft", "ArrowRight", "ArrowDown", "Home", "End"].map((k) => (at = press(k, at)!));
-		expect(seen).toEqual([back(1), back(8), back(1), last, days[0], last]);
-		expect(cells.filter((x) => x.attrs.tabindex === "0").map((x) => x.attrs["data-day"])).toEqual([last]); // still one roving stop
-	});
-
-	it("lists the corpus's most touched files when a year has no observations, and keeps them selectable", async () => {
-		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: yearApi({ top_files: [{ path: "src/a.ts", count: 3 }] }) });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("No observations in work in the last 12 months.");
-		const file = () => find(b.view(), "button").find((x) => x.attrs["data-f"] === "file:src/a.ts")!;
-		expect(file()).toBeDefined(); // a selectable file filter
-		expect(file().attrs["aria-pressed"]).toBe("false");
-		file().on.click!();
-		await settle();
-		expect(file().attrs["aria-pressed"]).toBe("true");
-		expect(b.win.location.hash).toBe("#activity?profile=work&file=src%2Fa.ts");
-	});
-
-	it("reads the summaries again while it is open, so a capture upload shows without Refresh, and stops after leaving the tab", async () => {
-		let note = "asked before the capture";
-		const reads: string[] = [];
-		let stream!: ReadableStreamDefaultController<Uint8Array>;
-		const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
-			// The live stream stays up, as it does while a capture uploads: nothing pauses it.
-			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
-			const u = new URL(path, "https://x");
-			if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
-			reads.push(path);
-			const to = u.searchParams.get("to")!;
-			return Response.json(year(u.searchParams.get("from")!, to, { observations: 1, sessions: 1, active_days: 1, latest: [{ session: "s1", kind: "ask", text: note, at: `${to}T10:00:00Z` }] }));
-		} });
-		// A capture adds digest parts but no activity row, so no live event comes; the page's own timer is held here and run by hand.
-		const later: [() => unknown, number][] = [];
-		Object.assign(b.win, { setTimeout: (f: () => unknown, ms: number) => later.push([f, ms]), clearTimeout() {} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("asked before the capture");
-		note = "asked after the capture";
-		const tick = async () => { const i = later.findIndex(([, ms]) => ms === 60_000); expect(i).toBeGreaterThanOrEqual(0); const [due] = later.splice(i, 1); await due![0](); for (let j = 0; j < 2; j++) await settle(); };
-		await tick();
-		expect(text(b.view())).toContain("asked after the capture");
-		b.go("#/memories");
-		const before = reads.length;
-		await tick();
-		expect(reads.length).toBe(before); // no read once Activity is gone
-		expect(later.some(([, ms]) => ms === 60_000)).toBe(false); // and no further reload is scheduled
-		b.listeners.pagehide!();
-		stream.close();
-	});
-
-	it("moves its rolling year forward on Refresh after UTC midnight, with today's cell", async () => {
-		const reads: string[] = [], realNow = Date.now;
-		Date.now = () => Date.parse("2026-11-04T23:59:30Z");
-		try {
-			const b = browser({ signedIn: true, hash: "#activity?profile=work", api: (path) => {
-				const u = new URL(path, "https://x");
-				if (u.pathname !== "/api/profiles/work/activity-summary") return undefined;
-				reads.push(u.searchParams.get("to")!);
-				return Response.json(year(u.searchParams.get("from")!, u.searchParams.get("to")!, { observations: 1, sessions: 1, active_days: 1 }));
-			} });
-			await dashboardMain(b.win);
-			for (let i = 0; i < 3; i++) await settle();
-			const day = (d: string) => find(b.view(), "button").some((x) => x.attrs["data-day"] === d);
-			expect([reads.at(-1), day("2026-11-04"), day("2026-11-05")]).toEqual(["2026-11-04", true, false]);
-			Date.now = () => Date.parse("2026-11-05T00:00:30Z"); // the tab stays open past midnight
-			click(button(b.view(), "Refresh")); // the minute poll runs the same refresh
-			for (let i = 0; i < 3; i++) await settle();
-			expect([reads.at(-1), day("2026-11-05")]).toEqual(["2026-11-05", true]);
-		} finally { Date.now = realNow; }
-	});
-});
-
-describe("dashboard Memories tab", () => {
-	// From the Memories tab author's smoke: the list, server strength, the record link, and Forget with Undo.
-	const row = (id: string, name: string) => ({ memory_id: id, profile: "work", name, type: "feedback", scope: "repo:x", status: "active", revision: 3, passage: `${name} passage`,
-		provenance: { source_platform: "claude-code" }, freshness: { updated_at: "2026-11-03T10:00:00Z" }, score: 1 });
-	const record = { id: "m1", node: { id: "m1", kind: "rule", memory_type: "feedback", scope: "repo:x", name: HOSTILE, status: "active", origin: "agent", pinned: false, flagged: null,
-		revision: 3, created_at: "2026-11-01T10:00:00.000Z", updated_at: "2026-11-03T10:00:00.000Z", source_platform: "claude-code", updated_source_platform: null,
-		description: "Prefer small diffs", truncated: [] }, content: { text: "Keep the diff small.", chars: 20, complete: true }, evidence: { items: [], truncated: false }, links: [],
-		history: { items: [{ revision: 3, op: "created", at: "2026-11-01T10:00:00.000Z", actor: "agent", device_id: null }], next_before: null } };
-
-	it("lists records as text with the server's strength, opens one keeping ?profile, and forgets only after a second click, with Undo", async () => {
-		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", HOSTILE), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
-			if (path.startsWith("/api/profiles/work/recall-strength?")) {
-				const ids = new URL(`http://x${path}`).searchParams.get("ids")!.split(",");
-				return Response.json({ strength: Object.fromEntries(ids.map((id) => [id, { hits_90d: 14, strength: 10, last_recalled: "2026-11-02" }])) });
-			}
-			if (path === "/api/profiles/work/nodes/m1") return Response.json(record);
-			if (path === "/api/profiles/work/nodes/m1/forget") return Response.json({ ok: true, action: "forgotten", activity_id: 41 });
-			if (path === "/api/profiles/work/activity/41/undo") return Response.json({ ok: true });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain(HOSTILE);
-		expect(find(b.view(), "script")).toEqual([]);
-		expect(text(b.view())).toContain("10/10");
-		expect(find(b.view(), "tbody")[0]!.attrs["data-list"]).toBe("");
-		find(b.view(), "a").find((a) => a.attrs.href === "#memories/m1?profile=work")!.on.click!({ preventDefault() {} });
-		await settle();
-		expect(b.win.location.hash).toBe("#memories/m1?profile=work");
-		const panel = find(b.view(), "aside")[0]!;
-		expect(find(panel, "button").some((x) => "data-close" in x.attrs)).toBe(true);
-		click(button(panel, "Forget…"));
-		expect(b.seen.posted.filter((x) => x.endsWith("/forget"))).toEqual([]); // asks first
-		click(button(panel, "Forget it"));
-		await settle();
-		expect(b.seen.posted).toContain("/api/profiles/work/nodes/m1/forget");
-		click(button(b.view(), "Undo"));
-		await settle();
-		expect(b.seen.posted).toContain("/api/profiles/work/activity/41/undo"); // then the list reads again
-	});
-
-	it("shows each profile's own records only: a me overlay hit in a profile's recall is neither relabelled nor listed twice", async () => {
-		const mine = (id: string, profile: string) => ({ ...row(id, `${profile} ${id}`), profile });
-		const b = browser({ signedIn: true, hash: "#memories", api: (path) => {
-			// Owner recall for a named profile also returns the authorized me overlay; each hit names its own profile.
-			if (path === "/api/profiles/work/recall") return Response.json({ results: [mine("w1", "work"), mine("me1", "me")], next_cursor: "more-is-me", truncated: false, lexical_only: true });
-			if (path === "/api/profiles/personal/recall") return Response.json({ results: [mine("p1", "personal"), mine("me1", "me")], next_cursor: null, truncated: false, lexical_only: true });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
-		expect(hrefs.sort()).toEqual(["#memories/p1?profile=personal", "#memories/w1?profile=work"]);
-		expect(text(b.view())).not.toContain("me me1");
-		expect(b.seen.fetched.filter((x) => x.includes("recall-strength")).sort()).toEqual(["/api/profiles/personal/recall-strength?ids=p1", "/api/profiles/work/recall-strength?ids=w1"]);
-		expect(text(b.view())).not.toContain("more are available"); // past its own records the cursor only walks me
-	});
-
-	it("searches a profile with the plain payload and lists all 25 of its matches, as the owner recall route returns them", async () => {
-		// The owner route reads only the named profile before its cap (mcp-auth: "keeps 25 inferred Work matches under the cap"),
-		// so 25 inferred Work matches come back even when 25 stated me preferences match too. The tab adds no field for that.
-		const bodies: unknown[] = [];
-		const pref = (i: number) => ({ ...row(`w${i}`, `crowded ${i}`), kind: "preference", type: "user", origin: "inferred" });
-		const b = browser({ signedIn: true, hash: "#memories?profile=work&q=crowded", api: (path, _m, body) => {
-			if (path !== "/api/profiles/work/recall") return undefined;
-			bodies.push(body);
-			return Response.json({ read_set: ["work"], results: Array.from({ length: 25 }, (_, i) => pref(i)), next_cursor: null, truncated: true, lexical_only: true });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(bodies).toEqual([{ limit: 25, count_hits: false, keyword: "crowded" }]); // only the fields the route admits
-		const hrefs = find(b.view(), "a").map((a) => a.attrs.href).filter((h) => h?.startsWith("#memories/"));
-		expect(hrefs).toEqual(Array.from({ length: 25 }, (_, i) => `#memories/w${i}?profile=work`));
-		expect(text(b.view())).toContain("Showing 25 records");
-	});
-
-	it("drops the selection and an open bulk confirmation when a new search replaces the list", async () => {
-		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const box = () => find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
-		box().checked = true;
-		box().on.change!();
-		click(button(b.view(), "Forget selected…"));
-		expect(button(b.view(), "Forget 1")).toBeDefined(); // the confirmation names its one target
-		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the same search again: the rows are rebuilt unchecked
-		for (let i = 0; i < 2; i++) await settle();
-		expect(box().checked).toBe(false);
-		expect(text(b.view())).toContain("0 selected.");
-		expect(button(b.view(), "Forget selected…").disabled).toBe(true);
-		expect(button(b.view(), "Forget 1")).toBeUndefined(); // no stale confirmation can forget a record that shows unchecked
-		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
-	});
-
-	// A record longer than one entity read: the first 4,000 characters, then "Load the full content" pages the rest.
-	const FULL = `${"a".repeat(4000)}${"b".repeat(1000)}`;
-	const longApi = (saved: unknown[] = []): Api => (path, _m, body) => {
-		if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "Long")], next_cursor: null, truncated: false, lexical_only: false });
-		if (path === "/api/profiles/work/nodes/m1") return Response.json({ ...record, content: { text: FULL.slice(0, 4000), chars: FULL.length, complete: false } });
-		if (path === "/api/profiles/work/nodes/m1?content=all") return Response.json({ content: { content: FULL, cursor: null } });
-		if (path === "/api/profiles/work/save") { saved.push(body); return Response.json({ name: HOSTILE, revision: 4 }); }
-	};
-
-	it("enables Edit once the full content has loaded, and edits the whole text", async () => {
-		const saved: unknown[] = [];
-		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi(saved) });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const panel = () => find(b.view(), "aside")[0]!;
-		expect(button(panel(), "Edit").disabled).toBe(true); // only the first 4,000 characters are shown
-		click(button(panel(), "Load the full content"));
-		await settle();
-		expect(button(panel(), "Edit").disabled).toBe(false);
-		expect(button(panel(), "Edit").getAttribute("title")).toBeNull();
-		click(button(panel(), "Edit"));
-		const content = find(panel(), "textarea").find((x) => x.attrs.id === "mem-edit-content")!;
-		expect(content.value).toBe(FULL);
-		find(panel(), "form").find((x) => x.attrs["aria-label"]?.startsWith("Edit "))!.on.submit!({ preventDefault() {} });
-		await settle();
-		expect(saved).toMatchObject([{ memory_id: "m1", expected_revision: 3, content: FULL }]);
-	});
-
-	it("exports the loaded text with its completeness: the shown part before Load the full content, all of it after", async () => {
-		const b = browser({ signedIn: true, hash: "#memories/m1?profile=work", api: longApi() });
-		const files: { record: { id: string; node: { id: string }; content: { text: string; chars: number; complete: boolean } } }[] = [];
-		const doc = b.win.document as unknown as { createElement(t: string): El }, make = doc.createElement;
-		doc.createElement = (t: string) => Object.assign(make(t), { click() {} }); // a download link's click saves nothing here
-		Object.assign(b.win, { Blob: class { constructor(readonly parts: string[]) {} },
-			URL: { createObjectURL: (x: { parts: string[] }) => { files.push(JSON.parse(x.parts[0]!)); return "blob:x"; }, revokeObjectURL() {} } });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const panel = () => find(b.view(), "aside")[0]!;
-		click(button(panel(), "Export JSON"));
-		click(button(panel(), "Load the full content"));
-		await settle();
-		click(button(panel(), "Export JSON"));
-		expect(files.map((f) => [f.record.content.text.length, f.record.content.chars, f.record.content.complete])).toEqual([[4000, 5000, false], [5000, 5000, true]]);
-		expect([files[1]!.record.id, files[1]!.record.node.id]).toEqual(["m1", "m1"]); // the rest of the record is as read
-	});
-
-	it("closes an open bulk confirmation when the selection changes, so an unchecked record is never forgotten", async () => {
-		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), row("m2", "Second")], next_cursor: null, truncated: false, lexical_only: false });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
-		box.checked = true;
-		box.on.change!();
-		click(button(b.view(), "Forget selected…"));
-		expect(button(b.view(), "Forget 1")).toBeDefined();
-		box.checked = false; // the owner changes their mind
-		box.on.change!();
-		expect(text(b.view())).toContain("0 selected.");
-		const stale = button(b.view(), "Forget 1");
-		if (stale) click(stale); // a confirmation left open would forget the unchecked record
-		await settle();
-		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
-		expect(stale).toBeUndefined();
-	});
-
-	it("clears the selection, its checkboxes and an open confirmation when the Agent filter changes", async () => {
-		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/recall") return Response.json({ results: [row("m1", "First"), { ...row("m2", "Second"), provenance: { source_platform: "codex" } }], next_cursor: null, truncated: false, lexical_only: false });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const box = find(b.view(), "input").find((x) => x.attrs["aria-label"] === "Select First")!;
-		box.checked = true;
-		box.on.change!();
-		click(button(b.view(), "Forget selected…"));
-		expect(button(b.view(), "Forget 1")).toBeDefined();
-		const agent = find(b.view(), "select").find((x) => x.attrs.id === "mem-agent")!;
-		agent.value = "codex"; // First, a claude-code record, is now hidden
-		agent.on.change!();
-		expect([box.checked, text(b.view()).includes("0 selected.")]).toEqual([false, true]);
-		const stale = button(b.view(), "Forget 1");
-		if (stale) click(stale); // a confirmation left open would forget the hidden record
-		await settle();
-		expect(b.seen.posted.filter((x) => x.includes("forget"))).toEqual([]);
-		expect(stale).toBeUndefined();
-	});
-
-	it("keeps the search when the header picker changes profile", async () => {
-		const b = browser({ signedIn: true, hash: "#memories?profile=work", api: (path) =>
-			path.endsWith("/recall") ? Response.json({ results: [], next_cursor: null, truncated: false, lexical_only: false }) : undefined });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value = "diffs";
-		find(b.view(), "form")[0]!.on.submit!({ preventDefault() {} }); // the tab writes ?q= into the address without a render
-		await settle();
-		expect(b.win.location.hash).toBe("#memories?profile=work&q=diffs");
-		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
-		pick.value = "personal";
-		pick.on.change!();
-		expect(b.win.location.hash).toBe("#memories?profile=personal&q=diffs"); // the tab's own address after it reads personal
-		expect(find(b.view(), "input").find((x) => x.attrs.id === "mem-q")!.value).toBe("diffs");
-	});
-});
-
 describe("dashboard Audit tab and Admin pages", () => {
 	// From the Audit and Admin author's smoke: undo conflicts, filters from the link, token-safe copy, and every Admin page's intro.
 	const act = (id: number, at: string, p: string, extra: Record<string, unknown> = {}) => ({ id, at, actor: "agent", device_id: null, op: "save", summary: `${p} change ${id} <b>x</b>`,
@@ -2483,7 +1120,7 @@ describe("dashboard Audit tab and Admin pages", () => {
 		expect(find(b.view(), "b")).toEqual([]);
 		find(b.view(), "button").find((x) => /^Undo work change 9/.test(x.attrs["aria-label"] ?? ""))!.on.click!();
 		for (let i = 0; i < 2; i++) await settle();
-		expect(text(b.view())).toContain("Changed since. Review by hand");
+		expect(text(b.view())).toContain("Nothing was undone: those records changed again since. Review them by hand.");
 		expect(b.seen.posted.at(-1)).toBe("/api/profiles/work/activity/9/undo");
 		b.go("#audit?profile=work&actor=owner");
 		for (let i = 0; i < 2; i++) await settle();
@@ -2493,7 +1130,7 @@ describe("dashboard Audit tab and Admin pages", () => {
 		expect(text(b.view())).not.toContain("personal change");
 		click(button(b.view(), "Copy curl"));
 		await settle();
-		expect(copied.at(-1)).toContain("/api/profiles/work/activity?limit=50&actor=owner");
+		expect(copied.at(-1)).toContain("/api/profiles/work/activity?limit=25&actor=owner");
 		expect(copied.at(-1)).toContain("$AGENT_MEMORY_OWNER_TOKEN");
 		expect(copied.join()).not.toContain("session-token");
 	});
@@ -2503,8 +1140,7 @@ describe("dashboard Audit tab and Admin pages", () => {
 		await dashboardMain(b.win);
 		await settle();
 		const bad: string[] = [];
-		for (const h of ["#/profiles", "#/draft/work", "#/path/work", "#/map/work", "#/timeline/work", "#/journals/work", "#/review/work", "#/backups", "#/routing", "#/move",
-			"#/copy/work", "#/wipe", "#/wipe/work", "#/work/work", "#/about/work"]) {
+		for (const h of ["#/profiles", "#/draft/work", "#/review/work", "#/backups", "#/routing", "#/move", "#/copy/work", "#/wipe", "#/wipe/work"]) {
 			b.go(h);
 			for (let i = 0; i < 2; i++) await settle();
 			const t = text(b.view());
@@ -2514,237 +1150,493 @@ describe("dashboard Audit tab and Admin pages", () => {
 	});
 });
 
-describe("dashboard tabs on the shared profile choice", () => {
-	it("keeps Overview narrow for an active profile the snapshot did not read, and asks the one-profile tabs for a profile without reading", async () => {
-		const b = browser({ signedIn: true, hash: "#overview?profile=personal", api: (path) => path === "/api/viewer/snapshot" ? Response.json({ ...SNAPSHOT, profiles: ["work"] }) : undefined });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Overview");
-		expect(text(b.view())).toContain("The snapshot did not read personal, so its sessions and feed are not shown.");
-		const pick = find(b.els.tools!, "select").find((x) => x.attrs.id === "profile-choice")!;
-		expect([pick.hidden, pick.value]).toEqual([false, "personal"]); // the choice stays; nothing falls back to All or to work
-		for (const [hash, label] of [["#profile", "Profile"], ["#replay", "Replay"]]) {
-			const before = b.seen.fetched.length;
-			b.go(hash!);
-			await settle();
-			expect(find(b.view(), "h2")[0]!.textContent).toBe(`${label}: choose a profile`);
-			expect(find(b.view(), "a").map((a) => a.attrs.href)).toEqual([`${hash}?profile=personal`, `${hash}?profile=work`]); // no All for a one-profile tab
-			expect(b.seen.fetched.length).toBe(before);
-		}
-	});
-});
 
-describe("dashboard Overview and Health tabs", () => {
-	it("updates Health's viewer-feed line when the stream connects after the page has drawn", async () => {
-		const open = gate();
-		let stream!: ReadableStreamDefaultController<Uint8Array>;
-		const b = browser({ signedIn: true, hash: "#health", api: async (path) => {
-			if (path === "/api/health") return Response.json({ error: { code: "unavailable", message: "down" } }, { status: 503 });
-			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [] });
-			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
-			if (path.startsWith("/api/viewer/events?")) { await open.wait; return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } }); }
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("Not connected yet");
-		open.open();
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toMatch(/Viewer feed Live since/);
-		expect(text(b.view())).not.toContain("Not connected yet");
-		b.listeners.pagehide!();
-		stream.close();
+describe("dashboard library: sections, detail, connections, map", () => {
+	const today = new Date().toISOString();
+	const N = (id: string, kind: string, name: string, extra: Record<string, unknown> = {}) => ({ id, kind, name, type: null, scope: null, status: "active", updated_at: today, created_at: today, ...extra });
+	const NODES = [N("p1", "project", "agent-memory", { key: "github:wrick17/agent-memory" }), N("p2", "project", "bettergit"), N("u1", "person", "Ana"),
+		N("m1", "decision", "cache-policy", { type: "project", scope: "agent-memory" }), N("l1", "rule", "Always run the tests", { type: "feedback" }),
+		N("j1", "journal", "task-journal-2026-11-12-1130-claude-code-dashboard-hill-climb", { type: "project" }), N("s1", "session", "", { key: "session:codex:abc" }),
+		N("p3", "project", "synthetic-fixture-project"), N("40e647a4-713a-5ea9-85bc-b9ddf5ec1956", "project", "Synthetic corpus acceptance project 59c5", { key: "github:Sequoia-Engineering/kernel-eureka-frontend" })];
+	const E = (id: number, src: string, dst: string, rel: string) => ({ id, src, dst: { id: dst, readable: true }, rel });
+	const EDGES = [E(1, "u1", "p1", "works_on"), E(2, "m1", "s1", "relates_to"), E(3, "l1", "p1", "part_of"), E(4, "u1", "l1", "authored"), E(5, "p2", "u1", "relates_to"), E(6, "j1", "p1", "part_of"), E(7, "l1", "p2", "part_of")];
+	const api: Api = (path) => {
+		if (path.startsWith("/api/profiles/work/graph?part=nodes")) return Response.json({ items: NODES, next_after: null, done: true, total: NODES.length });
+		if (path.startsWith("/api/profiles/work/graph?part=edges")) return Response.json({ items: EDGES, next_after: null, done: true });
+		if (path.startsWith("/api/profiles/personal/graph")) return Response.json({ items: [], next_after: null, done: true, total: 0 });
+		if (path === "/api/profiles/work/nodes/m1") return Response.json({ node: { id: "m1", name: "cache-policy", kind: "decision", memory_type: "project", status: "active", revision: 2 },
+			content: { text: `## Why\nWe cache **reads** for \`60s\`.\n\n- one\n- two\n\n${HOSTILE} [bad](javascript:alert(1)) [docs](https://example.test/x)\n\n\`\`\`\nrm -rf <b>\n\`\`\``, complete: true },
+			evidence: { items: [{ kind: "session", ref: "codex:abc" }] }, links: [], history: { items: [] } });
+		if (path.startsWith("/api/profiles/work/journals?id=j1&limit=25")) return Response.json({ journal: { id: "j1" }, entries: [
+			{ entry_seq: 1, created_at: "2026-11-12T09:00:00Z", body: "## entry 1\nFirst." }, { entry_seq: 5, created_at: today, body: "## entry 5 — decision\nUse **blocks**." }] });
+		if (path.startsWith("/api/profiles/work/nodes/")) return Response.json({ node: { id: "x" }, links: [], evidence: { items: [] }, history: { items: [] }, content: {} });
+	};
+	const open = async (hash: string) => { const b = browser({ signedIn: true, hash, api }); await dashboardMain(b.win); for (let i = 0; i < 25; i++) await settle(); return b; };
+
+	it("writes dates for humans: today and yesterday with the time, else the day, with the year only when it is not this one", async () => {
+		const b = await open("#home?profile=work");
+		const am = (b.win as unknown as { __am: { when(iso: string): { text: string; full: string } } }).__am, now = new Date();
+		const at = (d: number, h = 10, m = 28) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - d, h, m).toISOString();
+		expect(am.when(at(0)).text).toBe("Today 10:28");
+		expect(am.when(at(1, 18, 2)).text).toBe("Yesterday 18:02");
+		expect(am.when(new Date(now.getFullYear() - 1, 10, 12).toISOString()).text).toBe(`12 Nov ${now.getFullYear() - 1}`);
+		expect(am.when("not a date").text).toBe("");
 	});
 
-	it("reads the batch status again with a fresh snapshot instead of keeping the sign-in copy", async () => {
-		const stuck = { last_lease_at: null, last_status: { status: "stuck", reason: "lease_lost", items: 0, at: "2026-11-04T09:00:00Z" } };
-		let batch: unknown = stuck;
-		const b = browser({ signedIn: true, hash: "#overview?profile=work", api: (path) => path === "/api/profiles/work/batch" ? Response.json(batch) : undefined });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("work: parked");
-		batch = { ...stuck, last_lease_at: "2026-11-04T10:00:00Z" }; // a later batch ran
-		await (b.win as unknown as { __am: { api: { snapshot(): Promise<unknown> } } }).__am.api.snapshot();
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("work: leased");
-		expect(text(b.view())).not.toContain("work: parked");
+	it("lists memories with human titles and one meta line, and opens one with its markdown as safe text and where it came from", async () => {
+		const b = await open("#memories/work/m1?profile=work");
+		const row = find(b.view(), "a").find((a) => a.attrs.class === "row")!;
+		expect(text(row)).toContain("Cache policy");
+		expect(text(row)).toMatch(/Today \d\d:\d\d/);
+		expect(text(row)).toContain("Project note · memory · in your work profile"); // its scope says wrick17's repo: personal, though stored in work
+		const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
+		expect(find(detail, "h2")[0]!.textContent).toBe("Cache policy");
+		expect(text(detail)).toContain("From a Codex session");
+		expect(find(detail, "h4").map((h) => text(h).trim())).toContain("Why");
+		expect(find(detail, "strong").map((x) => text(x).trim())).toContain("reads");
+		expect(find(detail, "li").map(text)).toEqual(expect.arrayContaining(["one", "two"]));
+		expect(find(detail, "pre").map(text)).toEqual(["rm -rf <b>"]);
+		expect([find(detail, "img"), find(detail, "b")]).toEqual([[], []]); // stored text never becomes markup
+		expect(find(detail, "a").filter((a) => /javascript/.test(a.attrs.href ?? ""))).toEqual([]); // only http(s) links
+		expect(find(detail, "a").find((a) => a.textContent === "docs")!.attrs.href).toBe("https://example.test/x");
+		const chips = find(detail, "a").filter((a) => String(a.attrs.class).startsWith("chip-link")).map((a) => text(a).trim());
+		expect(chips[0]).toBe("memory"); // its project by its short name, from its scope; the session is the source line, not a chip
+		expect(chips).toEqual(expect.arrayContaining(["Always run the tests", "Dashboard hill climb"])); // the rest of its project
+		const more = find(detail, "details").find((d) => d.attrs.class === "conn-more")!;
+		expect(text(find(more, "summary")[0]!)).toBe("More in memory (2)"); // folded under the direct links, which come first
+		expect(text(detail)).toContain("Stored in your work profile"); // a quiet hint; nothing is moved
+		expect(text(detail)).not.toMatch(/none recorded|\(0\)/i);
 	});
 
-	it("draws one recall-quality line per profile when All profiles holds runs from two", async () => {
-		const run = (profile: string, at: string, v: number) => ({ id: `${profile}-${at}`, device_id: "d1", profile, at, channels: "hybrid", k: 5, cases: 3,
-			recall_all_at_k: v, any_hit_at_k: v, mrr: v });
-		const b = browser({ signedIn: true, hash: "#health", api: (path) => {
-			if (path === "/api/health") return Response.json({ error: { code: "unavailable", message: "down" } }, { status: 503 });
-			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [run("work", "2026-11-03T10:00:00Z", 1), run("personal", "2026-11-04T10:00:00Z", 0)] });
-			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
-		} });
-		Object.assign(b.win.document, { createElementNS: (_ns: string, tag: string) => make(tag) }); // the chart is SVG
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		const svg = find(b.view(), "svg")[0]!;
-		expect(find(svg, "polyline")).toHaveLength(2);
-		const legend = find(svg, "text").map((x) => x.textContent).filter((t) => t.includes("k=5"));
-		expect(legend).toEqual([expect.stringMatching(/^work hybrid k=5:/), expect.stringMatching(/^personal hybrid k=5:/)]);
+	it("shows a journal's entries newest first as cards, with the heading noise gone and its label as a tag", async () => {
+		const b = await open("#journals/work/j1?profile=work");
+		const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
+		expect(find(detail, "h2")[0]!.textContent).toBe("Dashboard hill climb");
+		const cards = find(detail, "li").filter((li) => li.attrs.class === "entry");
+		expect(cards.map(text)[0]).toContain("decision");
+		expect(text(cards[0]!)).toMatch(/Use\s+blocks\s*\./);
+		expect(text(detail)).not.toMatch(/##|entry 5/);
 	});
 
-	it("keeps health checks that stream in while the first report is loading, instead of painting the older report over them", async () => {
-		const held = gate();
-		let stream!: ReadableStreamDefaultController<Uint8Array>;
-		const check = (state: string, at: string) => ({ check_id: "capture_stale", subject: "laptop", state, detail: `capture ${state}`, at });
-		const b = browser({ signedIn: true, hash: "#health", api: async (path) => {
-			if (path === "/api/health") { await held.wait; return Response.json({ verdict: "ok", checks: [check("ok", "2026-11-04T10:00:00Z")], devices: [], consolidation: [],
-				backups: { last_export_at: null, retained: [] }, search: { lexical_documents: 0, vectors: 0, embeddings: false, semantic_ms: 3000 } }); } // read before the sweep
-			if (path.startsWith("/api/eval/runs?")) return Response.json({ runs: [] });
-			if (path.includes("/eval-candidates?")) return Response.json({ rows: [], next_cursor: null });
-			if (path.startsWith("/api/viewer/events?")) return new Response(new ReadableStream<Uint8Array>({ start(c) { stream = c; } }), { headers: { "content-type": "text/event-stream" } });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 3; i++) await settle();
-		stream.enqueue(new TextEncoder().encode(`event: health\ndata: ${JSON.stringify([check("fail", "2026-11-04T10:05:00Z")])}\nid: 2\n\n`)); // a newer sweep
-		for (let i = 0; i < 2; i++) await settle();
-		expect(text(b.view())).toContain("1 failed.");
-		held.open();
-		for (let i = 0; i < 3; i++) await settle();
-		expect(text(b.view())).toContain("1 failed."); // the newer check stays; the stream will not send it again
-		expect(text(b.view())).not.toContain("Every check passed");
-		b.listeners.pagehide!();
-		stream.close();
+	it("shows projects as workspace groups of cards, one entity per repo, and a project's page as a hub", async () => {
+		const b = await open("#projects?profile=work");
+		const secs = find(b.view(), "section").filter((x) => x.attrs.class === "ws-sec");
+		expect(secs.map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Personal"]); // only projects memories resolve to; bettergit has only a person
+		const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard");
+		expect(cards.map((c) => text(find(c, "strong")[0]!).trim())).toEqual(["memory", "bettergit"]); // the short name first
+		expect(text(cards[0]!)).not.toContain("agent-memory"); // the GitHub repo name stays behind the GitHub link
+		expect(text(cards[0]!)).toMatch(/1 memory · 1 learning · 1 journal/);
+		expect(text(cards[0]!)).toContain("Personal"); // the profile its GitHub owner gives, as a quiet tag
+		expect(text(b.view())).not.toMatch(/Synthetic|eureka|Show all known repos/i); // fixture projects are dropped, even with a real-looking key
+		b.go(cards[0]!.attrs.href!);
+		for (let i = 0; i < 5; i++) await settle();
+		const detail = find(b.view(), "section").find((x) => String(x.attrs.class).startsWith("lib-detail"))!;
+		expect(text(detail)).toContain("When work happened");
+		const weeks = find(detail, "figure").find((f) => f.attrs.class === "chart daily")!; // stacked day bars, as on Home
+		expect(text(find(weeks, "figcaption")[0]!)).toMatch(/1 journal.*1 memory.*1 learning.*added in the last \d+ weeks/);
+		const rel = find(detail, "figure").find((f) => f.attrs.class === "chart rel")!;
+		expect(text(rel)).toContain("bettergit");
+		expect(text(rel)).toContain("1 learning in common"); // the edge says how the two projects connect
+		expect(text(rel)).not.toContain("Ana"); // People is off the dashboard for now
+		expect(find(detail, "a").find((a) => a.textContent === "Open on GitHub ↗")!.attrs.href).toBe("https://github.com/wrick17/agent-memory");
+		expect(find(b.view(), "a").find((a) => a.textContent === "← All projects")).toBeDefined();
 	});
-});
 
-// Repo facts (#118) and goal metrics (#130): what the Facts, Goals and Lessons tabs show for empty, thin and populated data.
-const lane = (laneId: string, extra: Record<string, unknown> = {}) => ({ lane: laneId, state: "active", exercised: 5, fired: 2, prevented: 1, rate: 0.6, eligible: true, confirmations: 3,
-	last_event: { order: "2026-11-10T09:00:00.000Z/0000000004/d1", session: "codex:0123456789ab", kind: "confirm" }, updated_at: "2026-11-10T09:00:00Z", ...extra });
-const fact = (id: string, extra: Record<string, unknown> = {}) => ({ memory_id: id, repo_key: "github.com/acme/app", fact_key: "0123456789abcdef", detector: "form_repair", class: "environment",
-	literal: "pytest => python -m pytest", statement: "Run `python -m pytest` instead of plain `pytest`; plain `pytest` fails on this machine.", state: "active", user_tier: false,
-	pinned: false, high_stakes: false, dormant: false, revision: 2, lanes: [lane("d1"), lane("d2", { exercised: 1, fired: 0, prevented: 0, rate: null, eligible: false })],
-	evidence: [{ kind: "session", ref: "codex:0123456789ab", note: "confirm" }], created_at: "2026-11-01T09:00:00Z", updated_at: "2026-11-10T09:00:00Z", ...extra });
-const costDay = (extra: Record<string, unknown> = {}) => ({ repo_key: "github.com/acme/app", day: "2026-11-10", sessions: 4, usage_sessions: 2, input: 1000, cached_input: 600, output: 200,
-	cache_write: 0, commands: 40, failed: 2, repeated_failures: 1, injected: 3, prevented: 1, fired: 0, ...extra });
-const goalWeek = (week: string, extra: Record<string, unknown> = {}) => ({ week,
-	corrections: { total: 0, learned: 0, repeats: 0, pending: 0, rate: null }, guided: { sessions: 0, guided: 0, share: null, seen: 0, captured: 0, coverage: null },
-	followed: { injected: 0, exercised: 0, fired: 0, prevented: 0, rate: null, prevented_share: null, memory: { injected: 0, processed: 0, failed: 0, rate: null } },
-	cost: { sessions: 0, usage_sessions: 0, input: 0, cached_input: 0, output: 0, failed: 0, repeated_failures: 0, tokens_per_session: null, failures_per_session: null, cache_ratio: null }, ...extra });
-const goals = (repos: unknown[], missing: unknown[] = []) => ({ from: "2026-10-26", to: "2026-11-11", weeks: ["2026-10-26", "2026-11-02", "2026-11-09"],
-	targets: { repeat_correction: 0.1, guided_share: 0.8, capture_coverage: 0.95 }, min_sample: 3, repos, missing, truncated: false });
-const rows = (root: El) => find(find(root, "tbody")[0]!, "tr");
+	it("sets the width mode the layout follows, and gives a phone's full-screen detail a way back to the list", async () => {
+		const modeAt = async (w: number) => { const b = browser({ signedIn: true, hash: "#memories/work/m1?profile=work", api }); Object.assign(b.win, { innerWidth: w }); await dashboardMain(b.win); return b; };
+		expect((await modeAt(390)).html.attrs["data-width"]).toBe("phone");
+		expect((await modeAt(768)).html.attrs["data-width"]).toBe("tablet");
+		expect((await modeAt(1024)).html.attrs["data-width"]).toBe("desktop"); // list and detail side by side, 40/60
+		const wide = await modeAt(1920);
+		expect(wide.html.attrs["data-width"]).toBe("desktop");
+		for (let i = 0; i < 25; i++) await settle();
+		const back = find(wide.view(), "a").find((a) => a.attrs.class === "back-btn")!;
+		expect([back.textContent, back.attrs.href]).toEqual(["← Back", "#memories?profile=work"]); // CSS shows it on a phone, where Close hides
+		expect(find(wide.view(), "section").map((x) => x.attrs.class)).toEqual(expect.arrayContaining(["lib-side", "lib-list", "lib-detail"]));
+	});
 
-describe("dashboard Facts, Goals and Lessons guidance", () => {
-	it("lists facts with state, tier, lanes and firing, and shows per-session cost from the daily rows", async () => {
-		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [fact("f1"),
-				fact("f2", { class: "repo", repo_key: "github.com/acme/web", state: "active", dormant: true, user_tier: true, pinned: true, statement: "Dormant one",
-					lanes: [lane("*", { state: "retired", exercised: 0, fired: 0, prevented: 0, rate: null })] })] });
-			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [costDay()] });
-		} });
-		await dashboardMain(b.win);
+	it("suggests results while typing, grouped by type, moves through them with the arrow keys, and opens the chosen one on Enter", async () => {
+		const b = await open("#home?profile=work");
+		const box = byId(b.els.tools!, "global-search"), list = find(b.els.tools!, "ul").find((u) => u.attrs.id === "search-results")!;
+		box.value = "cache";
+		box.on.keydown!({ key: "ArrowDown", preventDefault() {} } as never); // opens the list (typing does the same after a short pause)
+		expect(list.hidden).toBe(false);
+		expect(find(list, "li").filter((li) => li.attrs.class === "sr-group").map((g) => g.textContent)).toEqual(["Memories"]);
+		const opts = find(list, "li").filter((li) => li.attrs.role === "option");
+		expect(opts.map((o) => text(o).trim())[0]).toMatch(/^Cache policy/);
+		expect([opts[0]!.attrs["aria-selected"], box.attrs["aria-activedescendant"]]).toEqual(["true", "sr-0"]);
+		find(b.els.tools!, "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(b.win.location.hash).toBe("#memories/work/m1?profile=work");
+		expect(list.hidden).toBe(true);
+	});
+
+	it("gives every record one display title: slug noise stripped, a thin slug title replaced by its own first sentence everywhere", async () => {
+		const b0 = await open("#home?profile=work");
+		const human = (b0.win as unknown as { __am: { human(n: string, k?: string): string } }).__am.human;
+		expect(["bettergit-010", "opus-routing-57A8CC3C", "repo-facts-privacy-signoff-2026-11-11", "task-journal-2026-11-12-1130-codex-mfe-rsdoctor"].map((n) => human(n)))
+			.toEqual(["Bettergit", "Opus routing", "Repo facts privacy signoff", "Mfe rsdoctor"]);
+		NODES.push(N("m2", "decision", "MEMORY.md", { type: "reference" }));
+		try {
+			const b = browser({ signedIn: true, hash: "#memories/work/m2?profile=work", api: (p, m, body) => p === "/api/profiles/work/nodes/m2"
+				? Response.json({ node: { id: "m2", name: "MEMORY.md", kind: "decision", status: "active", description: "- Keep the memory file short. Then more." }, content: { text: "x", complete: true }, evidence: { items: [] } })
+				: api(p, m, body) });
+			await dashboardMain(b.win);
+			for (let i = 0; i < 25; i++) await settle();
+			const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!, row = find(b.view(), "a").find((a) => a.attrs.class === "row" && a.attrs.href?.includes("/m2"))!;
+			expect(find(detail, "h2")[0]!.textContent).toBe("Keep the memory file short."); // from its own words, list marker gone
+			expect(text(find(row, "span").find((x) => x.attrs.class === "row-title")!).trim()).toBe("Keep the memory file short."); // the same title in the list
+		} finally { NODES.pop(); }
+	});
+
+	it("lists direct links first, each saying how, and folds the rest of the project away", async () => {
+		EDGES.push(E(8, "m1", "l1", "supersedes"));
+		try {
+			const b = await open("#memories/work/m1?profile=work");
+			const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
+			const groups = find(detail, "div").filter((d) => d.attrs.class === "conn-group").map((g) => text(g).replace(/\s+/g, " ").trim());
+			expect(groups.find((g) => g.startsWith("Linked"))).toContain("replaces Always run the tests"); // the relation as a small label before the title
+			expect(text(find(detail, "details").find((d) => d.attrs.class === "conn-more")!)).not.toContain("Always run the tests"); // never twice
+		} finally { EDGES.pop(); }
+	});
+
+	it("opens the phone menu with the sections and the profile choice, and Enter without a highlight opens all results", async () => {
+		const b = await open("#home?profile=work");
+		const menu = find(b.els.tools!, "button").find((x) => x.attrs["aria-label"] === "Sections")!;
+		click(menu);
+		expect([b.els.nav!.attrs["data-open"], menu.attrs["aria-expanded"]]).toEqual(["true", "true"]);
+		const pick = find(b.els.nav!, "select")[0]!;
+		expect([find(pick, "option").map((o) => o.textContent), pick.value]).toEqual([["All profiles", "personal", "work"], "work"]); // the header's choice, mirrored
+		const box = find(b.els.tools!, "input").find((x) => x.attrs.id === "global-search")!;
+		box.value = "cache";
+		find(b.els.tools!, "form")[0]!.on.submit!({ preventDefault() {} });
+		expect(b.win.location.hash).toBe("#search?q=cache&profile=work");
+		// The dropdown's footer is a real link to the same page, and a click on it goes there.
+		b.go("#home?profile=work");
+		box.value = "cache";
+		box.on.keydown!({ key: "ArrowDown", preventDefault() {} } as never);
+		const all = find(b.els.tools!, "li").find((x) => String(x.attrs.class).includes("sr-all"))!;
+		expect(find(all, "a")[0]!.attrs.href).toBe("#search?q=cache&profile=work");
+		all.on.click!({ preventDefault() {} });
+		expect(b.win.location.hash).toBe("#search?q=cache&profile=work");
+		// Search starts closed on a phone; only ⌕ (named "Search") opens its row, and Esc closes it.
+		const opener = find(b.els.tools!, "button").find((x) => x.attrs["aria-label"] === "Search")!, row = find(b.els.tools!, "div").find((x) => String(x.attrs.class).includes("gwrap"))!;
+		expect([row.attrs.class, opener.attrs["aria-expanded"], find(opener, "span").map((x) => x.textContent)]).toEqual(["pop-host gwrap", "false", ["Search"]]);
+		click(opener);
+		expect(row.attrs.class).toBe("pop-host gwrap open");
+		b.key("Escape");
+		expect([row.attrs.class, opener.attrs["aria-expanded"]]).toEqual(["pop-host gwrap", "false"]);
+	});
+
+	it("colours sub-types with distinct, fixed hues (Rule and Preference never share one), and keeps kind colours elsewhere", async () => {
+		NODES.push(N("l2", "preference", "Prefer short answers"));
+		try {
+			const b = await open("#learnings?profile=work");
+			const chips = find(b.view(), "button").filter((x) => x.attrs["aria-pressed"] !== undefined && find(x, "i").length)
+				.map((x) => `${text(find(x, "span")[0]!).trim()} ${find(x, "i")[0]!.attrs.class}`);
+			expect(chips).toEqual(expect.arrayContaining(["Rule sw t-s1", "Preference sw t-s2"]));
+			const dots = find(b.view(), "a").filter((a) => a.attrs.class === "row").map((a) => find(a, "i")[0]!.attrs.class);
+			expect(new Set(dots)).toEqual(new Set(["sw t-s1", "sw t-s2"])); // the list's dots match its chips
+			const home = await open("#home?profile=work");
+			const learn = find(home.view(), "a").filter((a) => a.attrs.class === "row" && a.attrs.href?.startsWith("#learnings")).map((a) => find(a, "i")[0]!.attrs.class);
+			expect(new Set(learn)).toEqual(new Set(["sw t-learning"])); // outside its section a record shows its kind
+		} finally { NODES.pop(); }
+	});
+
+	// The pre-production review's fixes (Sol, 2026-11-12): each a write or read that must never lose or cut text.
+	const am = (b: ReturnType<typeof browser>) => (b.win as unknown as { __am: { drafts: Map<string, Record<string, unknown>> } }).__am;
+	const withNode = (node: Record<string, unknown>, content: Record<string, unknown>, extra: Api = () => undefined): Api => async (p, m, body) =>
+		(await extra(p, m, body)) ?? (p === "/api/profiles/work/nodes/m1" ? Response.json({ node: { id: "m1", name: "cache-policy", kind: "decision", memory_type: "project", status: "active", revision: 4, ...node }, content, evidence: { items: [] } }) : api(p, m, body));
+	const openWith = async (hash: string, a: Api) => { const b = browser({ signedIn: true, hash, api: a }); await dashboardMain(b.win); for (let i = 0; i < 25; i++) await settle(); return b; };
+
+	it("edits with the whole text: reads every content page first, refuses a cut description, and never replaces an unsaved draft", async () => {
+		const b = await openWith("#memories/work/m1?profile=work", withNode({ description: "why" }, { text: "part one ", chars: 17, complete: false }, (p) =>
+			p === "/api/profiles/work/nodes/m1?content=all" ? Response.json({ id: "m1", content: { content: "part one ", complete: false, cursor: "k1" } })
+				: p === "/api/profiles/work/nodes/m1?content=all&cursor=k1" ? Response.json({ id: "m1", content: { content: "part two", complete: true, cursor: null } }) : undefined));
+		click(button(b.view(), "Edit"));
+		for (let i = 0; i < 6; i++) await settle();
+		expect(am(b).drafts.get("work")).toMatchObject({ memory_id: "m1", expected_revision: 4, description: "why", content: "part one part two" }); // never the prefix
+		expect(b.win.location.hash).toBe("#/draft/work");
+
+		// A draft already waiting in that profile is kept: Edit says so instead of replacing it.
+		const c = await openWith("#memories/work/m1?profile=work", withNode({ description: "why" }, { text: "all of it", complete: true }));
+		am(c).drafts.set("work", { name: "unsaved" });
+		click(button(c.view(), "Edit"));
 		for (let i = 0; i < 4; i++) await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Facts");
-		const [first, second] = rows(b.view());
-		expect(text(first!)).toContain("ACTIVE");
-		expect(text(first!)).toContain("REPO TIER");
-		expect(text(first!)).toContain("2 devices");
-		expect(text(first!)).toContain("Exercised 6"); // summed over both device lanes
-		expect(text(first!)).toContain("Fired 2, prevented 1");
-		expect(text(first!)).toContain("50%"); // (fired + prevented) / exercised
-		expect(text(second!)).toContain("DORMANT");
-		expect(text(second!)).toContain("USER TIER");
-		expect(text(second!)).toContain("PINNED");
-		expect(text(second!)).toContain("Shared");
-		expect(text(second!)).toContain("Not exercised yet");
-		// The cost table: input minus cache reads per usage session, cached and output per usage session, failures per session.
-		const cost = find(b.view(), "table").find((t) => text(t).includes("Session cost per repo and day"))!;
-		const cells = find(rows(cost)[0]!, "td").map((td) => text(td));
-		expect(cells).toEqual(["2026-11-10", "github.com/acme/app", "4 (2 with usage)", "200", "300", "100", "60%", "0.5", "0.25"]);
-		const filter = find(b.view(), "select").find((x) => x.attrs.id === "facts-state")!;
-		filter.value = "dormant";
-		filter.on.change!();
-		expect(rows(b.view()).map((r) => text(r).includes("Dormant one"))).toEqual([true]);
+		expect(am(c).drafts.get("work")).toEqual({ name: "unsaved" });
+		expect(text(c.view())).toContain("There is an unsaved draft in work; save or discard it in Write first.");
+
+		// A description the server cut short: no Edit at all, and the page says why.
+		const d = await openWith("#memories/work/m1?profile=work", withNode({ description: "x".repeat(4000), truncated: ["description"] }, { text: "body", complete: true }));
+		expect(find(d.view(), "button").some((x) => x.textContent === "Edit")).toBe(false);
+		expect(text(d.view())).toContain("Editing is off here");
 	});
 
-	it("flags a fact only with a reason, through the flag route, and offers its Undo", async () => {
-		let flagged: unknown;
-		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path, method, body) => {
-			if (path === "/api/profiles/work/facts/flag" && method === "POST") { flagged = body; return Response.json({ ok: true, action: "flagged", activity_id: 7 }); }
-			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [fact("f1")] });
-			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [] });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		click(button(b.view(), "Flag…"));
-		click(button(b.view(), "Flag it"));
-		await settle();
-		expect(b.seen.posted).toEqual([]);
-		expect(text(b.view())).toContain("Give a reason first.");
-		find(b.view(), "textarea")[0]!.value = "  python -m pytest is wrong here  ";
-		click(button(b.view(), "Flag it"));
-		for (let i = 0; i < 4; i++) await settle();
-		expect(b.seen.posted).toEqual(["/api/profiles/work/facts/flag"]);
-		expect(flagged).toEqual({ memory_id: "f1", scope: "repo", reason: "python -m pytest is wrong here", request_id: expect.stringMatching(/^dashboard:/) });
-		expect(text(b.view())).toContain("Done: flagged");
+	it("reads a long record in full on request", async () => {
+		const b = await openWith("#memories/work/m1?profile=work", withNode({}, { text: "part one ", chars: 17, complete: false }, (p) =>
+			p.startsWith("/api/profiles/work/nodes/m1?content=all") ? Response.json({ id: "m1", content: { content: p.includes("cursor") ? "part two" : "part one ", complete: p.includes("cursor"), cursor: p.includes("cursor") ? null : "k1" } }) : undefined));
+		click(button(b.view(), "Read all 17 characters"));
+		for (let i = 0; i < 6; i++) await settle();
+		expect(text(find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!)).toContain("part one part two");
+	});
+
+	it("keeps Forget's outcome and Undo on screen after the record stops reading", async () => {
+		let gone = false;
+		const b = await openWith("#memories/work/m1?profile=work", withNode({}, { text: "body", complete: true }, (p, m) => {
+			if (p === "/api/profiles/work/nodes/m1/forget" && m === "POST") { gone = true; return Response.json({ ok: true, action: "forget", activity_id: 21 }); }
+			if (p === "/api/profiles/work/nodes/m1" && gone) return Response.json({ error: { code: "not_found", message: "no such record" } }, { status: 404 });
+		}));
+		click(button(b.view(), "Forget…"));
+		click(button(b.view(), "Forget"));
+		for (let i = 0; i < 8; i++) await settle();
+		expect(text(b.view())).toMatch(/Forgot “[^”]+”\./);
+		expect(text(b.view())).toContain("This record is no longer here");
 		expect(button(b.view(), "Undo last change")).toBeDefined();
 	});
 
-	it("says so when a profile has no facts and no session cost yet", async () => {
-		const b = browser({ signedIn: true, hash: "#facts?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/facts?limit=200") return Response.json({ next_after: null, facts: [] });
-			if (path.startsWith("/api/profiles/work/facts/efficiency?")) return Response.json({ rows: [] });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		expect(text(b.view())).toContain("No repo facts yet.");
-		expect(text(b.view())).toMatch(/No session cost recorded from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}\./);
+	it("shows a long journal's newest entries first, reading every page", async () => {
+		const page = (after: number) => Array.from({ length: Math.min(25, 250 - after) }, (_, i) => ({ entry_seq: after + i + 1, created_at: today, body: `note ${after + i + 1}` }));
+		const b = await openWith("#journals/work/j1?profile=work", (p, m, body) => {
+			const m2 = /^\/api\/profiles\/work\/journals\?id=j1&limit=25(?:&entries_after=(\d+))?$/.exec(p);
+			if (!m2) return api(p, m, body);
+			const after = Number(m2[1] ?? 0), entries = page(after);
+			return Response.json({ journal: { id: "j1", status: "active" }, entries, next_after: after + entries.length < 250 ? after + entries.length : null });
+		});
+		const cards = find(b.view(), "li").filter((li) => li.attrs.class === "entry");
+		expect(text(cards[0]!)).toContain("note 250"); // the newest, not entry 225
+		expect(text(b.view())).toContain("Entries 250");
+		expect(text(b.view())).not.toContain("has more than the page reads");
 	});
 
-	it("shows goal metrics per repo and week, Not enough data for thin weeks, and every missing input", async () => {
-		const full = goalWeek("2026-11-09", {
-			corrections: { total: 10, learned: 10, repeats: 1, pending: 2, rate: 0.1 },
-			guided: { sessions: 10, guided: 9, share: 0.9, seen: 20, captured: 19, coverage: 0.95 },
-			followed: { injected: 6, exercised: 4, fired: 1, prevented: 3, rate: 1, prevented_share: 0.75, memory: { injected: 5, processed: 4, failed: 1, rate: 0.75 } },
-			cost: { sessions: 10, usage_sessions: 8, input: 80_000, cached_input: 40_000, output: 8_000, failed: 5, repeated_failures: 1, tokens_per_session: 11_000, failures_per_session: 0.5, cache_ratio: 0.5 } });
-		const b = browser({ signedIn: true, hash: "#goals?profile=work", api: (path) => {
-			if (path === "/api/profiles/work/goal-metrics?weeks=12") return Response.json(goals([
-				{ repo_key: "github.com/acme/app", weeks: [goalWeek("2026-10-26"), goalWeek("2026-11-02"), full] }, { repo_key: null, weeks: [goalWeek("2026-10-26")] }],
-				[{ metric: "cost", reason: "No daily session cost rows are stored yet." }]));
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		expect(find(b.view(), "h2")[0]!.textContent).toBe("Goals");
-		const page = text(b.view());
-		expect(page).toContain("Cost per session: No daily session cost rows are stored yet.");
-		expect(page).toContain("Sessions with no linked GitHub repo");
-		const repo = find(b.view(), "section").find((s) => text(s).includes("github.com/acme/app"))!;
-		const weeks = rows(repo);
-		expect(weeks.map((r) => text(find(r, "td")[0]!))).toEqual(["2026-11-09", "2026-11-02", "2026-10-26"]); // newest first
-		const newest = text(weeks[0]!);
-		for (const t of ["10%", "1 of 10 learned, 2 waiting", "90%", "95%", "19 of 20 seen", "Facts 100%", "75% prevented", "Lessons 75%", "3 of 4 processed followed", "11,000", "0.5"])
-			expect(newest).toContain(t);
-		expect(text(weeks[2]!)).toContain("Not enough data");
-		// Headlines sum the last 4 weeks: guided 9 of 10 meets the 80% target; repeat corrections have one week of data, so no decline yet.
-		const stats = find(repo, "div").filter((d) => d.attrs.class === "stat").map((d) => text(d));
-		expect(stats.find((t) => t.includes("Guided sessions"))).toContain("On target");
-		expect(text(repo)).toContain("fewer than 4 weeks with enough data");
+	it("opens an older address with only the record id in its profile's place", async () => {
+		const b = await open("#memories/m1?profile=work");
+		expect(b.win.location.hash).toBe("#memories/work/m1?profile=work");
+		expect(find(find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!, "h2")[0]!.textContent).toBe("Cache policy");
 	});
 
-	it("says so when no sessions fall in the window", async () => {
-		const b = browser({ signedIn: true, hash: "#goals?profile=work", api: (path) => path.startsWith("/api/profiles/work/goal-metrics") ? Response.json(goals([])) : undefined });
+	it("retries a failed library read, says it failed with a Retry, and recovers from Retry", async () => {
+		let fail = true, reads = 0;
+		const b = await openWith("#home?profile=work", (p, m, body) => {
+			if (p.startsWith("/api/profiles/work/graph?part=nodes")) { reads++; if (fail) return Response.json({ error: { code: "unavailable", message: "store down" } }, { status: 503 }); }
+			return api(p, m, body);
+		});
+		await new Promise((r) => setTimeout(r, 4200)); // two retries, 0.8 s and 3 s apart
+		for (let i = 0; i < 5; i++) await settle();
+		expect(reads).toBe(3); // the first read and two retries, then it waits: no loop of empty reads
+		const sync = find(b.els.tools!, "span").find((x) => x.attrs.class === "sync")!;
+		expect(text(sync)).toContain("Couldn’t refresh");
+		fail = false;
+		click(find(sync, "button").find((x) => x.textContent === "Retry")!);
+		for (let i = 0; i < 25; i++) await settle();
+		expect(text(sync)).toContain("Live");
+		expect(text(b.view())).toContain("Cache policy");
+	}, 15_000);
+
+	it("stops a page's scroll observers when the page is left", async () => {
+		const live = new Set<object>();
+		class IO { constructor() { live.add(this); } observe() {} disconnect() { live.delete(this); } }
+		const entries = Array.from({ length: 30 }, (_, i) => ({ entry_seq: i + 1, created_at: today, body: `note ${i + 1}` }));
+		const b = browser({ signedIn: true, hash: "#journals/work/j1?profile=work", api: (p, m, body) => p.startsWith("/api/profiles/work/journals?id=j1") ? Response.json({ journal: { id: "j1", status: "active" }, entries }) : api(p, m, body) });
+		Object.assign(b.win, { IntersectionObserver: IO });
 		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		expect(text(b.view())).toContain("No sessions in this window yet.");
+		for (let i = 0; i < 25; i++) await settle();
+		expect(live.size).toBeGreaterThan(0); // the journal's "earlier entries" row is watched
+		b.go("#home?profile=work");
+		expect(live.size).toBe(0);
 	});
 
-	it("shows a lesson's guidance receipts as a chip, and nothing for one never injected", async () => {
-		const g = (injected: number, processed: number, failed: number) => ({ injected, processed, failed, followed: processed - failed, followed_rate: processed ? (processed - failed) / processed : null });
-		const b = browser({ signedIn: true, hash: "#lessons?profile=work", api: (path) => {
-			if (path.startsWith("/api/profiles/work/owner-model")) return Response.json({ next_after: null, items: [
-				pref("l1", { kind: "rule", name: "Run tests first", guidance: g(5, 4, 1) }), pref("l2", { kind: "rule", name: "Pending one", guidance: g(2, 0, 0) }),
-				pref("l3", { kind: "rule", name: "Never injected", guidance: null })] });
-			if (path.startsWith("/api/profiles/work/recall-strength")) return Response.json({ strength: {} });
-		} });
-		await dashboardMain(b.win);
-		for (let i = 0; i < 4; i++) await settle();
-		const chips = (name: string) => find(rows(b.view()).find((r) => text(r).includes(name))!, "span").filter((s) => /^(FOLLOWED|INJECTED)/.test(s.textContent));
-		expect(chips("Run tests first").map((c) => [c.textContent, c.attrs.class])).toEqual([["FOLLOWED 3/4", "chip c-warn"]]);
-		expect(chips("Pending one").map((c) => c.textContent)).toEqual(["INJECTED 2"]);
-		expect(chips("Never injected")).toEqual([]);
+	it("creates a device with checked permissions and shows its token once; Revoke asks first and Cancel changes nothing", async () => {
+		const b = await openWith("#/devices", (p, m, body) => {
+			if (p === "/api/devices" && m === "POST") return Response.json({ name: (body as { name: string }).name, token: "am_dev_secret" }, { status: 201 });
+			return api(p, m, body);
+		});
+		const form = find(b.view(), "form")[0]!, name = find(form, "input").find((x) => x.attrs.name === "name")!;
+		name.value = "new-box";
+		form.on.submit!({ preventDefault() {} });
+		for (let i = 0; i < 6; i++) await settle();
+		expect(b.seen.bodies.at(-1)).toMatchObject({ name: "new-box", scopes: ["read", "write"], profiles: ["personal"] });
+		const token = find(form, "div").find((x) => x.attrs.class === "token")!;
+		expect([token.hidden, token.textContent]).toEqual([false, "Token for new-box (shown once; keep it in the keychain now): am_dev_secret"]);
+		const revoke = find(b.view(), "button").find((x) => x.attrs["aria-label"] === "Revoke laptop")!;
+		click(revoke);
+		click(button(b.view(), "Cancel"));
+		expect(b.seen.posted.filter((x) => x.includes("/revoke"))).toEqual([]);
+		expect(revoke.hidden).toBe(false);
+	});
+
+	it("charts Home per day over 12 weeks: 84 stacked bars, no numbers on them, today marked, a day's counts on demand", async () => {
+		const b = await open("#home?profile=work");
+		expect(find(b.view(), "h3").map((h) => h.textContent)).toContain("Added per day, last 12 weeks");
+		const fig = find(b.view(), "figure").find((f) => f.attrs.class === "chart daily")!, cols = find(fig, "div").filter((d) => /^col( |$)/.test(String(d.attrs.class)));
+		expect(cols.length).toBe(84);
+		expect(find(fig, "span").some((x) => x.attrs.class === "val")).toBe(false); // no per-bar numbers
+		expect(cols.at(-1)!.attrs.class).toContain("today");
+		const readout = find(fig, "p").find((p) => p.attrs.class === "readout")!;
+		expect(readout.textContent).toMatch(/^Today: 1 memory, 1 learning, 1 journal$/); // today's counts until a day is chosen
+		find(fig, "div").find((d) => String(d.attrs.class).startsWith("cols"))!.on.keydown!({ key: "ArrowLeft", preventDefault() {} } as never);
+		expect(readout.textContent).toMatch(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d+ [A-Z][a-z]{2}: nothing added$/);
+		expect(text(fig)).toContain("added in the last 12 weeks");
+		const fit = (b.win as unknown as { __am: { fitWeeks(box: unknown, w: number): number } }).__am.fitWeeks;
+		expect([fit({ clientWidth: 800 }, 12), fit({ clientWidth: 240 }, 12)]).toEqual([12, 4]); // bars under 2 px fall back to 4 weeks
+	});
+
+	it("names records and sources for people: tag and command fragments read the record's text, devices and raw links are detail", async () => {
+		NODES.push(N("m3", "decision", "<kernel planning> push feat dynav a h", { type: "reference" }));
+		try {
+			const b = await openWith("#memories/work/m3?profile=work", (p, m, body) => p === "/api/profiles/work/nodes/m3"
+				? Response.json({ node: { id: "m3", name: "x", kind: "decision", status: "active", description: "Push the dynav feature branch. Then more.", source_platform: "device:main-work-personal-20261102", origin: "agent", created_at: today },
+					content: { text: "body", complete: true }, evidence: { items: [{ kind: "url", ref: "https://drafts.wrick17.com/d/3a4f026ac12360e57d7" }, { kind: "pr", ref: "https://github.com/wrick17/bettergit/pull/66" }] } })
+				: api(p, m, body));
+			const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
+			expect(find(detail, "h2")[0]!.textContent).toBe("Push the dynav feature branch.");
+			const from = text(find(detail, "div").find((d) => String(d.attrs.class).includes("from"))!);
+			expect(from).toContain("Saved by an agent");
+			expect(from).not.toContain("main-work-personal"); // the device is in the tooltip only
+			expect(from).toContain("Draft page");
+			expect(from).not.toContain("3a4f026ac");
+		} finally { NODES.pop(); }
+		const p2 = await open("#projects?profile=work");
+		expect(text(find(p2.view(), "span").find((x) => x.attrs.class === "count")!)).toMatch(/^\d+ unique$/);
+	});
+
+	// Sol re-check, 2026-11-12: three P2s, each with its regression.
+	it("still reads and edits a record whose evidence link has a malformed escape", async () => {
+		const b = await openWith("#memories/work/m1?profile=work", withNode({}, { text: "body", complete: true }, (p) => p === "/api/profiles/work/nodes/m1"
+			? Response.json({ node: { id: "m1", name: "cache-policy", kind: "decision", memory_type: "project", status: "active", revision: 4 }, content: { text: "body text", complete: true }, evidence: { items: [{ kind: "url", ref: "https://example.com/100%" }] } })
+			: undefined));
+		const detail = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!;
+		expect(text(detail)).toContain("body text");
+		expect(text(detail)).toContain("example.com: 100%"); // the path text, undecoded
+		expect(button(detail, "Edit")).toBeDefined();
+	});
+
+	it("adds Linked chips that arrive after the record, redrawing only Connections", async () => {
+		const edges = gate();
+		EDGES.push(E(8, "m1", "l1", "supersedes"));
+		try {
+			const b = await openWith("#memories/work/m1?profile=work", async (p, m, body) => {
+				if (p.startsWith("/api/profiles/work/graph?part=edges")) { await edges.wait; return Response.json({ items: EDGES, next_after: null, done: true }); }
+				return api(p, m, body);
+			});
+			const detail = () => find(b.view(), "section").find((x) => x.attrs.class === "lib-detail")!, h2 = find(detail(), "h2")[0]!;
+			expect(text(detail())).not.toContain("replaces");
+			edges.open();
+			for (let i = 0; i < 30; i++) await settle();
+			expect(text(detail())).toContain("replaces Always run the tests");
+			expect(find(detail(), "h2")[0]).toBe(h2); // the same pane: nothing else redrawn
+			expect(find(detail(), "section").filter((x) => x.attrs.class === "connections").length).toBe(1);
+		} finally { EDGES.pop(); }
+	});
+
+	it("bins and labels days by calendar date across a daylight-saving change", async () => {
+		const b = await open("#home?profile=work");
+		const am = (b.win as unknown as { __am: { daily(parent: El, series: { label: string; kind: string; dates: string[] }[], weeks: number): El } }).__am;
+		// New York time around the 8 Mar 2026 change (UTC-5, then UTC-4), with the clock at noon on 15 Mar 2026.
+		const Real = Date, DST = Real.UTC(2026, 2, 8, 7), off = (t: number) => (t >= DST ? 4 : 5) * 3_600_000;
+		class NY extends Real {
+			constructor(...a: number[]) {
+				if (a.length === 0) super(Real.UTC(2026, 2, 15, 16));
+				else if (a.length === 1) super(a[0]!);
+				else { const g = Real.UTC(a[0]!, a[1]!, a[2] ?? 1, a[3] ?? 0, a[4] ?? 0); super(g + off(g + 5 * 3_600_000)); }
+			}
+			private local() { return new Real(this.getTime() - off(this.getTime())); }
+			getFullYear() { return this.local().getUTCFullYear(); }
+			getMonth() { return this.local().getUTCMonth(); }
+			getDate() { return this.local().getUTCDate(); }
+			getDay() { return this.local().getUTCDay(); }
+			getHours() { return this.local().getUTCHours(); }
+			getMinutes() { return this.local().getUTCMinutes(); }
+		}
+		const box = b.win.document.createElement("div") as unknown as El;
+		globalThis.Date = NY as unknown as DateConstructor;
+		try { am.daily(box, [{ label: "memory", kind: "memory", dates: ["2026-02-16T15:00:00Z"] }], 12); } finally { globalThis.Date = Real; }
+		const titles = find(box, "div").filter((d) => /^col( |$)/.test(String(d.attrs.class))).map((d) => d.attrs.title);
+		expect(titles.length).toBe(84);
+		expect(titles).toContain("Mon 16 Feb: 1 memory");
+		expect(titles).toContain("Sun 15 Feb: nothing added");
+		expect(titles.at(-1)).toBe("Today: nothing added");
+		expect(titles[0]).toBe("Mon 22 Dec: nothing added"); // 84 calendar days ending 15 Mar
+	});
+
+	it("places a record by its tagged project_key when the server sends one, and by its scope when it does not", async () => {
+		NODES.push(N("t1", "decision", "Tagged decision", { type: "project", scope: "codex", project_key: "github:sequoia-engineering/kernel-idm-frontend" }));
+		try {
+			const b = await open("#projects?profile=work");
+			const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard").map((c) => text(find(c, "strong")[0]!).trim());
+			expect(cards).toEqual(expect.arrayContaining(["idm", "memory"])); // idm from the tag; memory from its scope, as before
+		} finally { NODES.pop(); }
+	});
+
+	it("searches titles across every section", async () => {
+		const b = await open("#search?q=cache&profile=work");
+		expect(find(b.view(), "h2")[0]!.textContent).toBe("Results for “cache”");
+		expect(text(b.view())).toContain("Cache policy");
+		expect(text(b.view())).not.toContain("Always run the tests");
+	});
+
+	it("draws the map as readable blocks that never overlap, and opens a block's page beside it", async () => {
+		const b = await open("#map?profile=work");
+		const rect = (e: El) => { const s = e.attrs.style ?? "", n = (k: string) => Number(new RegExp(`${k}:(-?[\\d.]+)px`).exec(s)?.[1]); return { x: n("left"), y: n("top"), w: n("width"), h: n("height") }; };
+		const blocks = () => find(b.view(), "button").filter((x) => String(x.attrs.class).includes("block"));
+		const check = () => {
+			const rs = blocks().map(rect);
+			expect(rs.length).toBeGreaterThan(1);
+			for (const [i, r] of rs.entries()) {
+				expect(r.w).toBeGreaterThan(150);
+				expect(text(blocks()[i]!).trim()).not.toBe("");
+				for (const o of rs.slice(i + 1)) expect(r.x + r.w <= o.x || o.x + o.w <= r.x || r.y + r.h <= o.y || o.y + o.h <= r.y).toBe(true);
+			}
+		};
+		check();
+		expect(blocks().map((x) => find(x, "span")[1]!.textContent)).toEqual(expect.arrayContaining(["memory", "bettergit"]));
+		expect(blocks().some((x) => text(x).includes("Ana"))).toBe(false); // no people on the map
+		const ana = blocks().find((x) => text(x).includes("bettergit"))!;
+		find(b.view(), "div").find((d) => d.attrs.class === "blocks")!.on.click!({ target: { closest: () => ana }, preventDefault() {} } as never);
+		await settle();
+		check();
+		const side = find(b.view(), "aside").find((a) => a.attrs.class === "map-side")!;
+		expect(side.hidden).toBe(false);
+		expect(find(side, "h2")[0]!.textContent).toBe("bettergit");
+		expect(b.win.location.hash).toBe(b.win.location.hash); // the trail is in the address once the camera settles
+	});
+
+	it("places a record by Sol's rules: explicit repo key, then a verified scope alias, then the workspace, else Unsorted", async () => {
+		const b = await open("#home?profile=work");
+		const am = (b.win as unknown as { __am: { placeOf(r: Record<string, unknown>): Record<string, unknown> } }).__am;
+		const at = (r: Record<string, unknown>) => { const x = am.placeOf({ profile: "work", ...r }); return [x.workspace, x.project, x.confidence]; };
+		// Explicit keys win, normalized to lowercase owner/repo; the owner decides the workspace.
+		expect(at({ kind: "project", name: "idm", key: "github:Sequoia-Engineering/kernel-idm-frontend" })).toEqual(["sequoia", "sequoia-engineering/kernel-idm-frontend", "high"]);
+		expect(at({ repo_key: "github.com/wrick17/agent-memory", scope: "sequoia" })).toEqual(["personal", "wrick17/agent-memory", "high"]);
+		expect(am.placeOf({ profile: "work", scope: "personal/dotfiles" })).toEqual({ workspace: "personal", workspaces: ["personal"], project: "wrick17/dotfiles", confidence: "high", profile: "personal" });
+		// One repo, several workspace folders: adminshell is checked out in sequoia and apps.
+		expect(am.placeOf({ profile: "work", scope: "claude/Projects-sequoia-adminshell" }).workspaces).toEqual(["sequoia", "apps"]); // the aggregator's nested checkout is still adminshell
+		// Verified aliases, including Claude's encoded roots exactly as listed (no hyphen-to-slash guessing).
+		expect(at({ scope: "claude/Projects-personal-bettergit" })).toEqual(["personal", "wrick17/bettergit", "high"]);
+		expect(at({ scope: "claude/Projects-mfe" })).toEqual(["sequoia", "sequoia-engineering/kernel-mfe-frontend", "high"]);
+		expect(at({ scope: "claude/Projects-aggregator" })).toEqual(["sequoia", "sequoia-engineering/kernel-aggregator-frontend", "high"]); // a project, not a workspace
+		expect(at({ kind: "project", name: "Bot HQ", key: "github:wrick17/bothq" })).toEqual(["personal", null, "high"]); // the owner: Bot HQ is not a project
+		expect(at({ kind: "project", name: "x", key: "github:wrick17/n5-japanese" })).toEqual(["personal", null, "high"]); // not in the registry: its workspace only
+		expect(at({ scope: "claude/Projects-sequoia-adminshell" })).toEqual(["sequoia", "sequoia-engineering/kernel-adminshell-frontend", "medium"]);
+		expect(at({ scope: "projects/spur" })).toEqual(["personal", "pratyush-poddar_seq/spur", "high"]); // checked out in the personal folder…
+		expect(am.placeOf({ profile: "personal", scope: "projects/spur" }).profile).toBe("work"); // …but its owner makes it work
+		// Workspace-only aliases: a workspace with no project.
+		expect(at({ scope: "sequoia" })).toEqual(["sequoia", null, "high"]);
+		expect(at({ scope: "Sequioa" })).toEqual(["sequoia", null, "high"]);
+		expect(at({ scope: "claude/Projects-apps" })).toEqual(["apps", null, "high"]); // apps is its own workspace folder
+		expect(at({ scope: "apps" })).toEqual(["apps", null, "high"]);
+		expect(at({ scope: "personal" })).toEqual(["personal", null, "medium"]);
+		// Counterexamples: never a project.
+		for (const scope of ["bot_hq", "claude/Projects-bot-hq", "bothq/unscoped", "codex", "tooling/codex", "tooling/t3-code", "default", "", "repo-fact", "agent-evaluation", "am-accept-refs-20261101-59c5", "fixture/v1-cutover-20261102", "dashboard-smoke"])
+			expect([scope, am.placeOf({ profile: "work", scope }).project, am.placeOf({ profile: "work", scope }).workspace]).toEqual([scope, null, null]);
+		expect(am.placeOf({ profile: "work", kind: "project", id: "40e647a4-713a-5ea9-85bc-b9ddf5ec1956", key: "github:Sequoia-Engineering/kernel-eureka-frontend" }).drop).toBe(true); // a fixture, before its real-looking key
+		// Capture-tagged sessions (project_key, workspace): the strongest signal when present, normalized through the registry…
+		expect(at({ scope: "sequoia", project_key: "github:Sequoia-Engineering/kernel-idm-frontend" })).toEqual(["sequoia", "sequoia-engineering/kernel-idm-frontend", "high"]);
+		expect(at({ scope: "bot_hq", project_key: "github:wrick17/bettergit" })).toEqual(["personal", "wrick17/bettergit", "high"]);
+		expect(at({ project_key: "github:someone/unknown-repo" })).toEqual(["personal", null, "high"]); // not in the registry: its workspace only
+		expect(at({ project_key: null, workspace: "apps", scope: "default" })).toEqual(["apps", null, "high"]);
+		// …and a server that does not send them yet falls back to the scope rules unchanged.
+		expect(at({ scope: "claude/Projects-mfe", project_key: undefined, workspace: undefined })).toEqual(["sequoia", "sequoia-engineering/kernel-mfe-frontend", "high"]);
+		expect(at({ scope: "codex", project_key: null, workspace: null })).toEqual([null, null, null]);
+		// Unverified histories stay Unsorted rather than guessed: f1 is not f1-replay, browser-mcp needs its own evidence.
+		for (const scope of ["projects/f1", "projects/browser-mcp", "projects/n5", "task-train/japan-hotels", "travel/japan-2027"]) expect(at({ scope })).toEqual([null, null, null]);
 	});
 });

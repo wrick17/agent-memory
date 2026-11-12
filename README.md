@@ -13,7 +13,7 @@ It runs on your own Cloudflare account, with sign-in through your own Clerk appl
 - **Learning from every session.** The local client turns each finished session into a short redacted digest, with Claude Code sub-agents captured as their own sessions. A daily batch reads the digests and records lessons, decisions and preferences. Full transcripts never leave your machine.
 - **Guidance while agents work.** Each session starts with a brief of at most 400 tokens: repo facts, the open journal, project rules and decisions, and your `me` preferences. The loop guard adds one short note when a turn keeps failing the same way.
 - **Repo facts.** The client spots repeatable command failures in a GitHub repo, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction.
-- **A dashboard.** Browse memories, the graph, sessions, lessons, goals and health at `/app`. Manage devices and routing at `/settings`.
+- **A dashboard.** Browse memories, learnings, journals and projects, and see how they connect on the Map, at `/app`. Owner tools, devices included, sit behind the Settings gear (`/settings` redirects there).
 - **Backups and recovery.** A nightly job writes encrypted exports to your own R2 bucket and keeps the two newest. Profiles and account state can be restored.
 - **Careful cleanup.** Server housekeeping is rule-based and runs no model. The background batch never changes stated rules, pinned records or `me`, and every change can be undone.
 
@@ -29,7 +29,7 @@ The brief, fact synthesis and the loop guard are off in a new client. Turn them 
 2. **Detect.** In a GitHub checkout, the client also sends a repo-fact report: hashes, fact keys and outcomes, never command output or paths.
 3. **Learn.** The server queues review items from digests and housekeeping rules. The batch leases them at most once a day per profile, judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
 4. **Guide.** At the next session start, the Worker builds the brief from the repo's profile and `me`. The client injects it into the agent's context.
-5. **Measure.** The dashboard's **Goals** tab tracks repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
+5. **Measure.** `GET /api/profiles/:p/goal-metrics` reports repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
 
 ### Components
 

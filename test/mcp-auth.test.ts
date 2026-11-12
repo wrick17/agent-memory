@@ -6,7 +6,6 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resetKeyCache } from "../src/auth";
 import { egressFetch } from "../src/egress";
-import { settingsMain } from "../src/settings";
 import wranglerConfig from "../wrangler.jsonc?raw";
 import { listExports } from "../src/backup";
 import { nextSeq } from "../src/storage";
@@ -794,9 +793,12 @@ describe("owner API", () => {
 		expect((await exports.default.fetch(new Request(`${origin}/api/devices`, { headers: { authorization: `Bearer ${foreign}` } }))).status).toBe(401);
 		const whoami = await (await exports.default.fetch(new Request(`${origin}/v1/whoami`, { headers: { authorization: `Bearer ${await jwt({})}` } }))).json() as { claims: { aud: string[] } };
 		expect(whoami.claims.aud).toContain(env.RESOURCE_URL);
-		const page = await exports.default.fetch(new Request(`${origin}/settings`));
+		// The old Settings page is retired: it sends the browser to the dashboard's Devices and tokens page.
+		const old = await exports.default.fetch(new Request(`${origin}/settings`), { redirect: "manual" } as never);
+		expect([old.status, old.headers.get("location")]).toEqual([302, "/#/devices"]);
+		const page = await exports.default.fetch(new Request(`${origin}/app`));
 		const policy = Object.fromEntries(page.headers.get("content-security-policy")!.split("; ").map((d) => { const [name, ...src] = d.split(" "); return [name!, src]; }));
-		// The dashboard shell and script are public like /settings, under the same policy and no-store; its data stays owner-only.
+		// The dashboard shell and script are public, under one policy and no-store; its data stays owner-only.
 		const [app, appJs] = await Promise.all(["/app", "/app.js"].map((p) => exports.default.fetch(new Request(`${origin}${p}`))));
 		expect([app!.status, app!.headers.get("content-security-policy"), app!.headers.get("cache-control"), appJs!.headers.get("content-type"), appJs!.headers.get("cache-control")])
 			.toEqual([200, page.headers.get("content-security-policy"), "no-store", "text/javascript; charset=utf-8", "no-store"]);
@@ -822,64 +824,6 @@ describe("owner API", () => {
 		}
 		expect(policy["script-src"]).not.toContain("'unsafe-inline'");
 		expect(await page.text()).toContain(`data-clerk-publishable-key="${env.CLERK_PUBLISHABLE_KEY}"`);
-	});
-});
-
-/** A stand-in browser and ClerkJS 6 that enforce the SDK rule behind the live failure: no components unless load() got ui.ClerkUI. */
-function fakeBrowser(o: { clerk?: boolean; ui?: boolean; loadError?: string; signedIn?: boolean } = {}) {
-	type El = { textContent: string; hidden: boolean; children: unknown[]; appendChild(c: unknown): void; replaceChildren(): void; addEventListener(t: string, f: unknown): void };
-	const els: Record<string, El> = {};
-	const make = (): El => ({ textContent: "", hidden: true, children: [], appendChild(c) { this.children.push(c); }, replaceChildren() { this.children = []; }, addEventListener() {} });
-	const seen: { load?: { ui?: { ClerkUI?: unknown }; telemetry?: unknown }; mounted?: unknown; fetched: string[] } = { fetched: [] };
-	const ClerkUI = function ClerkUI() {};
-	const clerk = {
-		user: o.signedIn ? { id: env.OWNER_USER_ID } : null,
-		session: { getToken: async () => "session" },
-		async load(opts: typeof seen.load) { seen.load = opts; if (o.loadError) throw new Error(o.loadError); },
-		mountSignIn(target: unknown) {
-			if (!seen.load?.ui?.ClerkUI) throw new Error("Clerk was not loaded with Ui components");
-			seen.mounted = target;
-		},
-	};
-	const win = {
-		document: { readyState: "complete", getElementById: (id: string) => (els[id] ??= make()), createElement: () => make() },
-		addEventListener() {},
-		fetch: async (path: string) => { seen.fetched.push(path); return Response.json([]); },
-		FormData: class {},
-		...(o.clerk === false ? {} : { Clerk: clerk }),
-		...(o.ui === false ? {} : { __internal_ClerkUICtor: ClerkUI }),
-	};
-	return { win, els, seen, ClerkUI };
-}
-
-describe("Settings page start-up", () => {
-	it("loads ClerkJS with the UI constructor, then mounts sign-in", async () => {
-		const b = fakeBrowser();
-		await settingsMain(b.win);
-		expect(b.els.status!.textContent).toBe("Sign in as the owner.");
-		expect(b.seen.load).toEqual({ ui: { ClerkUI: b.ClerkUI }, telemetry: false });
-		expect(b.seen.mounted).toBe(b.els.signin);
-	});
-
-	it("lists devices once signed in", async () => {
-		const b = fakeBrowser({ signedIn: true });
-		await settingsMain(b.win);
-		expect(b.els.status!.textContent).toBe("Signed in.");
-		expect(b.els.app!.hidden).toBe(false);
-		expect(b.seen.fetched).toEqual(["/api/devices"]);
-	});
-
-	it("says which script failed to load, and surfaces a load() error", async () => {
-		const noUi = fakeBrowser({ ui: false });
-		await settingsMain(noUi.win);
-		expect(noUi.els.status!.textContent).toMatch(/^Sign-in could not start: the Clerk UI bundle did not load/);
-		expect(noUi.seen.load).toBeUndefined();
-		const noClerk = fakeBrowser({ clerk: false });
-		await settingsMain(noClerk.win);
-		expect(noClerk.els.status!.textContent).toMatch(/^Sign-in could not start: ClerkJS did not load/);
-		const failing = fakeBrowser({ loadError: "network down" });
-		await settingsMain(failing.win);
-		expect(failing.els.status!.textContent).toBe("Sign-in could not start: network down");
 	});
 });
 
