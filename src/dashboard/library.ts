@@ -436,10 +436,11 @@ export function libraryTab(am: Am): void {
 					load.replaceChildren();
 					if (typeof r?.next_after === "number") note(text, `Showing the first ${entries.length.toLocaleString()} entries; this journal has more than the page reads.`, "warn");
 					if (journal.status === "active") moveLinks(after, it);
-					// The journal read gives each long entry or summary only its first part; the record read pages the whole text.
-					if (summaryCut || entries.some((e) => e.complete === false)) {
+					// The journal read gives each long entry or summary only its first part, and leaves out text saved with the journal
+					// itself (Write's body); the record read pages all of it, so it is always one click away.
+					if (entries.length || summary) {
 						const wrap = el("div", text);
-						note(wrap, "Some long parts of this journal show only their beginning (marked …).", "muted");
+						if (summaryCut || entries.some((e) => e.complete === false)) note(wrap, "Some long parts of this journal show only their beginning (marked …).", "muted");
 						const more = cls(el("button", wrap, "Read the whole journal"), "linklike more");
 						more.setAttribute("type", "button");
 						more.addEventListener("click", async () => {
@@ -485,7 +486,12 @@ export function libraryTab(am: Am): void {
 							el("span", b, entryTitle(body) || words(body) || `Entry ${entries.length - i}`);
 							b.addEventListener("click", () => { ensure(i); (cards[i] as J).scrollIntoView?.({ block: "start", behavior: "smooth" }); });
 						});
-					} else note(text, "No entries yet.", "muted");
+					} else {
+						// No entries or summary: the journal's words, if any, are the text saved with it.
+						const all = await wholeText(`${base}/nodes/${enc(it.id)}`);
+						if (version !== am.pageVersion) return;
+						if (all.trim()) textOf(text, all); else note(text, "No entries yet.", "muted");
+					}
 					src.textContent = it.agent ? `Written by ${it.agent}` : "";
 					return;
 				}
