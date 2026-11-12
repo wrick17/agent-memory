@@ -200,8 +200,9 @@ export function storeTab(am: Am): void {
 		if (into) into.textContent = it.title;
 		if (into && it.weak) {
 			(showing.get(it.key) ?? showing.set(it.key, new Set()).get(it.key)!).add(into);
-			if (!asked.has(it.key)) {
-				asked.add(it.key);
+			const ask = `${it.key}@${it.updated ?? ""}`; // a changed record is read again
+			if (!asked.has(ask)) {
+				asked.add(ask);
 				waiting.push(async () => {
 					try { const r: J = await call(`/api/profiles/${enc(it.p)}/nodes/${enc(it.id)}`); settle(it, String(r?.node?.description || r?.content?.text || "")); } catch { /* the slug title stays */ }
 				});
