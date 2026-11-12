@@ -1,67 +1,69 @@
 # Agent Memory
 
-A shared memory for your coding agents. Claude Code and Codex save decisions, rules and context here, and recall them later in any session, on any machine. You stop explaining the same things twice.
+A shared memory for your coding agents. Claude Code and Codex save decisions, rules and context here, recall them in any session on any machine, and get a short brief at the start of each session. You stop explaining the same things twice.
 
 It runs on your own Cloudflare account, with sign-in through your own Clerk application. Each deployment serves one owner; it is not a shared service.
 
-## Features
+## What it does
 
-- **One memory for all your agents.** Claude Code and Codex connect over MCP. Desktop clients sign in through Clerk, and headless machines use a revocable device token.
-- **Separate profiles.** `work`, `personal` and `me` keep their memories apart. The agent picks the profile; storage never guesses from the content. Recall reads the chosen profile plus `me`. An owner-only wipe can remove `work` on its own.
+- **One memory for all your agents.** Claude Code and Codex connect over MCP. Desktop clients sign in through Clerk; headless machines use a revocable device token.
+- **Separate profiles.** `work`, `personal` and `me` never share a database. The agent picks the profile; storage never guesses from the content. Recall reads the chosen profile plus `me`.
 - **Linked knowledge.** Decisions carry their reasons and evidence, and records link to projects, people and work items. Agents can ask why something was decided, follow a path between records or read a timeline.
 - **Search that works without AI.** Recall uses exact names and full-text search. Semantic search with Workers AI is optional.
-- **Private capture.** The local client turns sessions into short, redacted digests on your machine. Full transcripts stay on that machine, and you can replay them there.
-- **A dashboard.** Browse memories, the graph, sessions, activity and health at `/app`, and manage devices and routing at `/settings`.
-- **Backups and recovery.** Nightly encrypted exports go to your own R2 bucket, and the two newest are kept. Profiles and account state can be restored.
-- **Careful cleanup.** Housekeeping is rule-based, with no model on the server. Stated rules, pinned records and `me` are never changed by the background batch, and changes can be undone.
+- **Learning from every session.** The local client turns each finished session into a short redacted digest, with Claude Code sub-agents captured as their own sessions. A daily batch reads the digests and records lessons, decisions and preferences. Full transcripts never leave your machine.
+- **Guidance while agents work.** Each session starts with a brief of at most 400 tokens: repo facts, the open journal, project rules and decisions, and your `me` preferences. The loop guard adds one short note when a turn keeps failing the same way.
+- **Repo facts.** The client spots repeatable command failures in a GitHub repo, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction.
+- **A dashboard.** Browse memories, the graph, sessions, lessons, goals and health at `/app`. Manage devices and routing at `/settings`.
+- **Backups and recovery.** A nightly job writes encrypted exports to your own R2 bucket and keeps the two newest. Profiles and account state can be restored.
+- **Careful cleanup.** Server housekeeping is rule-based and runs no model. The background batch never changes stated rules, pinned records or `me`, and every change can be undone.
 
-### Session guidance
+The brief, fact synthesis and the loop guard are off in a new client. Turn them on with `facts.inject`, `facts.synthesis` and `loop_guard.enabled`; see [repo facts and loop guard settings](docs/self-host.md#repo-facts-and-loop-guard-settings).
 
-Deployed on 11 Nov 2026. Each switch below is off by default in a new client. The details and evidence are in the [feature manifest](docs/feature-manifest.md#repo-facts-v2-and-forever-context-123-131-2026-11-11).
+## Architecture
 
-- **Session-start brief.** At session start, a repo gets its active repo facts, its open journal, the project's rules and recent decisions, and your `me` preferences and rules, in at most 400 tokens. Turn it on with `facts.inject`.
-- **Repo facts.** The local client spots repeatable failures in a GitHub repo's commands, such as a missing tool or a command that needs a wrapper. A fact becomes active after 3 confirming sessions and retires on a contradiction. Facts start empty and build from new sessions. A replay of past sessions found they would have prevented about 1% of failed commands.
-- **Lessons and decisions.** The nightly batch turns corrections and decisions in session digests into lessons and decision records, and tracks whether briefed lessons were followed.
-- **Goals tab.** The dashboard shows repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
-- **Loop guard.** One short note when a turn keeps failing the same way. No model call. Turn it on with `loop_guard.enabled`. In Codex, hooks run only after you trust them once.
+![Agent Memory architecture: agents and the local client on your machine talk to one Cloudflare Worker, which stores data in per-profile SQLite Durable Objects, backs up to R2 and checks sign-in with your Clerk app.](docs/architecture.svg)
 
-## How it works
+### The learning loop
 
-```mermaid
-flowchart LR
-	A["Claude Code / Codex"] -->|MCP| W["Cloudflare Worker"]
-	C["Local capture client"] -->|digests only| W
-	W --> P["One SQLite store per profile"]
-	W --> S["Account store: devices, routing, profiles"]
-	W --> R["R2: encrypted backups"]
-	W -.optional.-> V["Workers AI + Vectorize"]
-	W -->|verifies sign-in| K["Your Clerk app"]
-```
+1. **Capture.** When a session stops or ends, the client hooks redact the transcript into a short digest and upload it. The full transcript stays local.
+2. **Detect.** In a GitHub checkout, the client also sends a repo-fact report: hashes, fact keys and outcomes, never command output or paths.
+3. **Learn.** The server queues review items from digests and housekeeping rules. The batch leases them at most once a day per profile, judges each one locally with `codex exec`, and sends back lessons, decisions and preference updates.
+4. **Guide.** At the next session start, the Worker builds the brief from the repo's profile and `me`. The client injects it into the agent's context.
+5. **Measure.** The dashboard's **Goals** tab tracks repeat corrections, guided sessions, guidance followed and cost per session, per repo and week.
 
-One Worker serves the MCP endpoint, the dashboard and the API. Each profile lives in its own SQLite Durable Object, so profiles never share a database. An account store holds devices, routing rules and the profile list. The Worker checks Clerk's sign-in tokens with Clerk's public keys and needs no Clerk secret.
+### Components
+
+| Part | Where | Role |
+|---|---|---|
+| Worker | Cloudflare | Serves MCP, the REST API, the dashboard and Settings. Checks Clerk tokens with Clerk's public keys and needs no Clerk secret. |
+| Profile store | Durable Object per profile | Memories, revisions, journals, the graph, sessions and repo facts, in SQLite. |
+| Account store | Durable Object | Devices, routing rules and the profile list. |
+| R2 | Cloudflare | Nightly encrypted exports and the identity ledger. |
+| Vectorize and Workers AI | Cloudflare, optional | Semantic recall. Lexical recall works without them. |
+| `agent-memory` client | Each machine | Hooks for capture, the brief and the loop guard; local replay; `doctor` and `status`. |
+| Daily batch | Each machine | Runs after a session ends or on a schedule. Turns leased review items into lessons, decisions and preferences with your Codex CLI. |
 
 The full design is in [architecture](docs/architecture.md).
 
 ## Deploy your own
 
-Deploy your own copy with the self-host package.
-
 **You need:**
+
 - Node 24.
-- A Cloudflare account, ideally on Workers Paid. Use your own domain's zone, or the account's workers.dev subdomain.
+- A Cloudflare account, ideally on Workers Paid, with your own domain's zone or the account's workers.dev subdomain.
 - A Wrangler login for that account (`npx wrangler login`, or `CLOUDFLARE_API_TOKEN`). Setup never logs in for you.
 - A Clerk production instance on your domain, with sign-ups closed, OAuth (CIMD and PKCE) turned on, and the `memory` scope. The [self-host guide](docs/self-host.md#create-the-clerk-application) lists every setting.
 
 **Steps:**
 
-1. Build the self-host package from this repository. The command prints the archive path.
+1. Build the self-host package. The command prints the archive path.
 
 	```sh
 	npm ci
 	npm run pack:self-host -- /absolute/existing/output-directory
 	```
 
-2. Unpack it into a new directory, outside this repository, and install:
+2. Unpack it into a new directory outside this repository, and install:
 
 	```sh
 	mkdir my-agent-memory
@@ -85,11 +87,11 @@ Deploy your own copy with the self-host package.
 	curl <your-url>/.well-known/oauth-protected-resource/mcp
 	```
 
-Setup creates only what it plans: the Worker config, an R2 bucket and, with semantic search on, a Vectorize index. It refuses rather than overwrite an existing deployment. Backups stay off until you set a backup key; see [backups and restore](docs/self-host.md#profile-backups-and-restore).
+Setup creates only what it plans: the Worker config, an R2 bucket and, with semantic search on, a Vectorize index. It refuses to overwrite an existing deployment. Backups stay off until you set a backup key; see [backups and restore](docs/self-host.md#profile-backups-and-restore).
 
 ## Connect a client
 
-Use your own deployment's URL in place of `https://YOUR-DEPLOYMENT.example/mcp`.
+Replace `https://YOUR-DEPLOYMENT.example/mcp` with your deployment's URL.
 
 For Claude Code, add the server, then run `/mcp` in Claude Code to sign in:
 
@@ -104,14 +106,15 @@ codex mcp add memory --url https://YOUR-DEPLOYMENT.example/mcp
 codex mcp login memory
 ```
 
-For a machine without a browser, see [headless machines](docs/self-host.md#headless-machines).
+For a machine without a browser, see [headless machines](docs/self-host.md#headless-machines). Codex runs the capture hooks only after you trust them once in Codex; `agent-memory doctor` reports `codex_hook_trust` until then.
 
 ## Privacy
 
-- Automatic capture uploads only short, redacted digests of each session, never the full transcript. A digest can contain short excerpts. What an agent saves or imports on purpose is stored as written.
-- Full sessions stay on the machine that recorded them. `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
-- The server never calls GitHub or Jira, and holds no credentials for them.
-- In a GitHub checkout, the capture client also sends a small repo-fact report per finished session: hashes, fact keys, short detector literals, outcomes and token counts, never command output or paths. Optional fact synthesis (`facts.synthesis`, off) sends redacted command digests to the Codex CLI on your own Codex subscription.
+- Automatic capture uploads only short, redacted digests, never the full transcript. A digest can contain short excerpts. What an agent saves on purpose is stored as written.
+- `agent-memory replay --list` and `agent-memory replay --session ID` open a viewer on 127.0.0.1 only, behind a private token, and upload nothing.
+- Repo-fact reports carry hashes, fact keys, short detector literals, outcomes and token counts, never command output or paths.
+- Fact synthesis (`facts.synthesis`) and the daily batch send redacted digests to the Codex CLI on your own Codex subscription.
+- The server never calls GitHub or Jira and holds no credentials for them.
 
 ## Learn more
 
