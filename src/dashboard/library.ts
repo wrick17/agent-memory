@@ -425,7 +425,7 @@ export function libraryTab(am: Am): void {
 					// The entries come oldest first, 25 a page: read to the end so the newest are always there, then show newest first.
 					// shortcut: reads up to 400 pages (10,000 entries) and says so beyond; upgrade to a newest-first read if journals grow past it.
 					let r: J = await call(`${base}/journals?id=${enc(it.id)}&limit=25`);
-					const entries: J[] = Array.isArray(r?.entries) ? [...r.entries] : [], summary = r?.summary?.body, journal = r?.journal ?? {};
+					const entries: J[] = Array.isArray(r?.entries) ? [...r.entries] : [], summary = r?.summary?.body, journal = r?.journal ?? {}, summaryCut = r?.summary?.complete === false;
 					let pages = 1;
 					for (; typeof r?.next_after === "number" && pages < JOURNAL_PAGES; pages++) {
 						r = await call(`${base}/journals?id=${enc(it.id)}&limit=25&entries_after=${r.next_after}`);
@@ -436,7 +436,19 @@ export function libraryTab(am: Am): void {
 					load.replaceChildren();
 					if (typeof r?.next_after === "number") note(text, `Showing the first ${entries.length.toLocaleString()} entries; this journal has more than the page reads.`, "warn");
 					if (journal.status === "active") moveLinks(after, it);
-					if (summary) { el("h3", text, "Summary"); textOf(text, String(summary), 8); }
+					// The journal read gives each long entry or summary only its first part; the record read pages the whole text.
+					if (summaryCut || entries.some((e) => e.complete === false)) {
+						const wrap = el("div", text);
+						note(wrap, "Some long parts of this journal show only their beginning (marked …).", "muted");
+						const more = cls(el("button", wrap, "Read the whole journal"), "linklike more");
+						more.setAttribute("type", "button");
+						more.addEventListener("click", async () => {
+							more.disabled = true;
+							try { const all = await wholeText(`${base}/nodes/${enc(it.id)}`); if (version !== am.pageVersion) return; wrap.replaceChildren(); el("h3", wrap, "Whole journal"); textOf(wrap, all); }
+							catch (err) { more.disabled = false; note(wrap, `Could not read the rest: ${why(err)}`, "warn"); }
+						});
+					}
+					if (summary) { el("h3", text, "Summary"); textOf(text, String(summary) + (summaryCut ? "…" : ""), 8); }
 					if (entries.length) {
 						el("h3", text, `Entries ${entries.length}`);
 						const ol = cls(el("ol", text), "entries"), cards: Node[] = [];
@@ -444,7 +456,7 @@ export function libraryTab(am: Am): void {
 						// The latest ten, then ten more each time the end of the list scrolls into view; the outline renders up to
 						// an entry before jumping to it. A long journal never builds one giant page.
 						let shown = 0;
-						const upto = (m: number) => { for (const end = Math.min(entries.length, m); shown < end; shown++) cards[shown] = entryCard(ol, entries[shown]!); };
+						const upto = (m: number) => { for (const end = Math.min(entries.length, m); shown < end; shown++) cards[shown] = entryCard(ol, entries[shown]!.complete === false ? { ...entries[shown], body: `${entries[shown]!.body ?? ""}…` } : entries[shown]!); };
 						upto(10);
 						if (shown < entries.length) {
 							const row = cls(el("div", text), "sentinel");
@@ -659,7 +671,8 @@ export function libraryTab(am: Am): void {
 			if (selected) {
 				// A hub (project or person) draws again while its connections are still arriving; any other item draws once.
 				const it = lib.items.get(selected), hub = it && (it.kind === "project" || it.kind === "person");
-				const sig = it ? `${it.key}:${hub ? lib.links.get(it.key)?.size ?? 0 : ""}` : "";
+				// Anything else draws again when its record changes (an edit, a new journal entry), so an open pane never goes stale.
+				const sig = it ? `${it.key}:${hub ? lib.links.get(it.key)?.size ?? 0 : it.updated ?? ""}` : "";
 				// Each neighbour with its relations, so a new relation to a known neighbour (supersedes after relates to) counts too.
 				const links = it ? [...(lib.links.get(it.key) ?? new Map()) as Map<string, Set<string>>].map(([k, rels]) => `${k}:${[...rels].sort().join("+")}`).sort().join("|") : "";
 				if (it && sig !== shownDetail) { shownDetail = sig; shownLinks = links; detailH = detail(detailCol, lib, it, route); }
