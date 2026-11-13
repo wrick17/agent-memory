@@ -1581,66 +1581,99 @@ describe("capture hooks, scheduled runs and status (#16)", () => {
 		assert.deepEqual(fs.readdirSync(path.join(am.home(), "claimed")), []);
 	});
 
-	// One run() with a second drain: the first maintenance_next fires a hook, so the run drains again. `leases` maps a profile to the
-	// replies of its successive maintenance_next calls (then idle); `judge` stands in for the confined model, `complete` for the
-	// server's per-item reply, and `clock` for the run's clock.
-	async function twoDrains(profiles, leases, judge, { complete = { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] }, clock = Date.now } = {}) {
-		const first = transcript("first", [claudeLine("user", "We decided to batch on every drain.")]), late = transcript("during", [claudeLine("user", "We decided to capture the late hook.")]);
+	// One run() whose first maintenance_next fires a hook ("during"). `leases` maps a profile to the replies of its successive
+	// maintenance_next calls (then idle); `judge` stands in for the confined model, `complete` for the server's per-item reply.
+	// Each maintenance_next records whether "during" was already captured. With `late`, the first status report fires another
+	// hook, so the run drains a second time.
+	async function learnRun(profiles, leases, judge, { complete = { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] }, late = false, clock = Date.now } = {}) {
+		const first = transcript("first", [claudeLine("user", "We decided to batch on every drain.")]), during = transcript("during", [claudeLine("user", "We decided to capture the hook.")]);
+		const after = transcript("after", [claudeLine("user", "We decided to drain again.")]);
 		const tokenFile = path.join(am.home(), "job-token");
 		am.writePrivate(tokenFile, "job");
 		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: profiles, server: "https://memory.example.invalid", token_file: tokenFile }));
 		am.hook("claude-code", JSON.stringify({ session_id: "first", transcript_path: first, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
-		const asked = [], real = globalThis.fetch;
+		const asked = [], seen = [], real = globalThis.fetch;
+		let statuses = 0;
+		const server = { ...fakeServer(), status: async () => { if (late && !statuses++) am.hook("claude-code", JSON.stringify({ session_id: "after", transcript_path: after, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false }); } };
 		globalThis.fetch = async (_url, init = {}) => {
 			const { name, arguments: args } = JSON.parse(init.body).params;
 			let reply = typeof complete === "function" ? complete(name) : complete;
 			if (name === "maintenance_next") {
-				if (asked.push(args.profile) === 1) am.hook("claude-code", JSON.stringify({ session_id: "during", transcript_path: late, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
+				seen.push(server.log.some((b) => b.session.id === "during"));
+				if (asked.push(args.profile) === 1) am.hook("claude-code", JSON.stringify({ session_id: "during", transcript_path: during, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
 				reply = leases[args.profile]?.shift() ?? { lease_id: null, items: [], next_allowed_at: null };
 			}
 			return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(reply) }] } }), { status: 200 });
 		};
-		const server = { ...fakeServer(), status: async () => {} }, runner = Object.assign(keepAllRunner(), { classification: "denied", exec: judge });
+		const runner = Object.assign(keepAllRunner(), { classification: "denied", exec: judge });
 		try {
 			const r = await am.run({ server, runner, debounceMs: 0, clock });
 			assert.equal(r.results["claude-code-during.json"].status, "done", "the hook that fired during the batch was drained");
-			return { asked, r };
+			const last = JSON.parse(fs.readFileSync(path.join(am.home(), "batch", "last.json"), "utf8"));
+			assert.deepEqual(r.results.batch.profiles, last.profiles);
+			return { asked, seen, r, last };
 		} finally { globalThis.fetch = real; }
 	}
 	const leaseOf = (id) => ({ lease_id: id, lease_until: new Date(Date.now() + 900_000).toISOString(),
 		items: [{ item_id: 1, kind: "unlinked", subjects: ["a"], allowed_ops: ["dismiss"], context: { nodes: [{ id: "a", passage: "p" }], edges: [] } }] });
 	const dismiss = async () => ({ kind: "ok", part: { results: [{ item_id: 1, ops: [{ op: "dismiss" }] }] } });
 
-	it("leases again on a later drain of the same run after an idle lease", async () => {
-		const { asked } = await twoDrains(["work"], {}, async () => { throw new Error("no model call"); });
-		assert.deepEqual(asked, ["work", "work"]);
+	it("keeps leasing a profile in one drain until its queue is empty, capturing a hook that fired during a lease before the next one", async () => {
+		const { asked, seen, r, last } = await learnRun(["work"], { work: [leaseOf("L1"), leaseOf("L2"), leaseOf("L3")] }, dismiss);
+		assert.deepEqual(asked, ["work", "work", "work", "work"], "three clean leases, then an empty one");
+		assert.deepEqual(seen, [false, true, true, true], "the hook from the first lease was captured before the second");
+		assert.deepEqual([r.results.batch.leases, last.leases, last.profiles.work.status], [3, 3, "idle"]);
 	});
 
-	it("leases again on a later drain of the same run after a clean lease", async () => {
-		const { asked, r } = await twoDrains(["work"], { work: [leaseOf("L1"), leaseOf("L2")] }, dismiss);
-		assert.deepEqual(asked, ["work", "work"]);
-		assert.equal(r.results.batch.profiles.work.completed, 1, "the second drain's clean lease is the reported outcome");
+	it("leases an idle profile again after a capture pass handles a session, until it is idle with nothing left to capture", async () => {
+		// The queue is empty when the hook fires; capturing that session adds work, so learning starts again in the same drain.
+		const empty = { lease_id: null, items: [], next_allowed_at: null };
+		const { asked, seen, r } = await learnRun(["work"], { work: [empty, leaseOf("L1")] }, dismiss);
+		assert.deepEqual(asked, ["work", "work", "work"], "idle, then the new item, then idle with no trigger waiting");
+		assert.deepEqual(seen, [false, true, true]);
+		assert.equal(r.results.batch.leases, 1);
 	});
 
-	it("leases a profile again on the next drain of the same run after a discarded lease", async () => {
-		const { asked, r } = await twoDrains(["personal", "work"], { work: [leaseOf("LW"), leaseOf("LW2")] }, async () => ({ kind: "error" }));
-		assert.deepEqual(asked, ["personal", "work", "personal", "work"], "no per-run block after a failed lease");
-		const last = JSON.parse(fs.readFileSync(path.join(am.home(), "batch", "last.json"), "utf8"));
-		assert.deepEqual([last.profiles.work?.status, last.profiles.personal?.status], ["discarded", "idle"]);
-		assert.deepEqual(r.results.batch.profiles, last.profiles);
+	it("leases a profile again in the same drain after a lease that ran out of time but settled items", async () => {
+		// The first completion takes 15 minutes on the run's clock, so the lease's second item is never sent.
+		let skew = 0, completes = 0;
+		const complete = (name) => {
+			if (name === "maintenance_complete" && !completes++) skew = 900_000;
+			return { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] };
+		};
+		const two = leaseOf("L1");
+		two.items.push({ ...two.items[0], item_id: 2 });
+		const later = { ...leaseOf("L2"), lease_until: new Date(Date.now() + 1_800_000).toISOString() };
+		const judge = async () => ({ kind: "ok", part: { results: [1, 2].map((id) => ({ item_id: id, ops: [{ op: "dismiss" }] })) } });
+		const { asked, r } = await learnRun(["work"], { work: [two, later] }, judge, { complete, clock: () => Date.now() + skew });
+		assert.deepEqual(asked, ["work", "work", "work"], "the time-limited lease, the next lease, then idle");
+		assert.deepEqual([completes, r.results.batch.leases], [2, 2], "item 2 of the first lease was never sent");
 	});
 
-	it("leases a profile again on the next drain after a lease with unanswered and rejected items", async () => {
-		// First drain: the model answers only on its second follow-up run, and the server rejects that answer.
-		let runs = 0, completes = 0;
+	it("handles a trigger that fired during one profile's lease before the next profile's lease", async () => {
+		const { asked, seen } = await learnRun(["personal", "work"], { personal: [leaseOf("LP")], work: [leaseOf("LW")] }, dismiss);
+		assert.deepEqual(asked, ["personal", "work", "personal", "work"]);
+		assert.deepEqual(seen, [false, true, true, true], "the hook from personal's lease was captured before work's lease");
+	});
+
+	it("stops a profile after a discarded lease while a clean one continues, and every profile leases again on the next drain", async () => {
+		let runs = 0;
+		const judge = async (a) => (++runs === 2 ? { kind: "error" } : dismiss(a));
+		const { asked, last } = await learnRun(["personal", "work"], { personal: [leaseOf("LP")], work: [leaseOf("LW"), leaseOf("LW2")] }, judge, { late: true });
+		// Drain 1: personal is clean and goes again (idle); work is discarded and stops. Drain 2 (the late hook): both again.
+		assert.deepEqual(asked, ["personal", "work", "personal", "personal", "work", "work"], "no per-run block after a failed lease");
+		assert.deepEqual([last.profiles.personal.status, last.profiles.work.status, last.leases], ["idle", "idle", 3]);
+	});
+
+	it("stops a profile after a lease that settled no item, leaving the rest for the next run", async () => {
+		// The model answers only on its second follow-up run, and the server rejects that answer.
+		let runs = 0;
 		const judge = async () => (++runs <= 2 ? { kind: "ok", part: { results: [] } } : dismiss());
-		const complete = (name) => (name === "maintenance_complete" && !completes++
-			? { results: [{ item_id: 1, status: "rejected", reason: "moving", ops: [{ op: "dismiss", status: "rejected", code: "moving" }] }] }
-			: { results: [{ status: "done", ops: [{ op: "dismiss", status: "applied" }] }] });
-		const { asked, r } = await twoDrains(["work"], { work: [leaseOf("L1"), leaseOf("L2")] }, judge, { complete });
-		assert.deepEqual(asked, ["work", "work"]);
-		assert.equal(runs, 4, "first run, 2 follow-ups (the second answers), then the next drain's run");
-		assert.deepEqual([r.results.batch.profiles.work.completed, r.results.batch.profiles.work.unanswered], [1, 0], "the second drain's lease is the reported outcome");
+		const complete = (name) => (name === "maintenance_complete"
+			? { results: [{ item_id: 1, status: "rejected", reason: "moving", ops: [{ op: "dismiss", status: "rejected", code: "moving" }] }] } : {});
+		const { asked, last } = await learnRun(["work"], { work: [leaseOf("L1"), leaseOf("L2")] }, judge, { complete });
+		assert.deepEqual([asked, runs], [["work"], 3], "first run and 2 follow-ups, then no second lease");
+		assert.deepEqual([last.profiles.work.status, last.profiles.work.completed, last.profiles.work.rejected], ["completed", 0, 1]);
 	});
 
 	it("run --scheduled drains a hook that fired while its idle status report held the lock", async () => {
