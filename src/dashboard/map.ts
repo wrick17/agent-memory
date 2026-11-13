@@ -103,8 +103,7 @@ export function mapTab(am: Am): void {
 			if (it.href) b.setAttribute("data-href", it.href);
 			const t = cls(el("span", b), "b-title");
 			cls(el("i", t), `sw t-${it.kind}`).setAttribute("aria-hidden", "true");
-			if (it.wide) el("span", t, `${am.workspaceName(it.workspace)} · workspace-wide`);
-			else am.title(lib?.items.get(it.key) ?? it, el("span", t));
+			am.title(lib?.items.get(it.key) ?? it, el("span", t));
 			cls(el("span", b, child ? (it.more ? "Show all" : it.kind === "learning" || it.kind === "memory" || it.kind === "journal" ? it.when ?? "" : summary(it)) : summary(it)), "b-meta");
 			b.setAttribute("title", `${it.title}${child ? "" : ` · ${summary(it)}`}`);
 			boxes.set(it.key, { x, y, w, h: hgt });

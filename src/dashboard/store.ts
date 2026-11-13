@@ -346,9 +346,11 @@ export function storeTab(am: Am): void {
 		};
 		const explicit = githubKey(String(r.project_key ?? "")) ?? githubKey(String(r.repo_key ?? "")) ?? githubKey(String(r.key ?? ""));
 		if (explicit) return /synthetic|am-accept|fixture/.test(explicit) ? { ...none, drop: true } : project(explicit, "high");
-		// A tagged record with no repo still names its workspace folder (a known one, or any name when there is no registry).
-		const wsId = String(r.workspace ?? "").trim().toLowerCase();
-		if (wsId && WS_ID.test(wsId) && (reg.order.includes(wsId) || !reg.order.length)) { ensureWs(wsId, r.profile); return { workspace: wsId, project: null, confidence: "high", profile: wsProfile(wsId) }; }
+		// A tagged record with no repo still names its workspace folder (a known one, or any name when there is no registry). A
+		// folder name the registry folds into another workspace (an alias to "ws:<id>", such as an old folder) resolves to it.
+		const tagged = String(r.workspace ?? "").trim().toLowerCase(), folded = !WS_ID.test(tagged) || reg.order.includes(tagged) ? null : /^ws:([^?]+)(\??)$/.exec(reg.scopes.get(tagged) ?? "");
+		const wsId = folded?.[1] ?? tagged;
+		if (wsId && WS_ID.test(wsId) && (reg.order.includes(wsId) || !reg.order.length)) { ensureWs(wsId, r.profile); return { workspace: wsId, project: null, confidence: folded?.[2] ? "medium" : "high", profile: wsProfile(wsId) }; }
 		if (reg.drop.has(scope)) return { ...none, drop: true };
 		const hit = reg.scopes.get(scope) ?? (r.kind === "project" ? reg.scopes.get(scope.replace(/\s+/g, "-")) : undefined);
 		if (!hit) { const k = githubKey(scope); return k ? project(k, "high") : none; }
@@ -389,7 +391,7 @@ export function storeTab(am: Am): void {
 			if (a === b) return;
 			for (const [x, y] of [[a, b], [b, a]] as [string, string][]) { let m = links.get(x); if (!m) links.set(x, m = new Map()); let s = m.get(y); if (!s) m.set(y, s = new Set()); s.add(rel); }
 		};
-		// One project item per GitHub key, across stored profiles; one Workspace-wide item per workspace. Every known repo exists,
+		// One project item per GitHub key, across stored profiles; one item per workspace (its records that name no project), titled with its name. Every known repo exists,
 		// so "Show all known repos" can list the ones with nothing in memory yet.
 		const projectItem = (key: string, fallback: string): string => {
 			const p = profileOf(key, fallback), homes = homeOf(key, p), alias = reg.repos.get(key)?.alias;
@@ -402,7 +404,7 @@ export function storeTab(am: Am): void {
 		};
 		const wideItem = (w: string): string => {
 			const k = `${wsProfile(w)}/ws:${w}`;
-			if (!items.has(k)) items.set(k, { key: k, p: wsProfile(w), id: `ws:${w}`, kind: "project", raw: "project", type: null, name: reg.ws.get(w)?.name ?? w, title: "Workspace-wide",
+			if (!items.has(k)) items.set(k, { key: k, p: wsProfile(w), id: `ws:${w}`, kind: "project", raw: "project", type: null, name: reg.ws.get(w)?.name ?? w, title: reg.ws.get(w)?.name ?? w,
 				scope: null, created: null, updated: null, origin: null, agent: null, pinned: false, virtual: true, workspace: w, wide: true });
 			return k;
 		};

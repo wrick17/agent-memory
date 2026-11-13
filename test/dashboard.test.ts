@@ -1235,10 +1235,43 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		expect(text(detail)).not.toMatch(/##|entry 5/);
 	});
 
-	it("shows projects as workspace groups of cards, one entity per repo, and a project's page as a hub", async () => {
-		const b = await open("#projects?profile=work");
-		const secs = find(b.view(), "section").filter((x) => x.attrs.class === "ws-sec");
-		expect(secs.map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Studio"]); // only projects memories resolve to; sketchbook has only a person
+	it("shows projects in Work and Personal sections, workspace cards first, one entity per repo, and a project's page as a hub", async () => {
+		// A Sequoia-shaped work registry: one workspace, an old folder name ("apps") folded into it, a repo of another owner listed there.
+		const saved = regs.work;
+		regs.work = { workspaces: [{ id: "sequoia", name: "Sequoia", order: 1 }], owners: ["acme-corp"], default_workspace: "sequoia",
+			repos: [{ key: "acme-corp/idm-frontend", name: "idm", workspaces: ["sequoia"] }, { key: "contractor-org/spur", workspaces: ["sequoia"] }],
+			aliases: { apps: "ws:sequoia", "claude/projects-apps": "ws:sequoia" } };
+		NODES.push(N("t2", "decision", "Old apps folder note", { type: "project", scope: "default", workspace: "apps" }), N("t3", "decision", "Spur note", { type: "project", project_key: "github:contractor-org/spur" }),
+			N("t4", "decision", "Idm note", { type: "project", project_key: "github:acme-corp/idm-frontend" }));
+		try {
+			const all = await open("#projects");
+			const secs = find(all.view(), "section").filter((x) => x.attrs.class === "ws-sec");
+			expect(secs.map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Work", "Personal"]);
+			const names = (sec: El) => find(sec, "a").filter((a) => String(a.attrs.class).startsWith("pcard")).map((c) => [c.attrs.class, text(find(c, "strong")[0]!).trim()]);
+			// The workspace card comes first and stands alone; spur is listed by the work registry, so it is Work despite its owner.
+			expect(names(secs[0]!)[0]).toEqual(["pcard wscard", "Sequoia"]);
+			expect(names(secs[0]!).slice(1).sort()).toEqual([["pcard", "idm"], ["pcard", "spur"]]);
+			expect(names(secs[1]!)).toEqual([["pcard", "memory"], ["pcard", "sketchbook"]]);
+			const ws = find(secs[0]!, "a").find((a) => a.attrs.class === "pcard wscard")!;
+			expect(text(ws)).toMatch(/Workspace\s*Work.*1 memory/); // the record tagged with the old "apps" folder lands here
+			expect(text(ws)).not.toMatch(/idm|spur/); // no project list inside a workspace
+			expect(ws.attrs.href).toBe("#projects/work/ws%3Asequoia");
+			expect(find(ws, "span").some((x) => String(x.attrs.class).startsWith("pspark"))).toBe(true);
+			// The workspace is its own entity: its name is its title on its page, on a record's chip and on the Map.
+			all.go(ws.attrs.href!);
+			for (let i = 0; i < 5; i++) await settle();
+			const page = find(all.view(), "section").find((x) => String(x.attrs.class).startsWith("lib-detail"))!;
+			expect([find(page, "h2")[0]!.textContent, find(page, "span").find((x) => String(x.attrs.class).startsWith("kind"))!.textContent]).toEqual(["Sequoia", "Workspace"]);
+			all.go("#memories/work/t2");
+			for (let i = 0; i < 5; i++) await settle();
+			expect(find(all.view(), "a").filter((a) => a.attrs.class === "pill proj").map((a) => a.textContent)).toEqual(["Sequoia"]);
+			const map = await open("#map");
+			expect(find(map.view(), "button").filter((x) => String(x.attrs.class).includes("block")).map((x) => find(x, "span")[1]!.textContent)).toContain("Sequoia");
+			expect(text(map.view())).not.toMatch(/workspace-wide/i);
+			const one = await open("#projects?profile=work"); // one profile chosen: only its section
+			expect(find(one.view(), "section").filter((x) => x.attrs.class === "ws-sec").map((x) => text(find(x, "h3")[0]!).trim())).toEqual(["Work"]);
+		} finally { NODES.splice(-3); regs.work = saved; }
+		const b = await open("#projects");
 		const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard");
 		expect(cards.map((c) => text(find(c, "strong")[0]!).trim())).toEqual(["memory", "sketchbook"]); // the short name first
 		expect(text(cards[0]!)).not.toContain("recall-engine"); // the GitHub repo name stays behind the GitHub link
@@ -1563,8 +1596,8 @@ describe("dashboard library: sections, detail, connections, map", () => {
 			expect(from).toContain("Draft page");
 			expect(from).not.toContain("3a4f026ac");
 		} finally { NODES.pop(); }
-		const p2 = await open("#projects?profile=work");
-		expect(text(find(p2.view(), "span").find((x) => x.attrs.class === "count")!)).toMatch(/^\d+ unique$/);
+		const p2 = await open("#projects");
+		expect(text(find(p2.view(), "span").find((x) => x.attrs.class === "count")!)).toMatch(/^\d+ projects?$/);
 	});
 
 	// Sol re-check, 2026-11-12: three P2s, each with its regression.
@@ -1649,7 +1682,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 	it("places a record by its tagged project_key when the server sends one, and by its scope when it does not", async () => {
 		NODES.push(N("t1", "decision", "Tagged decision", { type: "project", scope: "codex", project_key: "github:acme-corp/idm-frontend" }));
 		try {
-			const b = await open("#projects?profile=work");
+			const b = await open("#projects");
 			const cards = find(b.view(), "a").filter((a) => a.attrs.class === "pcard").map((c) => text(find(c, "strong")[0]!).trim());
 			expect(cards).toEqual(expect.arrayContaining(["idm", "memory"])); // idm from the tag; memory from its scope, as before
 		} finally { NODES.pop(); }
@@ -1720,6 +1753,8 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		expect(at({ scope: "bot_hq", project_key: "github:jdoe/sketchbook" })).toEqual(["studio", "jdoe/sketchbook", "high"]);
 		expect(at({ project_key: "github:someone/unknown-repo" })).toEqual(["labs", null, "high"]); // not in the registry: this profile's default workspace
 		expect(at({ project_key: null, workspace: "apps", scope: "default" })).toEqual(["apps", null, "high"]);
+		expect(at({ project_key: null, workspace: "claude/projects-apps" })).toEqual([null, null, null]); // an alias key that is no folder name stays unplaced
+		expect(at({ project_key: null, workspace: "ai-internal" })).toEqual(["labs", null, "medium"]); // a folder the registry folds into a workspace, likely
 		expect(at({ project_key: null, workspace: "elsewhere" })).toEqual([null, null, null]); // a workspace no registry names
 		// …and without tags the scope rules apply unchanged.
 		expect(at({ scope: "claude/Projects-gizmo", project_key: undefined, workspace: undefined })).toEqual(["labs", "acme-corp/gizmo-frontend", "high"]);
@@ -1740,7 +1775,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 			expect(find(b.view(), "img")).toEqual([]);
 			expect(text(b.view())).not.toMatch(/onerror|javascript:/);
 			regs.work = "{ not json";
-			const c = await open("#projects?profile=work");
+			const c = await open("#projects");
 			expect(text(c.view())).toContain("memory"); // a registry that is not JSON counts as none: the personal one still places records
 		} finally { regs.work = saved; }
 	});
