@@ -1807,6 +1807,21 @@ describe("repo facts integration", () => {
 		assert.equal(ran.results.synthesis.counted, 1);
 		assert.deepEqual(fs.readdirSync(sy.dueDir()), []);
 	});
+
+	it("synthesizes, in the same drain, the markers of a session whose debounced trigger was captured after the first pass", async () => {
+		const sy = await import("./facts-synth.mjs"), { partitionId } = await import("./facts.mjs"), key = "github.com/o/r", part = partitionId("personal", key);
+		const f = transcript("debounced", [claudeLine("user", "We decided to synthesize after the late capture.")]);
+		am.writePrivate(path.join(am.home(), "config.json"), JSON.stringify({ batch_profiles: [], facts: { synthesis: true } }));
+		am.hook("claude-code", JSON.stringify({ session_id: "debounced", transcript_path: f, cwd: tmp, hook_event_name: "Stop" }), { spawnRun: false });
+		// The capture stands in for observeSession: it leaves a completed-synthesis marker.
+		const server = { ...fakeServer(), status: async () => {} }, ingest = server.ingest;
+		server.ingest = async (b) => { sy.markCompleted(am.withDefaults({ facts: { synthesis: true } }), key, "codex:000000000001", { partition: part, profile: "personal", repo: { remote: key }, repo_key: key }); return ingest(b); };
+		let skew = 0;
+		const r = await am.run({ server, runner: keepAllRunner(), debounceMs: 45_000, clock: () => Date.now() + skew, sleep: async (ms) => { skew += ms; } });
+		assert.equal(r.results["claude-code-debounced.json"].status, "done");
+		assert.equal(r.results.synthesis.counted, 1, "synthesis ran after the debounced capture");
+		assert.deepEqual(fs.readdirSync(sy.dueDir()), []);
+	});
 });
 
 describe("capture gaps and hook trust (#128)", () => {

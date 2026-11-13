@@ -1181,8 +1181,9 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 	runner ??= await confinedRunner(config).catch(() => null);
 	const qdir = path.join(home(), "queue");
 	const handled = new Map(), ended = new Set();
-	// Set by every pass that handled a session: its new learning items give a profile whose queue was empty another lease.
-	let captured = false;
+	// Set by every pass that handled a session: its new learning items give a profile whose queue was empty another lease, and
+	// its fact reports and synthesis markers are sent and synthesized before the next round of leases (factsDue).
+	let captured = false, factsDue = false;
 	// One scan of the queue: handles each trigger due now; returns whether it handled any and how long until the next one is due.
 	const pass = async () => {
 		let wait = Infinity, progressed = false;
@@ -1202,7 +1203,7 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 			const ct = readJson(claimed, t);
 			handled.set(f, genOf(ct));
 			if (ct.event === "SessionEnd" && typeof ct.cwd === "string") ended.add(ct.cwd);
-			progressed = captured = true;
+			progressed = captured = factsDue = true;
 			let r;
 			try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
 			results[f] = r;
@@ -1220,11 +1221,15 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 		fs.mkdirSync(claimDir(), { recursive: true, mode: 0o700 });
 		// Claims left by a worker that died mid-session go back to the queue.
 		for (const f of fs.readdirSync(claimDir())) unclaim(path.join(claimDir(), f), path.join(qdir, f));
+		const facts = async () => {
+			factsDue = false;
+			// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
+			try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
+			// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
+			try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
+		};
 		await pass();
-		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
-		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
-		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
-		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
+		await facts();
 		// Learning until every profile's queue is empty (owner decisions 2026-11-12 and 2026-11-13: no throttling), with the triggers
 		// due before each profile's lease handled first. Each drain starts every profile again, whatever it did before. A profile
 		// whose queue was empty (idle) leases again after a pass handles a session; one stopped by any other outcome waits for the
@@ -1234,6 +1239,8 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 		for (;;) {
 			if (captured && idle.length) { active = all.filter((p) => active.includes(p) || idle.includes(p)); idle = []; }
 			captured = false;
+			// Sessions captured since the last flush (a debounced trigger, or one handled between leases) reach synthesis within one round.
+			if (factsDue) await facts();
 			if (active.length && !stopping) {
 				results.batch = await batch({ runner, config, profiles: active, clock, trigger, earlier: results.batch, before: pass });
 				idle = idle.concat(active.filter((p) => results.batch.profiles[p]?.status === "idle"));
