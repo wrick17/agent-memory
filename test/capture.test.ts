@@ -474,6 +474,40 @@ describe("capture project tagging", () => {
 		});
 	});
 
+	it("links only an active project node, preferring the exact-case key, never an older retired fixture", async () => {
+		const c = await contextFor();
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:Eureka/App", name: "Synthetic fixture" }] });
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:EUREKA/APP", name: "Eureka upper" }] });
+		await inProfile("test", (sql) => sql.exec("UPDATE nodes SET status = 'retired' WHERE key = 'github:Eureka/App'"));
+		const { token } = await deviceToken("capture-tag-active", ["ingest"], ["test"], "test");
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_eur1" }, project: "github:eureka/app", digests: [heuristic("thr_eur1", 0)] });
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:eureka/app", name: "Eureka" }] });
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_eur2" }, project: "github:eureka/app", digests: [heuristic("thr_eur2", 0)] });
+		await inProfile("test", (sql) => {
+			const rows = listSessions(sql, { limit: 100 }).rows;
+			expect(rows.find((r) => r.id === nodeOf("thr_eur1"))).toMatchObject({ project_key: "github:EUREKA/APP" });
+			expect(rows.find((r) => r.id === nodeOf("thr_eur2"))).toMatchObject({ project_key: "github:eureka/app" });
+			expect(sql.exec("SELECT key, name, status, revision FROM nodes WHERE key = 'github:eureka/app' COLLATE NOCASE ORDER BY rowid").toArray()).toEqual([
+				{ key: "github:Eureka/App", name: "Synthetic fixture", status: "retired", revision: 1 }, { key: "github:EUREKA/APP", name: "Eureka upper", status: "active", revision: 1 },
+				{ key: "github:eureka/app", name: "Eureka", status: "active", revision: 1 }]);
+		});
+		// Only an inactive node under another casing: capture creates the lowercase project. An inactive node with the exact key: no link.
+		await call(c, "record_knowledge", { profile: "test", nodes: [{ kind: "project", key: "github:Solo/Repo", name: "Old solo" }, { kind: "project", key: "github:held/repo", name: "Held" }] });
+		await inProfile("test", (sql) => sql.exec("UPDATE nodes SET status = 'retired' WHERE key IN ('github:Solo/Repo', 'github:held/repo')"));
+		await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_eur3" }, project: "github:solo/repo", digests: [heuristic("thr_eur3", 0)] });
+		const held = await post(token, "/v1/ingest", { session: { client: "codex", id: "thr_eur4" }, project: "github:held/repo", digests: [heuristic("thr_eur4", 0)] });
+		expect([held.status, held.data.results?.map((r) => r.status)]).toEqual([200, ["stored"]]);
+		await inProfile("test", (sql) => {
+			const rows = listSessions(sql, { limit: 100 }).rows;
+			expect(rows.find((r) => r.id === nodeOf("thr_eur3"))).toMatchObject({ project_key: "github:solo/repo" });
+			expect(rows.find((r) => r.id === nodeOf("thr_eur4"))).toMatchObject({ project: null, project_key: null });
+			expect(sql.exec("SELECT key, name, status, revision FROM nodes WHERE key IN ('github:Solo/Repo', 'github:solo/repo', 'github:held/repo') ORDER BY rowid").toArray()).toEqual([
+				{ key: "github:Solo/Repo", name: "Old solo", status: "retired", revision: 1 }, { key: "github:held/repo", name: "Held", status: "retired", revision: 1 },
+				{ key: "github:solo/repo", name: "solo/repo", status: "active", revision: 1 }]);
+			expect(sql.exec("SELECT 1 FROM edges e JOIN nodes p ON p.id = e.dst WHERE e.src = ? AND p.key = 'github:held/repo'", nodeOf("thr_eur4")).toArray()).toEqual([]);
+		});
+	});
+
 	type Store = { ingest(who: unknown, batch: IngestBatch): Promise<{ ok: boolean }>; access(who: unknown, ids?: string[]): Promise<void>; register(who: unknown, ids: string[]): Promise<void> };
 	const onStore = async <T>(profile: string, fn: (store: Store, storage: DurableObjectStorage, who: { userId: string; profile: string; generation: string }) => Promise<T> | T) => {
 		const ref = (await contextFor()).account.profiles.find((p) => p.profile === profile)!;
