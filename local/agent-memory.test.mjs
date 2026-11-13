@@ -479,6 +479,14 @@ describe("confined runtime", () => {
 			assert.equal(async.error?.code, code, `${cmd} spawnAsync`);
 			if (!code) assert.deepEqual([async.status, async.stdout], [sync.status, sync.stdout]);
 		}
+		// A child that ignores SIGTERM and writes 32 MiB past a 1 KiB limit: at most 1 KiB is kept and its group gets one SIGTERM.
+		const terms = path.join(fs.mkdtempSync(path.join(tmp, "flood-")), "terms");
+		const flood = `const fs = require("fs"); process.on("SIGTERM", () => fs.appendFileSync(${JSON.stringify(terms)}, "t"));
+			const b = Buffer.alloc(65536, 120); let n = 0; const w = () => { if (n++ < 512) process.stdout.write(b, w); }; w();`;
+		const r = await am.spawnAsync(process.execPath, ["-e", flood], { encoding: "utf8", maxBuffer: 1024 });
+		assert.equal(r.error?.code, "ENOBUFS");
+		assert.ok(Buffer.byteLength(r.stdout) + Buffer.byteLength(r.stderr) <= 1024, "retained output stays within maxBuffer");
+		assert.equal(fs.readFileSync(terms, "utf8"), "t", "the group is stopped once");
 	});
 
 	it("settles a timeout whose child left a worker holding stdout open, and stops that worker", { timeout: 20_000 }, async () => {

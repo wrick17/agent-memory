@@ -1455,8 +1455,17 @@ export function spawnAsync(command, args, { input, timeout, maxBuffer = 1024 * 1
 			clearTimeout(timer);
 			resolve({ status, signal, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), error });
 		});
-		const stop = (code) => { error ??= Object.assign(new Error(`spawn ${code}`), { code }); stopGroup(child.pid); };
-		const collect = (into) => (d) => { into.push(d); if ((size += d.length) > maxBuffer) stop("ENOBUFS"); };
+		let stopped = false;
+		const stop = (code) => {
+			error ??= Object.assign(new Error(`spawn ${code}`), { code });
+			if (!stopped) { stopped = true; stopGroup(child.pid); }
+		};
+		// At most maxBuffer bytes are kept; past it the streams are still drained, so the child never blocks, and the rest is discarded.
+		const collect = (into) => (d) => {
+			const room = maxBuffer - size;
+			if (room > 0) into.push(room >= d.length ? d : d.subarray(0, room));
+			if ((size += d.length) > maxBuffer) stop("ENOBUFS");
+		};
 		if (timeout) timer = setTimeout(() => stop("ETIMEDOUT"), timeout);
 		child.stdout.on("data", collect(out));
 		child.stderr.on("data", collect(err));
