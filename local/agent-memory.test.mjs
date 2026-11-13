@@ -1006,7 +1006,10 @@ describe("general confined executor", () => {
 				calls++;
 				assert.equal(command, "fake-codex"); assert.equal(options.env, env); assert.equal(options.cwd, dir);
 				assert.equal(options.input, "private input");
-				assert.match(fs.readFileSync(configFile, "utf8").split("[features]\n")[1]?.split("\n[")[0] ?? "", /^view_image = false$/m);
+				const features = fs.readFileSync(configFile, "utf8").split("[features]\n")[1]?.split("\n[")[0] ?? "";
+				assert.match(features, /^view_image = false$/m);
+				// Codex 0.168.0 warns on the deprecated multi_agent key, which fails every confined run.
+				assert.match(features, /^multi_agent_v2 = false$/m); assert.doesNotMatch(features, /^multi_agent = /m);
 				assert.ok(args.includes("model_reasoning_effort=high"));
 				const schemaFile = args[args.indexOf("--output-schema") + 1];
 				assert.deepEqual(JSON.parse(fs.readFileSync(schemaFile)), OPS_SCHEMA);

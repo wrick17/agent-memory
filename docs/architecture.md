@@ -1635,7 +1635,8 @@ mcp_servers = {}
 [features]
 shell_tool = false
 view_image = false
-multi_agent = false
+multi_agent_v2 = false               # Codex 0.168.0 warns on the deprecated multi_agent key; [agents].enabled = false
+                                     # disables subagent tools unless multi_agent_v2 is on (checked 0.165.0 to 0.168.0)
 apps = false
 plugins = false
 hooks = false

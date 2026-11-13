@@ -1322,6 +1322,8 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 // ---------- confined runtime (section 12) ----------
 
 // Codex 0.165 ignores tools.view_image; disable its separate view_image feature as well as shell tools.
+// Codex 0.168.0 warns on the deprecated [features].multi_agent, and the strict parser rejects that warning.
+// [agents].enabled = false disables subagent tools unless multi_agent_v2 is on (0.165.0 to 0.168.0).
 export const CONFIG_TOML = `approval_policy = "never"
 default_permissions = "am_batch"
 web_search = "disabled"
@@ -1330,7 +1332,7 @@ mcp_servers = {}
 [features]
 shell_tool = false
 view_image = false
-multi_agent = false
+multi_agent_v2 = false
 apps = false
 plugins = false
 hooks = false
