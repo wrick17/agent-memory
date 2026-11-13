@@ -13,7 +13,7 @@ export function libraryTab(am: Am): void {
 		project: ["project", "Projects"] };
 	const TYPE: Record<string, string> = { project: "Project note", reference: "Reference", procedural: "How-to", feedback: "Rule", user: "About you", decision: "Decision", document: "Note" };
 	const typeOf = (it: J) => it.kind === "learning" ? (it.raw === "preference" || it.type === "user" ? "Preference" : "Rule") : it.kind === "memory" ? TYPE[it.type ?? it.raw] ?? "Note"
-		: it.kind === "journal" ? "Journal" : it.kind === "person" ? "Person" : "Project";
+		: it.kind === "journal" ? "Journal" : it.kind === "person" ? "Person" : it.wide ? "Workspace" : "Project";
 	/**
 	 * Sub-types inside a page (the facet chips, their bar, the daily chart and the list's dots) take a categorical colour of
 	 * their own, fixed per name so Rule is the same colour everywhere. Three validated hues (s1 blue, s2 orange, s3 aqua; see
@@ -50,7 +50,7 @@ export function libraryTab(am: Am): void {
 		} else {
 			parts.push(it.kind === "journal" ? it.agent ?? "Other agent" : typeOf(it));
 			const proj = nb.get("project")?.[0]?.it;
-			if (proj) parts.push(proj.wide ? `${am.workspaceName(proj.workspace)}, workspace-wide` : proj.title);
+			if (proj) parts.push(proj.title);
 		}
 		if (it.kind !== "project" && all) parts.push(it.p);
 		if (it.filedUnder) parts.push(`in your ${it.filedUnder} profile`);
@@ -200,7 +200,7 @@ export function libraryTab(am: Am): void {
 		for (const [label, list, opt] of rows) { const g = cls(el("div", sec), "conn-group"); cls(el("h4", g, label), "conn-head"); chipsOf(g, list, opt); }
 		if (peerList.length) {
 			const d = cls(el("details", sec), "conn-more"), more = projects[0] ? am.itemHref(projects[0], profileQ(route)) : "";
-			cls(el("summary", d, `More in ${projects[0]?.wide ? "this workspace" : projects[0]?.title ?? "this project"} (${peerList.length})`), "conn-sum");
+			cls(el("summary", d, `More in ${projects[0]?.title ?? "this project"} (${peerList.length})`), "conn-sum");
 			for (const [k, label] of [["memory", "Memories"], ["learning", "Learnings"], ["journal", "Journals"]] as [string, string][]) {
 				const list = peerList.filter((o: J) => o.kind === k);
 				if (list.length) { const g = cls(el("div", d), "conn-group"); cls(el("h4", g, label), "conn-head"); chipsOf(g, list, { more }, 4); }
@@ -372,16 +372,14 @@ export function libraryTab(am: Am): void {
 		const src = cls(el("span", meta), "src");
 		if (it.updated) { el("span", meta, "Updated "); am.time(meta, it.updated); }
 		if (it.kind !== "project" && profileQ(route) === null) cls(el("span", meta, it.p), "pill");
-		if (it.kind === "project") {
-			cls(el("span", meta, it.wide ? `${am.workspaceName(it.workspace)} workspace` : (it.workspaces ?? [it.workspace]).map((w: string) => am.workspaceName(w)).join(", ")), "pill");
-			if (!it.wide) {
-				// The profile its GitHub owner gives, unless the workspace already says it (Personal, personal).
-				if (!(it.workspaces ?? [it.workspace]).some((w: string) => w === it.p)) cls(el("span", meta, it.p), "pill");
-			}
+		if (it.kind === "project" && !it.wide) { // a workspace's own name is its heading
+			cls(el("span", meta, (it.workspaces ?? [it.workspace]).map((w: string) => am.workspaceName(w)).join(", ")), "pill");
+			// The profile its GitHub owner gives, unless the workspace already says it (Personal, personal).
+			if (!(it.workspaces ?? [it.workspace]).some((w: string) => w === it.p)) cls(el("span", meta, it.p), "pill");
 		}
 		// Near the top: the project it belongs to, as a link (a journal's agent shows in the source line beside it).
 		if (it.kind !== "project") for (const x of (neighbours(lib, it.key).get("project") ?? []).slice(0, 2)) {
-			const to = href(x.it, route), c = cls(el(to ? "a" : "span", meta, x.it.wide ? `${am.workspaceName(x.it.workspace)} · general` : x.it.title), "pill proj");
+			const to = href(x.it, route), c = cls(el(to ? "a" : "span", meta, x.it.title), "pill proj");
 			if (to) c.setAttribute("href", to);
 		}
 		if (it.url) { const gh = el("a", meta, "Open on GitHub ↗"); gh.setAttribute("title", it.name); gh.setAttribute("href", it.url); gh.setAttribute("target", "_blank"); gh.setAttribute("rel", "noopener noreferrer"); }
@@ -698,7 +696,7 @@ export function libraryTab(am: Am): void {
 				// One row per title: the same note filed in two workspaces is one row naming both. Each says what it connects to.
 				const ranked = all.map((it) => [it, linksOf(it)] as const).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
 				const byTitle = new Map<string, { it: J; also: string[] }>();
-				const placeOf2 = (it: J) => { const p = neighbours(lib, it.key).get("project")?.[0]?.it; return p ? (p.wide ? `${am.workspaceName(p.workspace)}, workspace-wide` : p.title) : ""; };
+				const placeOf2 = (it: J) => { const p = neighbours(lib, it.key).get("project")?.[0]?.it; return p ? p.title : ""; };
 				for (const [it] of ranked) {
 					const k = am.title(it).trim().toLowerCase(), seen = byTitle.get(k);
 					if (!seen) { if (byTitle.size < 6) byTitle.set(k, { it, also: [] }); continue; }
@@ -742,7 +740,7 @@ export function libraryTab(am: Am): void {
 		return detailH ?? h; // with an item open, focus its title (inside the pane), so the list keeps its place
 	};
 
-	// ---- Projects: workspaces as groups, each a grid of project cards ----
+	// ---- Projects: Work and Personal sections, each with workspace cards, then project cards ----
 	/** Twelve weekly bars of what was added to a project, for a card. */
 	const spark = (parent: Node, dates: (string | null)[]) => {
 		const s = cls(el("span", parent), "pspark"), W = 7 * 86_400_000, now = Date.now(), bins = new Array(12).fill(0) as number[];
@@ -790,45 +788,34 @@ export function libraryTab(am: Am): void {
 		const head = cls(el("div", root), "list-head");
 		const h = el("h2", head, "Projects");
 		const total = cls(el("span", head), "count");
-		const facetBox = el("div", root), out = el("div", root), foot = cls(el("p", root), "muted");
-		let ws = route.query.type ?? "";
+		const out = el("div", root), foot = cls(el("p", root), "muted");
+		// Two sections, Work then Personal (any other profile after them): each its workspaces' cards, then its project cards.
+		const rank = (p: string) => (p === "work" ? 0 : p === "personal" ? 1 : 2), label = (p: string) => `${p.charAt(0).toUpperCase()}${p.slice(1)}`;
 		const paint = () => {
 			if (version !== am.pageVersion) return;
 			const lib: J = am.library(only, paint), deg = (it: J) => lib.links.get(it.key)?.size ?? 0;
-			const real = (lib.list.project as J[]).filter((it) => !it.wide && deg(it) > 0);
-			const wideOf = (w: string) => lib.items.get(`${am.workspaceProfile(w)}/ws:${w}`);
-			const groups = am.workspaceOrder.map((w) => ({ w, list: real.filter((it) => (it.workspaces ?? [it.workspace]).includes(w)).sort((a, b) => deg(b) - deg(a)), wide: wideOf(w) }))
-				.filter((g) => g.list.length || (g.wide && deg(g.wide)));
-			// The header counts each project once; a repo checked out in two workspaces shows in both groups, marked "also in".
-			total.textContent = real.length ? `${real.length} unique` : "";
-			total.setAttribute("title", "Each project counted once. A project checked out in two workspaces appears in both groups.");
-			facetBox.replaceChildren();
-			if (groups.length > 1) am.facets(facetBox, groups.map((g) => ({ id: g.w, label: am.workspaceName(g.w), value: g.list.length, kind: subOf(g.w) })), ws, (id) => { ws = id; paint(); }, real.length);
+			const mine = (it: J) => deg(it) > 0 && (!only || it.p === only); // a project's section is its registry profile
+			const real = (lib.list.project as J[]).filter((it) => !it.wide && mine(it));
+			// A workspace is its own card for the records filed workspace-wide; its section is the profile whose registry defines it.
+			const wides = (lib.list.project as J[]).filter((it) => it.wide && mine(it)).sort((a, b) => am.workspaceOrder.indexOf(a.workspace) - am.workspaceOrder.indexOf(b.workspace));
+			const sections = [...new Set([...wides, ...real].map((it) => it.p as string))].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+			total.textContent = real.length ? count(real.length, "project") : "";
 			out.replaceChildren();
-			for (const g of groups) {
-				if (ws && g.w !== ws) continue;
+			for (const p of sections) {
+				const ws = wides.filter((it) => it.p === p), list = real.filter((it) => it.p === p);
 				const sec = cls(el("section", out), "ws-sec"), hd = cls(el("div", sec), "ws-title");
-				el("h3", hd, am.workspaceName(g.w));
-				cls(el("span", hd, count(g.list.length, "project")), "muted");
-				const wd = g.wide ? deg(g.wide) : 0;
-				if (wd && g.wide) {
-					// The same words and numbers as the Map's "<Workspace> · workspace-wide" block.
-					const nb = neighbours(lib, g.wide.key), parts = ["memory", "learning", "journal"].map((k) => [k, nb.get(k)?.length ?? 0] as const).filter(([, n]) => n).map(([k, n]) => count(n, k));
-					const a = el("a", hd, `Workspace-wide: ${parts.join(" · ")}`);
-					a.setAttribute("href", href(g.wide, route));
-					a.setAttribute("title", "Records that name this workspace but no project");
-				}
+				el("h3", hd, label(p));
+				cls(el("span", hd, [ws.length ? count(ws.length, "workspace") : "", list.length ? count(list.length, "project") : ""].filter(Boolean).join(" · ")), "muted");
 				const grid = cls(el("div", sec), "pgrid");
-				for (const it of g.list) {
+				for (const it of [...ws, ...list]) {
 					const nb = neighbours(lib, it.key), get = (k: string) => (nb.get(k) ?? []).map((x) => x.it);
-					const card = cls(el("a", grid), "pcard");
+					const card = cls(el("a", grid), it.wide ? "pcard wscard" : "pcard");
 					card.setAttribute("href", href(it, route));
-					card.setAttribute("title", `${it.name}${it.alias ? ` (${it.alias})` : ""}`);
+					card.setAttribute("title", it.wide ? "Records that name this workspace but no project" : `${it.name}${it.alias ? ` (${it.alias})` : ""}`);
 					const top = cls(el("span", card), "pc-top");
 					cls(el("strong", top, it.title), "pc-name");
-					cls(el("span", top, it.p === "work" ? "Work" : "Personal"), `pill tag-${it.p}`).setAttribute("title", `Profile: ${it.p}`);
-					const others = (it.workspaces ?? []).filter((w: string) => w !== g.w);
-					if (others.length) cls(el("span", card, `Also in ${others.map((w: string) => am.workspaceName(w)).join(", ")}`), "pc-also");
+					if (it.wide) cls(el("span", top, "Workspace"), "pill");
+					cls(el("span", top, label(it.p)), `pill tag-${it.p}`).setAttribute("title", `Profile: ${it.p}`);
 					spark(card, [...get("memory"), ...get("learning"), ...get("journal")].map((x) => x.created ?? x.updated));
 					cls(el("span", card, ["memory", "learning", "journal"].map((k) => [k, get(k).length] as const).filter(([, n]) => n).map(([k, n]) => count(n, k)).join(" · ")), "pc-counts");
 					const last = cls(el("span", card), "pc-last");
@@ -839,11 +826,10 @@ export function libraryTab(am: Am): void {
 						i.setAttribute("aria-label", `${n} stored in your ${it.filedUnder} profile`);
 					}
 				}
-				if (!g.list.length) note(sec, "No projects yet; only general notes.", "muted");
 			}
 			foot.replaceChildren();
-			if (lib.loading && !real.length) foot.textContent = "Loading…";
-			else if (!groups.length) foot.textContent = "No projects yet.";
+			if (lib.loading && !sections.length) foot.textContent = "Loading…";
+			else if (!sections.length) foot.textContent = "No projects yet.";
 			else if (lib.unsorted) { const a = el("a", foot, `${lib.unsorted.toLocaleString()} notes not tied to a project`); a.setAttribute("href", `#memories?unsorted=1${only ? `&profile=${enc(only)}` : ""}`); }
 		};
 		paint();

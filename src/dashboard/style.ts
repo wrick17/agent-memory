@@ -104,7 +104,8 @@ main{width:100%;padding:1rem 1.5rem 2.5rem}
 .hint{color:var(--warn);font-size:12.5px}.has-gh{position:relative}.gh{position:absolute;right:.9rem;bottom:.55rem;font-size:12px;color:var(--muted)}.gh:hover{color:var(--info)}.has-gh .row-meta{padding-right:4.5rem}
 .back{display:inline-block;margin:.1rem 0 .6rem;font-size:14px}.lib-detail.page{position:static;max-height:none}
 .ws-sec{margin:0 0 1.6rem}.ws-title{display:flex;align-items:baseline;gap:.8rem;margin:.2rem 0 .7rem}.ws-title h3{font-size:1.15rem}.ws-title a{font-size:13px}
-.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:.75rem}.pgrid>.pcard{max-width:560px}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr));gap:.75rem}.pgrid>.pcard{max-width:560px;min-width:0}
+.wscard{border-left:3px solid var(--line)}
 .pcard{display:grid;gap:.3rem;padding:.75rem .9rem;background:var(--panel);border:1px solid var(--rule);border-radius:12px;color:var(--ink)}.pcard:hover{border-color:var(--line);text-decoration:none;box-shadow:0 2px 10px rgba(0,0,0,.08)}
 .pc-top{display:flex;align-items:center;gap:.5rem}.pc-name{flex:1;min-width:0;font-weight:620;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .pc-alias{font-size:12.5px;color:var(--muted);margin-top:-.25rem}.pc-counts{font-size:13px;color:var(--ink)}.pc-last{font-size:12.5px;color:var(--muted)}
@@ -350,7 +351,6 @@ background:var(--panel);border:1px solid var(--rule);border-radius:12px;box-shad
 .chip-link.rel-chip{border-radius:12px;align-items:flex-start;max-width:26rem}.rel-chip .sw{margin-top:.45rem}.chip-body{display:flex;flex-direction:column;min-width:0}
 .chip-link .chip-body>span{white-space:normal}.chip-rel{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);line-height:1.3}
 .chip-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
-.pc-also{font-size:12px;color:var(--muted)}
 /* Phone header: the profile showing, small under the name (the choice itself is in the menu). The open search row takes its own room. */
 @media (max-width:640px){.top .mark[data-profile]::after{content:attr(data-profile);display:block;font-size:11px;font-weight:550;color:var(--muted);line-height:1.2;overflow:hidden;text-overflow:ellipsis}}
 @media (max-width:1100px){:root[data-search=open] main{padding-top:calc(3.6rem + .8rem)}}

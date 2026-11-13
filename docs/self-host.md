@@ -247,7 +247,7 @@ The dashboard's Projects page and Map group records by project and workspace. Yo
   "not_projects": ["acme-corp/notes"] }
 ```
 
-Workspaces and owners belong to the profile that holds the record: a repo whose GitHub owner is listed there shows that profile's tag. With a registry, only its `repos` are projects; a key it does not list shows only its workspace. `aliases` map a record's scope to a repo or, with `ws:`, to a workspace; a trailing `?` marks the mapping as likely rather than certain. `drop` lists scopes that never name a project.
+Workspaces and owners belong to the profile that holds the record: a repo whose GitHub owner is listed there shows that profile's tag. With a registry, only its `repos` are projects; a key it does not list shows only its workspace. `aliases` map a record's scope to a repo or, with `ws:`, to a workspace; a trailing `?` marks the mapping as likely rather than certain. A `ws:` alias also applies to a session's workspace tag, so after you merge two workspaces, an alias from the old folder name to the merged workspace places records already tagged with the old name. `drop` lists scopes that never name a project.
 
 Deploy the Worker before the client: an older Worker refuses a batch with these fields, and the client keeps such batches spooled or pending and sends them again after the Worker is upgraded. Nothing is lost, but capture stalls until then.
 
