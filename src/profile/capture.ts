@@ -34,7 +34,7 @@ export interface IngestBatch {
 }
 
 // The GitHub owner and repo patterns facts.mjs repoKey normalizes to, lowercase.
-const PROJECT_KEY = /^github:([a-z0-9][a-z0-9-]{0,38})\/((?!\.{1,2}$)[a-z0-9._-]{1,100})$/;
+const PROJECT_KEY = /^github:([a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9])?)\/((?!\.{1,2}$)[a-z0-9._-]{1,100})$/;
 // Acceptance and smoke fixtures, and runtime labels that are not projects. Exact or anchored, so a real repo named test-utils still counts.
 const NOT_PROJECT = /^(?:am-accept.*|fixtures?(?:[-_.].*)?|dashboard-smoke|bot_hq|bothq|codex)$/;
 

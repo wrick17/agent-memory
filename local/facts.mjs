@@ -21,7 +21,8 @@ const cut = (s, n = FACT_LIMITS.text) => (s.length <= n ? s : `${s.slice(0, n - 
 const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
 // A host or SSH alias: DNS-style labels only, so no option-like (leading "-"), spaced or shell-special value reaches ssh.
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
-const OWNER = /^[a-z0-9][a-z0-9-]{0,38}$/, REPO = /^(?!\.{1,2}$)[a-z0-9._-]{1,100}$/;
+// EMU logins end in _<shortcode>.
+const OWNER = /^[a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9])?$/, REPO = /^(?!\.{1,2}$)[a-z0-9._-]{1,100}$/;
 const aliases = new Map();
 
 /**

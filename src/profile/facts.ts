@@ -18,7 +18,7 @@ import { BudgetTx } from "./archive";
 import { nextSeq } from "../storage";
 
 export const FACT_SCOPE = "repo-fact";
-export const REPO_KEY = /^github\.com\/[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/;
+export const REPO_KEY = /^github\.com\/[a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9])?\/[a-z0-9._-]{1,100}$/;
 export const SESSION_REF = /^(claude-code|codex):[0-9a-f]{12}$/;
 /** Machine paths the client scrubs to `~`; a fact that still names one is refused, never stored. */
 const HOME_PATH = /(?:^|[\s'"=:(])(?:\/Users\/|\/home\/|\/root\b|[A-Za-z]:\\Users\\)/;
