@@ -603,8 +603,10 @@ export class ProfileStore extends DurableObject<Env> {
 
 	/**
 	 * Project tagging: the captured session's part_of link to the GitHub project its checkout belongs to, through record_knowledge's
-	 * write (activity, undo) as actor index. The project node is created only when no node carries the key (GitHub keys match
-	 * case-insensitively) and is never rewritten here: the command is planned again after the last await, right before the
+	 * write (activity, undo) as actor index. The link goes to an active node with the key (GitHub keys match
+	 * case-insensitively; an exact-case key wins, then the earliest), so a retired fixture under another casing never takes it. The
+	 * project node is created only when no active node carries the key, and not while an inactive node holds the exact key. It is
+	 * never rewritten here: the command is planned again after the last await, right before the
 	 * synchronous write, so a project the owner created meanwhile is linked, not overwritten. A work project's name guards me first,
 	 * as a work upload's does. Nothing is written once the session already has a current part_of link to it, so most batches cost one
 	 * read. The request id is stable per profile, session and key, so a retried batch replays. A fixture or malformed key, or a key
@@ -618,8 +620,10 @@ export class ProfileStore extends DurableObject<Env> {
 		const repo = key.slice("github:".length), node = { kind: "project" as const, key, name: repo };
 		const plan = () => {
 			const session = sql.exec<{ id: string }>("SELECT id FROM nodes WHERE key = ? AND kind = 'session' AND status = 'active'", sessionKey(batch.session)).toArray()[0]?.id;
-			const project = sql.exec<{ id: string; kind: string }>("SELECT id, kind FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved' ORDER BY rowid LIMIT 1", key).toArray()[0];
+			const project = sql.exec<{ id: string; kind: string }>("SELECT id, kind FROM nodes WHERE key = ? COLLATE NOCASE AND status = 'active' ORDER BY key = ? DESC, rowid LIMIT 1", key, key).toArray()[0];
 			if (!session || (project && project.kind !== "project")) return null;
+			// An inactive node holding this exact key blocks a new one (nodes_key) and the knowledge write would rewrite it: link nothing.
+			if (!project && sql.exec("SELECT 1 FROM nodes WHERE key = ? AND status <> 'moved'", key).toArray().length) return null;
 			if (project && sql.exec("SELECT 1 FROM edges WHERE src = ? AND rel = 'part_of' AND dst = ? AND dst_profile = '' AND ended_at IS NULL", session, project.id).toArray().length) return null;
 			const args: KnowledgeArgs = { request_id: `capture-project:${who.profile}:${session}:${key}`, ...(project ? {} : { nodes: [node] }),
 				edges: [{ from: { id: session }, rel: "part_of", to: project ? { id: project.id } : { ref: 0 }, reason: "Captured session ran in a checkout of this GitHub repository",

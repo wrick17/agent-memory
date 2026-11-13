@@ -467,6 +467,18 @@ describe("work uploads", () => {
 		});
 	});
 
+	it("puts a commit in the active project before a retired one, and the exact-case key before an earlier casing", async () => {
+		const p = await isolated(), [s1, s2] = [hex("casing1"), hex("casing2")];
+		await call(p.c, "record_knowledge", { profile: p.name, nodes: [{ kind: "project", key: `github:${p.org}/Web`, name: "Retired fixture" }, { kind: "project", key: `github:${p.org.toUpperCase()}/WEB`, name: "Upper" }] });
+		await p.inProfile((st) => st.sql.exec("UPDATE nodes SET status = 'retired' WHERE key = ?", `github:${p.org}/Web`));
+		const projectOf = (sha: string) => p.inProfile((st) => graph(st.sql).find((e) => e.src === `git:${p.ns}@${sha}` && e.dst.startsWith("github:"))?.dst);
+		await post(p.token, { repo: { remote: p.remote }, commits: [{ sha: s1, at: ago(3), title: "one", author: "a-lee" }], marker: { head: s1, as_of: ago(2) } });
+		expect(await projectOf(s1)).toBe(`github:${p.org.toUpperCase()}/WEB`);
+		await call(p.c, "record_knowledge", { profile: p.name, nodes: [{ kind: "project", key: `github:${p.ns}`, name: "Exact" }] });
+		await post(p.token, { repo: { remote: p.remote }, commits: [{ sha: s2, at: ago(2), title: "two", author: "a-lee" }], marker: { head: s2, as_of: ago(1) } });
+		expect(await projectOf(s2)).toBe(`github:${p.ns}`);
+	});
+
 	it("refuses a wrong-kind key and keeps unresolved or shortened identifiers as evidence", async () => {
 		const p = await isolated(), sha = hex("key");
 		await call(p.c, "record_knowledge", { profile: p.name, nodes: [{ kind: "ticket", key: `github:${p.ns}`, name: "wrong kind" }] });

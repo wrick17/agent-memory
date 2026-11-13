@@ -172,7 +172,8 @@ function relateOrWait(tx: Tx, src: string, k: string, held: { id: string } | und
 
 /** The node under `key` (GitHub keys match case-insensitively, the stored bytes stay), created only when absent and never rewritten here. */
 function ensure(tx: Tx, who: Who, created: string[], kind: "project" | "person" | "commit" | "pr" | "bug" | "feature" | "ticket", k: string, name: string, attrs: Record<string, unknown>, validFrom?: string): string {
-	const cur = tx.sql.exec<{ id: string; kind: string }>("SELECT id, kind FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved'", k).toArray()[0];
+	// An active node first, then an exact-case key, then the earliest, so a retired fixture under another casing loses to an active node.
+	const cur = tx.sql.exec<{ id: string; kind: string }>("SELECT id, kind FROM nodes WHERE key = ? COLLATE NOCASE AND status <> 'moved' ORDER BY status = 'active' DESC, key = ? DESC, rowid LIMIT 1", k, k).toArray()[0];
 	if (cur && cur.kind !== kind) throw Fail.of("validation", `key '${k}' belongs to a ${cur.kind} node, not a ${kind}`, { reason: "key_kind_conflict", memory_id: cur.id, kind: cur.kind });
 	if (cur) { assertWritable(tx.sql, cur.id); return cur.id; }
 	const id = createEntity(tx, who, { kind, key: k, name, ...(validFrom ? { valid_from: validFrom } : {}) }, "upload", { name, scope: "default", description: "", why: null, attrs });
