@@ -97,6 +97,8 @@ describe("repo key", () => {
 		const seen = [], resolveHost = (h) => { seen.push(h); return h === "personal" ? "github.com" : "gitlab.com"; };
 		for (const r of ["https://github.com/Org/Repo.git", "git@github.com:org/repo", "ssh://git@github.com:22/org/repo/", "https://x-access-token:secret@github.com/org/repo"]) assert.equal(repoKey(r, { resolveHost }), "github.com/org/repo");
 		assert.equal(repoKey("git@personal:org/repo.git", { resolveHost }), "github.com/org/repo");
+		for (const r of ["git@github.com:Pratyush-Poddar_seq/spur.git", "https://github.com/pratyush-poddar_seq/spur"]) assert.equal(repoKey(r, { resolveHost }), "github.com/pratyush-poddar_seq/spur", "an EMU owner keeps its underscore");
+		assert.equal(repoKey("git@github.com:owner_/repo", { resolveHost }), null, "an owner never ends in _");
 		assert.equal(repoKey("git@work:org/repo.git", { resolveHost }), null, "an alias for another host gives no key");
 		for (const r of ["git@-oProxyCommand=x:o/r", "git@a;b:o/r", "git@$(id):o/r", "https://gitlab.com/o/r", "git@github.com:o/r/extra", "file:///o/r", "", null]) assert.equal(repoKey(r, { resolveHost }), null, String(r));
 		assert.deepEqual(seen, ["personal", "work"], "only valid aliases ever reach ssh");
