@@ -476,7 +476,8 @@ export function shell(win: any): void {
 	const visible = (e: J) => !!e && !e.disabled && !e.hidden && (typeof e.getClientRects !== "function" || e.getClientRects().length > 0);
 	const closeAll = () => {
 		let closed = closeTips() || closePopovers();
-		if (!closed) { const c = $("view").querySelector?.("[data-close]"); if (visible(c)) { c.click(); closed = true; } }
+		// Below desktop width a detail hides its Close and shows ← Back, so Esc takes whichever of the two is showing.
+		if (!closed) { const c = ["[data-close]", "[data-back]"].map((s) => $("view").querySelector?.(s)).find(visible); if (c) { c.click(); closed = true; } }
 		return closed;
 	};
 	let gAt = 0;

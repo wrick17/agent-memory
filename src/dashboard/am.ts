@@ -12,7 +12,7 @@
 // - Space, Left and Right click the visible button marked data-key="Space", "ArrowLeft" or "ArrowRight". Space on a
 //   focused button or link activates that control instead.
 // - Esc closes a glossary tip, the glossary panel, the narrow menu or the Admin list; with none open, it clicks the visible
-//   [data-close] button in the view (a detail panel).
+//   [data-close] button in the view (a detail panel), else the visible [data-back] link (a detail's ← Back below desktop width).
 // The shell ignores keys typed into inputs, selects and text areas, except Esc.
 
 import type { FeedItem, HealthCheck, Snapshot } from "../viewer/types";
@@ -163,7 +163,7 @@ export type Am = {
 	daily: (parent: Node, series: { label: string; kind: string; dates: (string | null)[] }[], weeks?: number, caption?: string) => Node;
 	fitWeeks: (box: Node, weeks: number) => number; // the weeks a container can show as day bars at least 2 px wide (else 4)
 	bars: (parent: Node, rows: { label: string; value: number; href?: string; sub?: string }[], unit: string) => Node;
-	facets: (parent: Node, rows: { id: string; label: string; value: number; kind?: string }[], current: string, pick: (id: string) => void, all?: number) => Node;
+	facets: (parent: Node, rows: { id: string; label: string; value: number; kind?: string }[], current: string | readonly string[], pick: (id: string) => void, all?: number, name?: string) => Node;
 	related: (parent: Node, center: { title: string; kind: string }, rows: { title: string; kind: string; href: string; label: string; weight: number }[], cap?: number) => Node;
 	detail: (box: Node, lib: J, it: J, route: Route) => Node; // library.ts: one item's content and connections
 	md: (parent: Node, text: string) => Node; // library.ts: safe minimal markdown, DOM nodes only
