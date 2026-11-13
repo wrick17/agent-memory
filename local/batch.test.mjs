@@ -14,7 +14,7 @@ import { beforeEach, describe, it } from "node:test";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "am-batch-test-"));
 let n = 0;
 process.env.AGENT_MEMORY_HOME = path.join(tmp, "home-0");
-const { batch, mcpJob, OPS_SCHEMA } = await import("./batch.mjs");
+const { batch, leaseClean, mcpJob, OPS_SCHEMA } = await import("./batch.mjs");
 const { claudeEnv, claudeExec, confinedExec } = await import("./agent-memory.mjs");
 beforeEach(() => { process.env.AGENT_MEMORY_HOME = path.join(tmp, `home-${++n}`); });
 
@@ -77,7 +77,12 @@ describe("job flow", () => {
 
 	it("leases once per profile on every run, back to back, with the 40-item and 900 s sizing; an empty queue reports idle", async () => {
 		const server = fakeServer({ work: lease("LW", [item(1, "unlinked", ["a"])]) });
-		for (let run = 0; run < 2; run++) await batch({ runner: fakeRunner(dismissAll), config, server });
+		let r = null;
+		for (let run = 0; run < 2; run++) r = await batch({ runner: fakeRunner(dismissAll), config, server, earlier: r });
+		assert.equal(r.leases, 2, "the run's lease count: work's two leases, none for the idle profile");
+		// Only a completed lease that settled an item, with no failed follow-up, lets the run lease the profile again at once.
+		assert.deepEqual([r.profiles.work, r.profiles.personal, { status: "completed", completed: 0 }, { status: "completed", completed: 1, retry_failed: "bad_output" },
+			{ status: "lease_short", completed: 39 }, { status: "lease_short", reason: "lease_short", items: 40 }].map(leaseClean), [true, false, false, false, true, false]);
 		const leases = server.calls.filter((c) => c.name === "maintenance_next").map((c) => [c.args.profile, c.args.limit, c.args.lease_seconds]);
 		assert.deepEqual(leases, [["work", 40, 900], ["personal", 40, 900], ["work", 40, 900], ["personal", 40, 900]]);
 		const last = JSON.parse(fs.readFileSync(path.join(process.env.AGENT_MEMORY_HOME, "batch", "last.json"), "utf8"));

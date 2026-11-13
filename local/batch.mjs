@@ -3,7 +3,7 @@
 // Per profile: lease through the job token's `maintenance_next`, judge the items in `codex exec` (one profile per prompt,
 // items on stdin), then send each item's ops through `maintenance_complete`. Anything that fails leaves the items leased;
 // they return to the queue when the lease expires. Transport failures (network errors and 5xx) are retried with the same
-// arguments: maintenance_next carries one request_id per profile per run, and the server replays completion ops by their
+// arguments: maintenance_next carries one request_id per profile per lease, and the server replays completion ops by their
 // lease, item and index, so a retry applies nothing twice. Node 24, no dependencies.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -300,17 +300,25 @@ async function profileBatch(profile, { server, runner, config, clock, sleep, req
 }
 
 /**
+ * Whether a profile's outcome lets the run lease it again at once: a completed or time-limited lease that settled at least one
+ * item, with no failed follow-up run. Anything else (idle, expired, discarded, skipped, error) waits for the next drain.
+ * Requiring a settled item is what ends the run's learning loop.
+ */
+export const leaseClean = (r) => (r?.status === "completed" || r?.status === "lease_short") && r.completed > 0 && !r.retry_failed;
+
+/**
  * The batch for the configured profiles: one lease per profile per call, whenever it has open items (no cooldown since 2026-11-12;
- * the next drain or run takes the rest). `earlier` is this run's previous report: its profiles not batched now keep their outcome
- * in batch/last.json. `runner` is the
+ * the run calls it again while leases stay clean, see leaseClean). `earlier` is this run's previous report: its profiles not
+ * batched now keep their outcome in batch/last.json, and `leases` counts the leases taken across the run. `before`, when given,
+ * runs before each profile's lease (the run's capture pass). `runner` is the
  * capture run's confined runtime: without `available` (a failed control or a probe that was not `denied`) nothing is leased, no
  * model runs, and each profile only reports its content-free skip reason. `trigger` is what started the run: "hook" (a client
  * hook) or "scheduled" (`run --scheduled`). The outcome, codes and counts only, goes to batch/last.json (mode 600).
  */
 export async function batch({ runner, config = loadConfig(), server = mcpJob(config), profiles = config.batch_profiles ?? [], clock = Date.now,
-	sleep = (ms) => new Promise((r) => setTimeout(r, ms)), trigger = "hook", earlier = null } = {}) {
+	sleep = (ms) => new Promise((r) => setTimeout(r, ms)), trigger = "hook", earlier = null, before = null } = {}) {
 	if (trigger !== "hook" && trigger !== "scheduled") throw new Error("trigger is hook or scheduled");
-	const report = { at: new Date(clock()).toISOString(), trigger, runtime: runner?.classification ?? "unavailable", profiles: {} };
+	const report = { at: new Date(clock()).toISOString(), trigger, runtime: runner?.classification ?? "unavailable", leases: Number.isSafeInteger(earlier?.leases) ? earlier.leases : 0, profiles: {} };
 	const run = crypto.randomUUID();
 	const proven = runner?.available && typeof execOf(runner, config) === "function";
 	// The reason's code part only ("probe_indeterminate:curl" reports probe_indeterminate).
@@ -326,9 +334,13 @@ export async function batch({ runner, config = loadConfig(), server = mcpJob(con
 			continue;
 		}
 		if (stop) { report.profiles[profile] = { status: "batch_skipped", reason: stop }; continue; }
+		// The run's capture pass: triggers due now are handled before each lease, so none waits for more than one lease.
+		await before?.();
 		try {
 			const r = await profileBatch(profile, { server, runner, config, clock, sleep, requestId: `batch:${run}:${profile}`.slice(0, 256) });
 			if (r.fatal) { delete r.fatal; stop = `after_${profile}:${r.reason}`; }
+			// Every outcome that holds items came from a lease; idle and lease_expired took none.
+			if (r.items !== undefined) report.leases++;
 			report.profiles[profile] = r;
 		} catch (e) {
 			report.profiles[profile] = { status: "error", reason: e.code ?? "error" };

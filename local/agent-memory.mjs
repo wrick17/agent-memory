@@ -1168,9 +1168,12 @@ function sweep(now, debounceMs) {
 }
 
 /**
- * One pass of the lock holder: handle every queued trigger that is due, sleep until the next one is due, and return only when
- * every queued trigger generation has been handled. A trigger is claimed by an atomic rename before it is handled, so a
- * trigger written meanwhile lands in a new queue file and is handled after it. Then at most one lease per batch profile.
+ * One pass of the lock holder. Capture and learning alternate: handle every queued trigger that is due now, then take one lease
+ * per batch profile, and repeat while a profile's lease settles items cleanly (batch.mjs leaseClean); an unclean, empty or
+ * failed lease stops that profile until the next drain. Each repeat needs a lease that settled at least one item, so the loop
+ * ends. Then handle every queued trigger, sleeping until each is due, and return only when every queued trigger generation has
+ * been handled. A trigger is claimed by an atomic rename before it is handled, so a trigger written meanwhile lands in a new
+ * queue file and is handled after it.
  */
 async function drain({ server, runner, clock, sleep, debounceMs, trigger }, results) {
 	const config = loadConfig();
@@ -1178,55 +1181,78 @@ async function drain({ server, runner, clock, sleep, debounceMs, trigger }, resu
 	runner ??= await confinedRunner(config).catch(() => null);
 	const qdir = path.join(home(), "queue");
 	const handled = new Map(), ended = new Set();
+	// Set by every pass that handled a session: its new learning items give a profile whose queue was empty another lease, and
+	// its fact reports and synthesis markers are sent and synthesized before the next round of leases (factsDue).
+	let captured = false, factsDue = false;
+	// One scan of the queue: handles each trigger due now; returns whether it handled any and how long until the next one is due.
+	const pass = async () => {
+		let wait = Infinity, progressed = false;
+		// Every SessionStart request claimed by now is served by one bounded sweep; the swept sessions join this scan.
+		const claimedStarts = starts(qdir).filter((f) => { try { fs.renameSync(path.join(qdir, f), path.join(claimDir(), f)); return true; } catch { return false; } });
+		if (claimedStarts.length) {
+			try { sweep(clock(), debounceMs); } catch { /* best effort: queued sessions are still handled */ }
+			for (const f of claimedStarts) fs.rmSync(path.join(claimDir(), f), { force: true });
+		}
+		for (const f of queued(qdir)) {
+			const t = readJson(path.join(qdir, f), null);
+			if (!t || handled.get(f) === genOf(t)) continue;
+			const due = Math.min(t.at + debounceMs, t.first_at + DEBOUNCE_MAX_MS), now = clock();
+			if (now < due) { results[f] = "debouncing"; wait = Math.min(wait, due - now); continue; }
+			const claimed = path.join(claimDir(), f);
+			try { fs.renameSync(path.join(qdir, f), claimed); } catch { continue; }
+			const ct = readJson(claimed, t);
+			handled.set(f, genOf(ct));
+			if (ct.event === "SessionEnd" && typeof ct.cwd === "string") ended.add(ct.cwd);
+			progressed = captured = factsDue = true;
+			let r;
+			try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
+			results[f] = r;
+			// A range stuck under the current rules fails the same way until its transcript grows (a new trigger or the sweep) or
+			// DIGEST_REV changes (the sweep), so its trigger settles; its pending text and range state stay for that retry.
+			const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused" || o === "stuck");
+			// A session settled as source_missing (ephemeral, or no source after 7 days) is removed from the queue; its state keeps the reason.
+			if (settled || r.status === "source_missing_settled") fs.rmSync(claimed, { force: true });
+			else unclaim(claimed, path.join(qdir, f));
+		}
+		return { progressed, wait };
+	};
 	try {
 		await replaySpool(server);
 		fs.mkdirSync(claimDir(), { recursive: true, mode: 0o700 });
 		// Claims left by a worker that died mid-session go back to the queue.
 		for (const f of fs.readdirSync(claimDir())) unclaim(path.join(claimDir(), f), path.join(qdir, f));
+		const facts = async () => {
+			factsDue = false;
+			// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
+			try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
+			// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
+			try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
+		};
+		await pass();
+		await facts();
+		// Learning until every profile's queue is empty (owner decisions 2026-11-12 and 2026-11-13: no throttling), with the triggers
+		// due before each profile's lease handled first. Each drain starts every profile again, whatever it did before. A profile
+		// whose queue was empty (idle) leases again after a pass handles a session; one stopped by any other outcome waits for the
+		// next drain. The drain ends only when no profile can lease and no trigger is queued.
+		const all = config.batch_profiles ?? [], { batch, leaseClean } = all.length ? await import("./batch.mjs") : {};
+		let active = all, idle = [];
 		for (;;) {
-			let wait = Infinity, progressed = false;
-			// Every SessionStart request claimed by now is served by one bounded sweep; the swept sessions join this scan.
-			const claimedStarts = starts(qdir).filter((f) => { try { fs.renameSync(path.join(qdir, f), path.join(claimDir(), f)); return true; } catch { return false; } });
-			if (claimedStarts.length) {
-				try { sweep(clock(), debounceMs); } catch { /* best effort: queued sessions are still handled */ }
-				for (const f of claimedStarts) fs.rmSync(path.join(claimDir(), f), { force: true });
+			if (captured && idle.length) { active = all.filter((p) => active.includes(p) || idle.includes(p)); idle = []; }
+			captured = false;
+			// Sessions captured since the last flush (a debounced trigger, or one handled between leases) reach synthesis within one round.
+			if (factsDue) await facts();
+			if (active.length && !stopping) {
+				results.batch = await batch({ runner, config, profiles: active, clock, trigger, earlier: results.batch, before: pass });
+				idle = idle.concat(active.filter((p) => results.batch.profiles[p]?.status === "idle"));
+				active = active.filter((p) => leaseClean(results.batch.profiles[p]));
+				continue;
 			}
-			for (const f of queued(qdir)) {
-				const t = readJson(path.join(qdir, f), null);
-				if (!t || handled.get(f) === genOf(t)) continue;
-				const due = Math.min(t.at + debounceMs, t.first_at + DEBOUNCE_MAX_MS), now = clock();
-				if (now < due) { results[f] = "debouncing"; wait = Math.min(wait, due - now); continue; }
-				const claimed = path.join(claimDir(), f);
-				try { fs.renameSync(path.join(qdir, f), claimed); } catch { continue; }
-				const ct = readJson(claimed, t);
-				handled.set(f, genOf(ct));
-				if (ct.event === "SessionEnd" && typeof ct.cwd === "string") ended.add(ct.cwd);
-				progressed = true;
-				let r;
-				try { r = await processSession(ct, { server, runner: runner?.available ? runner : null, now: clock() }); } catch { r = { status: "error" }; }
-				results[f] = r;
-				// A range stuck under the current rules fails the same way until its transcript grows (a new trigger or the sweep) or
-				// DIGEST_REV changes (the sweep), so its trigger settles; its pending text and range state stay for that retry.
-				const settled = r.status === "done" && Object.values(r.outcomes).every((o) => o === "consolidated" || o === "refused" || o === "stuck");
-				// A session settled as source_missing (ephemeral, or no source after 7 days) is removed from the queue; its state keeps the reason.
-				if (settled || r.status === "source_missing_settled") fs.rmSync(claimed, { force: true });
-				else unclaim(claimed, path.join(qdir, f));
-			}
+			const { progressed, wait } = await pass();
 			if (progressed) continue;
 			if (wait === Infinity) break;
 			await sleep(wait);
 		}
-		// Fact reports saved but not yet accepted (network failure, or a crash between saving and sending), sent again as the same bytes.
-		try { results.facts = await (await import("./facts-client.mjs")).flushPending(server); } catch { /* retried on the next run */ }
-		// Repo-fact synthesis (off unless facts.synthesis): uploads saved results, then runs queued jobs within today's 3 slots.
-		try { results.synthesis = await (await import("./facts-synth.mjs")).synthesize({ config, runner: runner?.available ? runner : null, server, reader: readServer(config), clock }); } catch { results.synthesis = { status: "error" }; }
 		if (typeof config.corpus_profile === "string" && ended.size) results.corpus = await corpusAfterSessions(config, ended, runner);
-		// One lease per profile per drain, whatever the previous lease in this run() did (owner decision 2026-11-12: no throttling).
-		const profiles = config.batch_profiles ?? [];
-		if (profiles.length) {
-			const { batch } = await import("./batch.mjs");
-			results.batch = await batch({ runner, config, profiles, clock, trigger, earlier: results.batch });
-		}
 		results.status = await sendStatus(config, server, clock());
 	} finally {
 		runner?.cleanup?.();
@@ -1287,8 +1313,8 @@ export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop"
  * (a client hook started it) or "scheduled" (`run --scheduled` from launchd). A scheduled run with no queued trigger, no claim a
  * crashed run left behind, no spooled batch and no batch profile configured sends its status report and returns "idle" without
  * starting the confined runtime. The server has no batch cooldown, so a configured batch profile always makes the run drain.
- * A run lives as long as triggers keep arriving (a backfill beside active sessions can keep it for an hour or more), so each
- * drain leases every batch profile again, whatever its previous lease in this run did.
+ * Each drain leases every batch profile again, whatever its previous lease in this run did, and keeps leasing a profile while
+ * its leases settle items cleanly, so a run lives until learning is exhausted and no trigger is left.
  */
 export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
 	process.on("SIGTERM", stopRun).on("SIGINT", stopRun);
