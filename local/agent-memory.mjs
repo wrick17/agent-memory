@@ -1291,10 +1291,98 @@ export const hookEvents = (config = loadConfig(), client) => [...new Set(["Stop"
  * drain leases every batch profile again, whatever its previous lease in this run did.
  */
 export async function run({ server, runner, clock = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), debounceMs = loadConfig().debounce_ms ?? DEBOUNCE_MS, trigger = "hook" } = {}) {
+	process.on("SIGTERM", stopRun).on("SIGINT", stopRun);
+	try { return await runLocked({ server, runner, clock, sleep, debounceMs, trigger }); } finally { process.off("SIGTERM", stopRun).off("SIGINT", stopRun); }
+}
+
+/**
+ * SIGTERM or SIGINT during run(): Node runs no finally on a signal, and a hook-started run is its own process group, so nothing
+ * else stops its model children. Each child leads its own process group, so stopping the group also stops the native worker an
+ * npm launcher starts. Stop every child's group, then remove the runners' temp dirs, drop this process's lock entry and exit
+ * 128 + the signal number. Meanwhile `stopping` blocks new children and further lock takes.
+ */
+const STOP_GRACE_MS = 2000;
+let stopping = false;
+function stopRun(signal) {
+	if (stopping) return;
+	stopping = true;
+	Promise.all([...children].map((c) => stopGroup(c.pid))).then(() => {
+		for (const f of cleanups) f();
+		dropLock();
+		process.exit(128 + os.constants.signals[signal]);
+	});
+}
+
+const signalGroup = (pgid, sig) => { try { process.kill(-pgid, sig); } catch { /* the group is gone */ } };
+const groupGone = (pgid) => { try { process.kill(-pgid, 0); return false; } catch (e) { return e.code === "ESRCH"; } };
+/** SIGTERM process group `pgid`, then SIGKILL it when any member is left after STOP_GRACE_MS. Resolves once it is gone or killed. */
+function stopGroup(pgid) {
+	if (!(pgid > 0) || groupGone(pgid)) return Promise.resolve();
+	signalGroup(pgid, "SIGTERM");
+	const deadline = Date.now() + STOP_GRACE_MS;
+	return new Promise((resolve) => {
+		const poll = () => {
+			if (groupGone(pgid)) return resolve();
+			if (Date.now() >= deadline) { signalGroup(pgid, "SIGKILL"); return resolve(); }
+			setTimeout(poll, 50);
+		};
+		poll();
+	});
+}
+
+/**
+ * Removes confined-runner temp dirs (am-codex-home-<pid>-*, am-run-<pid>-*) whose run is gone. The owner pid in the name, not the
+ * lock, decides: a run under another AGENT_MEMORY_HOME shares this TMPDIR but not this lock. Names without a pid are left alone.
+ * A dead run's surviving model process groups are stopped first (stopOrphanGroups).
+ */
+async function sweepRunnerDirs() {
+	const tmp = os.tmpdir();
+	let names = [];
+	try { names = fs.readdirSync(tmp); } catch { return; }
+	for (const n of names) {
+		const m = /^am-(codex-home|run)-(\d+)-[A-Za-z0-9]{6}$/.exec(n), pid = Number(m?.[2]), dir = path.join(tmp, n);
+		if (!(pid > 0) || pid === process.pid || alive(pid)) continue;
+		try {
+			const st = fs.lstatSync(dir);
+			if (!st.isDirectory() || st.uid !== process.getuid()) continue;
+			if (m[1] === "run") await stopOrphanGroups(dir);
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch { /* best effort: the next run tries again */ }
+	}
+}
+
+/** The start time (ps lstart) of `pid` while it leads its own process group, else "". */
+const leaderStart = (pid) => {
+	const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(spawnSync("/bin/ps", ["-o", "pgid=,lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }).stdout ?? "");
+	return m && Number(m[1]) === pid ? m[2] : "";
+};
+
+/**
+ * Stops each process group a dead run recorded in its am-run dir (pgid-<n> holding the leader's start time, trackChild) only
+ * when that exact group is proved: its leader (pid n) still leads it with the recorded start time, and one of its processes still
+ * has that dir as its working directory. Anything else (a reused id, a leader gone, ps or lsof failing) is left alone and logged.
+ */
+async function stopOrphanGroups(dir) {
+	const records = fs.readdirSync(dir).map((f) => [Number(/^pgid-(\d+)$/.exec(f)?.[1]), f]).filter(([g]) => g > 0 && !groupGone(g));
+	if (!records.length) return;
+	const real = fs.realpathSync(dir);
+	const table = (spawnSync("/bin/ps", ["-A", "-o", "pid=,pgid="], { encoding: "utf8", timeout: 5000 }).stdout ?? "").split("\n").map((l) => l.trim().split(/\s+/).map(Number));
+	for (const [pgid, f] of records) {
+		const started = fs.readFileSync(path.join(dir, f), "utf8").trim();
+		const members = table.filter(([, g]) => g === pgid).map(([p]) => p);
+		const cwds = started && leaderStart(pgid) === started && members.length
+			? spawnSync("/usr/sbin/lsof", ["-a", "-p", members.join(","), "-d", "cwd", "-Fn"], { encoding: "utf8", timeout: 5000 }).stdout ?? "" : "";
+		if (cwds.split("\n").includes(`n${real}`)) await stopGroup(pgid);
+		else logCapture({ event: "orphan_group_left", pgid });
+	}
+}
+
+async function runLocked({ server, runner, clock, sleep, debounceMs, trigger }) {
 	const results = {};
 	let last = null, idle = null;
-	while (takeLock()) {
+	while (!stopping && takeLock()) {
 		try {
+			await sweepRunnerDirs();
 			if (trigger === "scheduled" && !last) {
 				const config = loadConfig(), qdir = path.join(home(), "queue"), spoolDir = path.join(home(), "spool");
 				const spooled = fs.existsSync(spoolDir) && fs.readdirSync(spoolDir).some((f) => f.endsWith(".json"));
@@ -1320,6 +1408,72 @@ export async function run({ server, runner, clock = Date.now, sleep = (ms) => ne
 }
 
 // ---------- confined runtime (section 12) ----------
+
+// The live model children and the temp-dir cleanups of this process's runners, for stopRun().
+const children = new Set(), cleanups = new Set();
+
+/**
+ * Tracks a model child that leads its own process group, and records the group and its leader's start time in `groupDir` (its
+ * run's am-run dir) for a later run's sweep. Calls settle(code, signal) once: when its streams close, or STOP_GRACE_MS after it exits with them still open (a
+ * worker it left behind holds them), destroying them then. Once it exits, whatever is left in its group is stopped. Returns a
+ * function that settles it at once, for a child that never started.
+ */
+function trackChild(child, groupDir, settle) {
+	const record = child.pid > 0 && groupDir ? path.join(groupDir, `pgid-${child.pid}`) : null;
+	if (record) { try { fs.writeFileSync(record, leaderStart(child.pid), { mode: 0o600 }); } catch { /* the sweep then leaves this group alone */ } }
+	// Tracked until its group is gone or SIGKILLed, so stopRun also waits for a group whose cleanup is still in flight.
+	children.add(child);
+	let settled = false, timer;
+	const finish = (code, signal) => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		if (!(child.pid > 0)) children.delete(child);
+		settle(code, signal);
+	};
+	child.on("exit", (code, signal) => {
+		stopGroup(child.pid).then(() => { children.delete(child); if (record) fs.rmSync(record, { force: true }); });
+		timer = setTimeout(() => { for (const s of [child.stdin, child.stdout, child.stderr]) s?.destroy(); finish(code, signal); }, STOP_GRACE_MS);
+	});
+	child.on("close", finish);
+	return finish;
+}
+
+/**
+ * spawnSync's result ({ status, signal, stdout, stderr, error }, utf8 text) without blocking the event loop, so a signal handler
+ * can run while a child is in flight. As in spawnSync: a timeout, or stdout and stderr together passing maxBuffer bytes, stops
+ * the child (ETIMEDOUT, ENOBUFS), and a failed input write (EPIPE) is the error. The child leads its own process group, which is
+ * what a timeout or ENOBUFS stops. Once the run is stopping, nothing is started.
+ */
+export function spawnAsync(command, args, { input, timeout, maxBuffer = 1024 * 1024, groupDir, ...options } = {}) {
+	if (stopping) return Promise.resolve({ status: null, signal: null, stdout: "", stderr: "", error: Object.assign(new Error("spawn stopping"), { code: "ECANCELED" }) });
+	return new Promise((resolve) => {
+		const child = spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"], detached: true });
+		const out = [], err = [];
+		let size = 0, error, timer;
+		const finish = trackChild(child, groupDir, (status, signal) => {
+			clearTimeout(timer);
+			resolve({ status, signal, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), error });
+		});
+		let stopped = false;
+		const stop = (code) => {
+			error ??= Object.assign(new Error(`spawn ${code}`), { code });
+			if (!stopped) { stopped = true; stopGroup(child.pid); }
+		};
+		// At most maxBuffer bytes are kept; past it the streams are still drained, so the child never blocks, and the rest is discarded.
+		const collect = (into) => (d) => {
+			const room = maxBuffer - size;
+			if (room > 0) into.push(room >= d.length ? d : d.subarray(0, room));
+			if ((size += d.length) > maxBuffer) stop("ENOBUFS");
+		};
+		if (timeout) timer = setTimeout(() => stop("ETIMEDOUT"), timeout);
+		child.stdout.on("data", collect(out));
+		child.stderr.on("data", collect(err));
+		child.stdin.on("error", (e) => { error ??= e; });
+		child.on("error", (e) => { error ??= e; if (child.pid === undefined) finish(null, null); });
+		child.stdin.end(input);
+	});
+}
 
 // Codex 0.165 ignores tools.view_image; disable its separate view_image feature as well as shell tools.
 // Codex 0.168.0 warns on the deprecated [features].multi_agent, and the strict parser rejects that warning.
@@ -1383,11 +1537,14 @@ export function classify({ status, stdout, stderr, error }, secret) {
  * owner's Codex login linked in for the Codex process only, positive controls, then classified denial probes under the
  * same configuration. `available` is true only when every control passes and every probe is `denied` on macOS.
  */
-export async function confinedRunner(config = {}, { codex = config.codex_bin || "codex", platform = process.platform, exec = spawnSync } = {}) {
+export async function confinedRunner(config = {}, { codex = config.codex_bin || "codex", platform = process.platform, exec } = {}) {
 	const tmp = os.tmpdir();
-	const codexHome = fs.mkdtempSync(path.join(tmp, "am-codex-home-"));
-	const runDir = fs.mkdtempSync(path.join(tmp, "am-run-"));
-	const cleanup = () => { fs.rmSync(codexHome, { recursive: true, force: true }); fs.rmSync(runDir, { recursive: true, force: true }); };
+	// The owner pid in the names lets a later run's sweepRunnerDirs() remove them once this process is gone.
+	const codexHome = fs.mkdtempSync(path.join(tmp, `am-codex-home-${process.pid}-`));
+	const runDir = fs.mkdtempSync(path.join(tmp, `am-run-${process.pid}-`));
+	const cleanup = () => { fs.rmSync(codexHome, { recursive: true, force: true }); fs.rmSync(runDir, { recursive: true, force: true }); cleanups.delete(cleanup); };
+	cleanups.add(cleanup);
+	exec ??= (command, args, options) => spawnAsync(command, args, { ...options, groupDir: runDir });
 	const fail = (classification, reason) => { cleanup(); return { available: false, classification, reason }; };
 	if (platform !== "darwin") return fail("indeterminate", "untested_platform");
 	const configFile = path.join(codexHome, "config.toml");
@@ -1408,7 +1565,7 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	if (!fs.readdirSync(os.homedir()).includes("Library")) return fail("indeterminate", "home_listing_control");
 	const net = await fetch("https://1.1.1.1/", { redirect: "manual", signal: AbortSignal.timeout(5000) }).then(() => true, () => false);
 	if (!net) return fail("indeterminate", "network_unreachable_outside");
-	const echo = sandbox(["/bin/echo", nonce]);
+	const echo = await sandbox(["/bin/echo", nonce]);
 	if (echo.error || echo.status !== 0 || echo.stdout.trim() !== nonce) return fail("indeterminate", "sandbox_cannot_run_command");
 	// Denial probes under the same CODEX_HOME and config that exec uses.
 	const probes = [
@@ -1416,7 +1573,7 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 		[["/usr/bin/curl", "-sS", "-v", "--connect-timeout", "5", "https://1.1.1.1/"], "HTTP/"],
 	];
 	for (const [args, secret] of probes) {
-		const c = classify(sandbox(args), secret);
+		const c = classify(await sandbox(args), secret);
 		if (c !== "denied") return fail(c, `probe_${c}:${path.basename(args[0])}`);
 	}
 	if (sha(fs.readFileSync(configFile)) !== configSha) return fail("indeterminate", "config_changed");
@@ -1453,7 +1610,7 @@ export function confinedExec({ exec, codex, runDir, env, configFile, configSha, 
 		const schemaFile = path.join(schemaDir, `output-${randomBytes(8).toString("hex")}.schema.json`);
 		try {
 			fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o400 });
-			const r = exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile,
+			const r = await exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile,
 				...(typeof replyFile === "string" && path.isAbsolute(replyFile) ? ["-o", replyFile] : []), "-"],
 				{ cwd: runDir, env, input: prompt, encoding: "utf8", timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
 			if (!unchanged()) return { kind: "runtime_warning" };
@@ -1553,8 +1710,9 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 		const trusted = `${prompt.slice(0, at)}\nReply with only one JSON object that matches this JSON Schema, with no other text:\n${JSON.stringify(schema)}`;
 		// Untrusted text is JSON, where "@" only occurs inside strings, so the escape keeps it valid.
 		const untrusted = prompt.slice(at + 1).replaceAll("@", "\\u0040");
-		if (at < 0 || trusted.includes("@")) return resolve({ kind: "runtime_error" });
-		const child = spawnFn(claude, [...CLAUDE_ARGS, "--model", model, "--effort", effort], { cwd: runDir, env, stdio: ["pipe", "pipe", "pipe"] });
+		if (at < 0 || trusted.includes("@") || stopping) return resolve({ kind: "runtime_error" });
+		// Its own process group, so stopRun's group signal reaches anything the CLI starts.
+		const child = spawnFn(claude, [...CLAUDE_ARGS, "--model", model, "--effort", effort], { cwd: runDir, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
 		let phase = "gate", init = null, reinit = false, buf = "", stderr = "", failure = null, tool = false, pending = null;
 		const fail = (kind) => {
 			if (kind === "tool_event") tool = true;
@@ -1563,7 +1721,8 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 			if (phase === "stopped") return;
 			phase = "stopped";
 			child.stdin.end();
-			child.kill("SIGKILL");
+			// The whole group, so a worker the CLI started stops too; a test double has no pid.
+			if (child.pid > 0) stopGroup(child.pid); else child.kill("SIGKILL");
 		};
 		const timer = setTimeout(() => fail("runtime_error"), timeoutMs);
 		const send = (content, shouldQuery) => child.stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content }, parent_tool_use_id: null, shouldQuery })}\n`);
@@ -1633,7 +1792,7 @@ export function claudeExec({ claude, runDir, env, spawnFn = spawn, timeoutMs = 1
 		child.stderr.setEncoding("utf8").on("data", (d) => { stderr += d; });
 		child.stdin.on("error", () => fail("runtime_error"));
 		child.on("error", () => fail("runtime_error"));
-		child.on("close", (code, signal) => {
+		trackChild(child, runDir, (code, signal) => {
 			clearTimeout(timer);
 			if (buf.trim()) failure ??= "bad_events";
 			if (TOOL_REJECTION.test(stderr)) tool = true;

@@ -464,6 +464,90 @@ describe("confined runtime", () => {
 		assert.equal(am.classify(sandbox(["/usr/bin/curl", "-sS", "-v", "--connect-timeout", "5", "https://example.invalid/"], strict), ""), "indeterminate");
 		for (const d of [ch, strict]) fs.rmSync(d, { recursive: true, force: true });
 	});
+
+	it("matches spawnSync's ENOBUFS (combined bytes) and EPIPE results", async () => {
+		const cases = [
+			// 600 two-byte characters on each stream: under maxBuffer per stream in characters and in bytes, over it combined in bytes.
+			[process.execPath, ["-e", "process.stdout.write('é'.repeat(600)); process.stderr.write('é'.repeat(600))"], { maxBuffer: 2000 }, "ENOBUFS"],
+			// Valid output, then exit without reading a 4 MiB input.
+			["/bin/sh", ["-c", "echo ok"], { input: "x".repeat(4 << 20) }, "EPIPE"],
+			["/bin/cat", [], { input: "hi" }, undefined],
+		];
+		for (const [cmd, args, options, code] of cases) {
+			const sync = spawnSync(cmd, args, { encoding: "utf8", ...options }), async = await am.spawnAsync(cmd, args, { encoding: "utf8", ...options });
+			assert.equal(sync.error?.code, code, `${cmd} spawnSync`);
+			assert.equal(async.error?.code, code, `${cmd} spawnAsync`);
+			if (!code) assert.deepEqual([async.status, async.stdout], [sync.status, sync.stdout]);
+		}
+		// A child that ignores SIGTERM and writes 32 MiB past a 1 KiB limit: at most 1 KiB is kept and its group gets one SIGTERM.
+		const terms = path.join(fs.mkdtempSync(path.join(tmp, "flood-")), "terms");
+		const flood = `const fs = require("fs"); process.on("SIGTERM", () => fs.appendFileSync(${JSON.stringify(terms)}, "t"));
+			const b = Buffer.alloc(65536, 120); let n = 0; const w = () => { if (n++ < 512) process.stdout.write(b, w); }; w();`;
+		const r = await am.spawnAsync(process.execPath, ["-e", flood], { encoding: "utf8", maxBuffer: 1024 });
+		assert.equal(r.error?.code, "ENOBUFS");
+		assert.ok(Buffer.byteLength(r.stdout) + Buffer.byteLength(r.stderr) <= 1024, "retained output stays within maxBuffer");
+		assert.equal(fs.readFileSync(terms, "utf8"), "t", "the group is stopped once");
+	});
+
+	it("settles a timeout whose child left a worker holding stdout open, and stops that worker", { timeout: 20_000 }, async () => {
+		const dir = fs.mkdtempSync(path.join(tmp, "worker-")), pidFile = path.join(dir, "worker.pid");
+		// The worker ignores SIGTERM and inherits stdout; the launcher waits on it, as the npm launcher waits on its native worker.
+		const r = await am.spawnAsync("/bin/sh", ["-c", `(trap "" TERM; exec sleep 30) & echo $! > "${pidFile}"; wait`], { encoding: "utf8", timeout: 300 });
+		const worker = Number(fs.readFileSync(pidFile, "utf8"));
+		try {
+			assert.equal(r.error?.code, "ETIMEDOUT");
+			for (let i = 0; i < 20 && (() => { try { process.kill(worker, 0); return true; } catch { return false; } })(); i++) await new Promise((res) => setTimeout(res, 50));
+			assert.throws(() => process.kill(worker, 0), { code: "ESRCH" }, "the worker is stopped");
+		} finally { try { process.kill(worker, "SIGKILL"); } catch { /* already stopped */ } }
+	});
+
+	it("on SIGTERM stops the in-flight codex child, removes the run's temp dirs and lock entry; sweeps only dead runs' dirs", async (t) => {
+		if (process.platform !== "darwin") { t.skip("the confined runner runs on macOS only"); return; }
+		const root = fs.mkdtempSync(path.join(tmp, "signal-")), tdir = path.join(root, "tmp"), userHome = path.join(root, "user"), amHome = path.join(root, "am");
+		for (const d of [tdir, path.join(userHome, "Library"), path.join(userHome, ".codex"), path.join(amHome, "spool")]) fs.mkdirSync(d, { recursive: true });
+		fs.writeFileSync(path.join(userHome, ".codex", "auth.json"), "{}", { mode: 0o600 });
+		// A scheduled run with a spooled batch drains; the fake codex blocks in the runner's first sandbox call, like the npm launcher
+		// waiting on its native worker (a grandchild that a signal to the launcher alone would not stop), and records both pids.
+		fs.writeFileSync(path.join(amHome, "spool", "x.json"), "{}");
+		const fake = path.join(root, "fake-codex");
+		fs.writeFileSync(fake, `#!/bin/sh\nif [ "$1" = sandbox ] && [ "$5" = /bin/echo ]; then sleep 30 & echo $! > "$HOME/grandchild.pid"; echo $$ > "$HOME/child.pid"; wait; exit 1; fi\necho "Operation not permitted" >&2; exit 1\n`, { mode: 0o755 });
+		fs.writeFileSync(path.join(amHome, "config.json"), JSON.stringify({ codex_bin: fake, codex_home: path.join(userHome, ".codex") }));
+		const deadPid = Number(spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" }).stdout);
+		const dead = path.join(tdir, `am-codex-home-${deadPid}-AbC123`), liveDir = path.join(tdir, `am-run-${process.pid}-AbC123`), unowned = path.join(tdir, "am-run-AbC123");
+		const deadRun = path.join(tdir, `am-run-${deadPid}-AbC123`);
+		for (const d of [dead, liveDir, unowned, deadRun]) fs.mkdirSync(d);
+		// The dead run recorded three process groups with their leaders' start times: its own, still working in its am-run dir
+		// (stopped by the sweep); one working elsewhere; and a reused id, working in the dir but started at another time (both left
+		// alone and logged).
+		const sleeper = (cwd) => spawn("/bin/sleep", ["30"], { cwd, detached: true, stdio: "ignore" });
+		const orphan = sleeper(deadRun), stranger = sleeper(root), reused = sleeper(deadRun);
+		const lstart = (pid) => spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+		for (const p of [orphan, stranger]) fs.writeFileSync(path.join(deadRun, `pgid-${p.pid}`), lstart(p.pid));
+		fs.writeFileSync(path.join(deadRun, `pgid-${reused.pid}`), "Thu Jan  1 00:00:00 2026");
+		const exists = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+		const child = spawn(process.execPath, ["--import", "data:text/javascript,globalThis.fetch=async()=>({})", fileURLToPath(new URL("./agent-memory.mjs", import.meta.url)), "run", "--scheduled"],
+			{ env: { PATH: process.env.PATH, HOME: userHome, TMPDIR: tdir, AGENT_MEMORY_HOME: amHome }, stdio: "ignore" });
+		const pidFile = path.join(userHome, "child.pid");
+		for (let i = 0; i < 100 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
+		const codexPid = Number(fs.readFileSync(pidFile, "utf8")), workerPid = Number(fs.readFileSync(path.join(userHome, "grandchild.pid"), "utf8"));
+		try {
+			const own = fs.readdirSync(tdir).filter((n) => n.includes(`-${child.pid}-`));
+			assert.equal(own.length, 2, "the runner's codex home and run dir");
+			assert.deepEqual([fs.existsSync(dead), fs.existsSync(deadRun), fs.existsSync(liveDir), fs.existsSync(unowned)], [false, false, true, true]);
+			assert.deepEqual([exists(orphan.pid), exists(stranger.pid), exists(reused.pid)], [false, true, true]);
+			const log = fs.readFileSync(path.join(amHome, "logs", "capture.log"), "utf8");
+			for (const p of [stranger, reused]) assert.match(log, new RegExp(`"event":"orphan_group_left","pgid":${p.pid}\\b`));
+			assert.equal(fs.readdirSync(path.join(amHome, "run.lock.d")).length, 1);
+			child.kill("SIGTERM");
+			const [code] = await once(child, "exit");
+			assert.equal(code, 143);
+			assert.deepEqual(fs.readdirSync(tdir).filter((n) => n.includes(`-${child.pid}-`)), []);
+			assert.deepEqual(fs.readdirSync(path.join(amHome, "run.lock.d")), []);
+			await new Promise((r) => setTimeout(r, 200));
+			assert.throws(() => process.kill(codexPid, 0), { code: "ESRCH" }, "the codex child is stopped");
+			assert.throws(() => process.kill(workerPid, 0), { code: "ESRCH" }, "its worker is stopped");
+		} finally { for (const pid of [codexPid, workerPid, orphan.pid, stranger.pid, reused.pid]) { try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ } } }
+	});
 });
 
 // Review L1-L8 (docs/review-sol-phase2a-local-2026-10-28.md), each from the reviewer's failing example.
