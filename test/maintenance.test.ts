@@ -423,6 +423,22 @@ describe("protection and the maintenance queue", () => {
 		});
 	});
 
+	it("counts the whole queue per state and the items settled in the last hour and day", async () => {
+		await inStore((storage, who) => {
+			const sql = storage.sql;
+			expect(batchStatus(sql).queue).toEqual({ open: 0, leased: 0, done: 0, dismissed: 0, stuck: 0, settled_last_hour: 0, settled_last_24h: 0 });
+			const digest = String(wired(storage, who, save({ name: "queue count digest" })).memory_id);
+			enqueue(storage, Array.from({ length: 8 }, (_, i) => ({ kind: "unlinked", subjects: [digest], slot: `q${i}` })));
+			const ids = sql.exec<{ id: number }>("SELECT id FROM maintenance ORDER BY id").toArray().map((r) => r.id);
+			const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+			// [state, done_at]: one settled 10 minutes ago, one 2 hours ago, one 2 days ago; open, leased and stuck rows are never settled.
+			const rows: [string, string | null][] = [["done", ago(600_000)], ["dismissed", ago(7_200_000)], ["done", ago(172_800_000)],
+				["leased", null], ["stuck", ago(60_000)], ["open", null], ["open", null], ["open", null]];
+			rows.forEach(([state, at], i) => sql.exec("UPDATE maintenance SET state = ?, done_at = ? WHERE id = ?", state, at, ids[i]));
+			expect(batchStatus(sql).queue).toEqual({ open: 3, leased: 1, done: 2, dismissed: 1, stuck: 1, settled_last_hour: 1, settled_last_24h: 2 });
+		});
+	});
+
 	it("a correction capture's preference_signal applies an OPS_SCHEMA-shaped inference; a refused one keeps its reason code", async () => {
 		const { token } = await deviceToken("infer-capture-job", ["ingest"], ["test"], "test");
 		const body = JSON.stringify({ asks: [{ text: "Fix it", pos: 10 }], decisions: [], corrections: [{ text: "Use tabs, not spaces.", pos: 1200 }],

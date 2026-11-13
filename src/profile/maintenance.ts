@@ -365,14 +365,25 @@ export function finishBatch(storage: DurableObjectStorage, c: { lease_id?: strin
 	});
 }
 
-/** The owner's view of the daily batch (section 15): when it last leased, and its last skip or park. Codes and dates only. */
+/** The owner's view of the daily batch (section 15): when it last leased, its last skip or park, and queue counts. Codes, dates and counts only. */
 export function batchStatus(sql: SqlStorage) {
 	const rows = new Map(sql.exec<{ stage: string; last_run_at: string | null; last_error: string | null; stats: string | null }>(
 		"SELECT stage, last_run_at, last_error, stats FROM cursors WHERE stage IN ('maintenance_batch', 'batch_status')").toArray().map((r) => [r.stage, r]));
 	const s = rows.get("batch_status"), stats = s?.stats ? (JSON.parse(s.stats) as { status: string; items: number }) : null;
 	return { last_lease_at: rows.get("maintenance_batch")?.last_run_at ?? null,
 		last_status: s && stats ? { status: stats.status, reason: s.last_error, items: stats.items, at: s.last_run_at } : null,
-		last_completed_lease: lastCompletedLease(sql) };
+		last_completed_lease: lastCompletedLease(sql), queue: queueCounts(sql) };
+}
+
+/** Whole-queue counts per state, and items settled (done or dismissed) in the last hour and day, for progress and ETA. */
+function queueCounts(sql: SqlStorage) {
+	const now = Date.now(), ago = (ms: number) => new Date(now - ms).toISOString();
+	return sql.exec<{ open: number; leased: number; done: number; dismissed: number; stuck: number; settled_last_hour: number; settled_last_24h: number }>(
+		`SELECT count(*) FILTER (WHERE state = 'open') AS open, count(*) FILTER (WHERE state = 'leased') AS leased,
+			count(*) FILTER (WHERE state = 'done') AS done, count(*) FILTER (WHERE state = 'dismissed') AS dismissed,
+			count(*) FILTER (WHERE state = 'stuck') AS stuck,
+			count(*) FILTER (WHERE state IN ('done', 'dismissed') AND done_at >= ?) AS settled_last_hour,
+			count(*) FILTER (WHERE state IN ('done', 'dismissed') AND done_at >= ?) AS settled_last_24h FROM maintenance`, ago(3_600_000), ago(86_400_000)).one();
 }
 
 // Stored op names and reasons predate this read; anything that is not a plain code reads as "unrecognized", never as text.
