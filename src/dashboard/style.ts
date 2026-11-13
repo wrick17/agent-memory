@@ -130,7 +130,7 @@ main{width:100%;padding:1rem 1.5rem 2.5rem}
 .bar-fill{display:block;height:100%;border-radius:999px;background:var(--project)}.bar-num{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums;font-size:13px}
 .rel{margin:.3rem 0 .6rem}.rel-svg{width:100%;height:auto;display:block;max-width:760px}.rel-edge{fill:none;stroke:var(--line)}.rel-box{fill:var(--panel);stroke:var(--k);stroke-width:1.5}.rel-box.center{fill:var(--soft)}
 .rel-title{fill:var(--ink);font:13.5px var(--sans)}.rel-title.strong{font-weight:650}.rel-label{fill:var(--muted);font:12px var(--sans)}.rel-node:hover .rel-edge{stroke:var(--ink)}.rel-node:hover .rel-box{stroke-width:2.5}
-.facets{margin:0 0 .7rem}.facet-strip{display:flex;height:6px;border-radius:999px;overflow:hidden;gap:2px;margin-bottom:.45rem}
+.filters>summary{cursor:pointer;font-weight:600;font-size:14px;padding:.3rem 0;margin-bottom:.3rem}.facets{margin:0 0 .7rem}.facet-strip{display:flex;height:6px;border-radius:999px;overflow:hidden;gap:2px;margin-bottom:.45rem}
 .facet-btns{display:flex;flex-wrap:wrap;gap:.3rem}.facet-btns button{display:inline-flex;align-items:center;gap:.4rem;margin:0;border-radius:999px;font-weight:500}
 .facet-btns button[aria-pressed=true]{background:var(--sel);color:var(--ink);border-color:var(--line)}
 /* Map: an infinite canvas of blocks */
@@ -220,7 +220,7 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 /* Touch widths: every tap target at least 40px. */
 @media (max-width:1100px),(pointer:coarse){button,select,input:not([type=checkbox]):not([type=radio]){min-height:40px}
 #nav a{display:inline-flex;align-items:center;min-height:40px;padding:.35rem .8rem}.gear,.icon{width:40px;height:40px}
-.row{padding:.75rem .9rem}.chip-link{min-height:40px;padding:.3rem .8rem}.facet-btns button{min-height:40px}.linklike{min-height:40px;display:inline-flex;align-items:center}
+.row{padding:.75rem .9rem}.chip-link{min-height:40px;padding:.3rem .8rem}.facet-btns button,.filters>summary{min-height:40px}.linklike{min-height:40px;display:inline-flex;align-items:center}
 .minicard,.pcard{min-height:44px}.crumbs button,.map-tools button{min-height:40px;min-width:40px}}
 /* Home and grids */
 @media (max-width:1100px){.home-charts{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.home-lists{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}

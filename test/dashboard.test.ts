@@ -1359,6 +1359,58 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		} finally { NODES.pop(); }
 	});
 
+	it("filters by several types and origins at once, keeps them in the address, and restores them on reload", async () => {
+		const added = [N("m2", "decision", "use-small-diffs", { type: "reference", origin: "stated" }), N("m3", "decision", "how-to-release", { type: "procedural", origin: "inferred" }),
+			N("m4", "decision", "agent-note", { type: "project", origin: "agent" })];
+		NODES.push(...added);
+		try {
+			const ids = (b: ReturnType<typeof browser>) => find(find(b.view(), "ul").find((u) => u.attrs["data-list"] !== undefined)!, "a").filter((a) => a.attrs.class === "row")
+				.map((a) => /\/work\/([^?]+)/.exec(a.attrs.href!)![1]).sort();
+			const group = (b: ReturnType<typeof browser>, name: string) => find(find(b.view(), "div").find((d) => d.attrs["aria-label"] === name)!, "button");
+			const pressed = (b: ReturnType<typeof browser>, name: string) => group(b, name).filter((x) => x.attrs["aria-pressed"] === "true").map((x) => find(x, "span")[0]!.textContent);
+			const chip = (b: ReturnType<typeof browser>, name: string, label: string) => group(b, name).find((x) => find(x, "span")[0]!.textContent === label)!;
+			const b = await open("#memories?profile=work&type=Reference,How-to&origin=stated,inferred");
+			expect(ids(b)).toEqual(["m2", "m3"]); // Reference or How-to, and stated or inferred: m1 (no origin) and m4 (agent) are out
+			expect(pressed(b, "Type")).toEqual(["Reference", "How-to"]);
+			expect(group(b, "Origin").map((x) => find(x, "span")[0]!.textContent)).toEqual(expect.arrayContaining(["All", "Stated by you", "Inferred by an agent", "Saved by an agent", "Not recorded"]));
+			expect(pressed(b, "Origin")).toEqual(["Stated by you", "Inferred by an agent"]);
+			// The rows fold under a summary that names the active choice (open on desktop width).
+			const sum = (x: ReturnType<typeof browser>) => find(find(x.view(), "details").find((d) => d.attrs.class === "filters")!, "summary")[0]!.textContent;
+			expect(sum(b)).toBe("Filters · Reference, How-to, Stated by you, Inferred by an agent");
+			click(chip(b, "Origin", "Stated by you")); // a second press drops one value and keeps the rest
+			expect(ids(b)).toEqual(["m3"]);
+			expect(chip(b, "Origin", "Stated by you").focused).toBe(true); // the redrawn chip keeps the keyboard focus
+			expect(b.win.location.hash).toBe("#memories?profile=work&type=Reference,How-to&origin=inferred");
+			click(chip(b, "Type", "Project note"));
+			click(chip(b, "Origin", "Saved by an agent"));
+			expect(ids(b)).toEqual(["m3", "m4"]);
+			// A row opens its record with the section's filters, and a reload restores them.
+			const again = await open(b.win.location.hash);
+			expect([ids(again), pressed(again, "Type"), pressed(again, "Origin")]).toEqual([["m3", "m4"], ["Project note", "Reference", "How-to"], ["Inferred by an agent", "Saved by an agent"]]);
+			const link = find(again.view(), "a").find((a) => a.attrs.class === "row" && a.attrs.href!.includes("/m4"))!.attrs.href;
+			expect(link).toBe("#memories/work/m4?profile=work&type=Reference,How-to,Project%20note&origin=inferred,agent");
+			// Opening it and going back keeps the filters, including a chip changed while the record is open.
+			again.go(link!);
+			for (let i = 0; i < 25; i++) await settle();
+			const close = find(again.view(), "a").find((a) => a.attrs["data-close"] !== undefined)!, back = find(again.view(), "a").find((a) => a.attrs.class === "back-btn")!;
+			expect([close.attrs.href, back.attrs.href]).toEqual(Array(2).fill("#memories?profile=work&type=Reference,How-to,Project%20note&origin=inferred,agent"));
+			click(chip(again, "Origin", "Inferred by an agent"));
+			close.on.click!();
+			expect(close.attrs.href).toBe("#memories?profile=work&type=Reference,How-to,Project%20note&origin=agent");
+			// Esc with the focus on a chip, at phone width: CSS hides Close and shows ← Back, so Esc must follow Back, keeping the filters.
+			const asLink = (a: typeof back, shown: boolean) => Object.assign(a, { getClientRects: () => (shown ? [{}] : []), click: () => { a.on.click?.(); again.go(a.attrs.href!); } });
+			asLink(close, false);
+			asLink(back, true);
+			chip(again, "Origin", "Saved by an agent").focus();
+			expect(again.key("Escape")).toBe(true);
+			for (let i = 0; i < 25; i++) await settle();
+			expect(again.win.location.hash).toBe("#memories?profile=work&type=Reference,How-to,Project%20note&origin=agent");
+			expect([ids(again), pressed(again, "Origin")]).toEqual([["m4"], ["Saved by an agent"]]);
+			click(chip(again, "Origin", "All")); // All clears the origin choice
+			expect([ids(again), again.win.location.hash]).toEqual([["m1", "m2", "m3", "m4"], "#memories?profile=work&type=Reference,How-to,Project%20note"]);
+		} finally { NODES.splice(NODES.length - added.length); }
+	});
+
 	// The pre-production review's fixes (Sol, 2026-11-12): each a write or read that must never lose or cut text.
 	const am = (b: ReturnType<typeof browser>) => (b.win as unknown as { __am: { drafts: Map<string, Record<string, unknown>> } }).__am;
 	const withNode = (node: Record<string, unknown>, content: Record<string, unknown>, extra: Api = () => undefined): Api => async (p, m, body) =>

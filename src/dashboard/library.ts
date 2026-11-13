@@ -26,6 +26,7 @@ export function libraryTab(am: Am): void {
 	const facetName = (it: J) => it.kind === "journal" ? it.agent ?? "Other agent" : typeOf(it);
 	const count = (n: number, kind: string) => `${n.toLocaleString()} ${n === 1 ? NAMES[kind]?.[0] ?? kind : (NAMES[kind]?.[1] ?? `${kind}s`).toLowerCase()}`;
 	const profileQ = (route: Route) => route.query.profile ?? null;
+	const FILTERS = ["type", "origin", "unsorted"]; // a section's filter keys in the address
 	const href = (it: J, route: Route) => am.itemHref(it, profileQ(route));
 
 	/** The items linked to `key`, by kind (sessions are only ever a source line), most recent first. */
@@ -57,7 +58,9 @@ export function libraryTab(am: Am): void {
 	};
 	const row = (ul: Node, lib: J, it: J, route: Route, selected: string | null, extra: string[] = []) => {
 		const li = el("li", ul), a = cls(el("a", li), "row");
-		a.setAttribute("href", href(it, route));
+		// Inside its own section a row keeps the section's filters, so opening a record leaves the list as it was.
+		const keep = route.tab === TABS_OF[it.kind] ? FILTERS.filter((k) => route.query[k]).map((k) => `${k}=${route.query[k]!.split(",").map(enc).join(",")}`) : [], to = href(it, route);
+		a.setAttribute("href", keep.length ? `${to}${to.includes("?") ? "&" : "?"}${keep.join("&")}` : to);
 		a.setAttribute("data-item", "");
 		if (it.key === selected) a.setAttribute("aria-current", "true");
 		const top = cls(el("span", a), "row-top");
@@ -113,7 +116,8 @@ export function libraryTab(am: Am): void {
 		try { plain = decodeURIComponent(word); } catch { /* a malformed escape ("100%") keeps the path text as it is */ }
 		return `${host}: ${plain.replace(/[-_]+/g, " ").replace(/\.[a-z0-9]+$/i, "").slice(0, 40)}`;
 	};
-	const ORIGIN: Record<string, string> = { stated: "Stated by you", inferred: "Inferred by an agent", agent: "Saved by an agent", migration: "Imported", maintenance: "Kept by tidy-up" };
+	// One label per origin, for the record's From chip and the sections' Origin filter alike.
+	const ORIGIN: Record<string, string> = { stated: "Stated by you", inferred: "Inferred by an agent", agent: "Saved by an agent", import: "Imported", migration: "Imported", maintenance: "Kept by tidy-up" };
 	const fromRow = (rail: Node, sec: Node | null, lib: J, it: J, r: J) => {
 		const n = r?.node ?? {}, ev: J[] = Array.isArray(r?.evidence?.items) ? r.evidence.items : [];
 		const chips: [string, string, string, string?][] = []; // [text, href, kind, detail on hover]
@@ -352,10 +356,13 @@ export function libraryTab(am: Am): void {
 		const version = am.pageVersion;
 		box.replaceChildren();
 		const head = cls(el("header", box), "detail-head");
-		const closeTo = `#${route.tab}${profileQ(route) ? `?profile=${enc(profileQ(route)!)}` : ""}`;
+		// Back to the list keeps the address's query (profile and the section's filters), read when used: chips change it in place.
+		const closeTo = () => { const cur = String(win.location.hash ?? ""), i = cur.indexOf("?"); return `#${route.tab}${i < 0 ? "" : cur.slice(i)}`; };
+		const toList = (a: Node) => { a.setAttribute("href", closeTo()); a.addEventListener("click", () => a.setAttribute("href", closeTo())); };
 		// On a phone the detail is a full-screen view: a clear way back to the list, which kept its place underneath.
 		const back = cls(el("a", head, "← Back"), "back-btn");
-		back.setAttribute("href", closeTo);
+		back.setAttribute("data-back", "");
+		toList(back);
 		cls(el("span", head, typeOf(it)), `kind t-${it.kind}-b`);
 		const h = el("h2", head);
 		am.title(it, h);
@@ -386,7 +393,7 @@ export function libraryTab(am: Am): void {
 		}
 		if (it.medium) cls(el("span", meta, "project likely"), "hint").setAttribute("title", "Placed in its project from a medium-confidence alias.");
 		const close = cls(el("a", head, "Close"), "close");
-		close.setAttribute("href", closeTo);
+		toList(close);
 		close.setAttribute("data-close", "");
 		// The last write on this page (Forgot, Pinned…) and its Undo, shown before and whatever the record read returns: a
 		// forgotten record no longer reads, and its Undo must still be there.
@@ -611,7 +618,10 @@ export function libraryTab(am: Am): void {
 		const head = cls(el("div", sideCol), "list-head");
 		const h = el("h2", head, title);
 		const total = cls(el("span", head), "count");
-		const facetBox = el("div", sideCol);
+		// The chip rows fold under one summary below desktop width, so the list starts near the top of a phone screen.
+		const filters = cls(el("details", sideCol), "filters"), filterSum = el("summary", filters, "Filters");
+		if ((Number(win.innerWidth) || 1440) >= 901) filters.setAttribute("open", "");
+		const facetBox = el("div", filters), originBox = el("div", filters);
 		const q = el("input", sideCol);
 		q.setAttribute("type", "search");
 		q.setAttribute("placeholder", `Filter ${title.toLowerCase()}`);
@@ -621,26 +631,52 @@ export function libraryTab(am: Am): void {
 		const ul = cls(el("ul", listCol), "rows");
 		ul.setAttribute("data-list", "");
 		const pages = el("div", listCol), status = cls(el("p", listCol), "muted");
-		let facet = route.query.type ?? "", shownDetail = "", shownLinks = "", detailH: Node | null = null;
+		let shownDetail = "", shownLinks = "", detailH: Node | null = null;
+		// Type and origin chips are multi-select (none picked is all); each choice lives in the address as a comma list (?type=Rule,Preference).
+		const listQ = (v?: string) => (v ?? "").split(",").filter(Boolean);
+		const picked = { type: listQ(route.query.type), origin: listQ(route.query.origin) };
+		const originOf = (it: J) => String(it.origin || "unknown");
+		const toggle = (key: "type" | "origin", id: string) => {
+			const now = picked[key];
+			picked[key] = !id ? [] : now.includes(id) ? now.filter((x) => x !== id) : [...now, id];
+			// The address keeps every other key (profile, unsorted) and the record path, so a reload or a shared link restores the filters.
+			if (picked[key].length) route.query[key] = picked[key].join(","); else delete route.query[key];
+			const cur = String(win.location.hash ?? ""), i = cur.indexOf("?"), path = i < 0 ? cur : cur.slice(0, i);
+			const kept = (i < 0 ? "" : cur.slice(i + 1)).split("&").filter((kv) => kv && kv.split("=")[0] !== key);
+			if (picked[key].length) kept.push(`${key}=${picked[key].map(enc).join(",")}`);
+			try { win.history?.replaceState?.(null, "", kept.length ? `${path}?${kept.join("&")}` : path); } catch { /* the filter still applies */ }
+			ul.replaceChildren(); // rows redraw with links that carry the new filters
+			paint();
+		};
+		const tally = (all: J[], of: (it: J) => string) => {
+			const counts = new Map<string, number>();
+			for (const it of all) counts.set(of(it), (counts.get(of(it)) ?? 0) + 1);
+			return [...counts].sort((a, b) => b[1] - a[1]);
+		};
 		const paint = () => {
 			if (version !== am.pageVersion) return;
 			const lib: J = am.library(only, paint);
 			// Projects list only those with something in memory unless every known repo is asked for.
 			const all: J[] = lib.list[kind] ?? [];
 			total.textContent = all.length ? all.length.toLocaleString() : "";
-			if (facetOf) {
-				const counts = new Map<string, number>();
-				for (const it of all) counts.set(facetOf(it), (counts.get(facetOf(it)) ?? 0) + 1);
-				facetBox.replaceChildren();
-				const rows = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([id, value]) => ({ id, label: id, value, kind: subOf(id) }));
-				if (rows.length > 1) am.facets(facetBox, rows, facet, (id) => { facet = id; paint(); });
-			}
+			// Every sub-type, then every origin, each with its count; a row with one value has nothing to choose and stays hidden.
+			// A picked value no record has (an old link) is ignored, so it never hides everything behind a row that is not shown.
+			const types = facetOf ? tally(all, facetOf) : [], origins = tally(all, originOf);
+			const tSet = new Set(picked.type.filter((t) => types.some(([id]) => id === t))), oSet = new Set(picked.origin.filter((o) => origins.some(([id]) => id === o)));
+			facetBox.replaceChildren();
+			originBox.replaceChildren();
+			if (types.length > 1) am.facets(facetBox, types.map(([id, value]) => ({ id, label: id, value, kind: subOf(id) })), [...tSet], (id) => toggle("type", id), all.length, "Type");
+			const originLabel = (id: string) => id === "unknown" ? "Not recorded" : ORIGIN[id] ?? id;
+			if (origins.length > 1) am.facets(originBox, origins.map(([id, value]) => ({ id, label: originLabel(id), value })), [...oSet], (id) => toggle("origin", id), all.length, "Origin");
+			filters.hidden = types.length < 2 && origins.length < 2;
+			const active = [...tSet, ...[...oSet].map(originLabel)];
+			filterSum.textContent = active.length ? `Filters · ${active.join(", ")}` : "Filters";
 			const needle = String(q.value ?? "").trim().toLowerCase();
 			const unsorted = route.query.unsorted === "1"; // the Projects page's "N unsorted": records with no project
-			const shown = all.filter((it) => (!facet || facetOf?.(it) === facet) && (!unsorted || !neighbours(lib, it.key).get("project")?.length)
+			const shown = all.filter((it) => (!tSet.size || tSet.has(facetOf!(it))) && (!oSet.size || oSet.has(originOf(it))) && (!unsorted || !neighbours(lib, it.key).get("project")?.length)
 				&& (!needle || `${it.title} ${it.name} ${it.scope ?? ""}`.toLowerCase().includes(needle)));
 			ul.replaceChildren();
-			am.pager(pages, shown, (it) => row(ul, lib, it, route, selected), 40, `${kind}|${only}|${facet}|${needle}`);
+			am.pager(pages, shown, (it) => row(ul, lib, it, route, selected), 40, `${kind}|${only}|${[...tSet].sort()}|${[...oSet].sort()}|${unsorted}|${needle}`);
 			status.textContent = lib.loading && !all.length ? "Loading…" : lib.missing ? "This server cannot list records yet." : lib.errors.length ? `Could not read ${lib.errors.join("; ")}.`
 				: !all.length ? `No ${title.toLowerCase()} yet.` : !shown.length ? "Nothing matches." : lib.loading ? "Still loading…" : "";
 			if (!all.length && lib.loading) am.loading(ul, 6);

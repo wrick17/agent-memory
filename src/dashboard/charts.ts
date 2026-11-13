@@ -102,8 +102,13 @@ export function chartsTab(am: Am): void {
 		return box;
 	};
 
-	/** A breakdown that is also a filter: one proportional bar of segments, then the same groups as toggle buttons with counts. */
-	const facets = (parent: Node, rows: { id: string; label: string; value: number; kind?: string }[], current: string, pick: (id: string) => void, all?: number) => {
+	/**
+	 * A breakdown that is also a filter: one proportional bar of segments, then the same groups as toggle buttons with counts.
+	 * `current` a string is single-select (a second click clears it); an array is multi-select: the caller toggles the picked id,
+	 * and "" (All) clears. `name` labels the button group for screen readers.
+	 */
+	let refocus = ""; // the chip just pressed: its row redraws inside pick(), and the new button takes the focus back
+	const facets = (parent: Node, rows: { id: string; label: string; value: number; kind?: string }[], current: string | readonly string[], pick: (id: string) => void, all?: number, name?: string) => {
 		const box = cls(el("div", parent), "facets");
 		const total = rows.reduce((t, r) => t + r.value, 0) || 1;
 		const strip = cls(el("div", box), "facet-strip");
@@ -112,16 +117,20 @@ export function chartsTab(am: Am): void {
 		rows.forEach((r, i) => cls(el("i", strip), `t-${r.kind ?? `n${i % 6}`}`).setAttribute("style", `flex:${r.value / total}`));
 		const btns = cls(el("div", box), "facet-btns");
 		btns.setAttribute("role", "group");
+		if (name) btns.setAttribute("aria-label", name);
+		const on = (id: string) => typeof current === "string" ? id === current : id ? current.includes(id) : !current.length;
 		// "All" is the caller's own total when groups overlap (one project in several workspaces), else the sum.
 		for (const r of [{ id: "", label: "All", value: all ?? rows.reduce((t, x) => t + x.value, 0) }, ...rows]) {
 			const b = el("button", btns);
 			b.setAttribute("type", "button");
-			b.setAttribute("aria-pressed", String(r.id === current));
+			b.setAttribute("aria-pressed", String(on(r.id)));
 			const kind = (r as { kind?: string }).kind;
 			if (r.id) cls(el("i", b), `sw t-${kind ?? `n${rows.indexOf(r as never) % 6}`}`);
 			el("span", b, r.label);
 			cls(el("span", b, String(r.value)), "muted");
-			b.addEventListener("click", () => pick(r.id === current ? "" : r.id));
+			const key = `${name ?? ""}\u0000${r.id}`;
+			if (key === refocus) b.focus();
+			b.addEventListener("click", () => { refocus = key; try { pick(typeof current === "string" && r.id === current ? "" : r.id); } finally { refocus = ""; } });
 		}
 		return box;
 	};
