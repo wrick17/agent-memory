@@ -8,6 +8,17 @@ import type { Am, Failure, J, Node, Route } from "./am";
 export function libraryTab(am: Am): void {
 	const { el, enc, call, note, why, win } = am;
 	const cls = (e: Node, c: string) => { e.setAttribute("class", c); return e; };
+	// The reading pane sticks below the header, but it first sits lower (under a project's top card or the Plain English bar).
+	// --pane-top is its real top, so its height (style.ts) always ends on screen and its own scroll works without the page's.
+	let fitting = 0;
+	const fitPane = () => { if (!fitting) fitting = win.requestAnimationFrame(() => {
+		fitting = 0;
+		const p = am.doc.querySelector(".pslot>.pcontent, .lib>.lib-detail");
+		if (p) am.doc.documentElement.style.setProperty("--pane-top", `${Math.max(0, Math.round(p.getBoundingClientRect().top))}px`);
+	}); };
+	win.addEventListener("scroll", fitPane, { passive: true });
+	win.addEventListener("resize", fitPane);
+	if (typeof win.ResizeObserver === "function") new win.ResizeObserver(fitPane).observe(am.doc.body); // pages drawing in move it
 	const JOURNAL_PAGES = 400; // 25 entries a page
 	const NAMES: Record<string, [string, string]> = { memory: ["memory", "Memories"], learning: ["learning", "Learnings"], journal: ["journal", "Journals"], person: ["person", "People"],
 		project: ["project", "Projects"] };

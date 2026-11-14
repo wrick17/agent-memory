@@ -189,7 +189,7 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 .lib-side{display:grid;gap:.15rem;align-content:start;min-width:0}.lib-list{min-width:0}
 :root[data-width=desktop] .lib{grid-template-columns:minmax(340px,2fr) minmax(0,3fr);grid-template-areas:"side detail" "list detail"}
 :root[data-width=desktop] .lib-side{grid-area:side}:root[data-width=desktop] .lib-list{grid-area:list}
-:root[data-width=desktop] .lib>.lib-detail{grid-area:detail;position:sticky;top:4.2rem;max-height:calc(100vh - 5.5rem);overflow:auto}
+:root[data-width=desktop] .lib>.lib-detail{grid-area:detail;position:sticky;top:4.2rem;max-height:calc(100vh - max(var(--pane-top,4.2rem),4.2rem) - 1.3rem);overflow:auto}
 @media (min-width:1600px){:root[data-width=desktop] .lib{grid-template-columns:230px minmax(380px,1.2fr) minmax(0,2fr);grid-template-areas:"side list detail"}
 :root[data-width=desktop] .lib-side{position:sticky;top:4.2rem}:root[data-width=desktop] .lib-side .facet-btns{flex-direction:column;align-items:stretch}
 :root[data-width=desktop] .lib-side .facet-btns button{justify-content:flex-start}:root[data-width=desktop] .lib-side .facet-btns button .muted{margin-left:auto}}
@@ -209,7 +209,7 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 .psplit{display:grid;grid-template-columns:minmax(0,1fr);gap:.9rem 1.25rem;align-items:start}.plist,.pslot{min-width:0}
 :root[data-width=desktop] .psplit{grid-template-columns:minmax(320px,2fr) minmax(0,3fr)}
 :root[data-width=desktop] .pslot{position:sticky;top:4.2rem}
-:root[data-width=desktop] .pslot>.pcontent{max-height:calc(100vh - 5.5rem);overflow:auto}
+:root[data-width=desktop] .pslot>.pcontent{max-height:calc(100vh - max(var(--pane-top,4.2rem),4.2rem) - 1.3rem);overflow:auto}
 :root:not([data-width=desktop]) .pslot{display:none}
 :root:not([data-width=desktop]) .psplit.open .pslot{display:block}
 :root:not([data-width=desktop]) .psplit.open .pcontent{position:fixed;z-index:25;inset:0;overflow:auto;border:0;border-radius:0;padding:.75rem 1rem 2rem}
