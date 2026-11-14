@@ -199,6 +199,21 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 :root:not([data-width=desktop]) .lib.open>.lib-detail{inset:0;border:0;padding:.75rem 1rem 2rem}
 :root[data-width=tablet] .lib.open>.lib-detail{padding:1rem 1.5rem 2.5rem}
 :root:not([data-width=desktop]) body:has(.lib.open){overflow:hidden}
+/* A project's page: a top card (heading and counts beside the activity chart, the same height), a tab per kind of record,
+   then the list beside the opened record. Below desktop width the list stands alone and an opened record is full screen. */
+.ptop{display:grid;grid-template-columns:minmax(0,1fr);gap:.8rem 2rem;background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:1.1rem 1.4rem;margin:0 0 .9rem}
+:root[data-width=desktop] .ptop{grid-template-columns:minmax(0,1fr) minmax(0,1.5fr)}
+.ptop-main{display:flex;flex-direction:column;min-width:0}.ptop-main .detail-head{margin:0}.ptop-main>.hub-stats{margin:.7rem 0 0}
+.ptop-chart{display:flex;flex-direction:column;justify-content:flex-end;min-width:0}.ptop-chart h3{margin:0 0 .4rem}
+#view .ptabs{margin:0 0 .8rem}#view .ptabs a{padding:.35rem .9rem;font-weight:600}
+.psplit{display:grid;grid-template-columns:minmax(0,1fr);gap:.9rem 1.25rem;align-items:start}.plist,.pslot{min-width:0}
+:root[data-width=desktop] .psplit{grid-template-columns:minmax(320px,2fr) minmax(0,3fr)}
+:root[data-width=desktop] .pslot{position:sticky;top:4.2rem}
+:root[data-width=desktop] .pslot>.pcontent{max-height:calc(100vh - 5.5rem);overflow:auto}
+:root:not([data-width=desktop]) .pslot{display:none}
+:root:not([data-width=desktop]) .psplit.open .pslot{display:block}
+:root:not([data-width=desktop]) .psplit.open .pcontent{position:fixed;z-index:25;inset:0;overflow:auto;border:0;border-radius:0;padding:.75rem 1rem 2rem}
+:root:not([data-width=desktop]) body:has(.psplit.open){overflow:hidden}
 .back-btn{display:none}
 :root:not([data-width=desktop]) .back-btn{display:inline-flex;align-items:center;min-height:40px;grid-column:1/-1;font-weight:600;margin:-.2rem 0 .2rem}
 :root:not([data-width=desktop]) .detail-head .close{display:none}

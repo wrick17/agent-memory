@@ -1260,7 +1260,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 			// The workspace is its own entity: its name is its title on its page, on a record's chip and on the Map.
 			all.go(ws.attrs.href!);
 			for (let i = 0; i < 5; i++) await settle();
-			const page = find(all.view(), "section").find((x) => String(x.attrs.class).startsWith("lib-detail"))!;
+			const page = find(all.view(), "section").find((x) => x.attrs.class === "ppage")!;
 			expect([find(page, "h2")[0]!.textContent, find(page, "span").find((x) => String(x.attrs.class).startsWith("kind"))!.textContent]).toEqual(["Sequoia", "Workspace"]);
 			all.go("#memories/work/t2");
 			for (let i = 0; i < 5; i++) await settle();
@@ -1280,7 +1280,7 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		expect(text(b.view())).not.toMatch(/Synthetic|eureka|Show all known repos/i); // fixture projects are dropped, even with a real-looking key
 		b.go(cards[0]!.attrs.href!);
 		for (let i = 0; i < 5; i++) await settle();
-		const detail = find(b.view(), "section").find((x) => String(x.attrs.class).startsWith("lib-detail"))!;
+		const detail = find(b.view(), "section").find((x) => x.attrs.class === "ppage")!;
 		expect(text(detail)).toContain("When work happened");
 		const weeks = find(detail, "figure").find((f) => f.attrs.class === "chart daily")!; // stacked day bars, as on Home
 		expect(text(find(weeks, "figcaption")[0]!)).toMatch(/1 journal.*1 memory.*1 learning.*added in the last \d+ weeks/);
@@ -1290,6 +1290,22 @@ describe("dashboard library: sections, detail, connections, map", () => {
 		expect(text(rel)).not.toContain("Ana"); // People is off the dashboard for now
 		expect(find(detail, "a").find((a) => a.textContent === "Open on GitHub ↗")!.attrs.href).toBe("https://github.com/jdoe/recall-engine");
 		expect(find(b.view(), "a").find((a) => a.textContent === "← All projects")).toBeDefined();
+		// A tab per kind of record, then that kind's whole list beside a panel where a record opens, not on its own tab.
+		const tabs = find(detail, "nav").find((n) => n.attrs.class === "ptabs")!;
+		expect(find(tabs, "a").map((a) => [text(a).trim(), a.attrs["aria-current"]])).toEqual([["Journals 1", "page"], ["Memories 1", undefined], ["Learnings 1", undefined]]);
+		b.go(find(tabs, "a")[1]!.attrs.href!);
+		for (let i = 0; i < 5; i++) await settle();
+		const list = find(b.view(), "section").find((x) => x.attrs.class === "plist")!;
+		const rec = find(list, "a").find((a) => a.attrs.class === "row")!;
+		expect(rec.attrs.href).toMatch(/^#projects\/[^?]+\?show=memory&open=/);
+		const projectHash = rec.attrs.href!.replace(/&open=.*$/, "");
+		b.go(rec.attrs.href!);
+		for (let i = 0; i < 5; i++) await settle();
+		const panel = find(b.view(), "section").find((x) => x.attrs.class === "lib-detail pcontent")!;
+		expect(find(panel, "h2")[0]!.textContent).toBe(text(find(rec, "span").find((x) => x.attrs.class === "row-title")!).trim());
+		expect(find(b.view(), "section").some((x) => x.attrs.class === "ppage")).toBe(true); // the project stays
+		expect(find(panel, "a").find((a) => a.attrs["data-close"] !== undefined)!.attrs.href).toBe(projectHash); // back to the Memories tab
+		expect(find(b.view(), "a").find((a) => a.attrs.class === "row" && a.attrs.href === rec.attrs.href)!.attrs["aria-current"]).toBe("true");
 	});
 
 	it("sets the width mode the layout follows, and gives a phone's full-screen detail a way back to the list", async () => {
