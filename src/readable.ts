@@ -7,7 +7,7 @@
 // kept out of exports) and the Worker makes every outside call through egress.ts.
 import { b64urlBytes, b64urlJson } from "./auth";
 import { sha256 } from "./domain/ids";
-import { MAX_TEXT, MAX_TEXTS, MODEL, PROMPT, PROMPT_VERSION, rewriteInput, rewriteItems, rewriteResults, SCHEMA, type RewriteItem } from "./domain/rewrite";
+import { EFFORT, inChunks, MAX_TEXT, MAX_TEXTS, MODEL, PROMPT, PROMPT_VERSION, rewriteInput, rewriteItems, rewriteResults, SCHEMA, type RewriteItem } from "./domain/rewrite";
 import { egressFetch } from "./egress";
 
 declare global { interface Env { READABLE_REWRITES?: string; READABLE_REWRITER_URL?: string; READABLE_REWRITER_TOKEN?: string } }
@@ -257,17 +257,17 @@ type Outcome = { state: "ok" } | { state: "limit" | "model_unavailable" | "not_c
 let formatAccepted = true; // shortcut: per isolate; a rejected text.format falls back to defensive parsing until the isolate restarts
 
 /** One Responses call for a batch of texts, read as a stream to response.completed. Malformed results are dropped. */
-async function viaChatgpt(env: Env, token: string, items: RewriteItem[]): Promise<{ results: Map<number, string> } & Outcome> {
+async function viaChatgpt(env: Env, token: string, items: RewriteItem[], signal: AbortSignal): Promise<{ results: Map<number, string> } & Outcome> {
 	const body = { model: MODEL, instructions: PROMPT, input: [{ role: "user", content: rewriteInput(items) }],
-		reasoning: { effort: "low" }, store: false, stream: true,
+		reasoning: { effort: EFFORT }, store: false, stream: true,
 		...(formatAccepted ? { text: { format: { type: "json_schema", name: "rewrites", strict: true, schema: SCHEMA } } } : {}) };
-	const res = await egressFetch(env, `${RESOURCE}/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify(body) });
+	const res = await egressFetch(env, `${RESOURCE}/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify(body), signal });
 	const none = new Map<number, string>();
 	if (!res.ok) {
 		const j = await jsonOf(res), err = (j.error ?? {}) as { code?: unknown; param?: unknown }, code = typeof err.code === "string" ? err.code : null, param = typeof err.param === "string" ? err.param : "";
 		logIssue("responses", res, { code, param: param || null });
 		if (res.status === 429 || code === LIMIT_CODE) return { results: none, state: "limit", message: "ChatGPT plan limit reached." };
-		if (res.status === 400 && formatAccepted && param.startsWith("text")) { formatAccepted = false; return viaChatgpt(env, token, items); }
+		if (res.status === 400 && formatAccepted && param.startsWith("text")) { formatAccepted = false; return viaChatgpt(env, token, items, signal); }
 		if (param === "model" || code === "model_not_found") { await vault(env).readable({ op: "model", available: false }); return { results: none, state: "model_unavailable", message: `${MODEL} is not available to this ChatGPT account.` }; }
 		return { results: none, state: "error", message: `ChatGPT returned ${res.status}${code ? ` (${code})` : ""}.` };
 	}
@@ -305,12 +305,12 @@ const outputText = (r: Record<string, unknown>) => (Array.isArray(r.output) ? r.
 /** A batch takes 15 to 25 seconds on the rewriter, longer when another batch is ahead of it in its queue. */
 const REWRITER_TIMEOUT_MS = 90_000;
 /** One POST of the batch to the rewriter service (local/rewriter.mjs), which answers {results: [{id, rewrite}]}. */
-async function viaRewriter(env: Env, items: RewriteItem[]): Promise<{ results: Map<number, string> } & Outcome> {
+async function viaRewriter(env: Env, items: RewriteItem[], signal: AbortSignal): Promise<{ results: Map<number, string> } & Outcome> {
 	const none = new Map<number, string>();
 	let res: Response;
 	try {
 		res = await egressFetch(env, env.READABLE_REWRITER_URL!, { method: "POST", headers: { authorization: `Bearer ${env.READABLE_REWRITER_TOKEN}`, "content-type": "application/json" },
-			body: JSON.stringify({ texts: items }), signal: AbortSignal.timeout(REWRITER_TIMEOUT_MS) });
+			body: JSON.stringify({ texts: items }), signal: AbortSignal.any([signal, AbortSignal.timeout(REWRITER_TIMEOUT_MS)]) });
 	} catch (e) {
 		const timedOut = (e as Error).name === "TimeoutError";
 		logIssue("rewriter", null, { error: timedOut ? "timeout" : String((e as Error).message).slice(0, 200) });
@@ -346,16 +346,25 @@ export async function readableApi(request: Request, env: Env, url: URL): Promise
 		const missing = items.filter((t) => cached[keyOf.get(t.id)!] === undefined);
 		if (!missing.length) return reply({ results, state: "ok" });
 		let out: Awaited<ReturnType<typeof viaRewriter>>;
-		if (rewriterOn(env)) out = await viaRewriter(env, missing);
+		// The browser's hang-up (request.signal) aborts the outbound call, so the rewriter stops its Codex run. Workers fire it only
+		// with the enable_request_signal flag (default from compatibility date 2026-11-17); before that it never aborts.
+		const hangUp = request.signal;
+		if (rewriterOn(env)) out = await viaRewriter(env, missing, hangUp);
 		else {
 			const status = await v.readable({ op: "status" }) as Status;
 			if (status.model === false) return reply({ results, state: "model_unavailable", message: `${MODEL} is not available to this ChatGPT account.` });
 			let token: string | null;
 			try { token = await v.readable({ op: "token" }) as string | null; } catch { return reply({ results, state: "error", message: "Could not renew the ChatGPT sign-in. Try again later." }); }
 			if (!token) return reply({ results, state: "not_connected", message: "Connect ChatGPT to see rewrites." });
-			try { out = await viaChatgpt(env, token, missing); } catch (e) { logIssue("responses", null, { error: String((e as Error).message).slice(0, 200) }); return reply({ results, state: "error", message: "Could not reach ChatGPT." }); }
+			// Parallel chunks, as the rewriter runs them; the first chunk that did not finish sets the state.
+			const bearer = token;
+			try {
+				const parts = await inChunks(missing, (chunk) => viaChatgpt(env, bearer, chunk, hangUp));
+				out = { ...(parts.find((p) => p.state !== "ok") ?? { state: "ok" as const }), results: new Map(parts.flatMap((p) => [...p.results])) };
+			} catch (e) { logIssue("responses", null, { error: String((e as Error).message).slice(0, 200) }); return reply({ results, state: "error", message: "Could not reach ChatGPT." }); }
 		}
 		const fresh = missing.filter((t) => out.results.has(t.id)).map((t) => ({ id: t.id, rewrite: out.results.get(t.id)! }));
+		if (hangUp.aborted) return reply({ results, state: "error", message: "Cancelled." }); // nobody reads it; nothing is cached
 		if (fresh.length) await v.readable({ op: "put", epoch, rows: fresh.map((r) => ({ key: keyOf.get(r.id)!, rewrite: r.rewrite })) });
 		return reply({ results: [...results, ...fresh], ...(out.state === "ok" ? { state: "ok" } : { state: out.state, message: out.message }) });
 	}

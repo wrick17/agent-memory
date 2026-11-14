@@ -1549,10 +1549,36 @@ describe("readable rewrites (local option)", () => {
 		expect((await rewrite(device)).status).toBe(403);
 		expect(await (await hit(withRewriter, "/api/readable", { headers: auth(session) })).json()).toMatchObject({ connected: true, backend: "rewriter" });
 		expect((await rewrite(session, JSON.stringify({ texts: [{ id: 1, text }], prompt: "x" }))).status).toBe(400);
-		expect((await rewrite(session, JSON.stringify({ texts: Array.from({ length: 9 }, (_, id) => ({ id, text })) }))).status).toBe(400);
+		expect((await rewrite(session, JSON.stringify({ texts: Array.from({ length: 25 }, (_, id) => ({ id, text })) }))).status).toBe(400);
 		expect(calls).toHaveLength(0);
 		for (let i = 0; i < 2; i++) expect(await (await rewrite(session)).json()).toEqual({ results: [{ id: 7, rewrite: `plain ${text}` }], state: "ok" });
 		expect(calls).toHaveLength(1);
+	});
+
+	it("aborts the outbound rewrite when the browser hangs up, and caches nothing", async () => {
+		let outbound: AbortSignal | undefined, calls = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url !== rewriterUrl) throw new Error(`unexpected egress to ${url}`);
+			calls++;
+			outbound = init?.signal ?? undefined;
+			const body = JSON.parse(String(init?.body)) as { texts: { id: number; text: string }[] };
+			// The first call runs until it is aborted; the second answers at once.
+			if (calls === 1) return new Promise<Response>((_r, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+			return Response.json({ results: body.texts.map((t) => ({ id: t.id, rewrite: `plain ${t.text}` })) });
+		});
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const body = JSON.stringify({ texts: [{ id: 1, text: `entry ${crypto.randomUUID()}` }] });
+		const post = (signal?: AbortSignal) => hit(withRewriter, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) }, body, ...(signal ? { signal } : {}) });
+		const browser = new AbortController(), pending = post(browser.signal);
+		await vi.waitFor(() => expect(outbound).toBeDefined()); // the rewrite is out
+		browser.abort();
+		expect(await (await pending).json()).toMatchObject({ results: [], state: "error" });
+		expect(outbound!.aborted).toBe(true);
+		// Nothing was cached: the next request generates again.
+		expect(await (await post()).json()).toMatchObject({ results: [{ id: 1 }], state: "ok" });
+		expect(calls).toBe(2);
 	});
 
 	it("rejects an unknown or reused sign-in state at /auth/callback", async () => {

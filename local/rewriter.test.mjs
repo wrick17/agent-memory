@@ -2,29 +2,31 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { after, describe, it } from "node:test";
-import { codexRewrite, handler, hourlyCap } from "./rewriter.mjs";
-import { MAX_TEXT, MAX_TEXTS, PROMPT, rewriteResults } from "../src/domain/rewrite.ts";
+import { codexRewrite, handler, hourlyCap, MAX_PENDING, MAX_RUNS, slots } from "./rewriter.mjs";
+import { CHUNK_CONCURRENCY, CHUNK_TEXTS, MAX_TEXT, MAX_TEXTS, PROMPT, rewriteResults } from "../src/domain/rewrite.ts";
 
 const TOKEN = "t".repeat(40);
 const servers = [];
 after(() => { for (const s of servers) s.close(); });
 
 /** A listening rewriter whose runner answers every text with "r<id>" after `ms`, recording each prompt and the peak concurrency. */
-async function rewriter({ cap = hourlyCap(), ms = 0 } = {}) {
-	const seen = { prompts: [], running: 0, peak: 0 };
-	const runner = { exec: async ({ prompt }) => {
+async function rewriter({ cap = hourlyCap(), ms = 0, runs = slots(MAX_RUNS) } = {}) {
+	const seen = { prompts: [], running: 0, peak: 0, aborted: 0 };
+	// A text "slow" runs for 10 s unless its caller hangs up; an abort ends the run as a killed Codex child would.
+	const runner = { exec: async ({ prompt, signal }) => {
 		seen.prompts.push(prompt);
 		seen.peak = Math.max(seen.peak, ++seen.running);
-		await new Promise((r) => setTimeout(r, ms));
+		await new Promise((r) => { const t = setTimeout(r, prompt.includes('"slow"') ? 10_000 : ms); signal?.addEventListener("abort", () => { clearTimeout(t); seen.aborted++; r(); }, { once: true }); });
 		seen.running--;
+		if (signal?.aborted) return { kind: "runtime_error" };
 		const texts = JSON.parse(prompt.slice(prompt.indexOf("<texts>\n") + 8, prompt.lastIndexOf("\n</texts>")));
 		return { kind: "ok", part: { results: texts.map((t) => ({ id: t.id, rewrite: `r${t.id}` })) } };
 	} };
-	const server = http.createServer(handler({ token: TOKEN, rewrite: codexRewrite(runner), cap, log: () => {} })).listen(0, "127.0.0.1");
+	const server = http.createServer(handler({ token: TOKEN, rewrite: codexRewrite(runner), cap, runs, log: () => {} })).listen(0, "127.0.0.1");
 	servers.push(server);
 	await new Promise((r) => server.once("listening", r));
 	const url = `http://127.0.0.1:${server.address().port}/v1/rewrite`;
-	const post = (body, token = TOKEN) => fetch(url, { method: "POST", headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) });
+	const post = (body, token = TOKEN, signal) => fetch(url, { method: "POST", headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body), signal });
 	return { post, seen };
 }
 const texts = (n, text = "some long text") => ({ texts: Array.from({ length: n }, (_, id) => ({ id, text })) });
@@ -57,11 +59,55 @@ describe("rewriter service", () => {
 		assert.ok(Number(limited.headers.get("retry-after")) > 0);
 	});
 
-	it("runs one batch at a time and answers every queued request", async () => {
+	it("runs requests concurrently, at most MAX_RUNS Codex runs at once across them, and answers each", async () => {
 		const { post, seen } = await rewriter({ ms: 50 });
-		const replies = await Promise.all([post(texts(1)), post(texts(2)), post(texts(1))]);
-		assert.deepEqual(replies.map((r) => r.status), [200, 200, 200]);
-		assert.equal(seen.peak, 1);
+		const replies = await Promise.all(Array.from({ length: MAX_RUNS + 4 }, () => post(texts(1))));
+		assert.deepEqual(replies.map((r) => r.status), Array(MAX_RUNS + 4).fill(200));
+		assert.equal(seen.peak, MAX_RUNS);
+	});
+
+	it("answers 503 with retry-after once MAX_PENDING requests wait or run", async () => {
+		const { post } = await rewriter({ ms: 150 });
+		const held = Array.from({ length: MAX_PENDING }, () => post(texts(1)));
+		await new Promise((r) => setTimeout(r, 30));
+		const busy = await post(texts(1));
+		assert.deepEqual([busy.status, Number(busy.headers.get("retry-after")) > 0], [503, true]);
+		assert.deepEqual((await Promise.all(held)).map((r) => r.status), Array(MAX_PENDING).fill(200));
+	});
+
+	it("skips a waiting request whose caller hung up before it reached Codex", async () => {
+		const { post, seen } = await rewriter({ ms: 150, runs: slots(1) });
+		const tick = () => new Promise((r) => setTimeout(r, 30));
+		const first = post(texts(1));
+		await tick(); // the first batch is running
+		const abort = new AbortController(), dropped = post(texts(1), TOKEN, abort.signal).catch(() => "aborted");
+		await tick(); // the second is queued behind it
+		abort.abort();
+		assert.equal(await dropped, "aborted");
+		assert.equal((await first).status, 200);
+		await tick();
+		assert.equal(seen.prompts.length, 1, "the hung-up batch never reached Codex");
+	});
+
+	it("splits a full request into parallel chunks, at most three at once, and answers once with every result", async () => {
+		const { post, seen } = await rewriter({ ms: 40 });
+		const r = await post(texts(MAX_TEXTS));
+		assert.equal(r.status, 200);
+		assert.deepEqual((await r.json()).results.map((x) => x.id), Array.from({ length: MAX_TEXTS }, (_, i) => i));
+		assert.deepEqual([seen.prompts.length, seen.peak], [MAX_TEXTS / CHUNK_TEXTS, CHUNK_CONCURRENCY]);
+	});
+
+	it("stops every running chunk of a request whose caller hung up, starts no more, and leaves other requests running", async () => {
+		const { post, seen } = await rewriter();
+		const tick = () => new Promise((r) => setTimeout(r, 30));
+		const abort = new AbortController(), slow = post(texts(MAX_TEXTS, "slow"), TOKEN, abort.signal).catch(() => "aborted");
+		await tick(); // the slow request's chunks are running
+		assert.equal((await post(texts(1))).status, 200, "another request runs beside it");
+		abort.abort();
+		assert.equal(await slow, "aborted");
+		await tick(); // the server sees the hang-up
+		assert.equal(seen.aborted, CHUNK_CONCURRENCY, "every running chunk was stopped");
+		assert.equal(seen.prompts.length, CHUNK_CONCURRENCY + 1, "no later chunk of the stopped request started");
 	});
 });
 

@@ -452,7 +452,7 @@ describe("confined runtime", () => {
 		process.env.HOME = home; // os.homedir() follows HOME, so the canaries and home entries are the synthetic ones
 		globalThis.fetch = async () => new Response(""); // the outside network control
 		try {
-			const run = async (authReadable) => {
+			const run = async (authReadable, curl) => {
 				const calls = [];
 				let config = "";
 				const exec = async (_cmd, args, opts) => {
@@ -462,6 +462,7 @@ describe("confined runtime", () => {
 					calls.push({ cwd: opts.cwd, inner });
 					if (inner[0] === "/bin/echo") return { status: 0, stdout: `${inner[1]}\n`, stderr: "" };
 					if (authReadable && inner[1] === auth) return { status: 0, stdout: "{}", stderr: "" };
+					if (curl && inner[0] === "/usr/bin/curl") return curl;
 					return { status: 1, stdout: "", stderr: `${inner[0]}: Permission denied` };
 				};
 				const r = await am.confinedRunner({ codex_home: path.dirname(auth) }, { platform: "linux", codex, exec });
@@ -479,6 +480,13 @@ describe("confined runtime", () => {
 			assert.ok(calls.every((c) => c.cwd === "/"));
 			// A readable login means the sandbox does not hold: the runner refuses.
 			assert.deepEqual([(await run(true)).r.available], [false]);
+			// seccomp refuses socket() itself, so curl exits 7 with no errno and no "Trying" line: denied on Linux only.
+			const noSocket = { status: 7, stdout: "", stderr: "curl: (7) Failed to connect to 1.1.1.1 port 443 after 0 ms: Could not connect to server\n" };
+			assert.equal((await run(false, noSocket)).r.available, true);
+			assert.equal(am.classify(noSocket, "HTTP/"), "indeterminate", "macOS classifies it as before");
+			// A socket was opened (an outside refusal) or another host answered: not proof of the sandbox.
+			for (const curl of [{ ...noSocket, stderr: `*   Trying 1.1.1.1:443...\n${noSocket.stderr}` }, { ...noSocket, stderr: noSocket.stderr.replace("1.1.1.1", "9.9.9.9") }])
+				assert.deepEqual([(await run(false, curl)).r.reason], ["probe_indeterminate:curl"]);
 		} finally { process.env.HOME = realHome; globalThis.fetch = realFetch; }
 	});
 
@@ -535,6 +543,18 @@ describe("confined runtime", () => {
 		const worker = Number(fs.readFileSync(pidFile, "utf8"));
 		try {
 			assert.equal(r.error?.code, "ETIMEDOUT");
+			for (let i = 0; i < 20 && (() => { try { process.kill(worker, 0); return true; } catch { return false; } })(); i++) await new Promise((res) => setTimeout(res, 50));
+			assert.throws(() => process.kill(worker, 0), { code: "ESRCH" }, "the worker is stopped");
+		} finally { try { process.kill(worker, "SIGKILL"); } catch { /* already stopped */ } }
+	});
+
+	it("stops the whole process group when its caller aborts, as a timeout does", { timeout: 20_000 }, async () => {
+		const dir = fs.mkdtempSync(path.join(tmp, "abort-")), pidFile = path.join(dir, "worker.pid"), ctl = new AbortController();
+		setTimeout(() => ctl.abort(), 300);
+		const r = await am.spawnAsync("/bin/sh", ["-c", `(trap "" TERM; exec sleep 30) & echo $! > "${pidFile}"; wait`], { encoding: "utf8", signal: ctl.signal });
+		const worker = Number(fs.readFileSync(pidFile, "utf8"));
+		try {
+			assert.equal(r.error?.code, "ABORT_ERR");
 			for (let i = 0; i < 20 && (() => { try { process.kill(worker, 0); return true; } catch { return false; } })(); i++) await new Promise((res) => setTimeout(res, 50));
 			assert.throws(() => process.kill(worker, 0), { code: "ESRCH" }, "the worker is stopped");
 		} finally { try { process.kill(worker, "SIGKILL"); } catch { /* already stopped */ } }

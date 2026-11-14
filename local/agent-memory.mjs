@@ -1471,14 +1471,16 @@ function trackChild(child, groupDir, settle) {
  * the child (ETIMEDOUT, ENOBUFS), and a failed input write (EPIPE) is the error. The child leads its own process group, which is
  * what a timeout or ENOBUFS stops. Once the run is stopping, nothing is started.
  */
-export function spawnAsync(command, args, { input, timeout, maxBuffer = 1024 * 1024, groupDir, ...options } = {}) {
+export function spawnAsync(command, args, { input, timeout, maxBuffer = 1024 * 1024, groupDir, signal: abort, ...options } = {}) {
 	if (stopping) return Promise.resolve({ status: null, signal: null, stdout: "", stderr: "", error: Object.assign(new Error("spawn stopping"), { code: "ECANCELED" }) });
 	return new Promise((resolve) => {
 		const child = spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"], detached: true });
 		const out = [], err = [];
 		let size = 0, error, timer;
+		const onAbort = () => stop("ABORT_ERR");
 		const finish = trackChild(child, groupDir, (status, signal) => {
 			clearTimeout(timer);
+			abort?.removeEventListener("abort", onAbort);
 			resolve({ status, signal, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8"), error });
 		});
 		let stopped = false;
@@ -1493,6 +1495,8 @@ export function spawnAsync(command, args, { input, timeout, maxBuffer = 1024 * 1
 			if ((size += d.length) > maxBuffer) stop("ENOBUFS");
 		};
 		if (timeout) timer = setTimeout(() => stop("ETIMEDOUT"), timeout);
+		// An aborted caller stops the whole process group, as a timeout does; spawn's own signal option would stop the child only.
+		if (abort?.aborted) onAbort(); else abort?.addEventListener("abort", onAbort, { once: true });
 		child.stdout.on("data", collect(out));
 		child.stderr.on("data", collect(err));
 		child.stdin.on("error", (e) => { error ??= e; });
@@ -1538,7 +1542,7 @@ enabled = false
 
 // Linux (codex sandbox runs bubblewrap plus seccomp there, codex-rs/linux-sandbox): the same profile, with the macOS deny lines
 // replaced by Linux paths. bubblewrap masks a denied directory with an empty mode-000 tmpfs, so a probe still fails with
-// "Permission denied", and its seccomp filter returns EPERM for network syscalls.
+// "Permission denied", and its seccomp filter returns EPERM for network syscalls, socket() for any family but AF_UNIX included.
 const MAC_DENY = `"/Users" = "deny"\n"/Volumes" = "deny"\n"/private/tmp" = "deny"\n"/private/var/folders" = "deny"\n`;
 export const linuxConfig = (denied) => CONFIG_TOML.replace(MAC_DENY, denied.map((p) => `${JSON.stringify(p)} = "deny"\n`).join(""));
 
@@ -1563,6 +1567,25 @@ export function linuxDenies(home, tmp, keep) {
 	}
 	return [...new Set(out)];
 }
+
+/**
+ * The lean variant (the rewriter's runner, `lean: true`): Codex's own base instructions and its injected permissions, apps,
+ * collaboration, skills and environment blocks are left out, about 11k input tokens a call. Keys from codex-rs config_toml.rs at
+ * rust-v0.169.0; `instructions` is the base-instructions fallback, kept inline so the hashed config covers it. Tools stay off and
+ * a tool event still discards the run; an ignored key would arrive as an error item, which parseEvents treats as a warning.
+ */
+export const leanConfig = (text) => `instructions = "Answer with exactly one JSON object that matches the given output schema. You have no tools."
+include_permissions_instructions = false
+include_apps_instructions = false
+include_collaboration_mode_instructions = false
+include_environment_context = false
+model_reasoning_summary = "none"
+model_verbosity = "low"
+${text.replace("[features]\n", "[features]\nsleep_tool = false\n")}[skills]
+include_instructions = false
+[tools.experimental_request_user_input]
+enabled = false
+`;
 
 /** A command name resolved on PATH, as execvp would, or the path itself. */
 const onPath = (cmd) => cmd.includes("/") ? cmd : (process.env.PATH ?? "").split(":").filter(Boolean).map((d) => path.join(d, cmd))
@@ -1591,12 +1614,20 @@ export function classify({ status, stdout, stderr, error }, secret) {
 }
 
 /**
+ * Linux: seccomp refuses socket(AF_INET) itself with EPERM, and curl (8.14, lib/cf-socket.c) reports a failed socket() as exit 7
+ * without the errno, before its verbose "Trying" line, which it prints only once it holds a socket. So the curl probe is denied
+ * there only when it exits 7 with curl's own connect failure for 1.1.1.1 and no "Trying" line: no IP socket was ever opened.
+ */
+export const curlNoSocket = ({ status, stdout, stderr, error }) => !error && status === 7 && !stdout.includes("HTTP/")
+	&& /curl: \(7\) Failed to connect to 1\.1\.1\.1 port 443 after \d+ ms: Could not connect to server/.test(stderr) && !/^\* +Trying /m.test(stderr);
+
+/**
  * Builds the confined Codex runtime for one run: a throwaway CODEX_HOME holding the fixed config (mode 400, hashed), the
  * owner's Codex login linked in for the Codex process only, positive controls, then classified denial probes under the
  * same configuration. `available` is true only when every control passes and every probe is `denied`, on macOS (Seatbelt) or
  * Linux (bubblewrap and seccomp, with the Linux deny list).
  */
-export async function confinedRunner(config = {}, { codex = config.codex_bin || "codex", platform = process.platform, exec } = {}) {
+export async function confinedRunner(config = {}, { codex = config.codex_bin || "codex", platform = process.platform, exec, lean = false } = {}) {
 	const tmp = os.tmpdir();
 	// The owner pid in the names lets a later run's sweepRunnerDirs() remove them once this process is gone.
 	const codexHome = fs.mkdtempSync(path.join(tmp, `am-codex-home-${process.pid}-`));
@@ -1608,7 +1639,7 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	if (platform !== "darwin" && platform !== "linux") return fail("indeterminate", "untested_platform");
 	const linux = platform === "linux";
 	const configFile = path.join(codexHome, "config.toml");
-	let configText = CONFIG_TOML;
+	let configText = lean ? leanConfig(CONFIG_TOML) : CONFIG_TOML;
 	if (linux) {
 		const bin = onPath(codex);
 		if (!bin) return fail("indeterminate", "codex_missing");
@@ -1616,7 +1647,7 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 		// The home canary's folder must exist before the home's entries are listed, so it is denied by name.
 		fs.mkdirSync(path.join(os.homedir(), ".agent-memory", "probe"), { recursive: true, mode: 0o700 });
 		// Real paths throughout: the binary is compared by its real path, so a symlinked home or temp dir must be too.
-		configText = linuxConfig(linuxDenies(fs.realpathSync(os.homedir()), fs.realpathSync(tmp), fs.realpathSync(bin)));
+		configText = (lean ? leanConfig : (t) => t)(linuxConfig(linuxDenies(fs.realpathSync(os.homedir()), fs.realpathSync(tmp), fs.realpathSync(bin))));
 	}
 	fs.writeFileSync(configFile, configText, { mode: 0o400 });
 	const configSha = sha(fs.readFileSync(configFile));
@@ -1649,7 +1680,9 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 		...(linux ? [[["/bin/cat", auth], null]] : []),
 	];
 	for (const [args, secret] of probes) {
-		const c = classify(await sandbox(args), secret);
+		const r = await sandbox(args);
+		let c = classify(r, secret);
+		if (linux && c === "indeterminate" && args[0] === "/usr/bin/curl" && curlNoSocket(r)) c = "denied";
 		if (c !== "denied") return fail(c, `probe_${c}:${path.basename(args[0])}`);
 	}
 	if (sha(fs.readFileSync(configFile)) !== configSha) return fail("indeterminate", "config_changed");
@@ -1681,14 +1714,14 @@ export const claudeEnv = (config) => ({ PATH: process.env.PATH ?? "/usr/bin:/bin
 /** Same proved CODEX_HOME, config and cwd for captures and batch items. Check the config before and after every exec. */
 export function confinedExec({ exec, codex, runDir, env, configFile, configSha, schemaDir }) {
 	const unchanged = () => { try { return sha(fs.readFileSync(configFile)) === configSha; } catch { return false; } };
-	return async ({ prompt, schema, model, effort, replyFile }) => {
+	return async ({ prompt, schema, model, effort, replyFile, signal }) => {
 		if (!unchanged()) return { kind: "runtime_warning" };
 		const schemaFile = path.join(schemaDir, `output-${randomBytes(8).toString("hex")}.schema.json`);
 		try {
 			fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o400 });
 			const r = await exec(codex, ["exec", "--ephemeral", "--json", "--skip-git-repo-check", "-m", model, "-c", `model_reasoning_effort=${effort}`, "--output-schema", schemaFile,
 				...(typeof replyFile === "string" && path.isAbsolute(replyFile) ? ["-o", replyFile] : []), "-"],
-				{ cwd: runDir, env, input: prompt, encoding: "utf8", timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
+				{ cwd: runDir, env, input: prompt, encoding: "utf8", timeout: 180_000, maxBuffer: 16 * 1024 * 1024, ...(signal ? { signal } : {}) });
 			if (!unchanged()) return { kind: "runtime_warning" };
 			// shortcut: recognize Codex 0.165's stderr-only router diagnostic; revisit when upgrading the CLI.
 			if (r.stderr?.includes("unsupported call:")) return { kind: "tool_event" };

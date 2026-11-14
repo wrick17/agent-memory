@@ -376,4 +376,7 @@ background:var(--panel);border:1px solid var(--rule);border-radius:12px;box-shad
 .rbar{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .9rem;margin:0 0 .8rem;font-size:13.5px;color:var(--muted)}
 .rswitch{display:inline-flex;align-items:center;gap:.45rem}.rswitch::before{content:"";flex:none;width:1.9rem;height:1.05rem;box-sizing:border-box;border-radius:999px;border:2px solid var(--line);background:radial-gradient(circle at 30% 50%,var(--line) .3rem,transparent .32rem)}
 .rswitch[aria-checked=true]::before{border-color:var(--info);background:radial-gradient(circle at 70% 50%,var(--info) .3rem,transparent .32rem)}
-.rw-head{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 .3rem}.rw-tag{text-transform:none;color:var(--info)}`;
+.rw-head{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 .3rem}.rw-tag{text-transform:none;color:var(--info)}
+.rw-status{gap:.45rem;font-size:13px;color:var(--muted)}.rw-status.bad{color:var(--warn)}.rw-secs{font-variant-numeric:tabular-nums}
+.rw-spin{flex:none;width:.8rem;height:.8rem;box-sizing:border-box;border-radius:50%;border:2px solid var(--line);border-top-color:var(--info);animation:rwspin .8s linear infinite}
+@keyframes rwspin{to{transform:rotate(1turn)}}@media (prefers-reduced-motion:reduce){.rw-spin{animation:none;border-color:var(--info)}}`;
