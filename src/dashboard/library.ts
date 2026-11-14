@@ -831,7 +831,7 @@ export function libraryTab(am: Am): void {
 				const next = it ? `${it.updated ?? ""}:${hubSig(lib, it)}` : lib.loading ? "" : "missing";
 				if (next === sig) return;
 				sig = next;
-				if (it) { detail(box, lib, it, route); if (panel) (box as J).__slot?.appendChild(panel); } else if (!lib.loading) { box.replaceChildren(); note(box, "This project has no memories in the chosen profile.", "muted"); } else {
+				if (it) { detail(box, lib, it, route); if (panel) (box as J).__slot?.appendChild(panel); } else if (!lib.loading) { box.replaceChildren(); note(box, "This project has no memories in the chosen profile.", "muted"); am.pageStatus(box); /* forgetting its last record keeps the Undo */ } else {
 					// Loading: a skeleton, and after a while a way to try again instead of waiting on a stalled read.
 					box.replaceChildren(); am.loading(box, 5);
 					win.setTimeout?.(() => {
