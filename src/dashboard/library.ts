@@ -27,7 +27,12 @@ export function libraryTab(am: Am): void {
 	const count = (n: number, kind: string) => `${n.toLocaleString()} ${n === 1 ? NAMES[kind]?.[0] ?? kind : (NAMES[kind]?.[1] ?? `${kind}s`).toLowerCase()}`;
 	const profileQ = (route: Route) => route.query.profile ?? null;
 	const FILTERS = ["type", "origin", "unsorted"]; // a section's filter keys in the address
-	const href = (it: J, route: Route) => am.itemHref(it, profileQ(route));
+	// On a project's page a memory, learning or journal opens in a panel on that page (?open=KEY), so the project stays in view.
+	const href = (it: J, route: Route) => route.tab === "projects" && route.rest.length >= 2 && TABS_OF[it.kind]
+		? `#projects/${route.rest.map(enc).join("/")}?show=${it.kind}&open=${enc(it.key)}${profileQ(route) ? `&profile=${enc(profileQ(route)!)}` : ""}`
+		: am.itemHref(it, profileQ(route));
+	/** The address without its opened record: closing the panel returns to the project page as it was. */
+	const dropOpen = (hash: string) => hash.replace(/([?&])open=[^&]*(&|$)/, (_m, a: string, b: string) => (b ? a : "")).replace(/\?$/, "");
 
 	/** The items linked to `key`, by kind (sessions are only ever a source line), most recent first. */
 	const neighbours = (lib: J, key: string) => {
@@ -257,6 +262,41 @@ export function libraryTab(am: Am): void {
 		const rel = relations(lib, it, route);
 		if (rel.length) { el("h3", parent, "Connected to"); am.related(parent, { title: it.title, kind: it.kind }, rel, compact ? 6 : 8); }
 	};
+	/**
+	 * A project's own page on the Projects tab: a top card (what it is and its counts, beside when work happened), a tab per kind
+	 * of record, then that kind's whole list beside the opened record. Returns the slot the opened record's panel goes in.
+	 */
+	const projectHub = (box: Node, top: Node, main: Node, lib: J, it: J, route: Route): Node | null => {
+		const nb = neighbours(lib, it.key), get = (k: string) => (nb.get(k) ?? []).map((x) => x.it);
+		const kinds = ["journal", "memory", "learning"].filter((k) => get(k).length);
+		const stats = cls(el("p", main), "hub-stats");
+		for (const k of kinds) cls(el("span", stats, count(get(k).length, k)), `stat-chip t-${k}-b`);
+		if (!kinds.length) { note(main, "Nothing is linked to this yet.", "muted"); return null; }
+		// Day by day, the same stacked bars as Home, over the project's own span (4 to 12 weeks).
+		const chart = cls(el("div", top), "ptop-chart"), work = kinds.flatMap(get);
+		const first = Math.min(...work.map((x) => Date.parse(x.created ?? x.updated ?? "") || Date.now())), span = Math.max(4, Math.min(12, Math.ceil((Date.now() - first) / (7 * 86_400_000)) + 1));
+		el("h3", chart, "When work happened");
+		am.daily(chart, kinds.map((k) => ({ label: k, kind: k, dates: get(k).map((x: J) => x.created ?? x.updated) })), am.fitWeeks(chart, span), "When work happened");
+		// The tab is the opened record's kind, else the one in the address, else the first with records.
+		const openKey = route.query.open ?? null, opened = openKey ? lib.items.get(openKey) : null;
+		const cur = opened && kinds.includes(opened.kind) ? opened.kind : kinds.includes(route.query.show ?? "") ? route.query.show! : kinds[0]!;
+		const base = `#projects/${route.rest.map(enc).join("/")}`, pq = profileQ(route) ? `&profile=${enc(profileQ(route)!)}` : "";
+		const tabs = cls(el("nav", box), "ptabs");
+		tabs.setAttribute("aria-label", "Records");
+		for (const k of kinds) { const a = el("a", tabs, `${NAMES[k]![1]} ${get(k).length}`); a.setAttribute("href", `${base}?show=${k}${pq}`); if (k === cur) a.setAttribute("aria-current", "page"); }
+		const split = cls(el("div", box), openKey ? "psplit open" : "psplit"), list = cls(el("section", split), "plist"), slot = cls(el("div", split), "pslot");
+		list.setAttribute("aria-label", NAMES[cur]![1]!);
+		const ul = cls(el("ul", list), "rows compact");
+		// Every record of the kind, in pages as the list scrolls; the key keeps how far it got when the page redraws.
+		am.pager(el("div", list), get(cur), (x: J) => row(ul, lib, x, route, openKey), 40, `proj|${it.key}|${cur}`);
+		if (!openKey) {
+			const ph = cls(el("section", slot), "lib-detail pcontent");
+			cls(el("p", ph, `Choose a ${NAMES[cur]![0]} to read it here.`), "placeholder");
+			const rel = relations(lib, it, route);
+			if (rel.length) { el("h3", ph, "Connected to"); am.related(ph, { title: it.title, kind: it.kind }, rel, 8); }
+		}
+		return slot;
+	};
 
 	// ---- Safe, minimal markdown: DOM nodes and textContent only, http(s) links only ----
 	const inline = (parent: Node, text: string) => {
@@ -355,14 +395,16 @@ export function libraryTab(am: Am): void {
 	const detail = (box: Node, lib: J, it: J, route: Route) => {
 		const version = am.pageVersion;
 		box.replaceChildren();
-		const head = cls(el("header", box), "detail-head");
+		// A project's own page (Projects tab) opens with a top card: the heading and counts beside its activity chart.
+		const hub = it.kind === "person" || it.kind === "project", proj = hub && route.tab === "projects";
+		const top = proj ? cls(el("div", box), "ptop") : null, topMain = top ? cls(el("div", top), "ptop-main") : null;
+		const head = cls(el("header", topMain ?? box), "detail-head");
 		// Back to the list keeps the address's query (profile and the section's filters), read when used: chips change it in place.
-		const closeTo = () => { const cur = String(win.location.hash ?? ""), i = cur.indexOf("?"); return `#${route.tab}${i < 0 ? "" : cur.slice(i)}`; };
+		const closeTo = () => { const cur = String(win.location.hash ?? ""), i = cur.indexOf("?"); return route.query.open ? dropOpen(cur) : `#${route.tab}${i < 0 ? "" : cur.slice(i)}`; };
 		const toList = (a: Node) => { a.setAttribute("href", closeTo()); a.addEventListener("click", () => a.setAttribute("href", closeTo())); };
-		// On a phone the detail is a full-screen view: a clear way back to the list, which kept its place underneath.
-		const back = cls(el("a", head, "← Back"), "back-btn");
-		back.setAttribute("data-back", "");
-		toList(back);
+		// On a phone the detail is a full-screen view: a clear way back to the list, which kept its place underneath. A project's
+		// page is the place itself: "← All projects" above it is the way back.
+		if (!proj) { const back = cls(el("a", head, "← Back"), "back-btn"); back.setAttribute("data-back", ""); toList(back); }
 		cls(el("span", head, typeOf(it)), `kind t-${it.kind}-b`);
 		const h = el("h2", head);
 		am.title(it, h);
@@ -390,16 +432,16 @@ export function libraryTab(am: Am): void {
 			h2.setAttribute("title", "Its GitHub owner says it belongs to the other profile. Nothing was moved.");
 		}
 		if (it.medium) cls(el("span", meta, "project likely"), "hint").setAttribute("title", "Placed in its project from a medium-confidence alias.");
-		const close = cls(el("a", head, "Close"), "close");
-		toList(close);
-		close.setAttribute("data-close", "");
+		if (!proj) { const close = cls(el("a", head, "Close"), "close"); toList(close); close.setAttribute("data-close", ""); }
 		// The last write on this page (Forgot, Pinned…) and its Undo, shown before and whatever the record read returns: a
 		// forgotten record no longer reads, and its Undo must still be there.
 		const status = it.kind === "memory" || it.kind === "learning" ? am.pageStatus(cls(el("div", box), "detail-status")) : null;
 		// The body: a main column (the item's words, or a hub's timeline and journals) and a rail (its connections, actions, an
-		// outline). Side by side when the pane is wide enough (a container query), stacked otherwise.
-		const hub = it.kind === "person" || it.kind === "project";
-		const grid = cls(el("div", box), hub ? "dgrid hub" : it.kind === "journal" && (Number(win.innerWidth) || 1440) >= 1280 ? "dgrid journal" : "dgrid"), body = cls(el("div", grid), "dmain"), after = cls(el("aside", grid), "drail");
+		// outline). Side by side when the pane is wide enough (a container query), stacked otherwise. A project's page keeps
+		// both in its top card.
+		const grid = proj ? null : cls(el("div", box), hub ? "dgrid hub" : it.kind === "journal" && (Number(win.innerWidth) || 1440) >= 1280 ? "dgrid journal" : "dgrid");
+		const body = topMain ?? cls(el("div", grid!), "dmain"), after = topMain ?? cls(el("aside", grid!), "drail");
+		if (proj) (box as J).__slot = projectHub(box, top!, topMain!, lib, it, route);
 		// A journal's connections lead its reading column; a memory's or learning's sit in the rail.
 		const connSec = hub ? null : connections(it.kind === "journal" ? body : after, lib, it, route);
 		let none: Node | null = !connSec && it.kind === "journal" && !it.virtual ? cls(el("p", body, "Not linked to a project or to any memory yet."), "muted conn-none") : null;
@@ -419,7 +461,7 @@ export function libraryTab(am: Am): void {
 			connNode = fresh;
 			none = null;
 		};
-		if (hub) hubOf(body, after, lib, it, route, route.tab === "map");
+		if (hub && !proj) hubOf(body, after, lib, it, route, route.tab === "map");
 		if (it.virtual) return h;
 		// The item's own words: a node read for memories, learnings, people and projects; a journal read for journals.
 		const load = am.loading(text, 3);
@@ -760,15 +802,35 @@ export function libraryTab(am: Am): void {
 			const back = el("a", root, "← All projects");
 			back.setAttribute("href", `#projects${q}`);
 			back.setAttribute("class", "back");
-			const box = cls(el("section", root), "lib-detail page");
-			let sig = "";
+			// A record opened from this page reads in a panel beside its list. The panel is drawn on its own and moved into each
+			// redraw of the page, so a change elsewhere in the project never resets the record being read.
+			const openKey = route.query.open ?? null, panel = openKey ? cls(el("section"), "lib-detail pcontent") : null;
+			panel?.setAttribute("aria-label", "Opened record");
+			const box = cls(el("section", root), "ppage");
+			let sig = "", openSig = "", openLinks = "", openH: Node | null = null;
+			const paintPanel = (lib: J) => {
+				if (!panel || !openKey) return;
+				const o = lib.items.get(openKey);
+				const links = o ? [...(lib.links.get(o.key) ?? new Map()) as Map<string, Set<string>>].map(([k, rels]) => `${k}:${[...rels].sort().join("+")}`).sort().join("|") : "";
+				if (o && `${o.key}:${o.updated ?? ""}` !== openSig) { openSig = `${o.key}:${o.updated ?? ""}`; openLinks = links; openH = detail(panel, lib, o, route); }
+				else if (o && links !== openLinks) { openLinks = links; (panel as J).__refreshConn?.(lib); } // links arrived after the record
+				else if (!o && !lib.loading && openSig !== "missing") {
+					openSig = "missing";
+					panel.replaceChildren();
+					note(panel, "This record is not in the chosen profile.", "muted");
+					const x = el("a", panel, "Close");
+					x.setAttribute("href", dropOpen(route.hash));
+					x.setAttribute("data-close", "");
+				}
+			};
 			const paint = () => {
 				if (version !== am.pageVersion) return;
 				const lib: J = am.library(only, paint), it = lib.items.get(selected);
+				paintPanel(lib);
 				const next = it ? `${it.updated ?? ""}:${hubSig(lib, it)}` : lib.loading ? "" : "missing";
 				if (next === sig) return;
 				sig = next;
-				if (it) detail(box, lib, it, route); else if (!lib.loading) { box.replaceChildren(); note(box, "This project has no memories in the chosen profile.", "muted"); } else {
+				if (it) { detail(box, lib, it, route); if (panel) (box as J).__slot?.appendChild(panel); } else if (!lib.loading) { box.replaceChildren(); note(box, "This project has no memories in the chosen profile.", "muted"); } else {
 					// Loading: a skeleton, and after a while a way to try again instead of waiting on a stalled read.
 					box.replaceChildren(); am.loading(box, 5);
 					win.setTimeout?.(() => {
@@ -783,7 +845,7 @@ export function libraryTab(am: Am): void {
 			};
 			paint();
 			const h = (box as J).querySelector?.("h2");
-			return h ?? back;
+			return openH ?? h ?? back;
 		}
 		const head = cls(el("div", root), "list-head");
 		const h = el("h2", head, "Projects");
