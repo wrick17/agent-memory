@@ -253,6 +253,92 @@ Deploy the Worker before the client: an older Worker refuses a batch with these 
 
 Deterministic fact detection follows capture and has no switch of its own: with capture installed, the client reports detector results for each completed session in a GitHub repository, whatever these settings say. Those reports hold hashes, fact keys, detector literals, injected-item outcomes, token counts and command counts, never command output or paths. The v2 server writes every statement itself. Turning `facts.synthesis` off stops only synthesis. After you change `facts.inject` or `loop_guard.enabled`, run `agent-memory install` again so the client registers the hooks.
 
+### Readable rewrites (local trial)
+
+The dashboard can show a plain-English rewrite of long entry text, written by `gpt-6-luna` on your ChatGPT plan. It is off unless one of the settings below is set, and it is meant for a local `wrangler dev` run. Nothing goes into `wrangler.jsonc`. With it on, a **Plain English** switch appears above each page. Turn it on, and each long text block that has a **Show more** button is rewritten as it scrolls into view. The rewrite is labelled **AI rewrite**, and **Show original** switches back. Rewrites are cached in the Worker, one per text, for every device.
+
+Two backends generate rewrites:
+
+| Setting | Backend |
+|---|---|
+| `READABLE_REWRITER_URL` and `READABLE_REWRITER_TOKEN` | The rewriter service, `local/rewriter.mjs` in the source repository (not in this archive; it uses the capture client's confined runner). It runs `codex exec -m gpt-6-luna` at low effort on a machine signed in to Codex with ChatGPT. Takes precedence when set. |
+| `READABLE_REWRITES=chatgpt-local` | Sign in with ChatGPT from the Worker itself, the open flow for locally hosted apps. Its callback must be `http://127.0.0.1:<port>/auth/callback`, so it works only on a local run. |
+
+Try it locally:
+
+1. Production Clerk refuses a `127.0.0.1` origin, so use your Clerk application's development instance. Create a user there, for example `you+clerk_test@example.com`, which signs in with the fixed development code `424242`. Copy the instance's publishable key (`pk_test_…`) and Frontend API URL, and the user's id.
+2. Start the rewriter. It reads its token from `REWRITER_TOKEN_FILE` (default `~/.agent-memory/rewriter-token`, at least 32 characters) and listens on `127.0.0.1:8790` (`REWRITER_PORT` changes the port):
+
+	```sh
+	(umask 077; openssl rand -hex 32 > ~/.agent-memory/rewriter-token)
+	node local/rewriter.mjs
+	```
+
+	It answers `POST /v1/rewrite` with `Authorization: Bearer <token>` and `{"texts": [{"id": 1, "text": "…"}]}`, at most 8 texts of at most 20,000 characters each. It runs one batch at a time and at most 200 texts per rolling hour, and returns 429 beyond that. It never takes a prompt from the caller. It starts only when the confined Codex runner passes its checks, on macOS or Linux.
+3. Write `.dev.vars` in the source directory. Git ignores it. Its values override `wrangler.jsonc`:
+
+	```sh
+	OWNER_USER_ID=user_…             # the development-instance user
+	CLERK_ISSUER=https://<dev instance>.clerk.accounts.dev
+	CLERK_FRONTEND_API=https://<dev instance>.clerk.accounts.dev
+	CLERK_PUBLISHABLE_KEY=pk_test_…
+	DASHBOARD_ORIGIN=http://127.0.0.1:8787
+	RESOURCE_URL=http://127.0.0.1:8787/mcp
+	EMBEDDINGS=off
+	CORPUS=off
+	IMPORT_PROFILES=
+	READABLE_REWRITES=chatgpt-local
+	READABLE_REWRITER_URL=http://127.0.0.1:8790/v1/rewrite
+	READABLE_REWRITER_TOKEN=<the rewriter token>
+	```
+
+	`EMBEDDINGS=off` keeps the remote Workers AI binding unused. Vectorize has no local mode, so local records never reach your index. Durable Objects and R2 stay in `.wrangler/state`.
+4. Start the Worker on the loopback address. `--local-upstream` keeps the request host as `127.0.0.1`, not your production route:
+
+	```sh
+	npx wrangler dev --ip 127.0.0.1 --port 8787 --local-upstream 127.0.0.1:8787
+	```
+
+5. Open `http://127.0.0.1:8787`, not `localhost`. Sign in as the development user and turn on **Plain English**. The local store starts empty. Add records with the dashboard's Write page, or with MCP calls to `http://127.0.0.1:8787/mcp` using a device token from Settings › Devices.
+
+To try Sign in with ChatGPT, remove both `READABLE_REWRITER_*` lines, restart `wrangler dev`, and choose **Connect ChatGPT**. The Worker keeps the ChatGPT tokens in its own storage, never in the browser, and **Disconnect ChatGPT** deletes them. Tokens and cached rewrites are not included in backups. When your plan limit is reached, rewrites pause and the page links to ChatGPT usage. A hosted dashboard cannot use this flow; it needs OpenAI's partner sign-in.
+
+For a hosted Worker, run the rewriter on an always-on machine behind a tunnel to `http://127.0.0.1:8790`. Set `READABLE_REWRITER_URL=https://rewriter.<your domain>/v1/rewrite` and set the token with `npx wrangler secret put READABLE_REWRITER_TOKEN`.
+
+On Linux, `codex sandbox` uses bubblewrap and seccomp. The runner writes a Linux deny list into its throwaway Codex config: other users' homes, `/root`, the temp roots, `/mnt`, `/media`, `/run/user`, and every entry of your home except the one that holds the Codex install (for example `~/.nvm`), because the sandbox helper runs Codex's own binary inside the sandbox. Install `bubblewrap` (`sudo apt install bubblewrap`) so Codex does not fall back to its bundled copy, and keep `curl` at `/usr/bin/curl` for the network probe. User namespaces must be allowed. Check the runner before you start the service; it prints `true null` when every probe passes, or `false` and the failing check:
+
+```sh
+cd /path/to/agent-memory
+node --input-type=module -e 'import { confinedRunner } from "./local/agent-memory.mjs"; const r = await confinedRunner(); console.log(r.available, r.reason ?? null); r.cleanup?.()'
+```
+
+To keep the rewriter running on a Linux machine, save this as `~/.config/systemd/user/agent-memory-rewriter.service`, with the Node path and source directory changed to yours:
+
+```ini
+[Unit]
+Description=Agent Memory rewriter
+
+[Service]
+WorkingDirectory=%h/agent-memory
+Environment=PATH=%h/.nvm/versions/node/v24.19.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REWRITER_TOKEN_FILE=%h/.agent-memory/rewriter-token
+ExecStart=%h/.nvm/versions/node/v24.19.0/bin/node local/rewriter.mjs
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+`PATH` must reach `codex`, and the restart delay covers a start before the network is up, since the runner checks the network first. Enable it, and let it run without a login session:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now agent-memory-rewriter
+sudo loginctl enable-linger "$USER"
+journalctl --user -u agent-memory-rewriter -f
+```
+
 ## Profile backups and restore
 
 Encrypted exports of profiles and account state keep up to two complete exports per store. Restore into a fresh profile generation is implemented through the owner-only backup and recovery HTTP API. Account-state restore is also implemented in source. List account exports with owner-authenticated `GET /api/account/exports`, then begin with `POST /api/account/restore` and `{"export":"<export id>"}` or `{"export":"latest"}`. Use `GET /api/recovery` for status and `POST /api/recovery/step`, `/api/recovery/open` or `/api/recovery/abort` to advance, reopen or roll back. The permanent R2 generation ledger and wipe refusals remain authoritative; unresolved recovery stays closed until abort reapplies the pre-restore checkpoint. A successful account restore disables every device token, so the owner must reissue needed tokens. Full current combined and actual-dataset account restore checks remain pending. Point-in-time profile restore and corpus recovery are implemented in source. Actual point-in-time restore and corpus recovery acceptance remain open. The recovery dashboard and scratch restore drill are implemented in source; actual point-in-time, drill and browser acceptance remain open.

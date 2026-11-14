@@ -437,10 +437,49 @@ describe("confined runtime", () => {
 	});
 
 	it("is indeterminate when Codex is missing or the platform is untested", async () => {
-		assert.deepEqual(await am.confinedRunner({}, { platform: "linux" }), { available: false, classification: "indeterminate", reason: "untested_platform" });
+		assert.deepEqual(await am.confinedRunner({}, { platform: "win32" }), { available: false, classification: "indeterminate", reason: "untested_platform" });
 		const missing = await am.confinedRunner({ codex_home: tmp }, {});
 		assert.equal(missing.available, false);
 		assert.equal(missing.classification, "indeterminate");
+	});
+
+	it("builds the Linux deny list around the Codex install and requires the real login to be unreadable", async (t) => {
+		if (!fs.existsSync("/usr/bin/curl")) { t.skip("needs /usr/bin/curl, as the Linux runner does"); return; }
+		// A synthetic home: the Codex install under ~/.nvm, the login under ~/.codex, one ordinary dotfile.
+		const home = fs.mkdtempSync(path.join(tmp, "linux-home-")), codex = path.join(home, ".nvm", "bin", "codex"), auth = path.join(home, ".codex", "auth.json");
+		for (const f of [codex, auth, path.join(home, ".bashrc")]) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, "", { mode: 0o700 }); }
+		const realHome = process.env.HOME, realFetch = globalThis.fetch;
+		process.env.HOME = home; // os.homedir() follows HOME, so the canaries and home entries are the synthetic ones
+		globalThis.fetch = async () => new Response(""); // the outside network control
+		try {
+			const run = async (authReadable) => {
+				const calls = [];
+				let config = "";
+				const exec = async (_cmd, args, opts) => {
+					config ||= fs.readFileSync(path.join(opts.env.CODEX_HOME, "config.toml"), "utf8");
+					if (args[0] !== "sandbox") return { status: 0, stdout: "", stderr: "" };
+					const inner = args.slice(4);
+					calls.push({ cwd: opts.cwd, inner });
+					if (inner[0] === "/bin/echo") return { status: 0, stdout: `${inner[1]}\n`, stderr: "" };
+					if (authReadable && inner[1] === auth) return { status: 0, stdout: "{}", stderr: "" };
+					return { status: 1, stdout: "", stderr: `${inner[0]}: Permission denied` };
+				};
+				const r = await am.confinedRunner({ codex_home: path.dirname(auth) }, { platform: "linux", codex, exec });
+				r.cleanup?.();
+				return { r, calls, config };
+			};
+			const { r, calls, config } = await run(false);
+			assert.deepEqual([r.available, r.classification], [true, "denied"], r.reason);
+			const denied = [...config.matchAll(/^"(.+)" = "deny"$/gm)].map((m) => m[1]);
+			const covered = (f) => { const real = fs.realpathSync(f); return denied.some((p) => real === p || real.startsWith(`${p}/`)); };
+			for (const f of [path.join(os.tmpdir(), "am-probe-canary"), path.join(home, ".codex"), path.join(home, ".bashrc"), path.join(home, ".agent-memory")]) assert.ok(covered(f), `${f} is denied`);
+			assert.ok(!covered(codex), "the Codex install stays readable");
+			assert.ok(!denied.includes("/Users") && !denied.includes("/private/tmp"), "no macOS deny lines");
+			assert.ok(calls.some((c) => c.inner[0] === "/bin/cat" && c.inner[1] === auth), "the login probe runs");
+			assert.ok(calls.every((c) => c.cwd === "/"));
+			// A readable login means the sandbox does not hold: the runner refuses.
+			assert.deepEqual([(await run(true)).r.available], [false]);
+		} finally { process.env.HOME = realHome; globalThis.fetch = realFetch; }
 	});
 
 	it("proves the denial on this Mac with the real `codex sandbox`, and classifies weakened, missing and DNS probes", async (t) => {

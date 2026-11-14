@@ -82,8 +82,8 @@ async function keyFor(env: Env, kid: string): Promise<CryptoKey | undefined> {
 	return keyCache.keys.get(kid);
 }
 
-const b64urlBytes = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-const b64urlJson = (s: string) => JSON.parse(new TextDecoder().decode(b64urlBytes(s))) as Record<string, unknown>;
+export const b64urlBytes = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+export const b64urlJson = (s: string) => JSON.parse(new TextDecoder().decode(b64urlBytes(s))) as Record<string, unknown>;
 
 const invalid = (description: string): AuthResult => ({ ok: false, status: 401, error: "invalid_token", description });
 

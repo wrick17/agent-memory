@@ -1536,6 +1536,38 @@ extends = ":read-only"
 enabled = false
 `;
 
+// Linux (codex sandbox runs bubblewrap plus seccomp there, codex-rs/linux-sandbox): the same profile, with the macOS deny lines
+// replaced by Linux paths. bubblewrap masks a denied directory with an empty mode-000 tmpfs, so a probe still fails with
+// "Permission denied", and its seccomp filter returns EPERM for network syscalls.
+const MAC_DENY = `"/Users" = "deny"\n"/Volumes" = "deny"\n"/private/tmp" = "deny"\n"/private/var/folders" = "deny"\n`;
+export const linuxConfig = (denied) => CONFIG_TOML.replace(MAC_DENY, denied.map((p) => `${JSON.stringify(p)} = "deny"\n`).join(""));
+
+/**
+ * The Linux deny list: other homes, root's home, temp and mount roots, and every entry of the user's home except the one that
+ * holds the Codex install (`keep`). The sandbox helper re-executes Codex's own binary inside bubblewrap, and Codex cannot reopen a
+ * read-only path under a denied directory, so the directories above `keep` are split into their other entries instead of denied.
+ * shortcut: entries are listed when the runner starts, so a home entry created later stays readable until the next start.
+ */
+export function linuxDenies(home, tmp, keep) {
+	const out = [], above = (p, child) => `${child}/`.startsWith(`${p}/`);
+	const split = (dir) => {
+		for (const name of fs.readdirSync(dir)) {
+			const p = path.join(dir, name);
+			if (!above(p, keep)) out.push(p);
+			else if (above(p, home)) split(p); // still above the home's own entries: go one level deeper
+		}
+	};
+	for (const root of ["/home", "/root", home, tmp, "/tmp", "/var/tmp", "/mnt", "/media", "/run/user"]) {
+		if (!fs.existsSync(root)) continue;
+		if (above(root, keep)) split(root); else out.push(root);
+	}
+	return [...new Set(out)];
+}
+
+/** A command name resolved on PATH, as execvp would, or the path itself. */
+const onPath = (cmd) => cmd.includes("/") ? cmd : (process.env.PATH ?? "").split(":").filter(Boolean).map((d) => path.join(d, cmd))
+	.find((p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } });
+
 /** The output schema the model is held to: the hosted digest schema's bounds (LIMITS, ITEM_FIELDS), so it is told every limit. */
 const bounded = { type: "string", maxLength: LIMITS.item }, count = { type: "integer", minimum: 0 };
 export const PART_SCHEMA = {
@@ -1561,7 +1593,8 @@ export function classify({ status, stdout, stderr, error }, secret) {
 /**
  * Builds the confined Codex runtime for one run: a throwaway CODEX_HOME holding the fixed config (mode 400, hashed), the
  * owner's Codex login linked in for the Codex process only, positive controls, then classified denial probes under the
- * same configuration. `available` is true only when every control passes and every probe is `denied` on macOS.
+ * same configuration. `available` is true only when every control passes and every probe is `denied`, on macOS (Seatbelt) or
+ * Linux (bubblewrap and seccomp, with the Linux deny list).
  */
 export async function confinedRunner(config = {}, { codex = config.codex_bin || "codex", platform = process.platform, exec } = {}) {
 	const tmp = os.tmpdir();
@@ -1572,15 +1605,27 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	cleanups.add(cleanup);
 	exec ??= (command, args, options) => spawnAsync(command, args, { ...options, groupDir: runDir });
 	const fail = (classification, reason) => { cleanup(); return { available: false, classification, reason }; };
-	if (platform !== "darwin") return fail("indeterminate", "untested_platform");
+	if (platform !== "darwin" && platform !== "linux") return fail("indeterminate", "untested_platform");
+	const linux = platform === "linux";
 	const configFile = path.join(codexHome, "config.toml");
-	fs.writeFileSync(configFile, CONFIG_TOML, { mode: 0o400 });
+	let configText = CONFIG_TOML;
+	if (linux) {
+		const bin = onPath(codex);
+		if (!bin) return fail("indeterminate", "codex_missing");
+		if (!fs.existsSync("/usr/bin/curl")) return fail("indeterminate", "curl_missing");
+		// The home canary's folder must exist before the home's entries are listed, so it is denied by name.
+		fs.mkdirSync(path.join(os.homedir(), ".agent-memory", "probe"), { recursive: true, mode: 0o700 });
+		// Real paths throughout: the binary is compared by its real path, so a symlinked home or temp dir must be too.
+		configText = linuxConfig(linuxDenies(fs.realpathSync(os.homedir()), fs.realpathSync(tmp), fs.realpathSync(bin)));
+	}
+	fs.writeFileSync(configFile, configText, { mode: 0o400 });
 	const configSha = sha(fs.readFileSync(configFile));
 	const auth = path.join(config.codex_home || path.join(os.homedir(), ".codex"), "auth.json");
 	if (!fs.existsSync(auth)) return fail("indeterminate", "codex_login_missing");
 	fs.symlinkSync(auth, path.join(codexHome, "auth.json"));
 	const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: os.homedir(), CODEX_HOME: codexHome };
-	const sandbox = (args) => exec(codex, ["sandbox", "-P", "am_batch", "--", ...args], { cwd: runDir, env, encoding: "utf8", timeout: 20_000 });
+	// On Linux the probes run from /: the run dir sits under a denied temp root, and bubblewrap enters the command's cwd.
+	const sandbox = (args) => exec(codex, ["sandbox", "-P", "am_batch", "--", ...args], { cwd: linux ? "/" : runDir, env, encoding: "utf8", timeout: 20_000 });
 	// Positive controls: known inputs that work outside the sandbox. Any failure here is indeterminate.
 	const nonce = randomBytes(8).toString("hex");
 	// The home canary is always under the real home directory, so its denial proves home reads are denied.
@@ -1588,15 +1633,20 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 	writePrivate(homeCanary, `home-${nonce}`);
 	writePrivate(tmpCanary, `tmp-${nonce}`);
 	if (fs.readFileSync(homeCanary, "utf8") !== `home-${nonce}` || fs.readFileSync(tmpCanary, "utf8") !== `tmp-${nonce}`) return fail("indeterminate", "canary_unreadable_outside");
-	if (!fs.readdirSync(os.homedir()).includes("Library")) return fail("indeterminate", "home_listing_control");
+	// macOS lists the home itself; on Linux the home's names stay visible (its entries are denied one by one), so the probe
+	// lists the canary's own folder instead.
+	const listDir = linux ? path.dirname(homeCanary) : os.homedir(), listName = linux ? "canary" : "Library";
+	if (!fs.readdirSync(listDir).includes(listName)) return fail("indeterminate", "home_listing_control");
 	const net = await fetch("https://1.1.1.1/", { redirect: "manual", signal: AbortSignal.timeout(5000) }).then(() => true, () => false);
 	if (!net) return fail("indeterminate", "network_unreachable_outside");
 	const echo = await sandbox(["/bin/echo", nonce]);
 	if (echo.error || echo.status !== 0 || echo.stdout.trim() !== nonce) return fail("indeterminate", "sandbox_cannot_run_command");
 	// Denial probes under the same CODEX_HOME and config that exec uses.
 	const probes = [
-		[["/bin/cat", homeCanary], nonce], [["/bin/cat", tmpCanary], nonce], [["/bin/ls", os.homedir()], "Library"],
+		[["/bin/cat", homeCanary], nonce], [["/bin/cat", tmpCanary], nonce], [["/bin/ls", listDir], listName],
 		[["/usr/bin/curl", "-sS", "-v", "--connect-timeout", "5", "https://1.1.1.1/"], "HTTP/"],
+		// Linux: the owner's real Codex login must stay unreadable too, whatever the deny list kept.
+		...(linux ? [[["/bin/cat", auth], null]] : []),
 	];
 	for (const [args, secret] of probes) {
 		const c = classify(await sandbox(args), secret);

@@ -167,6 +167,7 @@ export type Am = {
 	related: (parent: Node, center: { title: string; kind: string }, rows: { title: string; kind: string; href: string; label: string; weight: number }[], cap?: number) => Node;
 	detail: (box: Node, lib: J, it: J, route: Route) => Node; // library.ts: one item's content and connections
 	md: (parent: Node, text: string) => Node; // library.ts: safe minimal markdown, DOM nodes only
+	readable?: (box: Node, text: string, more: Node | null) => void; // readable.ts, only with the local Plain English option on: offers a long text block for an AI rewrite
 	pager: <T>(holder: Node, items: T[], draw: (it: T) => void, step?: number, key?: string) => void; // infinite scroll in pages; key keeps how far it got
 	autoMore: (button: Node) => void; // a next-page button that presses itself when scrolled into view
 	onLeave: (f: () => void) => () => void; // runs f before the next page replaces this one; the returned function runs it now

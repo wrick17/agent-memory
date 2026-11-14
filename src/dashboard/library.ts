@@ -357,7 +357,7 @@ export function libraryTab(am: Am): void {
 		flush();
 		return box;
 	};
-	/** Long text collapses to a few lines with "Show more". */
+	/** Long text collapses to a few lines with "Show more"; with Plain English on (readable.ts), it can show an AI rewrite instead. */
 	const textOf = (parent: Node, text: string, lines = 14) => {
 		const box = md(parent, text);
 		if (text.length > lines * 70 || text.split("\n").length > lines) {
@@ -365,6 +365,7 @@ export function libraryTab(am: Am): void {
 			const b = cls(el("button", parent, "Show more"), "linklike more");
 			b.setAttribute("type", "button");
 			b.addEventListener("click", () => { box.setAttribute("class", "md"); (b as J).remove(); });
+			am.readable?.(box, text, b);
 		}
 	};
 	/** A journal entry as a card: its "## …" line becomes the title, "entry 5 —" noise goes, a label like "decision" becomes a tag. */

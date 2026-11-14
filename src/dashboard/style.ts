@@ -371,4 +371,9 @@ background:var(--panel);border:1px solid var(--rule);border-radius:12px;box-shad
 @media (max-width:1100px){:root[data-search=open] main{padding-top:calc(3.6rem + .8rem)}}
 /* The live chip keeps one width whatever it says, so nothing beside it moves. */
 @media (min-width:1101px){.sync{width:9.8rem}}@media (max-width:1100px){.sync{min-width:5.6rem}}@media (max-width:640px){.sync{min-width:4.8rem}}
-.sync-retry{min-height:0!important;font-size:12.5px}`;
+.sync-retry{min-height:0!important;font-size:12.5px}
+/* Plain English (readable.ts, local option only): the switch bar above the view and a rewritten block's label. */
+.rbar{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .9rem;margin:0 0 .8rem;font-size:13.5px;color:var(--muted)}
+.rswitch{display:inline-flex;align-items:center;gap:.45rem}.rswitch::before{content:"";flex:none;width:1.9rem;height:1.05rem;box-sizing:border-box;border-radius:999px;border:2px solid var(--line);background:radial-gradient(circle at 30% 50%,var(--line) .3rem,transparent .32rem)}
+.rswitch[aria-checked=true]::before{border-color:var(--info);background:radial-gradient(circle at 70% 50%,var(--info) .3rem,transparent .32rem)}
+.rw-head{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 .3rem}.rw-tag{text-transform:none;color:var(--info)}`;
