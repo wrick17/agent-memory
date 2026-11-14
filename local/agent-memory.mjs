@@ -1644,8 +1644,10 @@ export async function confinedRunner(config = {}, { codex = config.codex_bin || 
 		const bin = onPath(codex);
 		if (!bin) return fail("indeterminate", "codex_missing");
 		if (!fs.existsSync("/usr/bin/curl")) return fail("indeterminate", "curl_missing");
-		// The home canary's folder must exist before the home's entries are listed, so it is denied by name.
+		// Both canaries must exist before the deny list is built: a directory above the Codex install is denied entry by entry,
+		// as listed now, so a canary created afterwards would stay readable and fail its probe.
 		fs.mkdirSync(path.join(os.homedir(), ".agent-memory", "probe"), { recursive: true, mode: 0o700 });
+		fs.closeSync(fs.openSync(path.join(tmp, "am-probe-canary"), "a", 0o600));
 		// Real paths throughout: the binary is compared by its real path, so a symlinked home or temp dir must be too.
 		configText = (lean ? leanConfig : (t) => t)(linuxConfig(linuxDenies(fs.realpathSync(os.homedir()), fs.realpathSync(tmp), fs.realpathSync(bin))));
 	}
