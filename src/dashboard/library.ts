@@ -8,6 +8,17 @@ import type { Am, Failure, J, Node, Route } from "./am";
 export function libraryTab(am: Am): void {
 	const { el, enc, call, note, why, win } = am;
 	const cls = (e: Node, c: string) => { e.setAttribute("class", c); return e; };
+	// The reading pane sticks below the header, but it first sits lower (under a project's top card or the Plain English bar).
+	// --pane-top is its real top, so its height (style.ts) always ends on screen and its own scroll works without the page's.
+	let fitting = 0;
+	const fitPane = () => { if (!fitting) fitting = win.requestAnimationFrame(() => {
+		fitting = 0;
+		const p = am.doc.querySelector(".pslot>.pcontent, .lib>.lib-detail");
+		if (p) am.doc.documentElement.style.setProperty("--pane-top", `${Math.max(0, Math.round(p.getBoundingClientRect().top))}px`);
+	}); };
+	win.addEventListener("scroll", fitPane, { passive: true });
+	win.addEventListener("resize", fitPane);
+	if (typeof win.ResizeObserver === "function") new win.ResizeObserver(fitPane).observe(am.doc.body); // pages drawing in move it
 	const JOURNAL_PAGES = 400; // 25 entries a page
 	const NAMES: Record<string, [string, string]> = { memory: ["memory", "Memories"], learning: ["learning", "Learnings"], journal: ["journal", "Journals"], person: ["person", "People"],
 		project: ["project", "Projects"] };
@@ -357,15 +368,17 @@ export function libraryTab(am: Am): void {
 		flush();
 		return box;
 	};
-	/** Long text collapses to a few lines with "Show more". */
-	const textOf = (parent: Node, text: string, lines = 14) => {
+	/** Long text collapses to a few lines with "Show more"; with Plain English on (readable.ts), it can show an AI rewrite instead.
+	 * `rw`: a journal entry, summary or description, offered for a rewrite from 160 characters even when it is short enough to show whole. */
+	const textOf = (parent: Node, text: string, lines = 14, rw = false) => {
 		const box = md(parent, text);
 		if (text.length > lines * 70 || text.split("\n").length > lines) {
 			box.setAttribute("class", `md clamped l${lines}`);
 			const b = cls(el("button", parent, "Show more"), "linklike more");
 			b.setAttribute("type", "button");
 			b.addEventListener("click", () => { box.setAttribute("class", "md"); (b as J).remove(); });
-		}
+			am.readable?.(box, text, b);
+		} else if (rw && text.length >= 160) am.readable?.(box, text, null);
 	};
 	/** A journal entry as a card: its "## …" line becomes the title, "entry 5 —" noise goes, a label like "decision" becomes a tag. */
 	/** An entry's own title: its leading "## …" line without the "entry 5 —" noise; "" when it has none or only a tag. */
@@ -388,7 +401,7 @@ export function libraryTab(am: Am): void {
 		am.time(head, e.created_at);
 		if (tag) cls(el("span", head, tag), "tag");
 		if (title) cls(el("strong", li, title), "entry-title");
-		textOf(li, body.trim() || "(empty entry)", 6);
+		textOf(li, body.trim() || "(empty entry)", 6, true);
 		return li;
 	};
 
@@ -496,7 +509,7 @@ export function libraryTab(am: Am): void {
 							catch (err) { more.disabled = false; note(wrap, `Could not read the rest: ${why(err)}`, "warn"); }
 						});
 					}
-					if (summary) { el("h3", text, "Summary"); textOf(text, String(summary) + (summaryCut ? "…" : ""), 8); }
+					if (summary) { el("h3", text, "Summary"); textOf(text, String(summary) + (summaryCut ? "…" : ""), 8, true); }
 					if (entries.length) {
 						el("h3", text, `Entries ${entries.length}`);
 						const ol = cls(el("ol", text), "entries"), cards: Node[] = [];
@@ -551,12 +564,15 @@ export function libraryTab(am: Am): void {
 				const got = fromRow(after, connNode, lib, it, r);
 				if (got) { connNode = got.box; fromG = got.g; }
 				if (src.textContent) el("span", meta, "");
-				if (n.description && n.description !== c.text) cls(el("p", text, String(n.description)), "lede");
+				if (n.description && n.description !== c.text) {
+					const lede = cls(el("p", text, String(n.description)), "lede");
+					if (String(n.description).length >= 160) am.readable?.(lede, String(n.description), null);
+				}
 				const cut: string[] = Array.isArray(n.truncated) ? n.truncated.map(String) : [];
 				if (cut.includes("description")) note(text, "The description is longer than this page shows.", "muted");
 				// Long text arrives as a prefix; the rest reads on request, in the server's pages, so it can be read in full.
 				const words = el("div", text), full = { text: typeof c.text === "string" ? c.text : "", complete: c.complete !== false };
-				const show = () => { words.replaceChildren(); if (full.text) textOf(words, full.text + (full.complete ? "" : "…")); else if (!hub && !n.description) note(words, "No text.", "muted"); };
+				const show = () => { words.replaceChildren(); if (full.text) textOf(words, full.text + (full.complete ? "" : "…"), 14, true); else if (!hub && !n.description) note(words, "No text.", "muted"); };
 				show();
 				const loadAll = async () => { if (!full.complete) { full.text = await wholeText(`${base}/nodes/${enc(it.id)}`); full.complete = true; if (version === am.pageVersion) show(); } return full.text; };
 				if (!full.complete) {

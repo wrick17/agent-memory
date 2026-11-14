@@ -13,11 +13,13 @@ import { mapTab } from "./dashboard/map";
 import { shell } from "./dashboard/shell";
 import { storeTab } from "./dashboard/store";
 import { DASHBOARD_CSS } from "./dashboard/style";
+import { readable } from "./dashboard/readable";
+import { readableOn } from "./readable";
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 export const DASHBOARD_HTML = (env: Env) => `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"${readableOn(env) ? ' data-readable="on"' : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Memory</title>
 <style>${DASHBOARD_CSS}</style></head>
 <body><header class="top"><a class="mark" href="#home">Agent Memory</a><nav id="nav" aria-label="Dashboard"><a href="#home">Home</a><a href="#memories">Memories</a><a href="#learnings">Learnings</a><a href="#journals">Journals</a><a href="#projects">Projects</a><a href="#map">Map</a></nav><div id="tools" class="tools"></div></header>
@@ -29,7 +31,7 @@ export const DASHBOARD_HTML = (env: Env) => `<!doctype html>
 <script defer src="/app.js"></script></body></html>`;
 
 /** The parts after the shell: the glossary (the owner tools' help), the library and charts every page reads, the pages, then the owner tools. */
-export const PARTS: Part[] = [glossary, storeTab, chartsTab, libraryTab, mapTab, auditTab, ...ADMIN];
+export const PARTS: Part[] = [glossary, storeTab, chartsTab, readable, libraryTab, mapTab, auditTab, ...ADMIN];
 
 /** The browser half, as /app.js runs it: the shell, every part, then sign-in and the first render. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- browser globals; this Worker project has no DOM types

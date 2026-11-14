@@ -1,8 +1,9 @@
-// fetch(): /mcp, /v1/whoami, /api/*, /settings, the dashboard at / (and /app) and protected-resource metadata. Stateless between requests.
+// fetch(): /mcp, /v1/whoami, /api/*, /settings, the local-only /auth/callback, the dashboard at / (and /app) and protected-resource metadata. Stateless between requests.
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { api, challenge, protectedResource } from "./api";
 import { authenticate } from "./auth";
 import { accountStub, buildServer, type ToolContext } from "./mcp";
+import { CALLBACK_PATH, readableCallback, siwcOn } from "./readable";
 
 export { AccountStore } from "./account/store";
 export { ProfileStore } from "./profile/store";
@@ -36,6 +37,8 @@ export default {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") return protectedResource(env);
 		if (pathname === "/mcp") return mcp(request, env, exec);
+		// The local readable-rewrites option's ChatGPT sign-in callback (src/readable.ts); absent unless READABLE_REWRITES=chatgpt-local.
+		if (pathname === CALLBACK_PATH && siwcOn(env)) return readableCallback(request, env);
 		if (pathname.startsWith("/api/") || pathname.startsWith("/v1/") || pathname === "/settings" || pathname === "/" || pathname === "/app" || pathname === "/app.js") return api(request, env, exec);
 		return new Response("not found", { status: 404 });
 	},

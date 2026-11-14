@@ -17,6 +17,7 @@ import { readContent, runWrite } from "../src/profile/write";
 import { migrate, nextSeq } from "../src/storage";
 import { driveTransfer, type TransferPorts } from "../src/transfer";
 import { wipeAccount, wipeProfile, type WipePorts } from "../src/wipe";
+import { ReadableVault } from "../src/readable";
 import { call } from "./helpers";
 
 const unwrap = <T>(r: Outcome<T>): T => { if (!r.ok) throw new Error(`${r.error.code}: ${r.error.message}`); return r.value; };
@@ -60,6 +61,19 @@ async function rig() {
 }
 
 describe("profile wipe", () => {
+	it("clears the readable-rewrite cache, and a rewrite generated before the wipe is not stored after it", async () => {
+		const r = await rig();
+		const vault = <T,>(f: (v: ReadableVault) => Promise<T>) => r.onAccount((s) => f(new ReadableVault(s.sql, env)));
+		const rows = Array.from({ length: 120 }, (_, i) => ({ key: `k${i}`, rewrite: `work text ${i}` })); // more than one 100-row page
+		const before = await vault(async (v) => { await v.run({ op: "put", epoch: 0, rows }); return v.run({ op: "get", keys: ["k0"] }); }) as { rewrites: Record<string, string>; epoch: number };
+		expect(before.rewrites).toEqual({ k0: "work text 0" });
+		unwrap(await wipeProfile(env, r.wipes, r.caller, "work", "work"));
+		// An in-flight request read the cache before the wipe; its late write carries that epoch and is dropped.
+		await vault((v) => v.run({ op: "put", epoch: before.epoch, rows: [{ key: "late", rewrite: "late work text" }] }));
+		expect(await r.onAccount((s) => s.sql.exec("SELECT count(*) AS n FROM readable_rewrites").one().n)).toBe(0);
+		expect(await vault((v) => v.run({ op: "get", keys: ["k0", "late"] }))).toMatchObject({ rewrites: {} });
+	});
+
 	it("redacts consumed-owner undo after an MCP work-to-personal transfer and completed work wipe", async () => {
 		const userId = `wc-${crypto.randomUUID().slice(0, 8)}`, testEnv = { ...env, OWNER_USER_ID: userId, EMBEDDINGS: "off" } as Env;
 		const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(userId));

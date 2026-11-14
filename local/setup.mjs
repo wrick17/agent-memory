@@ -110,7 +110,8 @@ export function render(s, { frontend, host, integrated, workersDev }) {
 		compatibility_date: COMPATIBILITY_DATE,
 		// global_fetch_strictly_public: the Worker fetches Clerk's signing keys from the public Frontend API, even when that
 		// host is a CNAME in the Worker's own zone.
-		compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
+		// enable_request_signal: readable rewrites cancel the outbound rewrite when the browser hangs up (default from 2026-11-17).
+		compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public", "enable_request_signal"],
 		// workers.dev needs no route or DNS record. Version preview URLs would be more public origins than RESOURCE_URL names.
 		...(workersDev ? { workers_dev: true, preview_urls: false } : { routes: [{ pattern: host, custom_domain: true }] }),
 		observability: { enabled: true },

@@ -4,6 +4,7 @@ import { resumeTransfer, transferPorts } from "./transfer";
 // generations cleared, and its indexes fenced. A retry replays the same plan. Last, before done, the wiped profile's exports
 // are deleted and every other store's are replaced by a clean one (section 18); a failure there leaves the wipe unfinished.
 import { Fail, ok, PROFILE_NAME, type Caller, type Outcome, type ProfileRef } from "./domain/types";
+import { purgeReadable } from "./readable";
 import { nextSeq } from "./storage";
 import type { Page, PurgeResult, WipeOut, WipeStep } from "./profile/store";
 
@@ -64,6 +65,8 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 					if (!p) throw Fail.of("not_found", "unknown profile");
 					let r = record(sql, cmd.profile);
 					if (p.status === "active") {
+						// Readable rewrites generated from now on are not stored; finish clears the cache (src/readable.ts).
+						purgeReadable(sql, true);
 						if (sql.exec("SELECT 1 FROM transfers WHERE (from_profile = ? OR to_profile = ?) AND state IN ('open','committing') LIMIT 1", cmd.profile, cmd.profile).toArray().length) throw Fail.of("moving", "finish or abort this profile's transfers before wiping it");
 						const generations = sql.exec<{ id: string }>("SELECT id FROM generations WHERE profile = ?", cmd.profile).toArray().map((g) => g.id);
 						r = { profile: cmd.profile, generations, wiped_at: tx.now, marker_key: `tombstones/${cmd.profile}-${tx.now}.json`, report: JSON.stringify({ state: "planning" }) };
@@ -105,6 +108,8 @@ export function wipeAccount(storage: DurableObjectStorage, cmd: WipeAccountComma
 					for (const q of ["DELETE FROM routing_rules WHERE id IN (SELECT id FROM routing_rules WHERE profile = ? LIMIT 40)", "DELETE FROM node_index WHERE node_id IN (SELECT node_id FROM node_index WHERE profile = ? LIMIT 100)"]) {
 						const before = tx.rows; tx.run(q, cmd.profile); if (tx.rows > before) return { after: "more" };
 					}
+					// The account-wide rewrite cache, keyed by text alone, may hold this profile's text: cleared page by page.
+					if (purgeReadable(sql, false)) return { after: "more" };
 					const gens = sql.exec<{ id: string }>("SELECT id FROM generations WHERE profile = ? AND state <> 'wiped' LIMIT 40", cmd.profile).toArray();
 					if (gens.length) { tx.run("UPDATE generations SET state = 'wiped', seq = ? WHERE id IN (SELECT value FROM json_each(?))", tx.seq, JSON.stringify(gens.map((g) => g.id))); return { after: "more" }; }
 					tx.run("UPDATE wipes SET report = ?, seq = ? WHERE profile = ? AND wiped_at = ?", cmd.report, tx.seq, cmd.profile, cmd.at);

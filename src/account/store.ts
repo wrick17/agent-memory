@@ -20,6 +20,7 @@ import { insertEvalRun, listEvalRuns } from "../eval";
 import type { ClientStatusBody, ClientStatusRow, EvalRunInput, HealthCheck, LeaseFacts } from "../viewer/types";
 import { healthSweep, readHealth } from "../health";
 import { listClientStatus, storeClientStatus } from "../client-status";
+import { READABLE_TABLES, ReadableVault, type ReadableOp } from "../readable";
 
 export { REBIND_MAX, type AccountTransfer, type TransferCommand } from "./transfers";
 
@@ -387,6 +388,9 @@ export class AccountStore extends DurableObject<Env> {
 	private get days(): refresh.Ledger {
 		return { sql: this.sql, env: this.env, userId: this.meta("user_id")!, write: (fn) => this.write(fn) };
 	}
+	private vault?: ReadableVault;
+	/** Readable rewrites (src/readable.ts): ChatGPT credentials and the rewrite cache, for the Worker's owner and callback routes only. */
+	async readable(op: ReadableOp): Promise<unknown> { return (this.vault ??= new ReadableVault(this.sql, this.env)).run(op); }
 	/** Daily refresh claims (account/refresh.ts), for the Worker's authenticated device or owner routes. */
 	async refreshClaim(ref: ProfileRef, deviceId: string, c: refresh.Control) { return refresh.claim(this.days, ref, deviceId, c); }
 	async refreshPlan(ref: ProfileRef, deviceId: string, c: Parameters<typeof refresh.plan>[3]) { return refresh.plan(this.days, ref, deviceId, c); }
@@ -624,7 +628,7 @@ export class AccountStore extends DurableObject<Env> {
 		return r?.results && "account" in r.results ? r.at ?? null : null;
 	}
 	private exportAccount(userId: string, preserve?: true) {
-		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: [], ...(preserve ? { preserve } : {}) }));
+		return this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: "account", userId, metaTable: "account_meta", control: READABLE_TABLES, ...(preserve ? { preserve } : {}) }));
 	}
 
 	/**
@@ -1881,7 +1885,7 @@ export class AccountStore extends DurableObject<Env> {
 		}
 		const started = Date.now(), live = () => Date.now() - started < 20_000;
 		if (r.state === "checkpoint") {
-			const cp = await this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: CHECKPOINT, userId, metaTable: "account_meta", control: [] }));
+			const cp = await this.ctx.blockConcurrencyWhile(() => exportStore(this.ctx.storage, this.env, { store: CHECKPOINT, userId, metaTable: "account_meta", control: READABLE_TABLES }));
 			if (!cp.ok) return cp;
 			this.advance(r, () => Object.assign(r, { state: "applying", checkpoint: cp.value.id, phase: "clear", next: 0, row: 0 }));
 		}
@@ -2044,7 +2048,7 @@ export class AccountStore extends DurableObject<Env> {
 	 * applies the checkpoint as it was. Wipe refusals are kept either way. True once every chunk is in and the counts match.
 	 */
 	private async applySnapshot(r: AccountRecovery, m: Manifest, rollback: boolean, live: () => boolean): Promise<boolean> {
-		const sql = this.sql, tables = exportTables(sql, { control: [] }).filter((t) => !MERGED.includes(t));
+		const sql = this.sql, tables = exportTables(sql, { control: READABLE_TABLES }).filter((t) => !MERGED.includes(t));
 		const keyOf = (t: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", t).toArray().map((c) => `"${c.name}"`).join(", ");
 		while (r.phase === "clear" && live()) this.advance(r, (tx) => {
 			for (const t of tables) {

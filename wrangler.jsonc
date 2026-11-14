@@ -13,7 +13,8 @@
 	// zone, served by Clerk's Worker. Cloudflare documents that without the flag same-zone fetches go to the zone's origin and
 	// that fetching a same-zone Worker fails (error 1042). Kept as the documented routing for this setup; a 1042 was never
 	// observed here. The live 503 was egress.ts using redirect: "error", which Workers rejects.
-	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	// enable_request_signal: readable rewrites cancel the outbound rewrite when the browser hangs up (default from 2026-11-17).
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public", "enable_request_signal"],
 	"observability": { "enabled": true },
 	// #13: the dashboard shows the deployed version id and time.
 	"version_metadata": { "binding": "CF_VERSION_METADATA" },

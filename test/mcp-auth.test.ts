@@ -6,6 +6,8 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resetKeyCache } from "../src/auth";
 import { egressFetch } from "../src/egress";
+import { ReadableVault } from "../src/readable";
+import worker from "../src/worker";
 import wranglerConfig from "../wrangler.jsonc?raw";
 import { listExports } from "../src/backup";
 import { nextSeq } from "../src/storage";
@@ -1498,5 +1500,165 @@ describe("v2 activity summary with no fully covered day (#15)", () => {
 		expect(res.status).toBe(200);
 		expect(body.from > body.to).toBe(true);
 		expect(body.top_files).toEqual([]);
+	});
+});
+
+describe("readable rewrites (local option)", () => {
+	const base = new URL(env.RESOURCE_URL).origin;
+	const rewriterUrl = "https://rewriter.test/v1/rewrite";
+	const withRewriter = { ...env, READABLE_REWRITER_URL: rewriterUrl, READABLE_REWRITER_TOKEN: "r".repeat(40) } as Env;
+	const chatgpt = { ...env, READABLE_REWRITES: "chatgpt-local" } as Env;
+	const hit = (e: Env, path: string, init: RequestInit = {}, origin = base) => worker.fetch(new Request(`${origin}${path}`, init) as Parameters<typeof worker.fetch>[0], e);
+	const auth = (token: string) => ({ authorization: `Bearer ${token}` });
+	/** JWKS for the owner's session token, plus a rewriter that answers each text with "plain <text>" and counts its calls. */
+	function serveWithRewriter() {
+		const calls: unknown[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url === rewriterUrl) {
+				const body = JSON.parse(String(init?.body)) as { texts: { id: number; text: string }[] };
+				calls.push(body);
+				return Response.json({ results: body.texts.map((t) => ({ id: t.id, rewrite: `plain ${t.text}` })) });
+			}
+			throw new Error(`unexpected egress to ${url}`);
+		});
+		return calls;
+	}
+
+	it("is absent when no setting turns it on: no page attribute, no routes, no callback", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		expect(await (await exports.default.fetch(new Request(`${base}/`))).text()).not.toContain("data-readable");
+		expect(await (await hit(withRewriter, "/")).text()).toContain('data-readable="on"');
+		expect((await exports.default.fetch(new Request(`${base}/auth/callback?state=x&code=y`))).status).toBe(404);
+		expect((await exports.default.fetch(new Request(`${base}/api/readable`, { headers: auth(session) }))).status).toBe(404);
+		expect((await exports.default.fetch(new Request(`${base}/api/readable/rewrite`, { method: "POST", headers: { ...auth(session), "content-type": "application/json" },
+			body: JSON.stringify({ texts: [{ id: 1, text: "x" }] }) }))).status).toBe(404);
+	});
+
+	it("serves only the owner, validates the texts and caches each rewrite once", async () => {
+		const calls = serveWithRewriter();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const { token: device } = await deviceToken("readable-device", ["read", "write"], ["personal"], "personal");
+		const text = `entry ${crypto.randomUUID()}`, body = JSON.stringify({ texts: [{ id: 7, text }] });
+		const rewrite = (token?: string, b = body) => hit(withRewriter, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...(token ? auth(token) : {}) }, body: b });
+		expect((await hit(withRewriter, "/api/readable")).status).toBe(401);
+		expect((await hit(withRewriter, "/api/readable", { headers: auth(device) })).status).toBe(403);
+		expect((await rewrite()).status).toBe(401);
+		expect((await rewrite(device)).status).toBe(403);
+		expect(await (await hit(withRewriter, "/api/readable", { headers: auth(session) })).json()).toMatchObject({ connected: true, backend: "rewriter" });
+		expect((await rewrite(session, JSON.stringify({ texts: [{ id: 1, text }], prompt: "x" }))).status).toBe(400);
+		expect((await rewrite(session, JSON.stringify({ texts: Array.from({ length: 25 }, (_, id) => ({ id, text })) }))).status).toBe(400);
+		expect(calls).toHaveLength(0);
+		for (let i = 0; i < 2; i++) expect(await (await rewrite(session)).json()).toEqual({ results: [{ id: 7, rewrite: `plain ${text}` }], state: "ok" });
+		expect(calls).toHaveLength(1);
+	});
+
+	it("aborts the outbound rewrite when the browser hangs up, and caches nothing", async () => {
+		let outbound: AbortSignal | undefined, calls = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url !== rewriterUrl) throw new Error(`unexpected egress to ${url}`);
+			calls++;
+			outbound = init?.signal ?? undefined;
+			const body = JSON.parse(String(init?.body)) as { texts: { id: number; text: string }[] };
+			// The first call runs until it is aborted; the second answers at once.
+			if (calls === 1) return new Promise<Response>((_r, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+			return Response.json({ results: body.texts.map((t) => ({ id: t.id, rewrite: `plain ${t.text}` })) });
+		});
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const body = JSON.stringify({ texts: [{ id: 1, text: `entry ${crypto.randomUUID()}` }] });
+		const post = (signal?: AbortSignal) => hit(withRewriter, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) }, body, ...(signal ? { signal } : {}) });
+		const browser = new AbortController(), pending = post(browser.signal);
+		await vi.waitFor(() => expect(outbound).toBeDefined()); // the rewrite is out
+		browser.abort();
+		expect(await (await pending).json()).toMatchObject({ results: [], state: "error" });
+		expect(outbound!.aborted).toBe(true);
+		// Nothing was cached: the next request generates again.
+		expect(await (await post()).json()).toMatchObject({ results: [{ id: 1 }], state: "ok" });
+		expect(calls).toBe(2);
+	});
+
+	it("retries each parallel chunk without the output schema when ChatGPT refuses text.format, so every rewrite returns", async () => {
+		const owner = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(owner, (_i, st) => {
+			new ReadableVault(st.storage.sql, chatgpt); // creates the tables
+			st.storage.sql.exec("INSERT OR REPLACE INTO readable_auth (key, value) VALUES ('credentials', ?), ('model', 'true')", JSON.stringify({ subject: "sub", email: null,
+				client_id: "oaiapp_test", id_token: "id", access_token: "live", refresh_token: "r", expires_at: Date.now() + 3_600_000, scopes: ["chatgpt.tokens.use.direct"], saved_at: "" }));
+		});
+		let refused = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url !== "https://api.openai.com/v1/responses") throw new Error(`unexpected egress to ${url}`);
+			const body = JSON.parse(String(init?.body)) as { text?: unknown; input: { content: string }[] };
+			if (body.text) { refused++; return Response.json({ error: { code: "invalid_request_error", param: "text.format" } }, { status: 400 }); }
+			const ids = (JSON.parse(body.input[0]!.content.replace(/^<texts>\n|\n<\/texts>$/g, "")) as { id: number }[]).map((t) => t.id);
+			const sse = (e: unknown) => `data: ${JSON.stringify(e)}\n\n`;
+			return new Response(sse({ type: "response.output_text.delta", delta: JSON.stringify({ results: ids.map((id) => ({ id, rewrite: `plain ${id}` })) }) }) + sse({ type: "response.completed", response: {} }),
+				{ headers: { "content-type": "text/event-stream" } });
+		});
+		try {
+			const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+			const run = crypto.randomUUID(), texts = Array.from({ length: 12 }, (_, id) => ({ id, text: `entry ${run} ${id}` }));
+			const r = await hit(chatgpt, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) }, body: JSON.stringify({ texts }) });
+			const out = await r.json() as { state: string; results: { id: number }[] };
+			expect(out.state).toBe("ok");
+			expect(out.results.map((x) => x.id).sort((a, b) => a - b)).toEqual(texts.map((t) => t.id));
+			expect(refused).toBe(3); // each of the three chunks was refused once, and each retried
+		} finally {
+			await runInDurableObject(owner, (_i, st) => { st.storage.sql.exec("DELETE FROM readable_auth WHERE key IN ('credentials', 'model')"); });
+		}
+	});
+
+	it("passes the rewriter's 503 on as state busy with its Retry-After", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url === rewriterUrl) return Response.json({ error: { code: "busy" } }, { status: 503, headers: { "retry-after": "30" } });
+			throw new Error(`unexpected egress to ${url}`);
+		});
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const r = await hit(withRewriter, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) },
+			body: JSON.stringify({ texts: [{ id: 1, text: `entry ${crypto.randomUUID()}` }] }) });
+		expect(r.headers.get("retry-after")).toBe("30");
+		expect(await r.json()).toMatchObject({ results: [], state: "busy", retryAfter: 30 });
+	});
+
+	it("rejects an unknown or reused sign-in state at /auth/callback", async () => {
+		serveJwks();
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const callback = async (q: string) => { const r = await hit(chatgpt, `/auth/callback?${q}`); return { status: r.status, text: await r.text() }; };
+		expect(await callback("state=never-issued&code=c")).toMatchObject({ status: 400, text: expect.stringContaining("already used") });
+		const connect = await hit(chatgpt, "/api/readable/connect", { method: "POST", headers: auth(session) }, "http://127.0.0.1:8787");
+		const state = new URL(((await connect.json()) as { url: string }).url).searchParams.get("state")!;
+		expect(await callback(`state=${state}&error=access_denied`)).toMatchObject({ status: 400, text: expect.stringContaining("declined") });
+		expect(await callback(`state=${state}&code=c`)).toMatchObject({ status: 400, text: expect.stringContaining("already used") });
+	});
+
+	it("does not reconnect when Disconnect lands during a token refresh, and revokes the late replacement", async () => {
+		let release: ((r: Response) => void) | undefined;
+		const revoked: string[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === "https://auth.openai.com/api/accounts/oauth/token") return new Promise<Response>((r) => { release = r; });
+			if (url === "https://auth.openai.com/.well-known/openid-configuration") return Response.json({ revocation_endpoint: "https://auth.openai.com/oauth/revoke" });
+			if (url === "https://auth.openai.com/oauth/revoke") { revoked.push(new URLSearchParams(String(init?.body)).get("token")!); return new Response(null, { status: 200 }); }
+			throw new Error(`unexpected egress to ${url}`);
+		});
+		await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.newUniqueId()), async (_i, s) => {
+			const vault = new ReadableVault(s.storage.sql, chatgpt);
+			s.storage.sql.exec("INSERT INTO readable_auth (key, value) VALUES ('credentials', ?)", JSON.stringify({ subject: "sub", email: null, client_id: "oaiapp_test",
+				id_token: "id", access_token: "old", refresh_token: "refresh-1", expires_at: 0, scopes: ["chatgpt.tokens.use.direct"], saved_at: "" }));
+			const token = vault.run({ op: "token" });
+			await vi.waitFor(() => expect(release).toBeTypeOf("function")); // the refresh is out
+			expect(await vault.run({ op: "disconnect" })).toEqual({ revoked: true });
+			release!(Response.json({ access_token: "new", refresh_token: "refresh-2", expires_in: 3600 }));
+			expect(await token).toBeNull();
+			expect(await vault.run({ op: "status" })).toMatchObject({ connected: false });
+			expect(revoked).toEqual(["refresh-1", "refresh-2"]);
+		});
 	});
 });

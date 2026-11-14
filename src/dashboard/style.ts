@@ -189,7 +189,7 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 .lib-side{display:grid;gap:.15rem;align-content:start;min-width:0}.lib-list{min-width:0}
 :root[data-width=desktop] .lib{grid-template-columns:minmax(340px,2fr) minmax(0,3fr);grid-template-areas:"side detail" "list detail"}
 :root[data-width=desktop] .lib-side{grid-area:side}:root[data-width=desktop] .lib-list{grid-area:list}
-:root[data-width=desktop] .lib>.lib-detail{grid-area:detail;position:sticky;top:4.2rem;max-height:calc(100vh - 5.5rem);overflow:auto}
+:root[data-width=desktop] .lib>.lib-detail{grid-area:detail;position:sticky;top:4.2rem;max-height:calc(100vh - max(var(--pane-top,4.2rem),4.2rem) - 1.3rem);overflow:auto}
 @media (min-width:1600px){:root[data-width=desktop] .lib{grid-template-columns:230px minmax(380px,1.2fr) minmax(0,2fr);grid-template-areas:"side list detail"}
 :root[data-width=desktop] .lib-side{position:sticky;top:4.2rem}:root[data-width=desktop] .lib-side .facet-btns{flex-direction:column;align-items:stretch}
 :root[data-width=desktop] .lib-side .facet-btns button{justify-content:flex-start}:root[data-width=desktop] .lib-side .facet-btns button .muted{margin-left:auto}}
@@ -209,7 +209,7 @@ dialog{background:var(--panel);color:var(--ink);border:1px solid var(--rule);bor
 .psplit{display:grid;grid-template-columns:minmax(0,1fr);gap:.9rem 1.25rem;align-items:start}.plist,.pslot{min-width:0}
 :root[data-width=desktop] .psplit{grid-template-columns:minmax(320px,2fr) minmax(0,3fr)}
 :root[data-width=desktop] .pslot{position:sticky;top:4.2rem}
-:root[data-width=desktop] .pslot>.pcontent{max-height:calc(100vh - 5.5rem);overflow:auto}
+:root[data-width=desktop] .pslot>.pcontent{max-height:calc(100vh - max(var(--pane-top,4.2rem),4.2rem) - 1.3rem);overflow:auto}
 :root:not([data-width=desktop]) .pslot{display:none}
 :root:not([data-width=desktop]) .psplit.open .pslot{display:block}
 :root:not([data-width=desktop]) .psplit.open .pcontent{position:fixed;z-index:25;inset:0;overflow:auto;border:0;border-radius:0;padding:.75rem 1rem 2rem}
@@ -371,4 +371,13 @@ background:var(--panel);border:1px solid var(--rule);border-radius:12px;box-shad
 @media (max-width:1100px){:root[data-search=open] main{padding-top:calc(3.6rem + .8rem)}}
 /* The live chip keeps one width whatever it says, so nothing beside it moves. */
 @media (min-width:1101px){.sync{width:9.8rem}}@media (max-width:1100px){.sync{min-width:5.6rem}}@media (max-width:640px){.sync{min-width:4.8rem}}
-.sync-retry{min-height:0!important;font-size:12.5px}`;
+.sync-retry{min-height:0!important;font-size:12.5px}
+/* Plain English (readable.ts, local option only): the switch bar above the view and a rewritten block's label. */
+.rbar{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .9rem;margin:0 0 .8rem;font-size:13.5px;color:var(--muted)}
+.rswitch{display:inline-flex;align-items:center;gap:.45rem}.rswitch::before{content:"";flex:none;width:1.9rem;height:1.05rem;box-sizing:border-box;border-radius:999px;border:2px solid var(--line);background:radial-gradient(circle at 30% 50%,var(--line) .3rem,transparent .32rem)}
+.rswitch[aria-checked=true]::before{border-color:var(--info);background:radial-gradient(circle at 70% 50%,var(--info) .3rem,transparent .32rem)}
+.rw-wrap{display:flow-root}/* own block formatting context: .rw-head margins must not collapse through and move the observed wrapper */
+.rw-head{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 .3rem}.rw-tag{text-transform:none;color:var(--info)}
+.rw-status{gap:.45rem;font-size:13px;color:var(--muted)}.rw-status.bad{color:var(--warn)}.rw-secs{font-variant-numeric:tabular-nums}
+.rw-spin{flex:none;width:.8rem;height:.8rem;box-sizing:border-box;border-radius:50%;border:2px solid var(--line);border-top-color:var(--info);animation:rwspin .8s linear infinite}
+@keyframes rwspin{to{transform:rotate(1turn)}}@media (prefers-reduced-motion:reduce){.rw-spin{animation:none;border-color:var(--info)}}`;

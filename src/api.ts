@@ -17,6 +17,7 @@ import { matchRule, mayUse, normalizeRemote, readSet, routeWrite } from "./routi
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard";
 import { deviceV2, factRepoSchema, ownerV2 } from "./v2-api";
 import { factRoute, SESSION_REF } from "./profile/store";
+import { readableApi } from "./readable";
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
@@ -794,6 +795,8 @@ export async function api(request: Request, env: Env, exec?: ExecutionContext): 
 	if (!auth.ok) return challenge(env, auth.status, auth.error, auth.description);
 	if (auth.principal.kind !== "owner") return json({ error: "forbidden" }, 403);
 	if (url.pathname === "/v1/whoami" && request.method === "GET") return json({ claims: auth.claims });
+	const readable = await readableApi(request, env, url);
+	if (readable) return readable;
 
 	const account = accountStub(env, auth.principal.userId);
 	const ctx = await account.context(auth.principal);

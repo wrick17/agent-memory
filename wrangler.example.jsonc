@@ -17,7 +17,8 @@
 	"compatibility_date": "2026-10-20",
 	"compatibility_flags": [
 		"nodejs_compat",
-		"global_fetch_strictly_public"
+		"global_fetch_strictly_public",
+		"enable_request_signal"
 	],
 	"routes": [
 		{
