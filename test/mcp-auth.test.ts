@@ -1581,6 +1581,52 @@ describe("readable rewrites (local option)", () => {
 		expect(calls).toBe(2);
 	});
 
+	it("retries each parallel chunk without the output schema when ChatGPT refuses text.format, so every rewrite returns", async () => {
+		const owner = env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID));
+		await runInDurableObject(owner, (_i, st) => {
+			new ReadableVault(st.storage.sql, chatgpt); // creates the tables
+			st.storage.sql.exec("INSERT OR REPLACE INTO readable_auth (key, value) VALUES ('credentials', ?), ('model', 'true')", JSON.stringify({ subject: "sub", email: null,
+				client_id: "oaiapp_test", id_token: "id", access_token: "live", refresh_token: "r", expires_at: Date.now() + 3_600_000, scopes: ["chatgpt.tokens.use.direct"], saved_at: "" }));
+		});
+		let refused = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url !== "https://api.openai.com/v1/responses") throw new Error(`unexpected egress to ${url}`);
+			const body = JSON.parse(String(init?.body)) as { text?: unknown; input: { content: string }[] };
+			if (body.text) { refused++; return Response.json({ error: { code: "invalid_request_error", param: "text.format" } }, { status: 400 }); }
+			const ids = (JSON.parse(body.input[0]!.content.replace(/^<texts>\n|\n<\/texts>$/g, "")) as { id: number }[]).map((t) => t.id);
+			const sse = (e: unknown) => `data: ${JSON.stringify(e)}\n\n`;
+			return new Response(sse({ type: "response.output_text.delta", delta: JSON.stringify({ results: ids.map((id) => ({ id, rewrite: `plain ${id}` })) }) }) + sse({ type: "response.completed", response: {} }),
+				{ headers: { "content-type": "text/event-stream" } });
+		});
+		try {
+			const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+			const run = crypto.randomUUID(), texts = Array.from({ length: 12 }, (_, id) => ({ id, text: `entry ${run} ${id}` }));
+			const r = await hit(chatgpt, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) }, body: JSON.stringify({ texts }) });
+			const out = await r.json() as { state: string; results: { id: number }[] };
+			expect(out.state).toBe("ok");
+			expect(out.results.map((x) => x.id).sort((a, b) => a - b)).toEqual(texts.map((t) => t.id));
+			expect(refused).toBe(3); // each of the three chunks was refused once, and each retried
+		} finally {
+			await runInDurableObject(owner, (_i, st) => { st.storage.sql.exec("DELETE FROM readable_auth WHERE key IN ('credentials', 'model')"); });
+		}
+	});
+
+	it("passes the rewriter's 503 on as state busy with its Retry-After", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === `${env.CLERK_FRONTEND_API}/.well-known/jwks.json`) return Response.json({ keys: [{ ...await crypto.subtle.exportKey("jwk", keys.publicKey), kid: KID, alg: "RS256", use: "sig" }] });
+			if (url === rewriterUrl) return Response.json({ error: { code: "busy" } }, { status: 503, headers: { "retry-after": "30" } });
+			throw new Error(`unexpected egress to ${url}`);
+		});
+		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });
+		const r = await hit(withRewriter, "/api/readable/rewrite", { method: "POST", headers: { "content-type": "application/json", ...auth(session) },
+			body: JSON.stringify({ texts: [{ id: 1, text: `entry ${crypto.randomUUID()}` }] }) });
+		expect(r.headers.get("retry-after")).toBe("30");
+		expect(await r.json()).toMatchObject({ results: [], state: "busy", retryAfter: 30 });
+	});
+
 	it("rejects an unknown or reused sign-in state at /auth/callback", async () => {
 		serveJwks();
 		const session = await jwt({ aud: undefined, scope: undefined, azp: env.DASHBOARD_ORIGIN });

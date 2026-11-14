@@ -251,23 +251,27 @@ async function modelAvailable(env: Env, token: string): Promise<boolean | null> 
 // ---- The Worker side ----
 
 const vault = (env: Env) => env.ACCOUNT.get(env.ACCOUNT.idFromName(env.OWNER_USER_ID)) as unknown as { readable(op: ReadableOp): Promise<unknown> };
-const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+const reply = (body: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
 
-type Outcome = { state: "ok" } | { state: "limit" | "model_unavailable" | "not_connected" | "error"; message: string };
+/** "busy" (an upstream 503) and "limit" (a 429) carry the upstream Retry-After in seconds, for the dashboard's next try. */
+type Outcome = { state: "ok" } | { state: "limit" | "busy" | "model_unavailable" | "not_connected" | "error"; message: string; retryAfter?: number };
+/** An upstream Retry-After in whole seconds, clamped to 1..3600; 30 when it is missing or not a number of seconds. */
+const retryAfterOf = (res: Response) => { const n = Number(res.headers.get("retry-after")); return Number.isFinite(n) && n > 0 ? Math.min(3600, Math.max(1, Math.round(n))) : 30; };
 let formatAccepted = true; // shortcut: per isolate; a rejected text.format falls back to defensive parsing until the isolate restarts
 
 /** One Responses call for a batch of texts, read as a stream to response.completed. Malformed results are dropped. */
-async function viaChatgpt(env: Env, token: string, items: RewriteItem[], signal: AbortSignal): Promise<{ results: Map<number, string> } & Outcome> {
+async function viaChatgpt(env: Env, token: string, items: RewriteItem[], signal: AbortSignal, format = formatAccepted): Promise<{ results: Map<number, string> } & Outcome> {
 	const body = { model: MODEL, instructions: PROMPT, input: [{ role: "user", content: rewriteInput(items) }],
 		reasoning: { effort: EFFORT }, store: false, stream: true,
-		...(formatAccepted ? { text: { format: { type: "json_schema", name: "rewrites", strict: true, schema: SCHEMA } } } : {}) };
+		...(format ? { text: { format: { type: "json_schema", name: "rewrites", strict: true, schema: SCHEMA } } } : {}) };
 	const res = await egressFetch(env, `${RESOURCE}/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify(body), signal });
 	const none = new Map<number, string>();
 	if (!res.ok) {
 		const j = await jsonOf(res), err = (j.error ?? {}) as { code?: unknown; param?: unknown }, code = typeof err.code === "string" ? err.code : null, param = typeof err.param === "string" ? err.param : "";
 		logIssue("responses", res, { code, param: param || null });
-		if (res.status === 429 || code === LIMIT_CODE) return { results: none, state: "limit", message: "ChatGPT plan limit reached." };
-		if (res.status === 400 && formatAccepted && param.startsWith("text")) { formatAccepted = false; return viaChatgpt(env, token, items, signal); }
+		if (res.status === 429 || code === LIMIT_CODE) return { results: none, state: "limit", message: "ChatGPT plan limit reached.", retryAfter: retryAfterOf(res) };
+		// Each chunk retries once without the schema if ITS request carried one; parallel chunks may all get this answer.
+		if (res.status === 400 && format && param.startsWith("text")) { formatAccepted = false; return viaChatgpt(env, token, items, signal, false); }
 		if (param === "model" || code === "model_not_found") { await vault(env).readable({ op: "model", available: false }); return { results: none, state: "model_unavailable", message: `${MODEL} is not available to this ChatGPT account.` }; }
 		return { results: none, state: "error", message: `ChatGPT returned ${res.status}${code ? ` (${code})` : ""}.` };
 	}
@@ -316,7 +320,8 @@ async function viaRewriter(env: Env, items: RewriteItem[], signal: AbortSignal):
 		logIssue("rewriter", null, { error: timedOut ? "timeout" : String((e as Error).message).slice(0, 200) });
 		return { results: none, state: "error", message: timedOut ? "The rewriter did not answer in time." : "Could not reach the rewriter." };
 	}
-	if (res.status === 429) { await res.body?.cancel(); return { results: none, state: "limit", message: "Rewrite limit reached. Try again later." }; }
+	if (res.status === 429) { await res.body?.cancel(); return { results: none, state: "limit", message: "Rewrite limit reached. Try again later.", retryAfter: retryAfterOf(res) }; }
+	if (res.status === 503) { await res.body?.cancel(); return { results: none, state: "busy", message: "The rewriter is busy. Trying again shortly.", retryAfter: retryAfterOf(res) }; }
 	if (!res.ok) { logIssue("rewriter", res); await res.body?.cancel(); return { results: none, state: "error", message: `The rewriter returned ${res.status}.` }; }
 	return { results: rewriteResults(await jsonOf(res), items.map((t) => t.id)), state: "ok" };
 }
@@ -366,7 +371,9 @@ export async function readableApi(request: Request, env: Env, url: URL): Promise
 		const fresh = missing.filter((t) => out.results.has(t.id)).map((t) => ({ id: t.id, rewrite: out.results.get(t.id)! }));
 		if (hangUp.aborted) return reply({ results, state: "error", message: "Cancelled." }); // nobody reads it; nothing is cached
 		if (fresh.length) await v.readable({ op: "put", epoch, rows: fresh.map((r) => ({ key: keyOf.get(r.id)!, rewrite: r.rewrite })) });
-		return reply({ results: [...results, ...fresh], ...(out.state === "ok" ? { state: "ok" } : { state: out.state, message: out.message }) });
+		if (out.state === "ok") return reply({ results: [...results, ...fresh], state: "ok" });
+		const wait = out.retryAfter !== undefined ? { retryAfter: out.retryAfter } : {};
+		return reply({ results: [...results, ...fresh], state: out.state, message: out.message, ...wait }, 200, out.retryAfter !== undefined ? { "retry-after": String(out.retryAfter) } : {});
 	}
 	return undefined;
 }

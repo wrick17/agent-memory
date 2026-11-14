@@ -17,7 +17,9 @@ export function readable(am: Am): void {
 	// A request in flight: its texts, its abort handle and when it was sent (its cards' live counter).
 	type Run = { texts: Set<string>; ctl: J; since: number };
 	// state: "" not asked, "wait" in view and queued, "fly" in request `run`, "fail" left without a rewrite.
-	type Block = { box: J; more: J; text: string; alt: J; body: J; flip: J; rewrite: string | null; original: boolean; vis: boolean;
+	// wrap: holds the status line, the rewrite and the text, and is what the observer watches, so the status line appearing
+	// or going never moves the watched element in or out of view (which would loop and keep the queue from ever sending).
+	type Block = { box: J; wrap: J; more: J; text: string; alt: J; body: J; flip: J; rewrite: string | null; original: boolean; vis: boolean;
 		state: "" | "wait" | "fly" | "fail"; run: Run | null; kind: string; line: J; say: J; secs: J; spin: J; again: J };
 	let on = saved(), status: { connected: boolean; email: string | null; model: boolean | null; backend: string } | null = null;
 	let halt: { text: string; usage?: boolean; limit?: boolean } | null = null, note = "";
@@ -94,13 +96,13 @@ export function readable(am: Am): void {
 	// One observer for all cards: whether each is in the viewport now, so only cards in view are asked for, and leaving cancels.
 	const IO = win.IntersectionObserver;
 	const io = typeof IO === "function" ? new IO((entries: J[]) => {
-		for (const e of entries) { const b = blocks.find((x) => x.box === e.target); if (b) b.vis = e.isIntersecting; }
+		for (const e of entries) { const b = blocks.find((x) => x.wrap === e.target); if (b) b.vis = e.isIntersecting; }
 		review();
 	}) : null;
 	/** Applies the latest view: forgets cards that left the page, queues cards in view, drops queued cards out of view, and aborts
 	 * each request once none of its cards is in view (the cards go back to unasked, so they are asked again on return). */
 	const review = () => {
-		blocks = blocks.filter((b) => { if (b.box.isConnected) return true; io?.unobserve(b.box); b.line?.remove(); return false; });
+		blocks = blocks.filter((b) => { if (b.box.isConnected) return true; io?.unobserve(b.wrap); b.line?.remove(); return false; });
 		for (const b of blocks) {
 			if (b.rewrite || b.state === "fail") continue;
 			const want = active() && b.vis;
@@ -112,17 +114,23 @@ export function readable(am: Am): void {
 		for (const r of runs) if (!blocks.some((b) => b.vis && b.state === "fly" && b.run === r)) r.ctl.abort();
 		mark();
 	};
-	/** Sends once navigation or scrolling has settled for 150 ms, so the requests cover the whole view at once. */
-	const soon = () => { win.clearTimeout(wake); wake = win.setTimeout(() => { wake = 0; pump(); }, 150); };
+	/** Sends once navigation or scrolling has settled for 150 ms, so the requests cover the whole view at once; reports that keep
+	 * arriving can push the send back for at most 350 ms more, so a batch always goes out within about half a second. */
+	let first = 0;
+	const soon = () => {
+		if (wake && Date.now() - first >= 350) return;
+		if (wake) win.clearTimeout(wake); else first = Date.now();
+		wake = win.setTimeout(() => { wake = 0; pump(); }, 150);
+	};
 	const retry = () => { halt = null; for (const b of blocks) if (b.state === "fail") b.state = ""; paint(); review(); };
 
 	const post = async (texts: { id: number; text: string }[], signal: J) => {
 		const res = await win.fetch("/api/readable/rewrite", { method: "POST", signal,
 			headers: { authorization: `Bearer ${await am.token()}`, "content-type": "application/json" }, body: JSON.stringify({ texts }) });
 		const body = await res.json().catch(() => ({}));
-		// The rewriter is busy (503, or the Worker's relayed "returned 503"): the caller waits its retry-after and tries once more.
-		if (res.status === 503 || body.state === "busy" || (body.state === "error" && /\b503\b/.test(String(body.message ?? ""))))
-			return { busy: Math.min(60, Number(res.headers.get("retry-after")) || 5) };
+		// A bare 503 or 429 reads like the Worker's own "busy" and "limit" answers, with the header's delay.
+		if (!res.ok && (res.status === 503 || res.status === 429))
+			return { state: res.status === 503 ? "busy" : "limit", message: body.error?.message, retryAfter: Number(res.headers.get("retry-after")) || undefined };
 		if (!res.ok) throw new Error(body.error?.message ?? (typeof body.error === "string" ? body.error : `HTTP ${res.status}`));
 		return body;
 	};
@@ -143,21 +151,30 @@ export function readable(am: Am): void {
 		for (const b of blocks) if (b.state === "wait" && run.texts.has(b.text)) { b.state = "fly"; b.run = run; }
 		const left = (to: Block["state"]) => { for (const b of blocks) if (b.state === "fly" && b.run === run) { b.state = to; b.run = null; } };
 		try {
-			const items = texts.map((text, id) => ({ id, text }));
-			let r = await post(items, run.ctl.signal);
-			if (r.busy) {
-				// The cards keep counting while it waits; leaving the view still aborts the wait.
-				await new Promise((ok, no) => { const t = win.setTimeout(ok, r.busy * 1000); run.ctl.signal.addEventListener("abort", () => { win.clearTimeout(t); no(new Error("aborted")); }); });
-				r = await post(items, run.ctl.signal);
-				if (r.busy) r = { state: "error", message: "The rewriter is busy. Try again in a moment." };
+			const take = (asked: string[], r: J) => {
+				for (const x of r.results ?? []) {
+					const t = asked[x.id];
+					if (t === undefined || typeof x.rewrite !== "string") continue;
+					done.set(t, x.rewrite);
+					for (const b of blocks) if (b.text === t) showRewrite(b, x.rewrite);
+				}
+			};
+			const ask = async (asked: string[]) => { const r = await post(asked.map((text, id) => ({ id, text })), run.ctl.signal); take(asked, r); return r; };
+			let r = await ask(texts);
+			// Busy (retry after at most 60 s), or a limit that lifts within 60 s: wait retryAfter and ask once more for what is still
+			// missing. A longer limit shows "Rewrite limit reached" at once. The cards keep counting meanwhile; leaving still aborts.
+			const after = Number(r.retryAfter) || 0;
+			const wait = r.state === "busy" ? Math.min(60, after || 5) : r.state === "limit" && after > 0 && after <= 60 ? after : 0;
+			const rest = texts.filter((t) => !done.has(t));
+			if (wait && rest.length) {
+				await new Promise((ok, no) => {
+					const t = win.setTimeout(ok, wait * 1000);
+					run.ctl.signal.addEventListener("abort", () => { win.clearTimeout(t); no(new Error("aborted")); });
+				});
+				r = await ask(rest);
 			}
-			for (const x of r.results ?? []) {
-				const t = texts[x.id];
-				if (t === undefined || typeof x.rewrite !== "string") continue;
-				done.set(t, x.rewrite);
-				for (const b of blocks) if (b.text === t) showRewrite(b, x.rewrite);
-			}
-			if (r.state === "limit") halt = { text: `${String(r.message ?? "Rewrite limit reached.")} Rewrites are paused.`, usage: status?.backend === "chatgpt", limit: true };
+			if (r.state === "busy") halt = { text: "The rewriter is busy. Try again in a moment." };
+			else if (r.state === "limit") halt = { text: `${String(r.message ?? "Rewrite limit reached.")} Rewrites are paused.`, usage: status?.backend === "chatgpt", limit: true };
 			else if (r.state === "model_unavailable") { if (status) status.model = false; }
 			else if (r.state === "not_connected") { if (status) status.connected = false; }
 			else if (r.state !== "ok") halt = { text: String(r.message ?? "Rewrites failed.") };
@@ -224,12 +241,15 @@ export function readable(am: Am): void {
 	/** library.ts calls this for each text block it collapses behind "Show more", and for journal entries, summaries and descriptions of 160+ characters. */
 	am.readable = (box: Node, text: string, more: Node | null) => {
 		if (text.length > MAX) return;
-		const b: Block = { box, more, text, alt: null, body: null, flip: null, rewrite: null, original: false, vis: !io,
+		const wrap = cls(el("div"), "rw-wrap");
+		(box as J).parentNode.insertBefore(wrap, box);
+		wrap.appendChild(box);
+		const b: Block = { box, wrap, more, text, alt: null, body: null, flip: null, rewrite: null, original: false, vis: !io,
 			state: "", run: null, kind: "", line: null, say: null, secs: null, spin: null, again: null };
 		blocks.push(b);
 		const known = done.get(text);
 		if (known !== undefined) showRewrite(b, known);
-		if (io) io.observe(box); else review(); // the observer's first report says whether it is in view
+		if (io) io.observe(wrap); else review(); // the observer's first report says whether it is in view
 	};
 	// Moving to another page: review once it has drawn, so a request for cards that are gone is cancelled even when the new
 	// page has no long text (the observer may not report removed cards).
