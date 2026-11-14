@@ -158,6 +158,7 @@ export function readable(am: Am): void {
 					done.set(t, x.rewrite);
 					for (const b of blocks) if (b.text === t) showRewrite(b, x.rewrite);
 				}
+				mark(); // cards answered now drop their Rewriting… line before any retry wait
 			};
 			const ask = async (asked: string[]) => { const r = await post(asked.map((text, id) => ({ id, text })), run.ctl.signal); take(asked, r); return r; };
 			let r = await ask(texts);
