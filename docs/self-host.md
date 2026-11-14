@@ -255,7 +255,7 @@ Deterministic fact detection follows capture and has no switch of its own: with 
 
 ### Readable rewrites (local trial)
 
-The dashboard can show a plain-English rewrite of long entry text, written by `gpt-6-luna` on your ChatGPT plan. It is off unless one of the settings below is set, and it is meant for a local `wrangler dev` run. Nothing goes into `wrangler.jsonc`. With it on, a **Plain English** switch appears above each page. Turn it on, and each long text block that has a **Show more** button is rewritten as it scrolls into view. The rewrite is labelled **AI rewrite**, and **Show original** switches back. Rewrites are cached in the Worker, one per text, for every device.
+The dashboard can show a plain-English rewrite of long entry text, written by `gpt-6-luna` on your ChatGPT plan. It is off unless one of the settings below is set, and it is meant for a local `wrangler dev` run. Nothing goes into `wrangler.jsonc`. With it on, a **Plain English** switch appears above each page. Turn it on, and each long text in view (a block with a **Show more** button, or a journal entry, summary or description of 160 or more characters) is rewritten, a few cards per request, with a loader on each card until its rewrite arrives. The rewrite is labelled **AI rewrite**, and **Show original** switches back. Navigating away cancels the rewrites still running. Rewrites are cached in the Worker, one per text, for every device.
 
 Two backends generate rewrites:
 
