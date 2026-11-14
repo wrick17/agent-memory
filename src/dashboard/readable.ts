@@ -93,14 +93,14 @@ export function readable(am: Am): void {
 		else if (!need && tick) { win.clearInterval(tick); tick = 0; }
 	};
 
-	// One observer for all cards: whether each is in the viewport now, so only cards in view are asked for, and leaving cancels.
+	// One observer for all cards: whether each is in the viewport now, so only cards in view are asked for. Scrolling away never cancels a request; leaving the page does.
 	const IO = win.IntersectionObserver;
 	const io = typeof IO === "function" ? new IO((entries: J[]) => {
 		for (const e of entries) { const b = blocks.find((x) => x.wrap === e.target); if (b) b.vis = e.isIntersecting; }
 		review();
 	}) : null;
 	/** Applies the latest view: forgets cards that left the page, queues cards in view, drops queued cards out of view, and aborts
-	 * each request once none of its cards is in view (the cards go back to unasked, so they are asked again on return). */
+	 * a request only once none of its cards is on the page any more (navigation); scrolling lets it finish. */
 	const review = () => {
 		blocks = blocks.filter((b) => { if (b.box.isConnected) return true; io?.unobserve(b.wrap); b.line?.remove(); return false; });
 		for (const b of blocks) {
@@ -111,7 +111,8 @@ export function readable(am: Am): void {
 			else if (want && b.state !== "fly") { b.state = "wait"; soon(); }
 			else if (!want && b.state === "wait") b.state = "";
 		}
-		for (const r of runs) if (!blocks.some((b) => b.vis && b.state === "fly" && b.run === r)) r.ctl.abort();
+		// Scrolling never cancels: a request runs on while any of its cards is still on the page. Navigating away removes them, which aborts it.
+		for (const r of runs) if (!blocks.some((b) => b.state === "fly" && b.run === r)) r.ctl.abort();
 		mark();
 	};
 	/** Sends once navigation or scrolling has settled for 150 ms, so the requests cover the whole view at once; reports that keep
