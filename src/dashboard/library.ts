@@ -818,6 +818,7 @@ export function libraryTab(am: Am): void {
 					openSig = "missing";
 					panel.replaceChildren();
 					note(panel, "This record is not in the chosen profile.", "muted");
+					am.pageStatus(panel); // a record just forgotten here keeps its outcome and Undo
 					const x = el("a", panel, "Close");
 					x.setAttribute("href", dropOpen(route.hash));
 					x.setAttribute("data-close", "");
