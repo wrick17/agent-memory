@@ -236,6 +236,17 @@ describe("MCP over /mcp", () => {
 		expect(list.data.result.tools).toHaveLength(12);
 	});
 
+	it("advertises no tool list changes, so a subscriptions/listen stream closes at once", async () => {
+		// An open listen stream is buffered by TLS-inspecting proxies, stalling Claude Code's connect for its 25 s probe bound.
+		serveJwks();
+		const token = await jwt({});
+		const discover = await rpc(token, "server/discover");
+		expect(discover.data.result.capabilities.tools.listChanged).toBe(false);
+		const listen = await rpc(token, "subscriptions/listen", { notifications: { toolsListChanged: true } });
+		expect(listen.status).toBe(200);
+		expect(listen.data.params.notifications).toEqual({});
+	});
+
 	it("filters tools by device-token scope and revokes on the next request", async () => {
 		const { id, token } = await deviceToken("reader-box", ["read"], ["personal", "me"], "personal");
 		const list = await rpc(token, "tools/list");
