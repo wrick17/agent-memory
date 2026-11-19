@@ -520,6 +520,10 @@ function render(outcome: Outcome<unknown>, wrap = false, corpus = false) {
 /** A fresh server per request with only the tools the caller's scopes allow (tools/list is filtered by scope). */
 export function buildServer(c: ToolContext): McpServer {
 	const server = new McpServer({ name: "agent-memory", version: "0.1.0" });
+	// No listChanged: the tool list never changes mid-connection, and advertising it makes 2026-07-28 clients hold a
+	// subscriptions/listen SSE stream open, which TLS-inspecting proxies buffer until the client's probe times out.
+	// Registered before the tools so it wins; only when some tool is allowed, so a tool-less token still sees no tools method.
+	if (TOOLS.some((t) => c.caller.scopes.includes(t.scope) && !("enabled" in t && !t.enabled(c.env)))) server.server.registerCapabilities({ tools: { listChanged: false } });
 	for (const tool of TOOLS) {
 		if (!c.caller.scopes.includes(tool.scope) || ("enabled" in tool && !tool.enabled(c.env))) continue;
 		server.registerTool(tool.name, { description: tool.description + (INTERACTIVE_READS.has(tool.name) || tool.name === "review_candidates" ? READ_ENVELOPE_NOTE : ""), inputSchema: tool.schema },
